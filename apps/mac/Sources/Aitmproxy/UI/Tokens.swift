@@ -354,6 +354,7 @@ enum Tok {
     /// SF Symbol per icon role (`icon.glyph.*.mac`).
     enum Glyph {
         static let agent = "cpu"
+        static let apps = "app.badge"
         static let browser = "globe"
         static let chevron = "chevron.right"
         static let clear = "trash"
@@ -366,10 +367,12 @@ enum Tok {
         static let lock = "lock"
         static let lockOpen = "lock.open"
         static let mark = "flag"
+        static let network = "network"
         static let palette = "command"
         static let pause = "pause.fill"
         static let pin = "pin"
         static let poc = "flag.checkered"
+        static let process = "terminal"
         static let record = "record.circle"
         static let replay = "arrow.counterclockwise"
         static let resume = "arrow.right.circle"

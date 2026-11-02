@@ -83,16 +83,9 @@ struct StatusPanel: View {
         let busy = session.coreHealth.captureBusy
         return layout {
             ForEach(summary.lanes, id: \.kind) { lane in
-                VStack(alignment: .leading, spacing: Space.md) {
-                    LaneCard(lane: lane, captureBusy: busy, run: run)
-                    // The CA fact sits under the Core card (spec D17.6); no row while the OS store
-                    // has not answered, so "unread" never reads as "not trusted".
-                    if lane.kind == .core, let facts = session.caTrust {
-                        CATrustRow(facts: facts, live: session.caTrustControlLive, run: run)
-                    }
-                }
-                .frame(width: cardWidth, alignment: .leading)
-                .gridProbe("status.\(lane.kind.rawValue)", area: "status", edge: nil)
+                LaneCard(lane: lane, captureBusy: busy, live: isLive, run: run)
+                    .frame(width: cardWidth, alignment: .leading)
+                    .gridProbe("status.\(lane.kind.rawValue)", area: "status", edge: nil)
             }
             // No trailing Spacer: it would add one more HStack spacing (20 pt) and push the
             // row past the viewport, which centres the whole page on a half point.
@@ -102,7 +95,7 @@ struct StatusPanel: View {
     // MARK: Getting started
 
     private func gettingStarted(_ summary: ConnectionSummary) -> some View {
-        let steps = stepsWithCATrust(summary)
+        let steps = summary.steps
         return VStack(alignment: .leading, spacing: Space.md) {
             TrackedLabel("Getting started").accessibilityAddTraits(.isHeader)
             if steps.allSatisfy(\.done) {
@@ -113,7 +106,7 @@ struct StatusPanel: View {
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(steps, id: \.kind) { step in
-                        StepRow(step: step, run: run)
+                        StepRow(step: step, live: isLive, run: run)
                         if step.kind != steps.last?.kind {
                             Rule(color: Tok.Line.rule)
                         }
@@ -124,15 +117,6 @@ struct StatusPanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Getting started")
-    }
-
-    /// The summary's steps with the session's CA step after Bus (spec D17.9); no row at all
-    /// while `ca.status` has never been read.
-    private func stepsWithCATrust(_ summary: ConnectionSummary) -> [GettingStartedStep] {
-        var steps = summary.steps
-        guard let step = session.caTrustStep, let at = steps.firstIndex(where: { $0.kind == .busConnected }) else { return steps }
-        steps.insert(step, at: at + 1)
-        return steps
     }
 
     // MARK: Recent
@@ -209,9 +193,22 @@ struct StatusPanel: View {
         case .trustCA:
             // Operator-only, like the capture switch: the one call path (Session+CATrust.swift).
             Task { await session.trustCA() }
-        case .showCoreLog, .reconnectBus, .openScope, .openBrowser, .copyListenAddress, .approveInSystemSettings, .openCAPanel:
+        case .setSystemProxy:
+            // Operator-only, like trusting the CA: the one call path (Session+SystemProxy.swift).
+            Task { await session.setSystemProxy() }
+        case .unsetSystemProxy:
+            Task { await session.restoreSystemProxy() }
+        case .showCoreLog, .reconnectBus, .openScope, .addScopeHost, .openBrowser, .copyListenAddress, .approveInSystemSettings, .openCAPanel:
             break // handled by Session.perform(connection:) above
         }
+    }
+
+    /// Whether a card or step button may be pressed now: the Flows banner's one predicate
+    /// (`RouteActions.standsDown`), so the CA and system-proxy buttons stand down the same way on
+    /// both pages while the bus is not the operator's or a change is in flight.
+    private func isLive(_ action: ConnectionAction) -> Bool {
+        !RouteActions.standsDown(action, caTrustControlLive: session.caTrustControlLive,
+                                 systemProxyControlLive: session.systemProxyControlLive)
     }
 }
 
@@ -222,6 +219,8 @@ struct StatusPanel: View {
 private struct LaneCard: View {
     var lane: ConnectionLane
     var captureBusy: Bool
+    /// Per-action gate from the page (the operator-only bus calls); the capture gate is this card's own.
+    var live: (ConnectionAction) -> Bool
     var run: (ConnectionAction) -> Void
 
     /// Actions that live in the trailing menu rather than inline (never the primary one).
@@ -270,17 +269,17 @@ private struct LaneCard: View {
         HStack(spacing: Space.xs) {
             if let primary {
                 FlatButton(primary.title) { run(primary) }
-                    .disabled(captureBusy && Self.isCaptureAction(primary))
+                    .disabled(captureBusy && Self.isCaptureAction(primary) || !live(primary))
             }
             ForEach(inline, id: \.self) { action in
                 FlatButton(action.title) { run(action) }
-                    .disabled(captureBusy && Self.isCaptureAction(action))
+                    .disabled(captureBusy && Self.isCaptureAction(action) || !live(action))
             }
             if !menu.isEmpty {
                 Menu {
                     ForEach(menu, id: \.self) { action in
                         Button(action.title, role: action.isDestructive ? .destructive : nil) { run(action) }
-                            .disabled(captureBusy && Self.isCaptureAction(action))
+                            .disabled(captureBusy && Self.isCaptureAction(action) || !live(action))
                     }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -299,42 +298,13 @@ private struct LaneCard: View {
     }
 }
 
-// MARK: - CA trust row
-
-/// The CA fact under the Core card (spec D17.6): state dot + the fact's text, the remedy, its
-/// actions. Every word is `CATrustFacts`'; the buttons stand down unless the bus is the
-/// operator's and no change is in flight (`live`).
-private struct CATrustRow: View {
-    var facts: CATrustFacts
-    var live: Bool
-    var run: (ConnectionAction) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.sm) {
-            LaneDot(state: facts.state, word: facts.text, title: CATrustFacts.laneTitle)
-                .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
-                .foregroundStyle(Tok.Ink.primary.color)
-            if let remedy = facts.remedy {
-                RemedyText(remedy)
-            }
-            if !facts.actions.isEmpty {
-                HStack(spacing: Space.xs) {
-                    ForEach(facts.actions, id: \.self) { action in
-                        FlatButton(action.title) { run(action) }.disabled(!live)
-                    }
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .contain)
-    }
-}
-
 // MARK: - Getting-started row
 
-/// `✓` (done: success + secondary word) or `○` (to do: primary word + its one action).
+/// `✓` (done: success + secondary word) or `○` (to do: primary word + its one action, which stands
+/// down while the page's `live` gate says its bus call cannot be made now).
 private struct StepRow: View {
     var step: GettingStartedStep
+    var live: (ConnectionAction) -> Bool
     var run: (ConnectionAction) -> Void
 
     var body: some View {
@@ -352,9 +322,11 @@ private struct StepRow: View {
             Spacer(minLength: Space.sm)
             if !step.done, let action = step.action {
                 FlatButton(action.title) { run(action) }
+                    .disabled(!live(action))
             }
         }
         .frame(height: Tok.Size.Row.default)
+        .help(step.detail ?? step.title)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(step.done ? "Done" : "To do"): \(step.title)")
     }

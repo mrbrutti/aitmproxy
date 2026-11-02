@@ -17,8 +17,13 @@ pub mod issue;
 pub mod job;
 pub mod point;
 pub mod profile;
+pub mod registry;
 pub mod results;
 pub mod session;
+/// Test stubs for this crate's traits, shared by its own tests and by any crate
+/// that enables the `testing` feature. Never compiled into a release build.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod traits;
 pub mod vocab;
 
@@ -28,6 +33,7 @@ pub use issue::*;
 pub use job::*;
 pub use point::*;
 pub use profile::*;
+pub use registry::*;
 pub use results::*;
 pub use session::*;
 pub use traits::*;

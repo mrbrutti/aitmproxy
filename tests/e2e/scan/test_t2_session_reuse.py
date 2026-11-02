@@ -34,6 +34,7 @@ from aitm_e2e.scan import (  # noqa: E402
     boot_target,
     issues,
     login_via_proxy,
+    require_crate_lane,
     require_lane,
     require_verbs,
     scan_call,
@@ -65,6 +66,7 @@ def main() -> None:
                 op = BusClient.operator(core)
                 require_verbs(op, "scan.start", "scan.status", "scan.issues", "scan.session.preview")
                 require_lane(op, "http")
+                require_crate_lane(op, "http", "needs T2 (aitm-scan-http)")
                 proxy = cfg.proxy_port
 
                 section("real login + authenticated GET /account through the proxy")

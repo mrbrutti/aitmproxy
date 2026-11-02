@@ -395,9 +395,13 @@ impl ScriptFlow {
 /// What a fallible handle operation returns: a catchable Rhai error.
 type ScriptResult = Result<(), Box<EvalAltResult>>;
 
-/// The error for a write to the request of a flow that has none.
+/// The error for a write to the request of a WebSocket flow. Its `request` is
+/// the upgrade handshake, projected for reading only: the upgrade already
+/// happened, so there is nothing an edit could reach.
 const NO_REQUEST: &str =
-    "flow.request cannot be edited: a WebSocket flow has no request (reads return \"\")";
+    "flow.request cannot be edited: a WebSocket flow's request is its upgrade \
+                          handshake, which has already been sent (reads work; edit the frames \
+                          through msg in on_ws_message instead)";
 
 /// The error for a write to the response before one exists — the request
 /// phase. The fix is the explicit short-circuit.
@@ -412,9 +416,14 @@ impl ScriptRequest {
         lock(&self.0).request.as_ref().map(f).unwrap_or_default()
     }
 
-    /// Edit the request; a flow without one (WebSocket) refuses the write.
+    /// Edit the request; a WebSocket flow (whose request is the read-only
+    /// handshake view, or absent) refuses the write.
     fn edit(&self, f: impl FnOnce(&mut RequestState)) -> ScriptResult {
-        match lock(&self.0).request.as_mut() {
+        let mut state = lock(&self.0);
+        if state.kind == FlowKind::WebSocket {
+            return Err(error(NO_REQUEST));
+        }
+        match state.request.as_mut() {
             Some(request) => {
                 f(request);
                 Ok(())
@@ -513,7 +522,18 @@ impl ScriptHeaders {
         if matches!(self.1, HeaderSide::ResponseHeaders) {
             check_response_mutable()?;
         }
-        match self.1.pairs_mut(&mut lock(&self.0)) {
+        let mut state = lock(&self.0);
+        // A WebSocket flow's request headers/query are the handshake's, a
+        // read-only view (see `ScriptRequest::edit`).
+        if state.kind == FlowKind::WebSocket
+            && matches!(
+                self.1,
+                HeaderSide::RequestHeaders | HeaderSide::RequestQuery
+            )
+        {
+            return Err(error(NO_REQUEST));
+        }
+        match self.1.pairs_mut(&mut state) {
             Some(pairs) => {
                 f(pairs);
                 Ok(())

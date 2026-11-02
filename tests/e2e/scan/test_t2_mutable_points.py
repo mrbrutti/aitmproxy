@@ -34,6 +34,7 @@ from aitm_e2e.scan import (  # noqa: E402
     REFLECTED_XSS_CLASSES,
     boot_target,
     issues,
+    require_crate_lane,
     require_lane,
     require_verbs,
     start_job,
@@ -80,6 +81,7 @@ def main() -> None:
                 op = BusClient.operator(core)
                 require_verbs(op, "scan.start", "scan.status", "scan.issues")
                 require_lane(op, "http")
+                require_crate_lane(op, "http", "needs T2 (aitm-scan-http)")
                 proxy = cfg.proxy_port
 
                 section("real proxied captures of /whoami and /prefs on V and P")

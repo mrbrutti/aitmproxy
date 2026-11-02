@@ -7,6 +7,13 @@
 //! valid. `aitm_core::Config` stays a plain data type; the file format lives
 //! here, in the binary's crate.
 //!
+//! Four sections are kept outside `aitm_core::Config` because `aitm-core` knows
+//! nothing about the modules that own them: `l4:` ([`L4Config`]),
+//! `macos_capture:` ([`MacosCaptureConfig`]), `system_proxy:`
+//! ([`SystemProxyConfig`]) and `scanner:` ([`ScannerConfig`], spec D11). They
+//! ride alongside [`Config`] in [`Settings`], parsed from the same file in the
+//! same pass, so a misspelled key in any of them is refused the same way.
+//!
 //! Keys mirror the Rust field names. Durations are integer seconds.
 
 use std::collections::BTreeMap;
@@ -23,7 +30,9 @@ use aitm_core::{
     PocConfig, ScopeConfig, ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
+use aitm_plugin_scanner::{Ceilings, ScannerConfig};
 use aitm_proto_l4::config::L4Config;
+use aitm_scan_model::ScanProfile;
 use aitm_sysproxy::SystemProxyConfig;
 
 use crate::macos_capture::config::MacosCaptureConfig;
@@ -53,6 +62,11 @@ pub struct Settings {
     /// CA audit log's sibling, `<dir of ca.audit_log>/system-proxy-state.json`
     /// (plan call C6), so it follows the same directory rule and fallbacks.
     pub system_proxy: SystemProxyConfig,
+    /// The scanner v2 engine's config (spec D11): agent gates, job limits, the
+    /// hard ceilings every profile is clamped to, the default profile and the
+    /// profiles the file declares. Outside `Config` like the three above. An
+    /// absent `scanner:` section is `ScannerConfig::default()`.
+    pub scanner: ScannerConfig,
 }
 
 /// Plan call C6: fill an unset `system_proxy.state_file` with the default that
@@ -96,6 +110,7 @@ pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
                     l4: L4Config::default(),
                     macos_capture: MacosCaptureConfig::default(),
                     system_proxy,
+                    scanner: ScannerConfig::default(),
                 })
             }
             Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
@@ -121,10 +136,14 @@ pub fn parse_full(yaml: &str) -> anyhow::Result<(Config, L4Config)> {
 /// `deny_unknown_fields`); absent keys keep their default value; an absent `l4`
 /// section is `L4Config::default()` — disabled, fail-closed.
 pub fn parse_settings(yaml: &str) -> anyhow::Result<Settings> {
-    let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
+    let mut file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
     let l4 = file.l4.clone().unwrap_or_default();
     let macos_capture = file.macos_capture.clone().unwrap_or_default();
     let mut system_proxy = file.system_proxy.clone().unwrap_or_default();
+    let mut scanner = ScannerConfig::default();
+    if let Some(s) = file.scanner.take() {
+        s.apply(&mut scanner);
+    }
     let mut core = Config::default();
     let mut rhai = RhaiConfig::default();
     file.apply(&mut core, &mut rhai)?;
@@ -136,6 +155,7 @@ pub fn parse_settings(yaml: &str) -> anyhow::Result<Settings> {
         l4,
         macos_capture,
         system_proxy,
+        scanner,
     })
 }
 
@@ -228,6 +248,9 @@ struct ConfigFile {
     maps: Option<MapsFile>,
     /// Session/flow file I/O agent gate (M6 F10).
     session_io: Option<SessionIoFile>,
+    /// The scanner v2 engine section (spec D11). Lives outside `Config` like
+    /// `l4`; an absent section is `ScannerConfig::default()`.
+    scanner: Option<ScannerFile>,
 }
 
 impl ConfigFile {
@@ -276,6 +299,81 @@ impl ConfigFile {
             session_io.apply(&mut c.session_io);
         }
         Ok(())
+    }
+}
+
+/// The `scanner:` section (spec D11): the scanner v2 engine's gates, limits,
+/// ceilings and profiles.
+///
+/// Mapped by hand rather than straight onto [`ScannerConfig`] because that
+/// struct also carries two fields the file never sets (`findings_dir` and
+/// `l4_allow_agent_inject`, both copied from elsewhere in the config by
+/// `wire.rs`) and the Stage 1 crawl budgets, which the profile tree replaces.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ScannerFile {
+    /// Let an agent (MCP) frontend start an active scan. Off by default.
+    allow_agent_active: Option<bool>,
+    /// Let an agent (MCP) frontend start a job whose profile runs an L4 fuzz
+    /// lane. Off by default, and independent of `allow_agent_active`.
+    allow_agent_l4_fuzz: Option<bool>,
+    /// How many scan jobs may run at once.
+    max_jobs: Option<u32>,
+    /// How many finished jobs the registry keeps.
+    history: Option<u32>,
+    /// Per-check wall-clock ceiling, in seconds.
+    check_timeout_s: Option<u64>,
+    /// The hard ceilings every profile is clamped to.
+    ceilings: Option<CeilingsFile>,
+    /// The profile `scan.start` uses when the caller names only a target.
+    default_profile: Option<String>,
+    /// Profiles declared in this file, by name.
+    profiles: Option<BTreeMap<String, ScanProfile>>,
+}
+
+impl ScannerFile {
+    fn apply(self, c: &mut ScannerConfig) {
+        set(&mut c.allow_agent_active, self.allow_agent_active);
+        set(&mut c.allow_agent_l4_fuzz, self.allow_agent_l4_fuzz);
+        set(&mut c.max_jobs, self.max_jobs);
+        set(&mut c.history, self.history);
+        set(&mut c.check_timeout_s, self.check_timeout_s);
+        if let Some(ceilings) = self.ceilings {
+            ceilings.apply(&mut c.ceilings);
+        }
+        set(&mut c.default_profile, self.default_profile);
+        set(&mut c.profiles, self.profiles);
+    }
+}
+
+/// The `scanner.ceilings:` block. Every key is optional and a key the file
+/// leaves out keeps the engine default, so raising one ceiling does not reset
+/// the other five.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CeilingsFile {
+    /// Maximum stimuli one job may send.
+    probes: Option<u32>,
+    /// Wall-clock ceiling for one job, in seconds.
+    time_s: Option<u64>,
+    /// Maximum L4 fuzz cases one job may send.
+    l4_cases: Option<u32>,
+    /// Maximum L4 send rate, in bytes per second.
+    l4_bytes_per_s: Option<u32>,
+    /// Maximum WebSocket frame payload one job may send, in bytes.
+    ws_frame_bytes: Option<u32>,
+    /// Maximum issues one job may record.
+    max_issues: Option<u32>,
+}
+
+impl CeilingsFile {
+    fn apply(self, c: &mut Ceilings) {
+        set(&mut c.probes, self.probes);
+        set(&mut c.time_s, self.time_s);
+        set(&mut c.l4_cases, self.l4_cases);
+        set(&mut c.l4_bytes_per_s, self.l4_bytes_per_s);
+        set(&mut c.ws_frame_bytes, self.ws_frame_bytes);
+        set(&mut c.max_issues, self.max_issues);
     }
 }
 
@@ -859,6 +957,188 @@ impl FindingsFile {
 mod tests {
     use super::{parse, parse_settings};
     use aitm_core::McpTransport;
+    use aitm_plugin_scanner::ScannerConfig;
+    use aitm_scan_model::LaneKind;
+
+    /// Spec D11: the `scanner:` section feeds `ScannerConfig`, which lives outside
+    /// `aitm_core::Config` like `l4:`. A key the file sets wins; a key it leaves
+    /// out keeps the engine default (`ceilings.time_s` below).
+    #[test]
+    fn scanner_section_feeds_scanner_config() {
+        let s = parse_settings(concat!(
+            "scanner:\n",
+            "  allow_agent_active: true\n",
+            "  max_jobs: 3\n",
+            "  ceilings:\n",
+            "    probes: 10\n",
+            "  default_profile: light-http\n",
+            "  profiles:\n",
+            "    my-api:\n",
+            "      name: my-api\n",
+            "      lanes: [http]\n",
+        ))
+        .expect("the scanner section parses");
+        assert!(s.scanner.allow_agent_active);
+        assert_eq!(s.scanner.max_jobs, 3);
+        assert_eq!(s.scanner.ceilings.probes, 10);
+        assert_eq!(s.scanner.ceilings.time_s, 7_200);
+        assert_eq!(s.scanner.default_profile, "light-http");
+        assert_eq!(s.scanner.profiles["my-api"].lanes, vec![LaneKind::Http]);
+    }
+
+    /// A misspelled `scanner.*` key is an error naming the key, not a silently
+    /// kept default (`deny_unknown_fields`, like every other section).
+    #[test]
+    fn scanner_section_unknown_key_is_an_error() {
+        let err = parse_settings("scanner:\n  max_job: 3\n").expect_err("a typo must be refused");
+        assert!(
+            format!("{err:#}").contains("max_job"),
+            "the error must name the key: {err:#}"
+        );
+    }
+
+    /// No `scanner:` section is the engine's own defaults.
+    #[test]
+    fn absent_scanner_section_is_default() {
+        let s = parse_settings("listen: 127.0.0.1:8080\n").expect("the config parses");
+        assert_eq!(s.scanner, ScannerConfig::default());
+    }
+
+    /// Tester (spec D11): every key of the `scanner:` section reaches its
+    /// `ScannerConfig` field, all six ceilings included, and the two fields the
+    /// file never sets (`findings_dir`, `l4_allow_agent_inject`) stay at their
+    /// defaults — they are copied from elsewhere by `wire.rs`, not read here.
+    #[test]
+    fn scanner_section_applies_every_key() {
+        let s = parse_settings(concat!(
+            "scanner:\n",
+            "  allow_agent_active: true\n",
+            "  allow_agent_l4_fuzz: true\n",
+            "  max_jobs: 4\n",
+            "  history: 7\n",
+            "  check_timeout_s: 90\n",
+            "  ceilings:\n",
+            "    probes: 1\n",
+            "    time_s: 2\n",
+            "    l4_cases: 3\n",
+            "    l4_bytes_per_s: 4\n",
+            "    ws_frame_bytes: 5\n",
+            "    max_issues: 6\n",
+            "  default_profile: my-api\n",
+            "  profiles:\n",
+            "    my-api:\n",
+            "      name: my-api\n",
+            "      intensity: light\n",
+            "      budget:\n",
+            "        probes: 50\n",
+        ))
+        .expect("the scanner section parses");
+        assert!(s.scanner.allow_agent_active);
+        assert!(s.scanner.allow_agent_l4_fuzz);
+        assert_eq!(s.scanner.max_jobs, 4);
+        assert_eq!(s.scanner.history, 7);
+        assert_eq!(s.scanner.check_timeout_s, 90);
+        assert_eq!(
+            s.scanner.ceilings,
+            aitm_plugin_scanner::Ceilings {
+                probes: 1,
+                time_s: 2,
+                l4_cases: 3,
+                l4_bytes_per_s: 4,
+                ws_frame_bytes: 5,
+                max_issues: 6,
+            }
+        );
+        assert_eq!(s.scanner.default_profile, "my-api");
+        let profile = &s.scanner.profiles["my-api"];
+        assert_eq!(profile.name, "my-api");
+        assert_eq!(profile.intensity, aitm_scan_model::Intensity::Light);
+        assert_eq!(profile.budget.probes, 50);
+        assert!(s.scanner.findings_dir.is_none(), "not a file key");
+        assert!(!s.scanner.l4_allow_agent_inject, "not a file key");
+        // The Stage 1 crawl budgets are not file keys either and keep their defaults.
+        assert_eq!(s.scanner.max_depth, ScannerConfig::default().max_depth);
+    }
+
+    /// Tester: `deny_unknown_fields` holds one level down too — a typo inside
+    /// `ceilings:` or inside a declared profile is refused naming the key, and a
+    /// value of the wrong type is refused rather than coerced.
+    #[test]
+    fn scanner_nested_typos_and_wrong_types_are_errors() {
+        let err = parse_settings("scanner:\n  ceilings:\n    probe: 10\n")
+            .expect_err("a ceilings typo must be refused");
+        assert!(format!("{err:#}").contains("probe"), "{err:#}");
+
+        let err = parse_settings(concat!(
+            "scanner:\n",
+            "  profiles:\n",
+            "    my-api:\n",
+            "      name: my-api\n",
+            "      lane: [http]\n",
+        ))
+        .expect_err("a profile typo must be refused");
+        assert!(format!("{err:#}").contains("lane"), "{err:#}");
+
+        let err = parse_settings(concat!(
+            "scanner:\n",
+            "  profiles:\n",
+            "    my-api:\n",
+            "      name: my-api\n",
+            "      intensity: nuclear\n",
+        ))
+        .expect_err("an unknown enum token must be refused");
+        assert!(format!("{err:#}").contains("nuclear"), "{err:#}");
+
+        assert!(
+            parse_settings("scanner:\n  max_jobs: many\n").is_err(),
+            "a non-integer max_jobs is refused"
+        );
+        assert!(
+            parse_settings("scanner:\n  max_jobs: -1\n").is_err(),
+            "a negative max_jobs is refused, not wrapped"
+        );
+        assert!(
+            parse_settings("scanner:\n  allow_agent_active: yes please\n").is_err(),
+            "a non-boolean gate is refused"
+        );
+    }
+
+    /// Tester: an empty `scanner:` section — the mapping form and the bare key —
+    /// is the engine default, exactly like no section at all.
+    #[test]
+    fn empty_scanner_section_is_default() {
+        for yaml in ["scanner: {}\n", "scanner:\n", "scanner: ~\n"] {
+            let s = parse_settings(yaml).expect("an empty section parses");
+            assert_eq!(s.scanner, ScannerConfig::default(), "{yaml:?}");
+        }
+    }
+
+    /// Tester: a `scanner:` section that only sets one ceiling leaves the other
+    /// five at the engine default and does not disturb the rest of the file.
+    #[test]
+    fn scanner_section_is_independent_of_the_core_sections() {
+        let s = parse_settings(concat!(
+            "listen: 127.0.0.1:9090\n",
+            "scanner:\n",
+            "  ceilings:\n",
+            "    max_issues: 9\n",
+        ))
+        .expect("parses");
+        assert_eq!(s.core.listen.to_string(), "127.0.0.1:9090");
+        assert_eq!(s.scanner.ceilings.max_issues, 9);
+        let defaults = ScannerConfig::default();
+        assert_eq!(s.scanner.ceilings.probes, defaults.ceilings.probes);
+        assert_eq!(s.scanner.ceilings.time_s, defaults.ceilings.time_s);
+        assert_eq!(s.scanner.ceilings.l4_cases, defaults.ceilings.l4_cases);
+        assert_eq!(
+            s.scanner.ceilings.l4_bytes_per_s,
+            defaults.ceilings.l4_bytes_per_s
+        );
+        assert_eq!(
+            s.scanner.ceilings.ws_frame_bytes,
+            defaults.ceilings.ws_frame_bytes
+        );
+    }
 
     /// LF-AC1: a config file with no `macos_capture` section parses to a disabled
     /// feeder config — the deny-by-default on-switch stays off.

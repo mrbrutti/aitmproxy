@@ -62,9 +62,18 @@ def xss_on_search(rows: list[dict]) -> list[dict]:
 
 
 def finding_files(root: str) -> dict[str, str]:
-    """relative path -> text, for every regular file under `root`."""
+    """relative path -> text, for every FindingRecord file under `root`.
+
+    The scanner's own state lives under `scan/` (`scan/issues/*.json`,
+    `scan/jobs/*.json`, `scan/profiles/*.yaml`, `scan/pocs/`); an issue JSON is
+    not a FindingRecord, so that subtree is excluded here (integration-shared
+    edit by T1b, 2026-11-01: on the Patched target the interim lane's passive
+    `reflection` issue on `/search` is legitimate and must not read as a record).
+    """
     out: dict[str, str] = {}
     for dirpath, _dirs, names in os.walk(root):
+        if os.path.relpath(dirpath, root).split(os.sep)[0] == "scan":
+            continue
         for n in names:
             p = os.path.join(dirpath, n)
             try:

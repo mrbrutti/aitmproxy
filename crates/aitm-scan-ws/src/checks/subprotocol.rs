@@ -25,8 +25,9 @@
 use std::sync::{Arc, OnceLock};
 
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
-    Intensity, LaneKind, Outcome, ProbeHost, ProbeResponse, RawProbe, Technique, Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Evidence, InsertionKind,
+    InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, ProbeResponse, RawProbe, Technique,
+    Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -77,6 +78,7 @@ fn meta() -> &'static CheckMeta {
         needs_baseline: false,
         wants_traits: None,
         targets_session: false,
+        scope: CheckScope::Point,
         cwe: None,
         description: "Asks for an arbitrary subprotocol and records whether the server echoes it \
              back or completes the upgrade without selecting one."
@@ -192,6 +194,8 @@ fn vulnerable(detail: impl Into<String>, evidence: Evidence) -> Verdict {
         evidence,
         detail: detail.into(),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 
