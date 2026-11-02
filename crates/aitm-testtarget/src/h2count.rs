@@ -426,4 +426,411 @@ mod tests {
         let back = writer.await.expect("writer task");
         assert_eq!(back, b"server-bytes", "writes pass through untouched");
     }
+
+    // --- Tester additions (stage 5): max-length payload, header-boundary
+    // splits, sticky stop, write-path delegation, read errors, the JSON row ---
+
+    /// Spec D2: "skips ... payload by count" and "stops counting on a frame
+    /// length past 16 MiB". The largest length a 24-bit field can carry is
+    /// 16_777_215 (one byte short of 16 MiB), so the maximum frame is SKIPPED,
+    /// never a stop: its payload, stuffed with bytes that spell HEADERS
+    /// headers on huge odd ids, counts nothing in any chunking, the walk does
+    /// not stall or lose sync, and the real HEADERS(1) right after it counts.
+    #[test]
+    fn a_maximum_length_payload_is_skipped_by_count_across_many_chunks() {
+        // The decoder's ceiling is exactly MAX_FRAME_LEN, so the `>` stop is
+        // unreachable from the wire; documented here on purpose.
+        let max_header = [0xff, 0xff, 0xff, 0x0, 0x0, 0, 0, 0, 1];
+        assert_eq!(decode_header(&max_header), (MAX_FRAME_LEN, 0x0, 1));
+        assert_eq!(MAX_FRAME_LEN, 16 * 1024 * 1024 - 1);
+
+        // Payload: HEADERS headers on id 0x7fff_fffd (odd, enormous) back to
+        // back; if any of them were read as a frame the high-water mark
+        // would jump and the trailing HEADERS(1) could never count.
+        let mut payload = Vec::with_capacity(MAX_FRAME_LEN);
+        while payload.len() < MAX_FRAME_LEN {
+            payload.extend(frame(0x1, 0x5, 0x7fff_fffd, &[]));
+        }
+        payload.truncate(MAX_FRAME_LEN);
+        let mut bytes = PREFACE.to_vec();
+        bytes.extend_from_slice(&max_header);
+        bytes.extend_from_slice(&payload);
+        bytes.extend(frame(0x1, 0x5, 1, &[0x82]));
+        bytes.extend(frame(0x1, 0x5, 3, &[0x82]));
+
+        for chunk in [4093usize, 65_536, bytes.len()] {
+            let (total, state) = observe_in_chunks(&bytes, chunk);
+            assert_eq!(total, 2, "chunk size {chunk}");
+            assert!(
+                matches!(state.state(), FrameState::Header { have: 0, .. }),
+                "chunk size {chunk}: {state:?}"
+            );
+        }
+
+        // And the remaining-count is exact at the frame's edge: one byte
+        // short of the payload is still Payload { 1 }, the next byte is the
+        // header boundary.
+        let mut state = Observer::new();
+        let edge = PREFACE.len() + FRAME_HEADER_LEN + MAX_FRAME_LEN - 1;
+        assert_eq!(state.observe(&bytes[..edge]), 0);
+        assert_eq!(state.state(), &FrameState::Payload { remaining: 1 });
+        assert_eq!(state.observe(&bytes[edge..edge + 1]), 0);
+        assert!(
+            matches!(state.state(), FrameState::Header { have: 0, .. }),
+            "{state:?}"
+        );
+        assert_eq!(state.observe(&bytes[edge + 1..]), 2);
+    }
+
+    /// "Partial reads carried across polls": a HEADERS frame split exactly at
+    /// the 9-byte header boundary counts in the slice that completes the
+    /// header (the id is known there), and one split inside the stream-id
+    /// bytes counts only once the id's last byte arrives; every single cut
+    /// point of the sequence totals the same.
+    #[test]
+    fn a_headers_frame_split_at_the_header_boundary_and_inside_the_stream_id() {
+        let mut bytes = PREFACE.to_vec();
+        bytes.extend(frame(0x4, 0x0, 0, &[]));
+        let hdr = bytes.len(); // the HEADERS(1) header starts here
+        bytes.extend(frame(0x1, 0x5, 1, &[0x82, 0x86, 0x84]));
+        bytes.extend(frame(0x1, 0x5, 3, &[0x82]));
+
+        // Split exactly after the 9-byte header, before the payload.
+        let mut state = Observer::new();
+        assert_eq!(state.observe(&bytes[..hdr + FRAME_HEADER_LEN]), 1);
+        assert_eq!(state.state(), &FrameState::Payload { remaining: 3 });
+        assert_eq!(state.observe(&bytes[hdr + FRAME_HEADER_LEN..]), 1);
+        assert!(
+            matches!(state.state(), FrameState::Header { have: 0, .. }),
+            "{state:?}"
+        );
+
+        // Split inside the stream-id bytes (7 of 9 header bytes seen: the id
+        // is bytes 5..9, so two of its four bytes are still missing).
+        let mut state = Observer::new();
+        assert_eq!(state.observe(&bytes[..hdr + 7]), 0);
+        match state.state() {
+            FrameState::Header { buf, have } => {
+                assert_eq!(*have, 7);
+                assert_eq!(&buf[..7], &bytes[hdr..hdr + 7]);
+            }
+            other => panic!("expected a partial header, got {other:?}"),
+        }
+        // Only the last two id bytes: that is the moment the stream counts.
+        assert_eq!(state.observe(&bytes[hdr + 7..hdr + 9]), 1);
+        assert_eq!(state.state(), &FrameState::Payload { remaining: 3 });
+        assert_eq!(state.observe(&bytes[hdr + 9..]), 1);
+
+        // Every cut point (including 0 and len, i.e. an empty slice) totals 2.
+        for cut in 0..=bytes.len() {
+            let mut state = Observer::new();
+            let total = state.observe(&bytes[..cut]) + state.observe(&bytes[cut..]);
+            assert_eq!(total, 2, "cut at {cut}");
+        }
+    }
+
+    /// "Stops counting (leaving the count as is)": `Stopped` is sticky. After
+    /// a preface that goes wrong on its LAST byte, a complete valid preface
+    /// plus SETTINGS and HEADERS on 1, 3, 5 (the plan sequence) fed in every
+    /// chunk size opens nothing and never moves the state again.
+    #[test]
+    fn stopped_is_sticky_across_further_bytes_including_a_later_valid_headers() {
+        let mut state = Observer::new();
+        assert_eq!(state.observe(&PREFACE[..PREFACE.len() - 1]), 0);
+        assert_eq!(
+            state.state(),
+            &FrameState::Preface {
+                seen: PREFACE.len() - 1
+            }
+        );
+        assert_eq!(state.observe(b"X"), 0);
+        assert_eq!(state.state(), &FrameState::Stopped);
+
+        let good = plan_sequence();
+        for chunk in [1usize, 9, good.len()] {
+            for piece in good.chunks(chunk) {
+                assert_eq!(state.observe(piece), 0, "chunk size {chunk}");
+            }
+            assert_eq!(state.state(), &FrameState::Stopped, "chunk size {chunk}");
+        }
+        assert_eq!(state.observe(&frame(0x1, 0x5, 1, &[0x82])), 0);
+        assert_eq!(state.observe(&[]), 0);
+        assert_eq!(state.state(), &FrameState::Stopped);
+        // The high-water mark never moved either.
+        assert_eq!(state.last_stream, 0);
+    }
+
+    /// A scripted IO for the wrapper: `poll_read` serves `reads` in order
+    /// (an `Err` is returned as is, exhaustion is EOF); every write call is
+    /// recorded by SHAPE, `write` buffers and `write_vectored` slice lists
+    /// separately, so delegation of each method is observable, not just the
+    /// concatenated bytes. `max_write` caps a single write to prove the
+    /// wrapper reports the inner count, not the caller's.
+    #[derive(Default)]
+    struct ScriptedIo {
+        reads: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+        writes: Vec<Vec<u8>>,
+        vectored: Vec<Vec<Vec<u8>>>,
+        flushes: usize,
+        shutdowns: usize,
+        vectored_ok: bool,
+        max_write: Option<usize>,
+    }
+
+    impl AsyncRead for ScriptedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            match this.reads.pop_front() {
+                None => Poll::Ready(Ok(())),
+                Some(Err(e)) => Poll::Ready(Err(e)),
+                Some(Ok(bytes)) => {
+                    let n = bytes.len().min(buf.remaining());
+                    buf.put_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        this.reads.push_front(Ok(bytes[n..].to_vec()));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
+    impl AsyncWrite for ScriptedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let n = this.max_write.map_or(buf.len(), |m| m.min(buf.len()));
+            this.writes.push(buf[..n].to_vec());
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.get_mut().flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.get_mut().shutdowns += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let total = bufs.iter().map(|b| b.len()).sum();
+            this.vectored
+                .push(bufs.iter().map(|b| b.to_vec()).collect());
+            Poll::Ready(Ok(total))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.vectored_ok
+        }
+    }
+
+    fn test_conn() -> Arc<ConnInfo> {
+        use crate::log::{ControlLog, Listener};
+        use crate::SeedMode;
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        let peer = "127.0.0.1:40000".parse().expect("peer");
+        log.open_conn(Listener::Tls, Some("h2"), peer)
+    }
+
+    /// "Writes pass through untouched": each of `poll_write`,
+    /// `poll_write_vectored`, `poll_flush`, `poll_shutdown` and
+    /// `is_write_vectored` reaches the inner IO as the same call with the
+    /// same bytes, a short write is reported as the inner reported it, and
+    /// none of it touches the stream count.
+    #[tokio::test]
+    async fn every_write_method_is_delegated_byte_identical() {
+        use std::io::IoSlice;
+        use tokio::io::AsyncWriteExt as _;
+
+        let conn = test_conn();
+        let io = ScriptedIo {
+            vectored_ok: true,
+            max_write: Some(4),
+            ..ScriptedIo::default()
+        };
+        let mut counted = H2StreamCounter::new(io, conn.clone());
+        assert!(counted.is_write_vectored(), "delegates is_write_vectored");
+
+        // A capped write: the wrapper must report the inner's 4, not 6.
+        let n = counted.write(b"abcdef").await.expect("write");
+        assert_eq!(n, 4);
+        // Vectored: the exact slice list reaches the inner.
+        let bufs = [
+            IoSlice::new(b"PRI"),
+            IoSlice::new(b""),
+            IoSlice::new(b" * "),
+        ];
+        let n = counted.write_vectored(&bufs).await.expect("write_vectored");
+        assert_eq!(n, 6);
+        counted.flush().await.expect("flush");
+        counted.shutdown().await.expect("shutdown");
+
+        let inner = &counted.inner;
+        assert_eq!(inner.writes, vec![b"abcd".to_vec()]);
+        assert_eq!(
+            inner.vectored,
+            vec![vec![b"PRI".to_vec(), Vec::new(), b" * ".to_vec()]]
+        );
+        assert_eq!(inner.flushes, 1);
+        assert_eq!(inner.shutdowns, 1);
+        assert_eq!(conn.streams.load(Ordering::SeqCst), 0, "writes never count");
+
+        // And a non-vectored inner is reported as such.
+        let plain = H2StreamCounter::new(ScriptedIo::default(), test_conn());
+        assert!(!plain.is_write_vectored());
+    }
+
+    /// Connection drop mid-stream: a read error from the inner IO is handed
+    /// back as is (same kind), the streams counted before it stay, nothing
+    /// after it is counted, and a half-delivered frame header at the drop
+    /// does not count. EOF (`Ok` with no bytes) is passed through too.
+    #[tokio::test]
+    async fn a_read_error_passes_through_and_leaves_the_count_as_is() {
+        use std::io::{Error, ErrorKind};
+        use tokio::io::AsyncReadExt as _;
+
+        let mut first = PREFACE.to_vec();
+        first.extend(frame(0x4, 0x0, 0, &[]));
+        first.extend(frame(0x1, 0x5, 1, &[0x82]));
+        // HEADERS(3) cut after 7 header bytes: the id is incomplete.
+        first.extend_from_slice(&frame(0x1, 0x5, 3, &[0x82])[..7]);
+
+        let conn = test_conn();
+        let io = ScriptedIo {
+            reads: [
+                Ok(first.clone()),
+                Err(Error::new(ErrorKind::ConnectionReset, "peer went away")),
+                Ok(frame(0x1, 0x5, 5, &[0x82])),
+            ]
+            .into_iter()
+            .collect(),
+            ..ScriptedIo::default()
+        };
+        let mut counted = H2StreamCounter::new(io, conn.clone());
+
+        let mut buf = vec![0u8; 4096];
+        let n = counted.read(&mut buf).await.expect("first read");
+        assert_eq!(&buf[..n], &first[..], "hyper-side bytes unchanged");
+        assert_eq!(conn.streams.load(Ordering::SeqCst), 1);
+
+        let err = counted.read(&mut buf).await.expect_err("the reset");
+        assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+        assert_eq!(
+            conn.streams.load(Ordering::SeqCst),
+            1,
+            "error counts nothing"
+        );
+
+        // The observer is mid-header (not Stopped), so if the transport did
+        // deliver more the walk continues from where it was: the first two
+        // bytes of HEADERS(5) complete HEADERS(3)'s header as id 0 (even:
+        // not a stream) with length 1, the third byte is that payload, and
+        // the other seven are a pending header. Count stays exactly 1 and the
+        // bytes reach the reader untouched.
+        assert!(
+            matches!(counted.observer.state(), FrameState::Header { have: 7, .. }),
+            "{:?}",
+            counted.observer.state()
+        );
+        let n = counted.read(&mut buf).await.expect("third read");
+        assert_eq!(n, 10);
+        assert_eq!(&buf[..n], &frame(0x1, 0x5, 5, &[0x82])[..]);
+        assert_eq!(conn.streams.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(counted.observer.state(), FrameState::Header { have: 7, .. }),
+            "{:?}",
+            counted.observer.state()
+        );
+
+        // EOF passes through as a zero-length read.
+        let n = counted.read(&mut buf).await.expect("eof");
+        assert_eq!(n, 0);
+        assert_eq!(conn.streams.load(Ordering::SeqCst), 1);
+    }
+
+    /// One `poll_read` that delivers several HEADERS frames adds ALL of them
+    /// (the per-slice `opened`, not a flag): the whole plan sequence in a
+    /// single read is 3 on the conn at once.
+    #[tokio::test]
+    async fn one_read_carrying_several_headers_adds_them_all() {
+        use tokio::io::AsyncReadExt as _;
+
+        let conn = test_conn();
+        let io = ScriptedIo {
+            reads: [Ok(plan_sequence())].into_iter().collect(),
+            ..ScriptedIo::default()
+        };
+        let mut counted = H2StreamCounter::new(io, conn.clone());
+        let mut buf = vec![0u8; 4096];
+        let n = counted.read(&mut buf).await.expect("one read");
+        assert_eq!(n, plan_sequence().len(), "the whole sequence in one poll");
+        assert_eq!(conn.streams.load(Ordering::SeqCst), 3);
+    }
+
+    /// (e) The wrapper counts on the very `Arc<ConnInfo>` the `/log/conns`
+    /// row reads: `ControlLog::conns_json` shows the number, it follows
+    /// further openings, and it survives `close_conn`.
+    #[tokio::test]
+    async fn the_log_conns_row_reports_what_the_wrapper_counted() {
+        use crate::log::{ControlLog, Listener};
+        use crate::SeedMode;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        let peer = "127.0.0.1:40000".parse().expect("peer");
+        let conn = log.open_conn(Listener::Tls, Some("h2"), peer);
+        let row = |log: &ControlLog| log.conns_json()["entries"][0].clone();
+        assert_eq!(row(&log)["streams"], serde_json::json!(0));
+
+        let (mut client, server) = tokio::io::duplex(16);
+        let mut counted = H2StreamCounter::new(server, conn.clone());
+        let bytes = plan_sequence();
+        let writer = tokio::spawn(async move {
+            for piece in bytes.chunks(3) {
+                client.write_all(piece).await.expect("client write");
+            }
+            client
+        });
+        let mut seen = vec![0u8; 1024];
+        let mut got = 0;
+        while got < plan_sequence().len() {
+            got += counted.read(&mut seen[got..]).await.expect("read");
+        }
+        assert_eq!(&seen[..got], &plan_sequence()[..]);
+        assert_eq!(row(&log)["streams"], serde_json::json!(3), "{}", row(&log));
+        assert_eq!(row(&log)["alpn"], serde_json::json!("h2"));
+
+        // One more HEADERS on a new odd id: the row follows.
+        let mut client = writer.await.expect("writer");
+        client
+            .write_all(&frame(0x1, 0x5, 7, &[0x82]))
+            .await
+            .expect("client write");
+        let mut got = 0;
+        while got < 10 {
+            got += counted.read(&mut seen[got..]).await.expect("read");
+        }
+        assert_eq!(row(&log)["streams"], serde_json::json!(4), "{}", row(&log));
+
+        // Closing the connection keeps the number on the row.
+        log.close_conn(&conn);
+        let closed = row(&log);
+        assert_eq!(closed["streams"], serde_json::json!(4), "{closed}");
+        assert_ne!(closed["closed_ms"], serde_json::Value::Null, "{closed}");
+        assert_eq!(closed["requests"], serde_json::json!(0), "{closed}");
+    }
 }
