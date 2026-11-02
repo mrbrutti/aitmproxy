@@ -320,16 +320,11 @@ describe('L4 store: once-per-message failure log (spec §7(c))', () => {
     expect(h.store.rows().map((r) => r.id)).toEqual(['A']);
   });
 
-  // DEFECT (tester pass 3, reported to the Coder): fix 4 keys `lastFailure` by call identity, but
-  // `recovered(key)` still calls `OnceLog.forget(message)`, which is keyed by message TEXT. Two reads
-  // that fail with the same text (two flows whose core error does not name the id; or the list read
-  // and the inspect read of the same broken flow, whose text is identical) share one `seen` entry, so
-  // when either recovers the other — still failing on every pass — is logged again. This is the same
-  // class as the quality Minor fix 4 closed ("one read's success forgets another's message"),
-  // surviving at the message level. Pinned with `it.fails` so the gate stays green while the defect
-  // is open: once `forget` releases a message only when no other key still holds it, these go red —
-  // drop the `.fails` then.
-  it.fails('two flows failing with the SAME message text, one recovering: the other, still failing on every pass, is not re-logged (tester pass 3)', async () => {
+  // Fix 5 (quality pass 3 Minor 1 + tester pass 3 pins): `lastFailure` is keyed by call identity but
+  // `OnceLog` by message TEXT, so two reads failing with the same text (two flows whose core error does
+  // not name the id; or the list read and the inspect read of the same broken flow) share one `seen`
+  // entry. `recovered(key)` therefore forgets a message only when no other read still produces it.
+  it('two flows failing with the SAME message text, one recovering: the other, still failing on every pass, is not re-logged (tester pass 3)', async () => {
     let broken = new Set(['A', 'B']);
     h = harness({
       replies: {
@@ -347,7 +342,7 @@ describe('L4 store: once-per-message failure log (spec §7(c))', () => {
     expect(h.notices).toEqual([['l4.flow.get: flow store closed', 'error']]);
   });
 
-  it.fails("a list read still failing is not re-logged because the inspect read of ANOTHER flow succeeded (tester pass 3)", async () => {
+  it("a list read still failing is not re-logged because the inspect read of ANOTHER flow succeeded (tester pass 3)", async () => {
     h = harness({
       replies: {
         'l4.flow.list': ['A', 'B'],
@@ -361,6 +356,21 @@ describe('L4 store: once-per-message failure log (spec §7(c))', () => {
     await h.store.refresh(true);
     expect(h.argsOf('l4.flow.get').filter((a) => a.id === 'A' && a.limit === 0)).toHaveLength(3);
     expect(h.notices).toEqual([['l4.flow.get: A broke', 'error']]);
+  });
+
+  it('inspect reads are keyed per flow: inspecting B successfully does not release A\'s inspect failure, so A failing again is not re-logged', async () => {
+    h = harness({
+      replies: {
+        'l4.flow.list': ['A', 'B'],
+        'l4.flow.get': (a: Record<string, unknown>) => (a.id === 'A' && a.limit !== 0 ? new BusError('A window broke') : flowWire(String(a.id), { packet_count: 1 })),
+      },
+    });
+    await h.store.refresh(true); // list reads of A and B succeed
+    await h.store.inspect('A'); // inspect A fails → logged once
+    await h.store.inspect('B'); // inspect B succeeds: a different read, not A's recovery
+    await h.store.inspect('A'); // inspect A still failing
+    expect(h.argsOf('l4.flow.get').filter((a) => a.id === 'A' && a.limit !== 0)).toHaveLength(2);
+    expect(h.notices).toEqual([['l4.flow.get: A window broke', 'error']]);
   });
 
   it('two distinct failure messages are each noticed once', async () => {

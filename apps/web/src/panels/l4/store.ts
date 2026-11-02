@@ -91,7 +91,9 @@ export function createL4Store(app: AppStore) {
   // per verb: when the same read succeeds again its last message is forgotten, so a recurrence after
   // recovery is logged again — while another read of the same verb (flow B's `l4.flow.get` beside
   // flow A's) succeeding, or a pass that ran only the slow group, cannot un-suppress a read still
-  // failing. The logged text keeps the verb `label`.
+  // failing. `OnceLog` is keyed by message text, so a message two reads produce (two flows whose core
+  // error does not name the id; a flow's list read beside its inspect read) is forgotten only when
+  // the last read still producing it recovers (fix 5). The logged text keeps the verb `label`.
   const readFailures = createOnceLog((msg) => app.notice(msg, 'error'));
   /** The last logged message per read key, forgotten when that same read succeeds. */
   const lastFailure = new Map<string, string>();
@@ -109,11 +111,16 @@ export function createL4Store(app: AppStore) {
     readFailures.log(message);
   }
 
-  /** The read under `key` succeeded: its last failure, if any, may be logged again if it recurs. */
+  /**
+   * The read under `key` succeeded: its last failure, if any, may be logged again if it recurs —
+   * unless another read is still failing with the same text, in which case the message stays
+   * suppressed until that read recovers too.
+   */
   function recovered(key: string): void {
     const message = lastFailure.get(key);
     if (message === undefined) return;
     lastFailure.delete(key);
+    for (const still of lastFailure.values()) if (still === message) return;
     readFailures.forget(message);
   }
 
@@ -252,7 +259,7 @@ export function createL4Store(app: AppStore) {
 
   /** Fetch the selected flow's first packet window (spec §2) for the inspector. */
   async function inspect(id: string): Promise<void> {
-    const flow = await read<L4FlowWire>('l4.flow.get', app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', windowed())), 'l4.flow.get inspect');
+    const flow = await read<L4FlowWire>('l4.flow.get', app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', windowed())), `l4.flow.get inspect ${id}`);
     if (!flow || flow.id !== id) return;
     // A flow's packet log is append-only, so a window already extended by `loadMore()` is a longer
     // prefix of the same log: keep it (and its continuation point) rather than shrink back to the
@@ -287,7 +294,7 @@ export function createL4Store(app: AppStore) {
       const more = await read<L4FlowWire>(
         'l4.flow.get',
         app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', windowed(), shown.next_offset)),
-        'l4.flow.get inspect',
+        `l4.flow.get inspect ${id}`,
       );
       if (!more || more.id !== id) return;
       const current = inspected();
