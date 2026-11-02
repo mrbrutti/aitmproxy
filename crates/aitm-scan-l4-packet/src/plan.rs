@@ -82,15 +82,17 @@ pub fn link_framing(interface: &str) -> LinkFraming {
 }
 
 /// The first source port the lane claims.
-pub const SRC_PORT_BASE: u16 = 40000;
-
-/// How many ports above [`SRC_PORT_BASE`] the lane's derived source ports span.
 ///
-/// 16000 keeps every derived port in `40000..56000`, below the 60000 floor of
-/// the ephemeral range the core and a loopback test target draw from, so a
-/// derived port is less likely to collide with one already in use (amendment
-/// 73 b).
-pub const SRC_PORT_RANGE: u16 = 16000;
+/// The window `16384..32768` lies below both kernels' default ephemeral
+/// ranges (Linux `ip_local_port_range` 32768-60999, macOS 49152-65535), so a
+/// reply addressed to our socketless source port is not handed to an
+/// unrelated local client that happened to bind it; the old `40000` window sat
+/// inside the Linux range (security delta review of amendment 73 b).
+pub const SRC_PORT_BASE: u16 = 16384;
+
+/// How many ports above [`SRC_PORT_BASE`] the lane's derived source ports span
+/// (amendment 73 b): the window ends at `32768`, the Linux ephemeral floor.
+pub const SRC_PORT_RANGE: u16 = 16384;
 
 /// FNV-1a 64-bit offset basis.
 const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
@@ -127,7 +129,7 @@ fn hash_job_id(job_id: &str) -> u64 {
 #[must_use]
 pub fn src_port_for(job_id: &str, target_index: usize) -> u16 {
     let index = u64::try_from(target_index).unwrap_or(u64::MAX);
-    // The modulo is `< SRC_PORT_RANGE` (16000), so the conversion is exact.
+    // The modulo is `< SRC_PORT_RANGE` (16384), so the conversion is exact.
     let offset = (hash_job_id(job_id).wrapping_add(index) % u64::from(SRC_PORT_RANGE)) as u16;
     SRC_PORT_BASE + offset
 }

@@ -2638,7 +2638,8 @@ mod tests {
 
     /// Every job id in a sample derives a source port inside the lane's window
     /// `SRC_PORT_BASE..SRC_PORT_BASE + SRC_PORT_RANGE`, before the exclusion
-    /// walk — the range stays below the 60000 ephemeral floor (amendment 73 b).
+    /// walk — the window ends at the Linux ephemeral floor 32768 and stays
+    /// below the macOS one (amendment 73 b, security delta).
     #[test]
     fn the_derived_port_stays_in_range() {
         for n in 0..256u32 {
