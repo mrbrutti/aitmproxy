@@ -556,5 +556,14 @@ Also in PR 3 (amendment 67): the Rhai bridge scrubs `Verdict.detail` (root and s
 
 ## Shipped
 
+PR #292 (`claude/scanner-v2-t1b-followup-2`, base `main` 32c4b5a4; head at the "ready" c3d79e76 + this note), opened 2026-11-02; merge is the coordinator's.
+
+- Gate: full workspace gate exit 0 at 64fedb5e (post-tester, 14m10s) and at c6092927 (post-panel, 10m38s); the only Rust change after that is the test-only Task 14 hunk (crate gate ×5 + clippy in the sandbox). `target/` deleted after the run.
+- Cells: `python3 tests/e2e/run.py scan` 22 pass / 16 skip / 0 fail at the final head (cells20; baseline 19 / 19 / 0). First run (cells17, c6092927) 20 / 17 / 1: the h2-observe cell's pooled heuristic (Task 13); cells19 21 / 16 / 1: the latent ALPN assertion (Task 13b).
+- Live proof 38: `checks.scheduled 5`, `points.found 2`, `points.audited 0` on the h2-observe profile whose `/` has no parameter; the five origin-scoped checks ran on five raw connections (target-log dump `/tmp/claude/t1b/proof/out/h2_dump.log`); `test_t3_h2_observe.py` PASS.
+- Live proof 39: `test_t3_version_override.py` PASS (forced h2 vs h1-only: `done`, both null, `crawl.errors 1`, `crawl.pages 0`, `crawl.last_error h2_not_negotiated`, `probes.errors 6`, 3 handshakes `alpn none`, zero requests).
+- 40, 46: unit-only by the plan's ruling (T5's live proof covered the lane half of 46 in #264).
+- Panel: security PASS, quality FAIL → fixed, spec FAIL → plan text fixed, spec rows pending the coordinator's docs PR (39b, 53, 55–59, 62, 63); follow-ups 67–70 on the coordinator's list; the panel comment is on #292.
+
 Filled at integration (stage 7): PR number and squash SHA, the four live-proof lines from
 "Acceptance", anything cut, follow-ups.
