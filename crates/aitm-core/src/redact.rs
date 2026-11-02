@@ -20,19 +20,24 @@
 //! `sidebar`), for decisions where a false positive costs nothing and a miss
 //! leaks.
 //!
-//! [`scrub_text_wide`] is the standard scan followed by a wide scan over its
-//! output, two runs of one private pair scanner, so it masks everything
-//! [`scrub_text`] masks and then more. A scan judges each key *run* by the
-//! predicate of its reading; a string that the predicate accepts can be several
-//! runs (`user[sid]` is two), so a scrubber and its predicate can differ on text
-//! that is not one run. The wide scan differs from the standard one in three
-//! declared places: the key test, the host:port exemption (the wide scan has
-//! none), and the three characters `\n`, `\r` and `\x0c`, which the wide scan
-//! does not skip beside a separator, so that it reads a pair on one line. Where a
-//! key run and a closing quote begin and end, where a value ends, and how a pair
-//! nested in a value is found are shared. The line-break rule is the one
-//! difference that changes where a value starts: `author:\nJohn` has no value in
-//! the wide scan, and `sid:\nabc` takes `abc` in the standard one.
+//! [`scrub_text_wide`] is two scans of one private pair scanner, over the output
+//! of the regex passes. The first judges a key run by the standard reading,
+//! except a run that begins inside a value it has just masked, which it judges by
+//! the wide one; the second judges every key run by the wide reading. A key
+//! *governs* the value after its separator. On well-formed input
+//! [`scrub_text_wide`] masks every value that a key accepted by [`is_secret_key`]
+//! governs, as [`scrub_text`] does, and then more. A scan judges each key *run* by
+//! the predicate of its reading; a string that the predicate accepts can be
+//! several runs (`user[sid]` is two), so a scrubber and its predicate can differ on
+//! text that is not one run. The two scans share every blank rule, value rule and
+//! quote rule: every whitespace character is a blank beside a separator, a line
+//! break included, so `sid:\nabc` takes `abc` in both. They differ in the key test
+//! outside a masked value and in the host:port exemption (the second scan has
+//! none).
+//!
+//! A secret pair that begins inside a value a scan has just masked is read too:
+//! `auth:\n  password: hunter2` masks `hunter2`, not only the `password:` that is
+//! the value of `auth:`.
 
 use std::sync::OnceLock;
 
@@ -106,8 +111,8 @@ fn contains_segment_word(lower: &str) -> bool {
     SECRET_KEY_SEGMENTS.iter().any(|word| lower.contains(word))
 }
 
-/// The compiled regex passes that [`scrub_text`] applies, in order, and so does
-/// [`scrub_text_wide`], which starts from it. The `key=value` pair pass is
+/// The compiled regex passes that [`apply_patterns`] runs, in order, for
+/// [`scrub_text`] and [`scrub_text_wide`] alike. The `key=value` pair pass is
 /// [`mask_secret_pairs`], not a regex, because it must judge each key by the
 /// predicate of the reading it runs under ([`is_secret_key`] or
 /// [`is_secret_key_wide`]) and handle quoted values.
@@ -128,6 +133,16 @@ fn patterns() -> &'static [(Regex, &'static str)] {
     })
 }
 
+/// Run the regex passes of [`patterns`] over `text`, in order. Both scrubs start
+/// here, before their pair scan.
+fn apply_patterns(text: &str) -> String {
+    let mut out = text.to_string();
+    for (re, rep) in patterns() {
+        out = re.replace_all(&out, *rep).into_owned();
+    }
+    out
+}
+
 /// Mask credential material embedded anywhere in `text` by *content* (not by the
 /// key it is stored under): an `Authorization:` line, a `Bearer <token>`, and
 /// every `key=value` / `key: value` pair whose key [`is_secret_key`] — both
@@ -141,13 +156,29 @@ fn patterns() -> &'static [(Regex, &'static str)] {
 /// next pair's key and leave its value in the clear while that pair's opening
 /// quote is present (`password='a b token='S3'` masks through `S3`); a padded
 /// value (`"token":"YWJj=","user":"bob"`) still closes, because a delimiter
-/// follows its quote. A next key with only a closing quote is a residual: in
-/// `password='x password'=S3CR3T` the first value closes at that quote and
-/// `S3CR3T` is left in the clear. An unquoted value, or one whose opening
-/// quote never closes, runs to the first whitespace, `&`, `;`, `,`, quote, or `}`.
+/// follows its quote. A next key with only a closing quote is read as a nested
+/// pair, by the rule below: `password='x password'=S3CR3T` becomes
+/// `password='[redacted]'=[redacted]`, and a next key that is not secret keeps its
+/// value (`password='x user'=S3CR3T` becomes `password='[redacted]'=S3CR3T`). An
+/// unmatched quote, an unescaped quote inside a quoted value, a quote shaped like
+/// an opener, and two kinds of quote interleaved (`Token:Jwt:'token="'id"`), are
+/// residuals: the scan can pair them differently inside a masked value than
+/// outside one, and a value that a secret key governs can then be left in the
+/// clear in a rare malformed input. An unquoted value, or one whose
+/// opening quote never closes, runs to the first whitespace, `&`, `;`, `,`, quote,
+/// or `}`.
 /// Whitespace is Unicode whitespace (`char::is_whitespace`), as the regex `\s`
 /// this replaces was. An empty value is left alone. A pair nested inside a
 /// non-secret value (`next=/cb?sid=…`) is still found.
+///
+/// A secret pair that begins inside a value just masked is read too: in
+/// `auth:\n  password: hunter2` the value of `auth:` is the token `password:`, and
+/// the pair `password: hunter2` inside it masks `hunter2`, so the output is
+/// `auth:\n  [redacted] [redacted]`. A nested key that is not secret keeps its
+/// value (`auth:\n  user: bob` keeps `bob`). A value that looks like a pair stays
+/// masked whole (`token:\n  AApwdBB==` masks all of `AApwdBB==`), because a pair
+/// whose value would start inside the masked text, its closing quote included, is
+/// left alone.
 ///
 /// A `host:port` is not a credential: a dotted key directly followed by `:` and
 /// one to five digits ending at `/`, `?`, `#`, a delimiter, or the end of the text
@@ -155,71 +186,91 @@ fn patterns() -> &'static [(Regex, &'static str)] {
 /// `=` are never exempt.
 ///
 /// Conservative by design: it over-redacts (any pair whose key reads as secret)
-/// rather than risk letting a secret through. Residual limit: a bare credential
-/// with no recognisable `key=` or `Bearer`/`Authorization` framing cannot be
-/// detected. Work is linear in the length of `text`.
+/// rather than risk letting a secret through. A key *governs* the value after its
+/// separator, and on well-formed input every value that a secret key governs, read
+/// by the value rule above, is masked (a value that starts with `[` or `{` is an
+/// unquoted value to that rule, so it ends at the first quote, comma or blank, and
+/// the elements of an array after that point stay visible:
+/// `{"api_keys": ["abc123", "def456"]}` becomes
+/// `{"api_keys": [redacted]"abc123", "def456"]}`). Residual limit: a bare
+/// credential with no recognisable `key=` or `Bearer`/`Authorization` framing
+/// cannot be detected, so a token that no secret key governs stays visible
+/// wherever it sits, after a quoted value that ends in a key and a separator
+/// (`"x-pwd:"`) included. Work is linear in the length of `text`.
 ///
 /// For the over-matching reading, which also masks keys that merely contain a
 /// short secret word (`author`, `sidebar`), see [`scrub_text_wide`].
 pub fn scrub_text(text: &str) -> String {
-    let mut out = text.to_string();
-    for (re, rep) in patterns() {
-        out = re.replace_all(&out, *rep).into_owned();
-    }
-    mask_secret_pairs(&out, Reading::Standard)
+    mask_secret_pairs(&apply_patterns(text), Reading::Standard)
 }
 
-/// [`scrub_text`], and then a second scan over its output that judges keys by
-/// [`is_secret_key_wide`]. It masks everything [`scrub_text`] masks, because the
-/// second scan only replaces more values with `[redacted]`, and then every pair
-/// whose key reads as secret under [`is_secret_key_wide`]. The standard scan runs
-/// first, so a standard-secret pair nested under a wide-only key is already masked
-/// when the wide scan's region would hide its key (`authentication:\n  password:
-/// hunter2` masks `hunter2`).
+/// [`scrub_text`] with a wider key test. On well-formed input it masks every value
+/// that a key accepted by [`is_secret_key`] governs, as [`scrub_text`] does, and
+/// then every pair whose key reads as secret under [`is_secret_key_wide`], so it
+/// also masks keys that merely contain a short secret word (`author`, `sidebar`).
 ///
-/// The second scan differs from the first in three places. It shares with the first
-/// where a key run and a closing quote begin and end, where a value ends, and how a
-/// pair nested in a value is found. Its key test is [`is_secret_key_wide`]. Nothing
-/// is exempt as a host:port, so `auth.example.com:8443` and
-/// `token.example.com:8443` are masked. And it does not skip `\n`, `\r` or `\x0c`
-/// beside a separator, so it reads a pair on one line. That third difference is the
-/// one that changes where a value starts: `author:\nJohn` has no value in the wide
-/// scan, while the standard scan reads a standard-secret pair across a line break
-/// (`sid:\nabc` takes `abc`). Every other whitespace character is skipped beside a
-/// separator by both. A credential on the next line under a wide-only key is not
-/// masked, as before (`userSession:\n  S3SS10N9`, `sidebar:\nS3SS10N9`), while the
-/// standard reading masks `session:\n  S3SS10N9`.
+/// After the regex passes of [`scrub_text`] it runs two scans of one private pair
+/// scanner. The first judges a key run by [`is_secret_key`], except a run that
+/// begins inside a value it has just masked, which it judges by
+/// [`is_secret_key_wide`]; the second judges every key run by
+/// [`is_secret_key_wide`]. The wide test inside a masked value is what masks the
+/// value of a wide-only key nested under a standard-secret pair
+/// (`Credentials:\n\tjwt:\n\tsidebar :  "Q"` masks `Q`): judged by the standard test,
+/// that key would be the masked value of the `jwt:` above it and the second scan
+/// could no longer see it.
+///
+/// The two scans share every blank rule, value rule and quote rule, so a line break
+/// beside a separator is skipped like any other whitespace and the wide scan reads
+/// across it. A credential on the line after a wide-only key is masked
+/// (`userSession:\n  S3SS10N9`, `sidebar:\nS3SS10N9`), and so is the first word of
+/// prose there (`author:\nJohn` becomes `author:\n[redacted]`). A secret pair that
+/// begins inside a masked value is read, whatever the key above it
+/// (`authentication:\n  password: hunter2` becomes
+/// `authentication:\n  [redacted] [redacted]`). The scans differ in the key test and
+/// in the host:port exemption: the second scan exempts nothing, so
+/// `auth.example.com:8443` and `token.example.com:8443` are masked.
 ///
 /// It over-redacts by design: use it where a masked innocent value costs nothing
 /// and a missed credential leaks (a PoC meant to be shared), never on text that
 /// goes to an agent, an audit record, or a finding, where `authority=` and
-/// `author=3` are ordinary. Its running time is linear, about twice that of
-/// [`scrub_text`], except on long runs of blank characters, where it takes up to
-/// about six times as long (still linear). A residual, in four shapes: a non-ASCII
-/// letter glued into a key, a non-ASCII space beside a separator, a dotted key whose
-/// name holds one of the longer secret words (`token`, `password`, ...) before a
-/// port, such as `token.example.com:8443`, and a quoted wide-only value that holds
-/// an unescaped quote after `=` or `:` and is followed, with no delimiter, by a
-/// quoted wide-only key (`nsid='='authr'=C1`). Each can make the wide scan read a
-/// wider pair than the standard one and let a wide-only pair nested right after it
-/// keep a quoted or padded value. The last shape needs that quote to have no
-/// delimiter behind it; in valid JSON, a form and a query a delimiter follows the
-/// closing quote, so they are not affected.
+/// `author=3` are ordinary. Its running time is linear in the length of `text`.
+///
+/// A residual, on malformed quotes: an unmatched quote, an unescaped quote inside
+/// a quoted value, a quote that closes a value but reads as an opener (it follows
+/// `=` or `:`, a value character follows it, and no delimiter does), and two kinds
+/// of quote interleaved (`Token:Jwt:'token="'id"`), can make a scan pair the
+/// quotes inside a masked value differently from the way it pairs them outside
+/// one, and so leave a value that a secret key governs in the clear in a rare
+/// malformed input. A well-formed input leaves no governed value in the clear: a
+/// quoted value that ends in a key and a separator (`"x-pwd:"`) is read whole, and
+/// what follows its closing quote is read by its own keys; a token that no secret
+/// key governs stays visible there.
 pub fn scrub_text_wide(text: &str) -> String {
-    mask_secret_pairs(&scrub_text(text), Reading::Wide)
+    mask_secret_pairs(
+        &mask_secret_pairs(&apply_patterns(text), Reading::FirstOfWide),
+        Reading::Wide,
+    )
 }
 
 /// Which reading of the vocabulary a scan applies. See [`mask_secret_pairs`]. The
-/// two variants are the readings of the first and of the second scan of
-/// [`scrub_text_wide`], and the first is the one scan of [`scrub_text`].
+/// three variants differ in the key test and the host:port exemption only; all
+/// three skip every whitespace character beside a separator, a line break
+/// included, and share every value rule and quote rule. A new variant must decide
+/// both: the key test is a `match` over every variant, but the host:port exemption
+/// is applied to every variant except `Wide`, so a variant added later is exempt
+/// unless that condition changes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reading {
-    /// The reading of the first scan: [`is_secret_key`], a host:port is exempt, and
-    /// every whitespace character is a blank beside a separator.
+    /// [`is_secret_key`] for every key run, and a host:port is exempt. The one scan
+    /// of [`scrub_text`].
     Standard,
-    /// The reading of the second scan: [`is_secret_key_wide`], nothing is exempt,
-    /// and `\n`, `\r` and `\x0c` are not blanks beside a separator.
+    /// [`is_secret_key_wide`] for every key run, and nothing is exempt. The second
+    /// scan of [`scrub_text_wide`].
     Wide,
+    /// [`is_secret_key_wide`] for a key run that begins inside a value the scan has
+    /// just masked, [`is_secret_key`] for every other key run, and a host:port is
+    /// exempt as for `Standard`. The first scan of [`scrub_text_wide`].
+    FirstOfWide,
 }
 
 /// Whether the ASCII byte `b` can be part of a key run: an ASCII alphanumeric,
@@ -285,31 +336,6 @@ fn skip_blanks(text: &str, mut i: usize) -> usize {
             0 => return i,
             n => i += n,
         }
-    }
-}
-
-/// The blank rule beside a separator, used at both skips of [`mask_secret_pairs`]
-/// (after a key run and its optional closing quote, and after the separator): the
-/// index of the first byte at or after `i` that is not a blank. For
-/// [`Reading::Standard`] every whitespace character is a blank (see [`blank_len`]),
-/// a line break included, so `sid:\nabc` is masked. For [`Reading::Wide`] the three
-/// ASCII characters `\n`, `\r` and `\x0c` are not blanks and stay where they are,
-/// so the wide scan reads a pair on one line: a line break after a separator leaves
-/// the key without a value, instead of making the next line's first token its value
-/// and swallowing a pair nested there. Every other whitespace character, the
-/// vertical tab and U+0085, U+2028 and U+2029 included, is skipped.
-fn skip_pair_blanks(text: &str, mut i: usize, reading: Reading) -> usize {
-    match reading {
-        Reading::Standard => skip_blanks(text, i),
-        Reading::Wide => loop {
-            if matches!(text.as_bytes().get(i), Some(b'\n' | b'\r' | 0x0C)) {
-                return i;
-            }
-            match blank_len(text, i) {
-                0 => return i,
-                n => i += n,
-            }
-        },
     }
 }
 
@@ -392,41 +418,65 @@ fn is_host_port(run: &[u8], after: &[u8]) -> bool {
 /// Replace the value of every `key=value` / `key: value` pair in `text` whose key
 /// run is secret under `reading` with `[redacted]`.
 ///
-/// `reading` is consulted in exactly three places: the secret test of a key run
-/// ([`is_secret_key`] for [`Reading::Standard`], [`is_secret_key_wide`] for
-/// [`Reading::Wide`]), the host:port exemption (applied for `Standard`, never for
-/// `Wide`), and [`skip_pair_blanks`], the blank rule beside a separator. It is read
-/// nowhere that decides where a key run, a separator, a value, or a closing quote
-/// starts or ends; its one effect on where a value starts is the third place,
-/// which leaves the wide scan with no value after a line break. So a pair that
-/// both readings call secret is scanned identically by both, host:port and line
-/// breaks beside a separator aside.
+/// `reading` is consulted in exactly two places: the secret test of a key run, and
+/// the host:port exemption. The secret test is [`is_secret_key`] for
+/// [`Reading::Standard`] and [`is_secret_key_wide`] for [`Reading::Wide`]; for
+/// [`Reading::FirstOfWide`] it is [`is_secret_key_wide`] when the key run begins
+/// inside the text this scan has already masked, and [`is_secret_key`] elsewhere.
+/// The exemption is applied for `Standard` and `FirstOfWide`, never for `Wide`. It
+/// is read nowhere that decides where a key run, a blank, a separator, a value, or a
+/// closing quote starts or ends, so a pair that two readings both call secret is
+/// scanned identically by them, host:port aside.
 ///
 /// One linear scan. A key run is followed by an optional closing quote, blanks
-/// (see [`skip_pair_blanks`]; for `Standard`, newlines are blanks, so a value on
-/// the next line is still masked), `=` or `:`, blanks, an optional opening quote,
-/// and the value (see [`scrub_text`] for the value rule). After a masked pair the
-/// scan resumes after the value; after any other key run it resumes right after
-/// the run, not after the value, so a pair nested in a non-secret value is still
-/// seen.
+/// (every whitespace character, a line break included, so a value on the next line
+/// is still masked), `=` or `:`, blanks, an optional opening quote, and the value
+/// (see [`scrub_text`] for the value rule). After any key run that is not a masked
+/// pair the scan resumes right after the run, not after the value, so a pair nested
+/// in a non-secret value is still seen. After a masked pair it resumes at the
+/// value's start, not its end, so a secret pair that begins inside the masked value
+/// is read too: such a pair is called nested.
 ///
-/// Each byte is read a constant number of times. A successful search for a closing
-/// quote ends where the scan resumes, so successful searches never overlap. A
-/// failed search for a quote character reads to the end of the text once, and is
-/// remembered: a later search for the same character starts further on and so
-/// considers a subset of the candidates, and a candidate is judged on its
-/// neighbouring characters alone, so it would fail too and is not run. That holds
-/// because every later search starts just after an opening quote that the failed
-/// search already passed as a non-closing candidate, so from there the two scans
-/// coincide; [`is_opening_quote`] must therefore stay a pure function of the text
-/// around the quote. The vocabulary is consulted only for a key run that is
-/// followed by a separator, so no allocation is spent on the rest of the text.
+/// Two guards keep a nested pair from reading text that is already masked, and so
+/// from reading it twice. The exact guard: after the blanks that follow the
+/// separator, a pair whose value would start before the first index the masked text
+/// does not cover (its closing quote included) is left alone, as a pair with a
+/// non-secret key is, with no value and no closing-quote search. Without it
+/// `token="sid:" tail="x"` would read the closing quote of the masked value as the
+/// opener of a value for the nested `sid:`, and swallow ` tail="x`. The early guard:
+/// a pair whose separator ends inside the masked text is skipped right after the
+/// separator is found, before the vocabulary is consulted. The exact guard implies
+/// it, so it changes no output; it only keeps a long masked value full of nested
+/// keys from costing one lowercase allocation for each.
+///
+/// The work is linear. The scan index strictly increases: after a masked pair it is
+/// the value's start, which is past the pair's key end. So key starts strictly
+/// increase too, and a pair reaches a closing-quote search only when its value
+/// starts at or after the end of the masked text, which is at or after `copied`.
+/// Searches therefore start at strictly increasing positions, and successful ones
+/// never overlap: each starts after the previous masked text. A failed search for a
+/// quote character reads to the end of the text once, and is remembered: a later
+/// search for the same character starts further on and so considers a subset of the
+/// candidates, and a candidate is judged on its neighbouring characters alone, so it
+/// would fail too and is not run. [`is_opening_quote`] must therefore stay a pure
+/// function of the text around the quote.
+///
+/// A byte is read once to find the end of a value and once more when the scan walks
+/// the masked value; masked values are disjoint and increasing, so a byte lies in at
+/// most one. Blank runs are read by the lookahead after a key run and by the loop's
+/// own steps. The slice `text[copied..value_start]` needs `value_start >= copied`,
+/// which the exact guard gives. The vocabulary is consulted only for a key run whose
+/// separator follows it and does not end inside the masked text, so no allocation is
+/// spent on the rest of the text.
 fn mask_secret_pairs(text: &str, reading: Reading) -> String {
     let bytes = text.as_bytes();
     let len = bytes.len();
     let mut out = String::with_capacity(len);
     // Start of the text not yet copied into `out`.
     let mut copied = 0;
+    // The first index the masked text does not cover: the end of the last masked
+    // value, and one more when its closing quote is part of the masked text.
+    let mut masked_to = 0;
     // Whether a search for a closing `"` (index 0) or `'` (index 1) has failed.
     let mut quote_unclosed = [false; 2];
     let mut i = 0;
@@ -445,12 +495,19 @@ fn mask_secret_pairs(text: &str, reading: Reading) -> String {
         if j < len && matches!(bytes[j], b'"' | b'\'') {
             j += 1;
         }
-        j = skip_pair_blanks(text, j, reading);
+        j = skip_blanks(text, j);
         if j >= len || !matches!(bytes[j], b'=' | b':') {
             continue;
         }
         let separator = bytes[j];
         j += 1;
+        // The early guard (see the doc above): a pair whose separator ends inside
+        // the masked text is left alone before the vocabulary costs an allocation
+        // for each key of a long masked value. The exact guard below would leave
+        // it alone as well, so this one changes no output.
+        if j < copied {
+            continue;
+        }
 
         // The scan only ever stops on char boundaries and `run_end` steps whole
         // chars, so `key_start..key_end` is on char boundaries.
@@ -458,11 +515,18 @@ fn mask_secret_pairs(text: &str, reading: Reading) -> String {
         let secret = match reading {
             Reading::Standard => is_secret_key(key),
             Reading::Wide => is_secret_key_wide(key),
+            Reading::FirstOfWide => {
+                if key_start < copied {
+                    is_secret_key_wide(key)
+                } else {
+                    is_secret_key(key)
+                }
+            }
         };
         if !secret {
             continue;
         }
-        if reading == Reading::Standard
+        if reading != Reading::Wide
             && separator == b':'
             && is_host_port(key.as_bytes(), &bytes[key_end..])
         {
@@ -470,7 +534,14 @@ fn mask_secret_pairs(text: &str, reading: Reading) -> String {
         }
 
         // Whitespace, an optional opening quote, then the value.
-        j = skip_pair_blanks(text, j, reading);
+        j = skip_blanks(text, j);
+        // The exact guard (see the doc above): a value that would start inside the
+        // masked text is no value: it is part of the parent's own value, or its
+        // closing quote. Leave the pair alone, as for a key that is not secret, so
+        // no closing-quote search starts there.
+        if j < masked_to {
+            continue;
+        }
         let quote = match bytes.get(j) {
             Some(&q) if matches!(q, b'"' | b'\'') => {
                 j += 1;
@@ -502,7 +573,10 @@ fn mask_secret_pairs(text: &str, reading: Reading) -> String {
         out.push_str(&text[copied..value_start]);
         out.push_str("[redacted]");
         copied = value_end;
-        i = value_end;
+        masked_to = value_end + usize::from(closer.is_some());
+        // Resume inside the masked value, so a secret pair that begins there is
+        // read too. The key runs before `value_start` were passed already.
+        i = value_start;
     }
     out.push_str(&text[copied..]);
     out
@@ -2085,22 +2159,25 @@ mod tests {
         }
     }
 
-    // ---- The wide scrub is the standard scan, then the wide scan over its output.
+    // ---- The wide scrub reads a pair that begins inside a masked value.
 
-    /// A standard-secret pair nested under a wide-only key, with the output of the
-    /// old two-scan pipeline. A wide-only key masks its value as one region, and
-    /// that region can end between the nested key and its value; the standard scan
-    /// runs first so that the nested pair is already masked.
+    /// A standard-secret pair nested under a wide-only key. In rows 1 to 4 the pair
+    /// is on the line after the key: the parent takes the child's label as its
+    /// value and the child masks its own, so both come out `[redacted]`. Rows 5 to
+    /// 9 are one-line shapes, and the rule leaves their outputs as they were.
     const NESTED_UNDER_A_WIDE_ONLY_KEY: &[(&str, &str)] = &[
         (
             "authentication:\n  password: hunter2",
-            "authentication:\n  password: [redacted]",
+            "authentication:\n  [redacted] [redacted]",
         ),
-        ("author:\n  token: abc123", "author:\n  token: [redacted]"),
-        ("sessions:\n  jwt: J1", "sessions:\n  jwt: [redacted]"),
+        (
+            "author:\n  token: abc123",
+            "author:\n  [redacted] [redacted]",
+        ),
+        ("sessions:\n  jwt: J1", "sessions:\n  [redacted] [redacted]"),
         (
             "sidebar:\n    api_key: K1",
-            "sidebar:\n    api_key: [redacted]",
+            "sidebar:\n    [redacted] [redacted]",
         ),
         (
             "authentication: {password: hunter2}",
@@ -2112,21 +2189,22 @@ mod tests {
         ("Auths:Pwd: C", "Auths:[redacted] [redacted]"),
     ];
 
-    /// Shapes with a line break beside a separator, as the wide scrub reads them: a
-    /// pair is read on one line, so a line break leaves a wide-only key without a
-    /// value, and the next line's key is read as a key.
-    const LINE_BREAK_IS_A_BOUNDARY: &[(&str, &str)] = &[
-        ("side:\nSid2':C", "side:\nSid2':[redacted]"),
+    /// Shapes with a line break beside a separator, as the wide scrub reads them:
+    /// it reads across the line break and a pair that begins inside a masked
+    /// value, so a wide-only key takes the next line's token as its value and a
+    /// key on that line is masked as well.
+    const PAIR_ACROSS_A_LINE_BREAK: &[(&str, &str)] = &[
+        ("side:\nSid2':C", "side:\n[redacted]':[redacted]"),
         (
             "authentication:\n  sessionKey: abc123",
-            "authentication:\n  sessionKey: [redacted]",
+            "authentication:\n  [redacted] [redacted]",
         ),
-        ("bsid:\rSIDE:'C", "bsid:\rSIDE:'[redacted]"),
-        ("author:\nJohn", "author:\nJohn"),
-        ("sidebar:\r\nv", "sidebar:\r\nv"),
-        ("sidebar\n:v", "sidebar\n:v"),
-        ("sidebar=\u{c}v", "sidebar=\u{c}v"),
-        // A standard key still reads across a line break.
+        ("bsid:\rSIDE:'C", "bsid:\r[redacted]'[redacted]"),
+        ("author:\nJohn", "author:\n[redacted]"),
+        ("sidebar:\r\nv", "sidebar:\r\n[redacted]"),
+        ("sidebar\n:v", "sidebar\n:[redacted]"),
+        ("sidebar=\u{c}v", "sidebar=\u{c}[redacted]"),
+        // A standard-secret key takes the next line's token as well.
         ("sid:\nabc", "sid:\n[redacted]"),
     ];
 
@@ -2171,6 +2249,7 @@ mod tests {
         assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
 
+    /// A corpus check; the general property is the ownership-aware one (spec Residual risks 4).
     #[test]
     fn scrub_text_wide_masks_everything_scrub_text_masks() {
         let inputs = corpus_inputs();
@@ -2202,14 +2281,14 @@ mod tests {
     }
 
     #[test]
-    fn scrub_text_wide_keeps_a_line_break_as_a_boundary() {
-        let bad = mismatches_wide(LINE_BREAK_IS_A_BOUNDARY);
+    fn scrub_text_wide_reads_a_pair_across_a_line_break() {
+        let bad = mismatches_wide(PAIR_ACROSS_A_LINE_BREAK);
         assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
 
-    // ---- Edges of the blank rule and of the two scans: the helper at its
-    // ---- boundaries, a pair read on one line beside non-ASCII spaces, a text cut
-    // ---- short, and oversized runs of line breaks.
+    // ---- Edges of the blank rule and of the two scans: a pair read across a
+    // ---- line break beside non-ASCII spaces, a text cut short, and oversized
+    // ---- runs of line breaks.
 
     /// Every input of the three corpora above, the recorded ones and the two
     /// tables of the line-break and nesting shapes.
@@ -2218,98 +2297,32 @@ mod tests {
             .iter()
             .map(|&(input, _, _)| input)
             .chain(NESTED_UNDER_A_WIDE_ONLY_KEY.iter().map(|&(input, _)| input))
-            .chain(LINE_BREAK_IS_A_BOUNDARY.iter().map(|&(input, _)| input))
+            .chain(PAIR_ACROSS_A_LINE_BREAK.iter().map(|&(input, _)| input))
             .collect()
     }
 
-    /// The blank rule on the helper itself, at its boundaries. Each row is `(text,
-    /// from, standard, wide)`: the byte index each reading returns. The standard
-    /// reading skips every whitespace character, a line break included. The wide
-    /// reading stops at an ASCII `\n`, `\r` or `\x0c` and skips every other one, so
-    /// a non-ASCII space on either side of a line break is skipped and the line
-    /// break is not. U+00A0 and U+0085 are two bytes, U+2009, U+2028, U+2029,
-    /// U+3000, U+1680 and U+200A are three.
+    /// The wide scan reads a pair across a line break, with a non-ASCII space
+    /// before or after the line break as much as without one, and a standard key
+    /// takes the next line's token the same way. The expected texts follow from the
+    /// scan's rules (a wide-only key takes the next line's token as its value, and
+    /// a key inside that value is read as a key), not from a recording.
     #[test]
-    fn skip_pair_blanks_leaves_only_the_three_line_breaks_to_the_wide_reading() {
-        let rows: &[(&str, usize, usize, usize)] = &[
-            // Nothing to skip, and the ends of the text.
-            ("", 0, 0, 0),
-            ("x", 0, 0, 0),
-            ("ab", 2, 2, 2),
-            ("ab", 9, 9, 9),
-            // A start inside a two-byte character is not a blank.
-            ("\u{a0}", 1, 1, 1),
-            // Blanks that both readings skip, the vertical tab among them.
-            (" ", 0, 1, 1),
-            ("\u{a0}x", 0, 2, 2),
-            ("\t\u{b} \u{a0}x", 0, 5, 5),
-            ("\u{85}\u{2029}x", 0, 5, 5),
-            // Each of the three line breaks, alone and with a space beside it.
-            ("\n", 0, 1, 0),
-            ("\r", 0, 1, 0),
-            ("\u{c}", 0, 1, 0),
-            ("\r\n", 0, 2, 0),
-            ("\n\u{a0}", 0, 3, 0),
-            (" \t\n", 0, 3, 2),
-            ("\u{a0}\n", 0, 3, 2),
-            ("\u{2009}\u{a0}\r\u{a0}x", 0, 8, 5),
-            ("\u{2028}\u{c}", 0, 4, 3),
-            ("\u{3000}\u{1680}\u{200a}\n", 0, 10, 9),
-            // From the middle of a text.
-            ("a \n b", 1, 4, 2),
-            ("a \n b", 2, 4, 2),
-            ("a \n b", 3, 4, 4),
-        ];
-        let bad: Vec<String> = rows
-            .iter()
-            .filter_map(|&(text, from, standard, wide)| {
-                let got = (
-                    skip_pair_blanks(text, from, Reading::Standard),
-                    skip_pair_blanks(text, from, Reading::Wide),
-                );
-                (got != (standard, wide)).then(|| {
-                    format!(
-                        "{text:?} from {from}: expected {:?}, got {got:?}",
-                        (standard, wide)
-                    )
-                })
-            })
-            .collect();
-        assert!(
-            bad.is_empty(),
-            "(standard, wide) indices are wrong: {bad:#?}"
-        );
-
-        // A megabyte of non-ASCII blanks that a line break ends: the wide reading
-        // stops on the line break and the standard reading reads on past it.
-        let run = "\u{a0}".repeat(1 << 19);
-        let text = format!("{run}\nx");
-        assert_eq!(skip_pair_blanks(&text, 0, Reading::Wide), run.len());
-        assert_eq!(skip_pair_blanks(&text, 0, Reading::Standard), run.len() + 1);
-    }
-
-    /// A pair is read on one line by the wide scan, with a non-ASCII space before
-    /// or after the line break as much as without one, and the standard scan still
-    /// reads a standard key across the line break. The expected texts follow from
-    /// the scan's rules (a wide-only key with a line break at its separator has no
-    /// value; the next line's key is read as a key), not from a recording.
-    #[test]
-    fn scrub_text_wide_reads_a_pair_on_one_line_beside_non_ascii_spaces() {
+    fn scrub_text_wide_reads_a_pair_across_a_line_break_beside_non_ascii_spaces() {
         let bad = mismatches_wide(&[
-            // A wide-only key: no value is found across a line break, and a
-            // non-ASCII space before or after it does not carry the scan over.
-            ("sidebar:\u{a0}\nJohn", "sidebar:\u{a0}\nJohn"),
-            ("author\u{a0}\n:John", "author\u{a0}\n:John"),
-            ("author\u{c}=John", "author\u{c}=John"),
-            // A key on the next line, after a non-ASCII space, is read as a key:
-            // wide-only, then standard.
+            // A wide-only key: the value is found across a line break, and a
+            // non-ASCII space before or after it does not stop the scan.
+            ("sidebar:\u{a0}\nJohn", "sidebar:\u{a0}\n[redacted]"),
+            ("author\u{a0}\n:John", "author\u{a0}\n:[redacted]"),
+            ("author\u{c}=John", "author\u{c}=[redacted]"),
+            // A key on the next line, after a non-ASCII space, is masked as the
+            // value of the wide-only key above it, and its own value with it.
             (
                 "sidebar:\n\u{a0}sessionKey: abc123",
-                "sidebar:\n\u{a0}sessionKey: [redacted]",
+                "sidebar:\n\u{a0}[redacted] [redacted]",
             ),
             (
                 "authentication:\u{2009}\r\n\u{2009}jwt:\u{a0}J1",
-                "authentication:\u{2009}\r\n\u{2009}jwt:\u{a0}[redacted]",
+                "authentication:\u{2009}\r\n\u{2009}[redacted]\u{a0}[redacted]",
             ),
             // The standard scan reads a standard key across a line break, with a
             // non-ASCII space on either side of it.
@@ -2322,7 +2335,7 @@ mod tests {
             // Windows line endings: a nested standard pair and a header block.
             (
                 "authentication:\r\n  password: hunter2",
-                "authentication:\r\n  password: [redacted]",
+                "authentication:\r\n  [redacted] [redacted]",
             ),
             (
                 "X-Authority: example.com\r\nX-Sid: S1\r\n",
@@ -2376,9 +2389,10 @@ mod tests {
     }
 
     /// Hostile text that gives both scans work: standard keys with a quote that
-    /// never closes, and a standard key beside a wide-only one. The standard scan
-    /// masks the first, and the wide scan reads the masked output. Each family
-    /// finishes, and each comes out as the scan's rules say.
+    /// never closes, and a standard key beside a wide-only one. The first scan
+    /// masks the standard keys, and the second reads its output and masks the
+    /// wide-only ones. Each family finishes, and each comes out as the scan's rules
+    /// say.
     #[test]
     fn scrub_text_wide_stays_linear_when_both_scans_have_work() {
         let input = "sid=\"x ".repeat(150_000);
@@ -2433,43 +2447,807 @@ mod tests {
     /// scan's rules say.
     #[test]
     fn scrub_text_wide_stays_linear_on_line_break_shapes() {
-        // A wide-only key whose separator ends its line, over a hundred thousand times: no
-        // value on any line, so nothing changes.
+        // A wide-only key whose separator ends its line, over a hundred thousand
+        // times: the first line keeps its key and every later line is the value of
+        // the key above it.
         let input = "author:\n".repeat(1 << 17);
         assert!(
-            scrub_text_wide(&input) == input,
-            "a wide-only key with a line break at its separator changed"
+            scrub_text_wide(&input)
+                == "author:\n".to_string() + &"[redacted]\n".repeat((1 << 17) - 1),
+            "a line after a wide-only key at a line end was not masked as its value"
         );
 
-        // A wide-only parent over a wide-only child, and over a standard child.
+        // A wide-only parent over a wide-only child, and over a standard child: the
+        // parent takes the child's label as its value and the child masks its own.
         let input = "authentication:\n  sessionKey: x\n".repeat(50_000);
         assert!(
-            scrub_text_wide(&input) == "authentication:\n  sessionKey: [redacted]\n".repeat(50_000),
-            "a wide-only child on the next line was not masked"
+            scrub_text_wide(&input) == "authentication:\n  [redacted] [redacted]\n".repeat(50_000),
+            "a wide-only child on the next line, with its parent, was not masked"
         );
         let input = "authentication:\n  password: x\n".repeat(50_000);
         assert!(
-            scrub_text_wide(&input) == "authentication:\n  password: [redacted]\n".repeat(50_000),
-            "a standard child on the next line was not masked"
+            scrub_text_wide(&input) == "authentication:\n  [redacted] [redacted]\n".repeat(50_000),
+            "a standard child on the next line, with its parent, was not masked"
         );
 
         // A standard key reads across the line break, so a value is the next
-        // line's first token; the scan resumes after it, so the lines pair off.
+        // line's first token; the scan resumes inside it, so every line after the
+        // first is masked.
         let input = "sid:\n".repeat(100_000);
         assert!(
-            scrub_text_wide(&input) == "sid:\n[redacted]\n".repeat(50_000),
-            "standard keys on consecutive lines were not masked in pairs"
+            scrub_text_wide(&input) == "sid:\n".to_string() + &"[redacted]\n".repeat(99_999),
+            "standard keys on consecutive lines were not each masked"
         );
 
-        // Half a million line breaks between a key and its separator: the wide scan
-        // stops at the first one, the standard scan reads through them all.
+        // Half a million line breaks between a key and its separator: a wide-only
+        // key and a standard key both read through all of them to the value.
         let breaks = "\n".repeat(1 << 19);
         let input = format!("sidebar{breaks}=v");
-        assert!(scrub_text_wide(&input) == input, "a wide-only key changed");
+        assert!(
+            scrub_text_wide(&input) == format!("sidebar{breaks}=[redacted]"),
+            "a wide-only key was not masked across half a million line breaks"
+        );
         let input = format!("sid{breaks}=v");
         assert!(
             scrub_text_wide(&input) == format!("sid{breaks}=[redacted]"),
             "a standard key was not masked across half a million line breaks"
+        );
+    }
+
+    /// Five thousand `(parent, credential)` pairs from a seeded xorshift64
+    /// generator, so every run sees the same ones. A credential is 4 to 43
+    /// characters of `A-Za-z0-9` followed by `=` or `==`, the shape of padded
+    /// base64; the parent is a standard secret key.
+    fn padded_credentials() -> Vec<(&'static str, String)> {
+        const PARENTS: [&str; 6] = ["token", "password", "secret", "session", "auth", "api_key"];
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..5_000)
+            .map(|_| {
+                let parent = PARENTS[(next() % PARENTS.len() as u64) as usize];
+                let len = 4 + (next() % 40) as usize;
+                let mut credential: String = (0..len)
+                    .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize] as char)
+                    .collect();
+                credential.push_str(if next() % 2 == 0 { "=" } else { "==" });
+                (parent, credential)
+            })
+            .collect()
+    }
+
+    /// After a secret key the first token is the value, even on the next line,
+    /// and it is masked whole. A secret pair that starts after that token is
+    /// masked as a pair; none of these rows has one that starts inside it.
+    #[test]
+    fn scrub_text_keeps_the_output_it_had_when_no_secret_pair_starts_inside_a_masked_value() {
+        let rows = [
+            ("auth:\n  password=hunter2", "auth:\n  [redacted]"),
+            ("auth=\n  password=hunter2", "auth=\n  [redacted]"),
+            (
+                "auth:\n  creds:\n    password: hunter2",
+                "auth:\n  [redacted]\n    password: [redacted]",
+            ),
+            ("auth:\n  user: bob", "auth:\n  [redacted] bob"),
+            ("token:\n  author: bob", "token:\n  [redacted] bob"),
+            (
+                "auth:\n  authority: example.com",
+                "auth:\n  [redacted] example.com",
+            ),
+            (
+                "auth:\n  user: bob\n  password: hunter2",
+                "auth:\n  [redacted] bob\n  password: [redacted]",
+            ),
+            (
+                "auth:\n  # note\n  password: hunter2",
+                "auth:\n  [redacted] note\n  password: [redacted]",
+            ),
+            (
+                "credentials:\n  - password: hunter2",
+                "credentials:\n  [redacted] password: [redacted]",
+            ),
+            (
+                "auth: x\n  password: hunter2",
+                "auth: [redacted]\n  password: [redacted]",
+            ),
+            ("auth:\n", "auth:\n"),
+            ("auth:\n  sessionKey: abc123", "auth:\n  [redacted] abc123"),
+            (
+                "Authorization:\n  password: hunter2",
+                "Authorization:\n  [redacted]",
+            ),
+            ("password:\n  hunter2", "password:\n  [redacted]"),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A value that reads like a pair (`YWJj=`, `s3cr:et`, `user:pass`) on the
+    /// line after a standard secret key is that key's value and is masked whole,
+    /// whatever separator or secret-looking word it contains.
+    #[test]
+    fn scrub_text_masks_a_value_that_looks_like_a_pair_under_a_secret_parent() {
+        let rows = [
+            ("token:\n  YWJj=", "token:\n  [redacted]"),
+            ("token:\n  YWJj==", "token:\n  [redacted]"),
+            ("password:\n  s3cr:et", "password:\n  [redacted]"),
+            ("token:\n  dXNlcjpwYXNz", "token:\n  [redacted]"),
+            ("password:\n  user:pass", "password:\n  [redacted]"),
+            ("token:\n  AApwdBB=", "token:\n  [redacted]"),
+            (
+                "token:\n  AApwdBB==\n  other: 1",
+                "token:\n  [redacted]\n  other: 1",
+            ),
+            ("password:\n  sid:abc", "password:\n  [redacted]"),
+            ("password:\n  auth=xyz", "password:\n  [redacted]"),
+            ("secret:\n  a=b", "secret:\n  [redacted]"),
+            ("auth:\n  user:pass", "auth:\n  [redacted]"),
+            ("token:\r\n  YWJj=\r\n", "token:\r\n  [redacted]\r\n"),
+            (
+                "session:\n\tQWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+                "session:\n\t[redacted]",
+            ),
+            (
+                "password:\n  jwt=eyJhbGciOi.eyJzdWIi.sig=",
+                "password:\n  [redacted]",
+            ),
+            ("api_key:\n  Key=AAA=:", "api_key:\n  [redacted]"),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A padded base64 credential on the line after a standard secret key is the
+    /// key's value, whatever its length and whichever key: the whole credential
+    /// is masked and nothing of it is left in the clear.
+    #[test]
+    fn scrub_text_masks_a_padded_base64_credential_on_the_next_line() {
+        let mut checked = 0;
+        for (parent, credential) in padded_credentials() {
+            let input = format!("{parent}:\n  {credential}");
+            let expected = format!("{parent}:\n  [redacted]");
+            let actual = scrub_text(&input);
+            assert!(
+                actual == expected,
+                "a padded credential was not masked whole: {input:?} gave {actual:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 5_000, "the generator changed its count");
+    }
+
+    /// The closing quote of a masked quoted value is not an opening quote: the
+    /// text that follows it is scanned as it always was, so a `sid:` inside the
+    /// quotes is part of the masked value and the quote after it ends that value.
+    #[test]
+    fn scrub_text_does_not_read_the_closing_quote_of_a_masked_value_as_an_opener() {
+        let rows = [
+            (
+                "token=\"sid: \" tail=\"x\"",
+                "token=\"[redacted]\" tail=\"x\"",
+            ),
+            (
+                "token=\"sid:\" tail=\"x\"",
+                "token=\"[redacted]\" tail=\"x\"",
+            ),
+            (
+                "token=\"a sid:\" tail=\"x\"",
+                "token=\"[redacted]\" tail=\"x\"",
+            ),
+            (
+                "x=1&token='auth='&y=\"z\"",
+                "x=1&token='[redacted]'&y=\"z\"",
+            ),
+            ("x=1&token=\"sid:\t\"\ny=2", "x=1&token=\"[redacted]\"\ny=2"),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A secret key whose value is another secret key's label, with the child's
+    /// own value after it: the parent masks the label and the child masks its
+    /// value, whichever parent and whichever blank layout lies between them.
+    #[test]
+    fn scrub_text_masks_a_credential_nested_under_a_secret_parent() {
+        const PARENTS: [&str; 11] = [
+            "auth",
+            "credentials",
+            "secret",
+            "token",
+            "session",
+            "cookie",
+            "password",
+            "sid",
+            "jwt",
+            "csrf",
+            "api_key",
+        ];
+        const LAYOUTS: [&str; 6] = ["\n  ", "\r\n  ", "\n\t", "\r  ", "\u{c}  ", "\n    "];
+        let mut owned: Vec<(String, String)> = Vec::new();
+        for parent in PARENTS {
+            for layout in LAYOUTS {
+                owned.push((
+                    format!("{parent}:{layout}password: hunter2"),
+                    format!("{parent}:{layout}[redacted] [redacted]"),
+                ));
+            }
+        }
+        owned.push((
+            "token:\r\n\tsid: S1".to_string(),
+            "token:\r\n\t[redacted] [redacted]".to_string(),
+        ));
+        owned.push((
+            "session:\n  csrf: C9".to_string(),
+            "session:\n  [redacted] [redacted]".to_string(),
+        ));
+        assert!(owned.len() >= 68, "the table lost rows: {}", owned.len());
+        let rows: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(input, expected)| (input.as_str(), expected.as_str()))
+            .collect();
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// The nested credential is masked in every form a pair takes: quoted keys,
+    /// a separator with blanks before it, a value on its own line, a quoted
+    /// value, and a run of empty lines between the parent and the child.
+    #[test]
+    fn scrub_text_masks_a_nested_credential_in_every_separator_and_quote_form() {
+        let rows = [
+            (
+                "\"auth\":\n  \"password\": \"x\"",
+                "\"auth\":\n  \"[redacted]\": \"[redacted]\"",
+            ),
+            (
+                "'auth':\n  'password' : 'x y'",
+                "'auth':\n  '[redacted]' : '[redacted]'",
+            ),
+            ("auth: password: hunter2", "auth: [redacted] [redacted]"),
+            (
+                "auth:\n  password :   hunter2",
+                "auth:\n  [redacted] :   [redacted]",
+            ),
+            (
+                "auth:\n  password:\n    hunter2",
+                "auth:\n  [redacted]\n    [redacted]",
+            ),
+            (
+                "auth:\n  password: 'hunter2'",
+                "auth:\n  [redacted] '[redacted]'",
+            ),
+            (
+                "auth:\n\n\n\n\n  password: x",
+                "auth:\n\n\n\n\n  [redacted] [redacted]",
+            ),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A chain of secret keys, each the value of the one before it: every pair
+    /// of the chain is read, so the last key in it masks its own value too.
+    #[test]
+    fn scrub_text_reads_every_pair_of_a_chain_of_secret_keys() {
+        let rows = [
+            (
+                "token:\n  sid:\n  password: hunter2",
+                "token:\n  [redacted]\n  [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  secret:\n    password: hunter2",
+                "auth:\n  [redacted]\n    [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  token:\n    secret:\n      password: hunter2",
+                "auth:\n  [redacted]\n    [redacted]\n      [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  password:\n  sid=abc",
+                "auth:\n  [redacted]\n  [redacted]",
+            ),
+            (
+                "auth:\n  secret:\n    \"password\": \"x\"",
+                "auth:\n  [redacted]\n    \"[redacted]\": \"[redacted]\"",
+            ),
+            ("sid:\nsid:\nsid:\n", "sid:\n[redacted]\n[redacted]\n"),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A padded base64 credential on the line after a nested pair's key is that
+    /// key's value, whatever its length: it is masked whole and nothing of it is
+    /// left in the clear.
+    #[test]
+    fn scrub_text_masks_a_padded_base64_credential_under_a_nested_pair() {
+        let mut checked = 0;
+        for (_, credential) in padded_credentials() {
+            let input = format!("auth:\n  password:\n    {credential}");
+            let expected = "auth:\n  [redacted]\n    [redacted]";
+            let actual = scrub_text(&input);
+            assert!(
+                actual == expected,
+                "a padded credential under a nested pair was not masked whole: {input:?} gave {actual:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 5_000, "the generator changed its count");
+    }
+
+    /// How many copies of `unit` make a text of at least one mebibyte and at most
+    /// two (`1 << 21` bytes). The count is clamped here, before any `repeat`, so no
+    /// hostile family is smaller than the size at which a quadratic scan shows and
+    /// none is larger than the bound these tests keep.
+    fn mebibyte_copies(unit: &str) -> usize {
+        const FLOOR: usize = 1 << 20;
+        const CEILING: usize = 1 << 21;
+        assert!(
+            !unit.is_empty() && unit.len() <= FLOOR,
+            "a unit of {} bytes is out of range",
+            unit.len()
+        );
+        (FLOOR / unit.len() + 1).min(CEILING / unit.len())
+    }
+
+    /// Nested pairs over inputs of a mebibyte and more: the scan reads each byte a
+    /// constant number of times, so these finish, and each comes out as the scan's
+    /// rules say, through both scrubs. Every family is sized by `mebibyte_copies`, so
+    /// none is under a mebibyte or over two.
+    #[test]
+    fn scrub_text_stays_linear_on_nested_pair_shapes() {
+        // A parent and a child on every other line.
+        let unit = "auth:\n  password: x\n";
+        let n = mebibyte_copies(unit);
+        let input = unit.repeat(n);
+        let expected = "auth:\n  [redacted] [redacted]\n".repeat(n);
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == expected,
+            "nested pairs on consecutive lines were not masked"
+        );
+        assert!(
+            scrub_text_wide(&input) == expected,
+            "wide: nested pairs on consecutive lines were not masked"
+        );
+
+        // A bare secret key on every line: each is the value of the one before.
+        let unit = "sid:\n";
+        let n = mebibyte_copies(unit);
+        let input = unit.repeat(n);
+        let expected = "sid:\n".to_string() + &"[redacted]\n".repeat(n - 1);
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == expected,
+            "a column of bare secret keys was not masked line by line"
+        );
+        assert!(
+            scrub_text_wide(&input) == expected,
+            "wide: a column of bare secret keys was not masked line by line"
+        );
+
+        let unit = "password:\n password:\n";
+        let n = mebibyte_copies(unit);
+        let input = unit.repeat(n);
+        let expected =
+            "password:\n [redacted]\n".to_string() + &"[redacted]\n [redacted]\n".repeat(n - 1);
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == expected,
+            "a column of indented secret keys was not masked line by line"
+        );
+        assert!(
+            scrub_text_wide(&input) == expected,
+            "wide: a column of indented secret keys was not masked line by line"
+        );
+
+        // A mebibyte of empty lines between a parent and its child.
+        let breaks = "\n".repeat(mebibyte_copies("\n"));
+        let input = format!("auth:{breaks}  password: x");
+        let expected = format!("auth:{breaks}  [redacted] [redacted]");
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == expected,
+            "a child after a mebibyte of empty lines was not masked"
+        );
+        assert!(
+            scrub_text_wide(&input) == expected,
+            "wide: a child after a mebibyte of empty lines was not masked"
+        );
+
+        // A quoted value that holds half a million key-like words and no closing
+        // quote until the end.
+        let words = "a=".repeat(mebibyte_copies("a="));
+        let input = format!("token=\"{words}\"");
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == "token=\"[redacted]\"",
+            "a quoted value full of key-like words was not masked whole"
+        );
+        assert!(
+            scrub_text_wide(&input) == "token=\"[redacted]\"",
+            "wide: a quoted value full of key-like words was not masked whole"
+        );
+
+        // Some two hundred thousand openers of a quoted value, one closing quote.
+        let unit = "sid:\"";
+        let n = mebibyte_copies(unit);
+        let input = format!("{}x\"", unit.repeat(n));
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == "sid:\"[redacted]\"",
+            "a run of quoted-value openers was not masked as one value"
+        );
+        assert!(
+            scrub_text_wide(&input) == "sid:\"[redacted]\"",
+            "wide: a run of quoted-value openers was not masked as one value"
+        );
+
+        // A masked quoted value with a secret-looking word inside, repeated.
+        let unit = "token=\"sid: \" tail=\"x\" ";
+        let n = mebibyte_copies(unit);
+        let input = unit.repeat(n);
+        let expected = "token=\"[redacted]\" tail=\"x\" ".repeat(n);
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == expected,
+            "repeated quoted values with a key-like word inside were not masked"
+        );
+        assert!(
+            scrub_text_wide(&input) == expected,
+            "wide: repeated quoted values with a key-like word inside were not masked"
+        );
+    }
+
+    /// The second scan of `scrub_text_wide` reads the output of the first. The
+    /// families of `scrub_text_stays_linear_on_nested_pair_shapes` hold standard
+    /// keys, which the first scan has masked before the second begins, so none of
+    /// them gives the second scan a nested opener to pass. A chain of quoted-value
+    /// openers under a wide-only key does: the first scan leaves it alone and the
+    /// second reads it as one quoted value that closes at the last quote. A scan
+    /// that starts a closing-quote search for each nested opener is quadratic here
+    /// and does not finish. The chain is sized by `mebibyte_copies`; the standard
+    /// scrub does not read `sidebar` as a key and leaves the text as it was.
+    #[test]
+    fn scrub_text_wide_stays_linear_on_a_chain_of_wide_only_quote_openers() {
+        let unit = "sidebar:\"";
+        let n = mebibyte_copies(unit);
+        let input = format!("{}x\"", unit.repeat(n));
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == input,
+            "the standard scrub changed a chain of wide-only quote openers"
+        );
+        assert!(
+            scrub_text_wide(&input) == "sidebar:\"[redacted]\"",
+            "a run of wide-only quoted-value openers was not masked as one value"
+        );
+    }
+
+    /// Under the wide reading the first token after a secret key is its value on
+    /// the next line too, so a wide-only key masks the line after it.
+    #[test]
+    fn scrub_text_wide_masks_a_next_line_credential_under_a_wide_only_parent() {
+        let rows = [
+            ("userSession:\n  S3SS10N9", "userSession:\n  [redacted]"),
+            ("sidebar:\nS3SS10N9", "sidebar:\n[redacted]"),
+            ("author:\nJohn", "author:\n[redacted]"),
+            ("sessionKey:\n  abc123", "sessionKey:\n  [redacted]"),
+            ("userSession:\r\n\tS3SS10N9", "userSession:\r\n\t[redacted]"),
+            ("sidebar=\u{c}v", "sidebar=\u{c}[redacted]"),
+            ("sidebar\n:v", "sidebar\n:[redacted]"),
+        ];
+        let bad = mismatches_wide(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// Under the wide reading a wide-only key nested under a standard secret key
+    /// is read as a pair too: the parent takes its label and it masks its value.
+    #[test]
+    fn scrub_text_wide_masks_a_wide_only_pair_nested_under_a_standard_parent() {
+        let rows = [
+            (
+                "auth:\n  sessionKey: abc123",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            ("auth: sessionKey: abc123", "auth: [redacted] [redacted]"),
+            (
+                "jwt:\n\tsidebar :  \"Q\"",
+                "jwt:\n\t[redacted] :  \"[redacted]\"",
+            ),
+            (
+                "Credentials:\n\tjwt:\n\tsidebar :  \"Q\"",
+                "Credentials:\n\t[redacted]\n\t[redacted] :  \"[redacted]\"",
+            ),
+        ];
+        let bad = mismatches_wide(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    // ---- Edges a pair that begins inside a masked value has to survive: a text cut
+    // ---- short, a text of a mebibyte and more, a value or a key that is not ASCII,
+    // ---- and a quote at the end of the text.
+
+    /// Cut each of `docs` at every char boundary and scrub the cut. Returns how many
+    /// cuts were scrubbed and, for each cut whose output still holds a `Q`, its
+    /// length and its output. Every credential in these texts is a run of `Q` and
+    /// `Q` is nowhere else in them, so a returned cut is a leak.
+    fn leaking_prefixes<'a>(
+        docs: impl IntoIterator<Item = &'a str>,
+        scrub: fn(&str) -> String,
+    ) -> (usize, Vec<(usize, String)>) {
+        let mut cuts = 0;
+        let mut leaks = Vec::new();
+        for doc in docs {
+            for prefix in prefixes(doc) {
+                cuts += 1;
+                let out = scrub(prefix);
+                if out.contains('Q') {
+                    leaks.push((prefix.len(), out));
+                }
+            }
+        }
+        (cuts, leaks)
+    }
+
+    /// A connection that drops mid-stream hands over a prefix of the text. Cut at
+    /// every char boundary, a text with a nested secret pair never makes either
+    /// scrub panic and never leaves a character of the credential behind: every
+    /// credential is a run of `Q`, and `Q` is nowhere else in a text. The whole text
+    /// comes out as the rule says. The wide scrub also masks every run of a prefix
+    /// that the standard scrub masks: the first scan of the wide scrub is not the
+    /// standard scrub, so this is checked here and not implied.
+    #[test]
+    fn scrub_text_masks_a_nested_credential_on_every_prefix_of_the_text() {
+        // Standard keys: both scrubs read these the same way.
+        let standard: &[(&str, &str)] = &[
+            ("auth:\n  password: QQQQ", "auth:\n  [redacted] [redacted]"),
+            (
+                "credentials:\r\n\tsecret: QQQQ",
+                "credentials:\r\n\t[redacted] [redacted]",
+            ),
+            (
+                "\"auth\":\n  \"password\": \"QQQQ\"",
+                "\"auth\":\n  \"[redacted]\": \"[redacted]\"",
+            ),
+            (
+                "auth:\n  password :   QQQQ",
+                "auth:\n  [redacted] :   [redacted]",
+            ),
+            (
+                "auth:\n  password:\n    QQQQ",
+                "auth:\n  [redacted]\n    [redacted]",
+            ),
+            (
+                "auth:\n  token:\n    secret:\n      password: QQQQ",
+                "auth:\n  [redacted]\n    [redacted]\n      [redacted] [redacted]",
+            ),
+            ("auth: password: QQQQ", "auth: [redacted] [redacted]"),
+            (
+                "token=\"sid: QQQQ\" tail=\"x\"",
+                "token=\"[redacted]\" tail=\"x\"",
+            ),
+            (
+                "auth:\n  password: \u{e9}QQQQ\u{1f600}",
+                "auth:\n  [redacted] [redacted]",
+            ),
+        ];
+        // Wide-only keys: only the wide scrub reads these.
+        let wide: &[(&str, &str)] = &[
+            ("userSession:\n  QQQQ", "userSession:\n  [redacted]"),
+            ("sidebar:\nQQQQ", "sidebar:\n[redacted]"),
+            (
+                "auth:\n  sessionKey: QQQQ",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            (
+                "Credentials:\n\tjwt:\n\tsidebar :  \"QQQQ\"",
+                "Credentials:\n\t[redacted]\n\t[redacted] :  \"[redacted]\"",
+            ),
+            (
+                "authentication:\u{2009}\r\n\u{2009}jwt:\u{a0}QQQQ",
+                "authentication:\u{2009}\r\n\u{2009}[redacted]\u{a0}[redacted]",
+            ),
+        ];
+
+        for &(doc, whole) in standard {
+            assert!(scrub_text(doc) == whole, "standard whole text: {doc:?}");
+            assert!(scrub_text_wide(doc) == whole, "wide whole text: {doc:?}");
+        }
+        for &(doc, whole) in wide {
+            assert!(scrub_text_wide(doc) == whole, "wide whole text: {doc:?}");
+        }
+
+        // The standard documents go through both scrubs, the wide ones through the
+        // wide scrub; each prefix is counted once.
+        let standard_docs = standard.iter().map(|&(doc, _)| doc);
+        let wide_docs = wide.iter().map(|&(doc, _)| doc);
+        let (standard_cuts, mut leaks) = leaking_prefixes(standard_docs.clone(), scrub_text);
+        let (_, wide_scrub_leaks) = leaking_prefixes(standard_docs, scrub_text_wide);
+        let (wide_cuts, wide_only_leaks) = leaking_prefixes(wide_docs, scrub_text_wide);
+        leaks.extend(wide_scrub_leaks);
+        leaks.extend(wide_only_leaks);
+        let cuts = standard_cuts + wide_cuts;
+
+        let mut not_a_superset: Vec<(String, Vec<&str>)> = Vec::new();
+        for &(doc, _) in standard {
+            for prefix in prefixes(doc) {
+                let (_, left) = runs_left_by_wide(prefix);
+                if !left.is_empty() {
+                    not_a_superset.push((prefix.to_string(), left));
+                }
+            }
+        }
+        assert!(cuts >= 300, "the documents are too short: {cuts} cuts");
+        assert!(leaks.is_empty(), "a credential survived a cut: {leaks:#?}");
+        assert!(
+            not_a_superset.is_empty(),
+            "(prefix, runs scrub_text masks that scrub_text_wide leaves): {not_a_superset:#?}"
+        );
+    }
+
+    /// The two ends of the text, an empty value, and the places a non-ASCII
+    /// character can sit beside a nested pair, read the standard way and the wide
+    /// way alike. Each row follows from the scan's rules (a masked value, a pair
+    /// that begins inside it, a value that would start inside the masked text or at
+    /// its closing quote is no value), not from a recording.
+    #[test]
+    fn scrub_text_reads_the_edges_of_a_nested_pair() {
+        let rows: &[(&str, &str)] = &[
+            // Nothing at all, and a key the text ends on or just after.
+            ("", ""),
+            ("auth:", "auth:"),
+            ("auth:\n  password", "auth:\n  [redacted]"),
+            ("auth:\n  password:", "auth:\n  [redacted]"),
+            ("auth:\n  password: ", "auth:\n  [redacted] "),
+            ("auth:\n  password:\n", "auth:\n  [redacted]\n"),
+            ("auth:\n  password: x", "auth:\n  [redacted] [redacted]"),
+            // A nested value that is one non-ASCII character of two and four
+            // bytes, and one that mixes them.
+            (
+                "auth:\n  password: \u{e9}t\u{e9}",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  password: \u{1f600}",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            // Non-ASCII blanks between the parent and the child, and in front of
+            // the child's key, and a non-ASCII letter in the child's key.
+            (
+                "auth:\n\u{a0}password:\u{a0}hunter2",
+                "auth:\n\u{a0}[redacted]\u{a0}[redacted]",
+            ),
+            (
+                "auth:\u{2028}password: x",
+                "auth:\u{2028}[redacted] [redacted]",
+            ),
+            (
+                "auth:\n  \u{e9}password: x",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            // The closing quote of a masked value is not read as an opener when a
+            // blank or the end of the text follows it.
+            ("token=\"sid:\"", "token=\"[redacted]\""),
+            ("token=\"sid:\" ", "token=\"[redacted]\" "),
+            // A quote that a value character follows is shaped like an opener (the
+            // malformed-quote residual of the spec), so the value of the pair before
+            // it ends there and the nested `sid:` takes the next token as its own.
+            // ASCII or not, one more token is masked, none is exposed, and the text
+            // is cut on char boundaries.
+            ("token=\"sid:\"x", "token=\"[redacted]\"[redacted]"),
+            ("token=\"sid:\"\u{e9}", "token=\"[redacted]\"[redacted]"),
+            ("token=\"sid:\"\u{1f600}", "token=\"[redacted]\"[redacted]"),
+            // A quote that never closes: the plain value rule, and the nested key
+            // inside it finds no value after it.
+            ("token=\"sid:", "token=\"[redacted]"),
+            ("token=\"", "token=\""),
+            ("token=\"sid: x", "token=\"[redacted] [redacted]"),
+            // A run of openers with one closing quote is one masked value.
+            ("sid:\"sid:\"sid:\"x\"", "sid:\"[redacted]\""),
+        ];
+        let bad = mismatches(rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+        // None of these rows has a wide-only key, so the wide scrub reads them the
+        // same way.
+        let bad = mismatches_wide(rows);
+        assert!(
+            bad.is_empty(),
+            "wide: (input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A quote that is unmatched, or that closes with the other quote character,
+    /// around a nested credential: the credential is still masked, and neither scrub
+    /// panics, whichever cut the text takes.
+    #[test]
+    fn scrub_text_masks_a_nested_credential_after_a_malformed_quote() {
+        let docs = [
+            "auth:\n  password: \"QQQQ",
+            "auth:\n  password: 'QQQQ\" x",
+            "auth:\n  password: QQQQ\0",
+            "\"auth:\n  password: QQQQ",
+        ];
+        let (cuts, mut leaks) = leaking_prefixes(docs, scrub_text);
+        let (_, wide_leaks) = leaking_prefixes(docs, scrub_text_wide);
+        leaks.extend(wide_leaks);
+        assert!(cuts >= 80, "the documents are too short: {cuts} cuts");
+        assert!(leaks.is_empty(), "a credential survived: {leaks:#?}");
+    }
+
+    /// One nested key, and one blank run between a nested key and its separator,
+    /// of a mebibyte each: the scan reads each once, and the credential after the
+    /// key is masked as the rule says. The long key is ASCII once and non-ASCII
+    /// once.
+    #[test]
+    fn scrub_text_reads_an_oversized_nested_key_and_blank_run() {
+        let ascii = "k".repeat(1 << 20);
+        let input = format!("auth:\n  {ascii}password: x");
+        assert!(
+            scrub_text(&input) == "auth:\n  [redacted] [redacted]",
+            "a nested key of a mebibyte was not read"
+        );
+        assert!(
+            scrub_text_wide(&input) == "auth:\n  [redacted] [redacted]",
+            "wide: a nested key of a mebibyte was not read"
+        );
+
+        // `\u{e9}` is two bytes: this key is a mebibyte as well.
+        let non_ascii = "\u{e9}".repeat(1 << 19);
+        let input = format!("auth:\n  {non_ascii}password: x");
+        assert!(
+            scrub_text(&input) == "auth:\n  [redacted] [redacted]",
+            "a non-ASCII nested key of a mebibyte was not read"
+        );
+        assert!(
+            scrub_text_wide(&input) == "auth:\n  [redacted] [redacted]",
+            "wide: a non-ASCII nested key of a mebibyte was not read"
+        );
+
+        // The parent's value is `password`; the child is that same key with a
+        // mebibyte of blanks before its separator.
+        let blanks = " ".repeat(1 << 20);
+        let input = format!("auth:\n  password{blanks}: x");
+        let expected = format!("auth:\n  [redacted]{blanks}: [redacted]");
+        assert!(
+            scrub_text(&input) == expected,
+            "a nested key with a mebibyte of blanks before its separator was not read"
+        );
+        assert!(
+            scrub_text_wide(&input) == expected,
+            "wide: a nested key with a mebibyte of blanks before its separator was not read"
         );
     }
 }
