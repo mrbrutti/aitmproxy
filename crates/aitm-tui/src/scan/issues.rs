@@ -448,8 +448,10 @@ impl FlowTag {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct IssuesState {
     /// `scan.issues`' rows, in wire order, at most [`ISSUES_PAGE_LIMIT`] of
-    /// them and every id in the wire form; the view groups them by severity
-    /// ([`grouped`] reads the severities off it). `rows` is its display
+    /// them, every id in the wire form and every other string and the
+    /// `jobs` list bounded once at fold ([`bound_summary`]; fix round H,
+    /// H86); the view groups them by severity ([`grouped`] reads the
+    /// severities off it). `rows` is its display
     /// twin, index for index (`fold_result` asserts the lengths); `list`
     /// stays because the reducer reads summary fields the display row does
     /// not carry for a row whose full issue is not yet read: the id for the
@@ -500,11 +502,14 @@ impl IssuesState {
     /// change moved the rows under a fixed index), and is clamped to the
     /// page only when that id is gone. Hostile-core bounds (D6): a row
     /// whose id is not in the wire form is dropped, the page is cut to
-    /// [`ISSUES_PAGE_LIMIT`], the row strings are bounded here, and `read`
-    /// keeps only the ids the page lists.
+    /// [`ISSUES_PAGE_LIMIT`], every summary the page keeps is bounded
+    /// ([`bound_summary`]: its free strings and its `jobs`; fix round H,
+    /// H86) before its display row is built from it, and `read` keeps only
+    /// the ids the page lists.
     pub fn fold_result(&mut self, mut result: IssuesResult) {
         result.issues.retain(|i| is_issue_id(&i.id));
         result.issues.truncate(ISSUES_PAGE_LIMIT);
+        result.issues.iter_mut().for_each(bound_summary);
         let selected = self.cursor_issue().map(|i| i.id.clone());
         self.rows = result.issues.iter().map(issue_row).collect();
         self.list = result.issues;
@@ -671,6 +676,64 @@ impl DetailLayout {
         } else {
             DetailRow::After(k - self.first_after)
         }
+    }
+}
+
+/// Cut every free string a `scan.issues` row carries to [`DETAIL_VALUE_MAX`]
+/// cells and its `jobs` to [`DETAIL_LIST_MAX`] ids, once, when the page
+/// enters `list` (D6 hostile-core bounds; fix round H, H86): the display
+/// twin [`issue_row`] builds is bounded by its own caps, but `list` kept
+/// the summary as received, so a page of [`ISSUES_PAGE_LIMIT`] rows each
+/// carrying an unbounded `jobs` array of unbounded ids, or a megabyte
+/// `name`, sat in memory whole, and `P` read the raw `poc_ref` and `name`
+/// off it. The same fields [`bound_issue`] cuts on the full issue are cut
+/// here on the summary shape (`job`, `jobs`, `check_id`, `class`, `name`,
+/// the target, the location and its L4 point, `poc_ref`, `finding_id`);
+/// `id` was matched by the fold and is left alone, as are the enums and
+/// numbers the contract bounds. The truncated `jobs` gives its capacity
+/// back.
+fn bound_summary(summary: &mut IssueSummary) {
+    let cut = |s: &mut String| cut_to(s, DETAIL_VALUE_MAX);
+    summary.jobs.truncate(DETAIL_LIST_MAX);
+    summary.jobs.shrink_to_fit();
+    let loc = &mut summary.location;
+    let mut fields: Vec<&mut String> = vec![
+        &mut summary.job,
+        &mut summary.name,
+        &mut summary.class,
+        &mut summary.check_id,
+        &mut summary.target.scheme,
+        &mut summary.target.host,
+        &mut loc.path,
+        &mut loc.path_template,
+        &mut loc.name,
+    ];
+    fields.extend(summary.jobs.iter_mut());
+    fields.extend(
+        [
+            summary.poc_ref.as_mut(),
+            summary.finding_id.as_mut(),
+            loc.method.as_mut(),
+            loc.field_path.as_mut(),
+            loc.ws_path.as_mut(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    if let Some(l4) = &mut loc.l4 {
+        fields.push(&mut l4.ip);
+        fields.extend(
+            [
+                l4.grammar.as_mut(),
+                l4.field_path.as_mut(),
+                l4.mutation.as_mut(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+    }
+    for field in fields {
+        cut(field);
     }
 }
 

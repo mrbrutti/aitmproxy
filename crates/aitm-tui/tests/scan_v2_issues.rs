@@ -20,7 +20,9 @@ use aitm_poc::Severity;
 use aitm_scan_model::IssueStatus;
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
-use aitm_tui::scan::{is_issue_id, IssueFilterKey, IssueFilters, ScanTab, READ_MAX};
+use aitm_tui::scan::{
+    is_issue_id, IssueFilterKey, IssueFilters, ScanTab, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, READ_MAX,
+};
 use common::*;
 use serde_json::{json, Value};
 
@@ -521,6 +523,121 @@ fn a_page_of_oversized_ids_is_dropped_without_a_read() {
     );
     assert!(app.scan.inflight.is_empty());
     assert_eq!(app.scan.issues.pending_read, None);
+}
+
+/// Fix round H, H86 (D6 hostile-core bounds): a page row's `jobs` is cut
+/// at fold like a read issue's (H84): a summary carrying 200 finder ids of
+/// 2000 chars each is stored with `DETAIL_LIST_MAX` ids of at most
+/// `DETAIL_VALUE_MAX` chars, its capacity given back, and `rows` stays
+/// `list`'s twin.
+#[test]
+fn a_page_rows_jobs_are_bounded_at_fold() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let mut page = page_of(1, |_| XSS.to_string());
+    let jobs: Vec<String> = (0..200)
+        .map(|k| format!("scan-{k:08x}{}", "a".repeat(2000 - 13)))
+        .collect();
+    assert!(jobs.iter().all(|j| j.chars().count() == 2000));
+    page["issues"][0]["jobs"] = json!(jobs);
+    let _ = app.on_bus(issues_reply(page));
+    let list = &app.scan.issues.list;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].jobs.len(), DETAIL_LIST_MAX);
+    assert!(list[0].jobs.capacity() < 200, "capacity given back");
+    for id in &list[0].jobs {
+        assert!(
+            id.chars().count() <= DETAIL_VALUE_MAX,
+            "{} chars",
+            id.chars().count()
+        );
+        assert!(id.starts_with("scan-"), "{id}");
+    }
+    assert_eq!(app.scan.issues.rows.len(), list.len());
+}
+
+/// Fix round H, H86 (D6 hostile-core bounds): every free string a page
+/// row carries (`job`, `check_id`, `class`, `name`, the target, the
+/// location and its L4 point, `poc_ref`, `finding_id`) is stored in `list`
+/// cut to `DETAIL_VALUE_MAX`, not only in its display row, so the reducer
+/// keys that read the summary (`P` reads `poc_ref` and `name`) and the
+/// page itself hold bounded text.
+#[test]
+fn a_page_rows_strings_are_bounded_at_fold() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let mut page = page_of(1, |_| XSS.to_string());
+    let long = "x".repeat(5000);
+    let row = &mut page["issues"][0];
+    for key in ["job", "check_id", "class", "name", "poc_ref", "finding_id"] {
+        row[key] = json!(long);
+    }
+    for key in ["scheme", "host"] {
+        row["target"][key] = json!(long);
+    }
+    for key in [
+        "method",
+        "path",
+        "path_template",
+        "name",
+        "field_path",
+        "ws_path",
+    ] {
+        row["location"][key] = json!(long);
+    }
+    row["location"]["l4"] = json!({
+        "ip": long,
+        "port": 53,
+        "proto": "udp",
+        "grammar": long,
+        "field_path": long,
+        "mutation": long,
+    });
+    let _ = app.on_bus(issues_reply(page));
+    let list = &app.scan.issues.list;
+    assert_eq!(list.len(), 1);
+    let s = &list[0];
+    let loc = &s.location;
+    let l4 = loc.l4.as_ref().expect("l4 kept");
+    let fields: Vec<(&str, &String)> = vec![
+        ("job", &s.job),
+        ("check_id", &s.check_id),
+        ("class", &s.class),
+        ("name", &s.name),
+        ("poc_ref", s.poc_ref.as_ref().expect("poc_ref kept")),
+        (
+            "finding_id",
+            s.finding_id.as_ref().expect("finding_id kept"),
+        ),
+        ("target.scheme", &s.target.scheme),
+        ("target.host", &s.target.host),
+        ("location.method", loc.method.as_ref().expect("method kept")),
+        ("location.path", &loc.path),
+        ("location.path_template", &loc.path_template),
+        ("location.name", &loc.name),
+        (
+            "location.field_path",
+            loc.field_path.as_ref().expect("field_path kept"),
+        ),
+        (
+            "location.ws_path",
+            loc.ws_path.as_ref().expect("ws_path kept"),
+        ),
+        ("l4.ip", &l4.ip),
+        ("l4.grammar", l4.grammar.as_ref().expect("grammar kept")),
+        (
+            "l4.field_path",
+            l4.field_path.as_ref().expect("field_path kept"),
+        ),
+        ("l4.mutation", l4.mutation.as_ref().expect("mutation kept")),
+    ];
+    for (name, value) in fields {
+        let n = value.chars().count();
+        assert!(n <= DETAIL_VALUE_MAX, "{name}: {n} chars");
+        assert!(value.starts_with("xxx"), "{name}: {value:?}");
+    }
+    assert_eq!(s.id, XSS, "the id is matched, not cut");
+    assert_eq!(app.scan.issues.rows.len(), list.len());
 }
 
 /// D1 (2): `read` is pruned to the page on every fold, so a hundred pages
