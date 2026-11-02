@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
@@ -454,7 +454,7 @@ impl ProbeHost for ScriptedHost {
     }
 
     /// None to lend: a scripted host answers from its table and never sends.
-    fn client(&self) -> Option<std::sync::Arc<dyn aitm_core::ProxyClient>> {
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
         None
     }
 

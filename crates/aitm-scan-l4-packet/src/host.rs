@@ -1875,10 +1875,14 @@ mod tests {
         let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
         let host = PacketHost::new(runner);
         let job = Arc::clone(&job).with_budget(1);
-        let spent = job.charged();
+        assert_eq!(
+            job.charged(),
+            0,
+            "discovery charged nothing before the test"
+        );
 
         assert!(!host.charge(2), "two units out of one are refused");
-        assert_eq!(job.charged(), spent, "a refused charge debits nothing");
+        assert_eq!(job.charged(), 0, "a refused charge debits nothing");
         assert_eq!(job.budget_left(), 1, "the one unit is still there");
 
         assert!(host.charge(1), "what is left is still affordable");
