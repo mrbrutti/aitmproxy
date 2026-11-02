@@ -96,7 +96,7 @@ that fails blocks the release until it is fixed or Matt accepts it in writing in
   `--bus-endpoint-file` + the config's `mcp.operator_token` for a terminal core. The client is
   `tests/e2e/aitm_e2e/bus.py` (token line, then newline-delimited JSON-RPC). The token is read
   into a variable and never echoed.
-- **Driving the UIs:** the mac app through System Events menu presses and CGEvent keystrokes
+- **Driving the UIs:** the mac app through System Events menu presses, keystrokes and clicks
   while it is frontmost (probe focus with one harmless character first; `pbcopy`+⌘V for text the
   keyboard cannot type; `screencapture -l <win>` in a background loop for transient states), the
   TUI through a Python pty with `TIOCSWINSZ` set before the first read and the cell-diff stream

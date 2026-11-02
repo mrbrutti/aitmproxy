@@ -392,6 +392,7 @@ def test_field_center() -> None:
     check(field_center(dump, "Host to add to scope") == (400, 412), "no identifier asked: first description match")
     check(field_center(dump, "nothing like it") is None, "unknown description -> None")
     check(field_center("AXTextField\t\t\tHost to add to scope", "Host to add to scope") is None, "a row without position/size columns (older dump) -> None")
+    check(field_center("AXTextField\t\t\tHost to add to scope\t\t0,0\t0,0", "Host to add to scope") is None, "the only match has zero size -> None (never a click at 0,0)")
 
 
 def test_tooling_mentioned() -> None:

@@ -436,7 +436,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 # Re-probe the focus AFTER the restart press (one digit + AX read): the restart may have moved
                 # it. Seen → paste + Return (the add lands while the core is still coming back); not seen →
                 # send NOTHING more (a blind paste could land in a persisting field such as Settings' bypass).
-                n1_focus = click_scope_field() and field_focused()
+                n1_focus = field_focused()   # no click here: the paste must land within ~1 s of the press (D7)
                 if n1_focus:
                     type_text(N1_HOST, enter=True)
             time.sleep(6)
