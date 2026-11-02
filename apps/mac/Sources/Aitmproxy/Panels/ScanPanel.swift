@@ -159,18 +159,26 @@ final class ScanPanelState {
     /// passes (D9). Computed, so a scope or tools change updates it with no read.
     var launchRefusal: String? { surface.launchRefusal(scopeHosts: session.scopeHosts, tools: session.tools) }
 
-    /// The job Cancel Scan would stop: the selected one while it is non-terminal,
-    /// else the only running one. Nil when the choice would be a guess.
-    var cancelTarget: String? {
-        if let job = surface.selectedJob,
-           let summary = surface.jobs.first(where: { $0.job == job }), !summary.state.isTerminal {
-            return job
-        }
-        let running = surface.runningJobs
-        return running.count == 1 ? running[0].job : nil
-    }
+    /// The job Cancel Scan would stop: the Kit's choice by the merged state (the
+    /// selected job while queued or running, else the only such job; never a
+    /// cancelling one, Jobs view D2), and nothing at all while the verbs are gated
+    /// off by the link (Jobs view D6).
+    var cancelTarget: String? { link.verbsEnabled ? surface.cancelTarget : nil }
 
     var canCancel: Bool { cancelTarget != nil }
+
+    /// The wall clock in epoch milliseconds, read once a second by the poll so the
+    /// link's age clause moves without a render-time clock (Jobs view D6).
+    var nowMs = ScanPanelState.clockMs
+
+    /// How the Jobs view is linked to the core right now: the bus state, the last
+    /// `scan.list` outcome and the age of the values on screen (Jobs view D6).
+    /// Computed each render; the verbs follow `verbsEnabled`.
+    var link: ScanJobsLink {
+        ScanJobsLink.make(bus: session.bus, listFailedAt: surface.listFailedAt, jobsLoadedAt: surface.jobsLoadedAt, now: nowMs)
+    }
+
+    private static var clockMs: Int { Int(Date().timeIntervalSince1970 * 1000) }
 
     // MARK: Surface reads
 
@@ -256,14 +264,17 @@ final class ScanPanelState {
         }
     }
 
-    /// `scan.list {}`: the job rows. A failure keeps the rows and their counters.
+    /// `scan.list {}`: the job rows, stamped with the clock so the link can say how
+    /// old they are. A failure keeps the rows and their counters and stamps the
+    /// failure instead (Jobs view D6).
     func refreshList() async {
         do {
             let value = try await session.runCommand("scan.list", [:])
-            surface.applyList(try ScanListResult(json: value))
-            statusRequested.formIntersection(Set(surface.jobs.map(\.job)))
+            surface.applyList(try ScanListResult(json: value), now: Self.clockMs)
+            let listed = Set(surface.jobs.map(\.job))
+            statusRequested = statusRequested.filter { listed.contains($0.job) }
         } catch {
-            surface.jobsError = scanUnableText("list jobs", BusService.describe(error))
+            surface.noteListFailure(scanUnableText("list jobs", BusService.describe(error)), now: Self.clockMs)
         }
     }
 
@@ -319,9 +330,17 @@ final class ScanPanelState {
 
     // MARK: Polling (D8)
 
-    /// Jobs whose `scan.status` has been asked for once already: `scan.list` carries
-    /// no profile name or targets, so every listed job needs one status read.
-    @ObservationIgnored private var statusRequested: Set<String> = []
+    /// One `scan.status` read the poll owes a listed job: `scan.list` carries no
+    /// profile name or targets, so every job is read once while nothing is stored,
+    /// and once more after the list calls it terminal while the stored status is
+    /// still live (Jobs view D2). The pair makes the second read distinct from the first.
+    private struct StatusReadKey: Hashable {
+        let job: String
+        let summaryIsTerminal: Bool
+    }
+
+    /// The reads already made (or in flight) under the rule above; pruned by the list.
+    @ObservationIgnored private var statusRequested: Set<StatusReadKey> = []
     /// The filters the loaded issues page was read under; a change re-reads it.
     @ObservationIgnored private var loadedIssueFilters: ScanIssueFilters?
     /// The job the loaded site-map page was read for, wrapped so "all jobs" (nil)
@@ -352,6 +371,8 @@ final class ScanPanelState {
     }
 
     private func pollTick(_ tick: Int) async {
+        // The link's clock, once a second, before any read so the age never runs ahead.
+        if tick.isMultiple(of: 4) { nowMs = Self.clockMs }
         guard surfaceOffered else { return }
         // Push flags first: `noteJobEvent` only ever flags, so the values on screen
         // come from `scan.status` / `scan.list` / `scan.issues`, never from the line.
@@ -373,8 +394,8 @@ final class ScanPanelState {
         // Timers: the list every 2 s.
         guard !Task.isCancelled else { return }
         if tick.isMultiple(of: 8), !listFlagged { await refreshList() }
-        // The selected job every 1 s while it runs, and once for every listed job
-        // whose status this app has not read yet.
+        // The selected job every 1 s until its stored status is terminal, and the
+        // once-or-twice reads every other listed job is owed (Jobs view D2).
         guard !Task.isCancelled else { return }
         if tick.isMultiple(of: 4) { await pollStatuses(flagged: flagged) }
         guard !Task.isCancelled else { return }
@@ -390,19 +411,34 @@ final class ScanPanelState {
         if surface.tab == .sitemap { await loadSitemapIfJobChanged() }
     }
 
+    /// The re-read rule (Jobs view D2). Rule 1: the selected job is read every beat
+    /// while its STORED status is missing or non-terminal, not while the list row is
+    /// (the list turns terminal first; the stored status must follow it there or the
+    /// detail freezes at its last live read, C1). A terminal stored status is final.
+    /// Rule 2: every other listed job is read when `needsStatusRead` says so and no
+    /// read under the same key has been made; a read that leaves the rule true (it
+    /// failed, or the core has not caught up) gives the key back for the next beat.
+    /// A job the push flags already read this tick is left alone.
     private func pollStatuses(flagged: Set<String>) async {
+        var readThisBeat = flagged
         if let job = surface.selectedJob, !flagged.contains(job),
-           let summary = surface.jobs.first(where: { $0.job == job }), !summary.state.isTerminal {
+           surface.statuses[job].map({ !$0.state.isTerminal }) ?? true {
+            readThisBeat.insert(job)
             await refreshStatus(job)
         }
-        for summary in surface.jobs where surface.statuses[summary.job] == nil {
+        for summary in surface.jobs {
             guard !Task.isCancelled else { return }
-            guard !flagged.contains(summary.job), !statusRequested.contains(summary.job) else { continue }
-            statusRequested.insert(summary.job)
-            await refreshStatus(summary.job)
-            // A read that failed is worth one more try on the next beat; one that
-            // succeeded has a stored status, so this job is never asked for again.
-            if surface.statuses[summary.job] == nil { statusRequested.remove(summary.job) }
+            let job = summary.job
+            guard !readThisBeat.contains(job),
+                  ScanSurfaceModel.needsStatusRead(summary: summary, stored: surface.statuses[job]) else { continue }
+            let key = StatusReadKey(job: job, summaryIsTerminal: summary.state.isTerminal)
+            guard !statusRequested.contains(key) else { continue }
+            statusRequested.insert(key)
+            await refreshStatus(job)
+            if let after = surface.jobs.first(where: { $0.job == job }),
+               ScanSurfaceModel.needsStatusRead(summary: after, stored: surface.statuses[job]) {
+                statusRequested.remove(key)
+            }
         }
     }
 
@@ -507,8 +543,11 @@ final class ScanPanelState {
 
     // MARK: Surface intents: jobs
 
-    /// `scan.cancel {job}`. The issues the job already found stay.
+    /// `scan.cancel {job}`. The issues the job already found stay. Sends nothing for
+    /// a job whose merged state is already cancelling or terminal, or while the link
+    /// has the verbs gated off (Jobs view D2, D6): pressing Cancel twice is one cancel.
     func cancel(job: String) async {
+        guard surface.mayCancel(job: job), link.verbsEnabled else { return }
         do {
             let value = try await session.runCommand("scan.cancel", ["job": .string(job)])
             if let status = try? ScanJobStatus(json: value) {
