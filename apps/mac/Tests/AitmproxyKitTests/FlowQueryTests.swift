@@ -77,4 +77,29 @@ private enum FlowQueryInputs {
         #expect(rows.map(\.seq) == [4, 6, 7])
         #expect(FlowQuery(pins: Pins()).apply(FlowQueryInputs.rows, details: [:]).isEmpty)
     }
+
+    /// AI-AC9: the app group and the pins key on `ClientInfo.groupKey` (the identifier), never
+    /// the display name; `.clientHost` is identifier ∧ authority; `.host` keeps its meaning.
+    @Test func groupsKeyOnTheIdentifier() {
+        func row(_ id: String, _ seq: Int, _ host: String, _ client: ClientInfo?) -> FlowRow {
+            FlowRow(id: FlowID(id), seq: seq, method: .get, scheme: "https", authority: host, path: "/", client: client)
+        }
+        let chrome = ClientInfo(name: "Google Chrome", bundleID: "com.google.Chrome")
+        let rows = [
+            row("A", 1, "a.example", chrome),
+            row("B", 2, "a.example", ClientInfo(name: "Google Chrome (Service)", bundleID: "com.google.Chrome.helper")),
+            row("C", 3, "a.example", chrome),
+            row("D", 4, "b.example",
+                ClientInfo(name: "Google Chrome (Service)", bundleID: "com.google.Chrome.helper.renderer")),
+            row("E", 5, "c.example", nil),
+        ]
+        func ids(_ q: FlowQuery) -> [String] { q.apply(rows, details: [:]).map(\.id.raw) }
+        #expect(ids(FlowQuery(group: .client("com.google.Chrome"))) == ["A", "C"])
+        #expect(ids(FlowQuery(group: .client("Google Chrome"))) == [])
+        #expect(ids(FlowQuery(group: .clientHost(client: "com.google.Chrome.helper", host: "a.example"))) == ["B"])
+        #expect(ids(FlowQuery(group: .clientHost(client: "com.google.Chrome", host: "b.example"))) == [])
+        #expect(ids(FlowQuery(group: .host("a.example"))) == ["A", "B", "C"])
+        #expect(ids(FlowQuery(pins: Pins(apps: ["com.google.Chrome.helper"]))) == ["B"])
+        #expect(ids(FlowQuery(pins: Pins(hosts: ["c.example"]))) == ["E"])
+    }
 }

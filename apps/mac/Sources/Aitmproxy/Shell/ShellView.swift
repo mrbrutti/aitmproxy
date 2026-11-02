@@ -251,7 +251,8 @@ struct MainView: View {
         .overlay {
             if session.visibleRows.isEmpty {
                 EmptyFlows(filtered: !session.rows.isEmpty, listen: session.listenAddress, routes: routes.advice,
-                           controlLive: session.caTrustControlLive) { action in
+                           caTrustControlLive: session.caTrustControlLive,
+                           systemProxyControlLive: session.systemProxyControlLive) { action in
                     RouteActions.run(action, session: session, openSettings: openSettings)
                 }
             }
@@ -313,13 +314,15 @@ struct BuildPoCTarget: Identifiable {
 /// "No flows yet — point a client at 127.0.0.1:8080 or open the browser." (foundation §2.8). Unfiltered,
 /// with closed routes to name (`routes`, the Kit's `TrafficRoutes.advice`), one row per entry with its
 /// buttons takes the generic line's place (spec 2026-10-31-mac-traffic-route-advice-design D4). A pure
-/// function of its inputs: the routes, whether the bus is the operator's (`controlLive`, which the Trust
-/// button needs), and `run`, the caller's `RouteActions.run` — the one place a route action becomes an effect.
+/// function of its inputs: the routes, whether the operator's bus calls can be made now (`caTrustControlLive`
+/// for the Trust button, `systemProxyControlLive` for Set as / Restore System Proxy), and `run`, the caller's
+/// `RouteActions.run` — the one place a route action becomes an effect.
 struct EmptyFlows: View {
     var filtered: Bool
     var listen: String
     var routes: [TrafficRoute]
-    var controlLive: Bool
+    var caTrustControlLive: Bool
+    var systemProxyControlLive: Bool
     var run: (ConnectionAction) -> Void
 
     var body: some View {
@@ -338,7 +341,8 @@ struct EmptyFlows: View {
             } else {
                 VStack(alignment: .leading, spacing: Space.md) {
                     ForEach(routes, id: \.kind) { route in
-                        RouteAdviceRow(route: route, controlLive: controlLive, run: run)
+                        RouteAdviceRow(route: route, caTrustControlLive: caTrustControlLive,
+                                       systemProxyControlLive: systemProxyControlLive, run: run)
                     }
                 }
                 .padding(.top, Space.sm)

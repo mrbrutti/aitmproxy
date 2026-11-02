@@ -116,7 +116,13 @@ async fn a_live_pause_reaches_an_open_loopback_connection_without_reconnecting()
     let _ca_dir = CaDirGuard(cfg.ca.dir.clone());
     let assembled = assemble(&cfg).expect("assemble");
     let governance = assembled.governance();
-    let services = tui::services(&assembled.proxy, &cfg, None, TuiLog::Off);
+    let services = tui::services(
+        &assembled.proxy,
+        &cfg,
+        None,
+        TuiLog::Off,
+        std::sync::Arc::clone(&assembled.job_bus),
+    );
     let (agent, tui) = tui::build_servers(&cfg, services, governance);
     let agent = agent.expect("a loopback-TCP transport gets an agent server");
 

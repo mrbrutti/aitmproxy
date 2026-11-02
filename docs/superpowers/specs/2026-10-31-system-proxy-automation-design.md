@@ -553,7 +553,16 @@ one short and one full form; neither invents a third.
 
 Remedies: `other` → "Another app owns the system proxy. Set as System Proxy
 records its setting and restores it on quit."; `off` → "Set as System Proxy so
-Safari and other proxy-aware apps use the core." Lane wording that says the two
+Safari and other proxy-aware apps use the core."
+
+**mac (amended 2026-11-01, PR 4 re-base on main 681dff57):** the mac column is realised by the
+traffic-route model (#265, spec 2026-10-31-mac-traffic-route-advice): the endpoint rows read
+that table's words — "system proxy on · <addr>" (+ " · set outside the app" when not managed),
+"system proxy on · <h:p>, not this core", "system proxy off" — and this table contributes the
+suffix, "setting system proxy…", "system proxy needs an administrator", the two remedies above
+(when the core reports `supported`) and the actions. `unsupported`/`unknown` name no route (the
+`guidance` line lives in Settings ▸ Proxy). The toolbar pill and `overall` are lanes only and do not
+take the fact's hue (orchestrator's call, flagged to Matt). Lane wording that says the two
 lanes cover different traffic, verbatim where both appear (Settings ▸ Proxy
 footnote, the first-run sheet, the Status page Core card tooltip): "System
 proxy → every proxy-aware app, regardless of Scope. All Apps → in-scope hosts of
@@ -576,20 +585,18 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   or a wildcard listen host with a loopback proxy host; `thisCore` when at least one protocol
   matches). `SystemProxyFacts` carries `route` plus the verb facts; the three non-endpoint states
   come from the verb's `state` string, not from the type.
-- **Facts in.** `Session` polls `proxy.status` already; it parses
-  `system_proxy` into `SystemProxyFacts { route: SystemProxyRoute, managedByUs:
-  Bool, setting: Bool, supported: Bool, remedy: String?, guidance: String? }`
-  (Kit, `Hashable`). `ConnectionSummary.make` gains one parameter
-  `systemProxy: SystemProxyFacts?` (nil = no verb on this bus) and one output
-  `systemProxy: SystemProxyFact?` (`text`, `state`, `remedy`, `actions`) that
-  the Core card renders under its detail; `ConnectionAction` gains
-  `.setSystemProxy` ("Set as System Proxy") and `.unsetSystemProxy` ("Restore
-  System Proxy") — the case names reserved by mac-attribution. `overall` and the
-  pill include the fact's state only when it is `warning` or `working`; `off`
-  stays calm. The fact is computed from the verb facts when present, else from
-  mac-attribution's `CFNetworkCopySystemProxySettings` read (then
-  `managedByUs` is unknown and the text drops the "· set outside the app"
-  suffix).
+- **Facts in (as built 2026-11-01, PR 4).** `BusService.refreshProxyStatus()` — the one
+  `proxy.status` reader — parses `system_proxy` into `SystemProxyFacts { word, state:
+  SystemProxyState?, managedByUs: Bool?, setting, supported, detail, remedy?, guidance? }` (Kit,
+  `init?(compact:listenAddress:)`; the same parser reads the full `proxy.system.status` object
+  and the set/unset replies). `ConnectionSummary.make` gains `systemProxyFacts: SystemProxyFacts?
+  = nil`; when present it is the system-proxy `TrafficRoute`'s one source (D1), else the
+  `systemProxy: SystemProxyState?` read. `ConnectionAction` gains `.setSystemProxy` ("Set as
+  System Proxy") and `.unsetSystemProxy` ("Restore System Proxy"). The route's `actions` are the
+  §D12 actions; the Getting-started step carries the closed route's first action (Restore lives in
+  the menu and Settings). The compact poll keeps the last `guidance`/`remedy` from a full
+  `proxy.system.status` read (Settings ▸ Proxy requests one on appear) while the word is
+  unchanged. `overall` and the pill are unchanged (the route is not a lane).
 - **Calls out.** A new `Session+SystemProxy.swift` holds the only two call
   sites of `"proxy.system.set"` / `"proxy.system.unset"` (`setSystemProxy()`,
   `restoreSystemProxy()`), marks `setting` locally until the reply, and feeds
@@ -598,21 +605,27 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   (operator-only, like capture).
 - **Settings ▸ Proxy** gains, below the embedded-proxy section: a live toggle
   "Set as system proxy" (position = the fact, never a preference; disabled with
-  the reason while `setting`, unsupported, or the bus is not connected as
-  operator); a persisted toggle "Set system proxy at launch"
+  the reason while `setting`, unsupported, the bus is not connected as operator, or the core has
+  not reported the system proxy yet; the route's line and an "N hosts" count under the field —
+  as built 2026-11-01); a persisted toggle "Set system proxy at launch"
   (`Store.defaults` key `systemProxy.auto`, read by `EmbeddedCore` at spawn
   and emitted as a top-level `system_proxy:\n  auto: true\n` block in the
   per-launch config, like `macos_capture`); an editable "Bypass hosts" field
   (`systemProxy.bypass`, comma/space separated, emitted as `system_proxy.bypass`
-  and passed as the `bypass` param on a live set); the §D12 lane sentence and
+  and passed as the `bypass` param on a live set; the mac field drops a piece carrying a control
+  or illegal scalar — the per-launch config would not parse — or a leading `-`, an argv flag to
+  `networksetup`; everything else is the core's to judge, §D5); the §D12 lane sentence and
   the §D5 copy as footnotes; the `guidance` line as selectable text when
   unsupported. The launch toggle and the bypass field apply on Restart Core
   (the existing Apply & Restart rule).
 - **First-run sheet** (once per install, `Store.defaults` key
   `systemProxy.sheetShown`): shown when the embedded core reaches `.ready`, the
-  bus is connected as operator, the fact is not `points_at_us`, `systemProxy.auto`
-  is off, and `systemProxy.promptSuppressed` is false; also when the operator
-  flips the toolbar Proxy switch to on under the same conditions. Title "Set
+  bus is connected as operator, the system-proxy route is known, closed and `supported` with no
+  change in flight (a word that names no endpoint — `unknown`, `unsupported`, `needs_privilege`,
+  `other` at our own address — shows no row to act on; as built 2026-11-01), `systemProxy.auto`
+  is off, and `systemProxy.promptSuppressed` is false. (The toolbar Proxy switch is
+  pause/resume, not the system proxy; the "flip to on" trigger was dropped 2026-11-01. The sheet
+  is `Shell/SetupSheet.swift`, shared with D17.8.) Title "Set
   aitmproxy as the system proxy?"; checklist, verbatim: "Route every proxy-aware
   app through aitmproxy", "Remember and restore your previous proxy setting",
   "Revert automatically if the app quits or crashes"; the §D12 lane sentence as
@@ -624,7 +637,9 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   would be gone at the next launch, which is not "automatically". **D17.8 adds the
   CA step to this sheet above the checklist, widens the show-condition to "or the CA
   is not trusted", and retitles it "Set up aitmproxy on this Mac".**
-- **No-traffic nudge**: on launches where the sheet did not show, when flows
+- **No-traffic nudge** — **dropped 2026-11-01 (orchestrator, flagged to Matt):** #265's Flows
+  empty state and banner already carry the closed route and its button; the text below is the
+  original design. on launches where the sheet did not show, when flows
   have stayed 0 for 30 s after `.ready` with the fact not `points_at_us`, not
   `setting`, supported, and not suppressed: a non-modal banner on the Status
   page and the flows list header, "No flows yet? Set aitmproxy as the system
@@ -644,17 +659,18 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   the `.caTrusted` step ("Trust the aitmproxy CA") between `.busConnected` and
   `.extensionOn`.**
 - **Menu**: Proxy ▸ "Set as System Proxy" / "Restore System Proxy" (one item,
-  title follows the fact; shortcut chosen by the builder from the free set in
-  `CommandMap`), palette entry included, both gated like the Settings toggle.
+  title follows the fact; ⌥⌘P), gated like the Settings toggle. Palette: the `CommandMap` row only
+  (the brief's contract); the raw verbs are excluded from the palette's Commands list and refused
+  by the Agent log's Approve (`Session.isSystemProxyVerb`, pinned by the tripwire's rule 3).
 - **Quit**: nothing new. The embedded core's orderly SIGTERM path (§D9 a)
   restores; the watchdog (§D9 b) covers a force-kill.
 - **Tripwire**: a new `apps/mac/tools/check-sysproxy-operator-only.sh`, the
   capture script's shape: the two verb strings appear only in
   `Session+SystemProxy.swift`; `setSystemProxy()`/`restoreSystemProxy()` are
-  called only from `SettingsView.swift`, `Panels/StatusPanel.swift`,
-  `Shell/ShellToolbar.swift` (the sheet), `App.swift` (the menu) and the sheet
-  and nudge views; each allow-list entry has an `expect` line; the
-  agent-reachable surfaces mention none of it.
+  called only from `SettingsView.swift`, `Panels/StatusPanel.swift`, `Shell/SetupSheet.swift`
+  (the sheet), `Shell/RouteBanner.swift` (the Flows banner and empty state) and `App.swift` (the
+  menu); each allow-list entry has an `expect` line pinned to the call shape; the agent-reachable
+  surfaces mention none of it; the `systemProxy.auto` writers and readers are pinned (rule 4).
 
 ### D14. TUI (PR 2)
 
@@ -1094,7 +1110,8 @@ SP-AC29 … SP-AC38 belong to the D17 addendum (PR 5).
     app (or `:sysproxy on` in the TUI for PR 2), then shows: `scutil --proxy`
     with `HTTPEnable : 1`, `HTTPProxy : 127.0.0.1`, `HTTPPort : <core port>`,
     the same for HTTPS; Safari loading a page produces flows in the app; the
-    Core card reads "system proxy → this core"; the state file exists with
+    Status page's system-proxy step reads "system proxy on · 127.0.0.1:<core port>" (amended
+    2026-11-01, PR 4 re-base); the state file exists with
     `previous` equal to the recorded before-state (Proxyman's `127.0.0.1:9090`
     today); quitting the app restores and the after `scutil --proxy` equals the
     before. The PR body quotes all three dumps. No bus token appears.
@@ -1110,9 +1127,9 @@ SP-AC29 … SP-AC38 belong to the D17 addendum (PR 5).
     `kill -9` → the watchdog restores `'none'`. The PR body quotes each
     `gsettings get`.
 23. **SP-AC23 [kit-unit]** `ConnectionSummary.make` with `systemProxy` facts
-    yields the §D12 mac-fact column for every row: text, state hue, actions;
-    `overall` is `.warning` for `other` and `needsPrivilege`, unchanged for
-    `off`; the `.firstFlow` step title is "Set aitmproxy as the system proxy,
+    yields the §D12 mac-fact column for every row as realised on the traffic route (state line,
+    remedy, actions); `overall` and the pill are unchanged (amended 2026-11-01: the route is not a
+    lane — orchestrator's call flagged to Matt); the `.firstFlow` step title is "Set aitmproxy as the system proxy,
     or open the browser" with action `.setSystemProxy` when supported and not at
     us, and "System proxy points at 127.0.0.1:8080 — waiting for the first
     flow" when at us.

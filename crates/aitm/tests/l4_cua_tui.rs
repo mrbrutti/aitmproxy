@@ -365,7 +365,10 @@ async fn tui_l4_cua_against_a_live_core() {
     .expect("assemble a core with l4 enabled");
     let governance = assembled.governance();
     let Assembled {
-        proxy, l4_ingress, ..
+        proxy,
+        l4_ingress,
+        job_bus,
+        ..
     } = assembled;
     let ingress = l4_ingress.expect("l4.enabled wires the capture ingress (AC17)");
 
@@ -398,7 +401,7 @@ async fn tui_l4_cua_against_a_live_core() {
     // (D) Serve the agent-facing server on loopback TCP, exactly as `aitm tui`
     // builds it (`services` → `build_servers`). Skip cleanly if the sandbox
     // refuses the bind.
-    let services = tui::services(&proxy, &cfg, None, tui::TuiLog::Off);
+    let services = tui::services(&proxy, &cfg, None, tui::TuiLog::Off, job_bus);
     let server = build_servers(&cfg, services, governance)
         .0
         .expect("a loopback-TCP transport yields an agent server");

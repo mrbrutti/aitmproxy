@@ -132,8 +132,14 @@ pub struct IssueLocation {
 pub struct Issue {
     /// `issue-<8 hex>`, stable for the life of the job.
     pub id: IssueId,
-    /// The job that found it.
+    /// The job that found it first (spec D6 dedupes across jobs, so a later
+    /// job that re-finds the same weakness merges into this record).
     pub job: JobId,
+    /// Every job that found or re-found it, `job` first (additive, 2026-11-01;
+    /// absent on the wire means `[job]`). `scan.issues { job }` and the job's
+    /// `issues` tally include an issue when the job is in this list.
+    #[serde(default)]
+    pub jobs: Vec<JobId>,
     /// The check that reported it.
     pub check_id: String,
     /// The weakness class (`reflected-xss`, `sqli-error`, ...).
@@ -177,12 +183,28 @@ pub struct Issue {
 }
 
 impl Issue {
+    /// `jobs` as a reader should see it: the list when it was recorded, else
+    /// `[job]` for a record written before the field existed.
+    pub fn jobs_or_job(&self) -> Vec<JobId> {
+        if self.jobs.is_empty() {
+            vec![self.job.clone()]
+        } else {
+            self.jobs.clone()
+        }
+    }
+
+    /// Whether `job` found or re-found this issue.
+    pub fn found_by(&self, job: &str) -> bool {
+        self.job == job || self.jobs.iter().any(|j| j == job)
+    }
+
     /// The summary form for the push line and `scan.list` (call A12): the same
     /// issue minus `evidence`, `description`, `remediation` and `note`.
     pub fn summary(&self) -> IssueSummary {
         IssueSummary {
             id: self.id.clone(),
             job: self.job.clone(),
+            jobs: self.jobs_or_job(),
             check_id: self.check_id.clone(),
             class: self.class.clone(),
             name: self.name.clone(),
@@ -208,8 +230,14 @@ impl Issue {
 pub struct IssueSummary {
     /// `issue-<8 hex>`.
     pub id: IssueId,
-    /// The job that found it.
+    /// The job that found it first (spec D6 dedupes across jobs, so a later
+    /// job that re-finds the same weakness merges into this record).
     pub job: JobId,
+    /// Every job that found or re-found it, `job` first (additive, 2026-11-01;
+    /// absent on the wire means `[job]`). `scan.issues { job }` and the job's
+    /// `issues` tally include an issue when the job is in this list.
+    #[serde(default)]
+    pub jobs: Vec<JobId>,
     /// The check that reported it.
     pub check_id: String,
     /// The weakness class.
@@ -246,10 +274,34 @@ pub struct IssueSummary {
 mod tests {
     use super::*;
 
+    /// `jobs` is additive: a record without it reads as `[job]`, and
+    /// `found_by` answers for the first finder and for every re-finder.
+    #[test]
+    fn jobs_defaults_to_the_first_job_and_found_by_covers_refinders() {
+        let mut issue = sample_issue();
+        issue.jobs.clear();
+        assert_eq!(issue.jobs_or_job(), vec!["scan-01020304".to_string()]);
+        assert!(issue.found_by("scan-01020304"));
+        assert!(!issue.found_by("scan-aaaabbbb"));
+        issue.jobs = vec!["scan-01020304".into(), "scan-aaaabbbb".into()];
+        assert!(issue.found_by("scan-aaaabbbb"));
+        let json = serde_json::to_value(&issue).expect("serializes");
+        assert_eq!(json["jobs"].as_array().map(Vec::len), Some(2));
+        let without: Issue = serde_json::from_value({
+            let mut v = json.clone();
+            v.as_object_mut().unwrap().remove("jobs");
+            v
+        })
+        .expect("a record without `jobs` still parses");
+        assert!(without.jobs.is_empty());
+        assert_eq!(without.summary().jobs, vec!["scan-01020304".to_string()]);
+    }
+
     fn sample_issue() -> Issue {
         Issue {
             id: "issue-9f8e7d6c".into(),
             job: "scan-01020304".into(),
+            jobs: vec!["scan-01020304".into()],
             check_id: "reflected-xss".into(),
             class: "reflected-xss".into(),
             name: "Reflected XSS".into(),

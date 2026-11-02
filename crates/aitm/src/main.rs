@@ -45,12 +45,13 @@ use aitm_core::{
 };
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
+use aitm_plugin_scanner::jobs::ScanServices;
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
 use aitm_sysproxy::{Recovery, SystemProxy};
 use aitm_term::error::ErrorReport;
 use aitm_term::reporter::Reporter;
 use tokio::net::TcpListener;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// The config file path when `--config` is not given.
 const CONFIG_ENV: &str = "AITM_CONFIG";
@@ -434,6 +435,11 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         // The `system_proxy:` section: `wire.rs` builds the `SystemProxy`
         // engine from it, and `auto` drives the startup recovery below.
         system_proxy,
+        // The `scanner:` section (spec D11): the scanner v2 engine's agent
+        // gates, job limits, ceilings and profiles. It rides the binary-owned
+        // feature set below, like the L4 config; assembly copies `findings.dir`
+        // and `l4.allow_agent_inject` onto it.
+        scanner,
     } = phase.finish_with(
         config_file::load_settings(config_path.as_deref()).map_err(|e| StartupError::ConfigFile {
             path: effective_path.clone(),
@@ -509,12 +515,19 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             shared.store.clone(),
         )
     });
-    // Scanner v2's `ws.*` script language slot (spec D1 and D8.3). It is built with
-    // the SAME `LateHandles` the script tier uses as its scope/rate guard, so every
-    // `ws.*` host fn is guarded: a script cannot reach a host outside scope or past
-    // the rate limit. `None` while track T4 is unimplemented, and a `None` slot adds
-    // no language — the engine then has no `ws.*` namespace (deny-by-default).
-    let ws_language = aitm_scan_ws::language(handles.clone());
+    // Scanner v2's `ws.*` script language slot (spec D1 and D8.3): the WS lane's
+    // language from `aitm-scan-ws`, built with the SAME `LateHandles` the script
+    // tier uses as its scope/rate guard, so every `ws.*` host fn is guarded: a
+    // script cannot reach a host outside scope or past the rate limit. The slot is
+    // `None` only when a build ships without the lane, and a `None` slot adds no
+    // language — the engine then has no `ws.*` namespace (deny-by-default).
+    // It dials under the SAME certificate policy as the WS *lane*
+    // (`wire::collect_lanes_with`): `aitm::wire::ws_tls_policy(&cfg)` maps the
+    // operator's `ssl_insecure` onto `TlsPolicy`, so a self-signed `wss://` lab
+    // target behaves the same whether a script or a scan reached it. The default
+    // (`ssl_insecure: false`) verifies the chain against the webpki roots.
+    let ws_language =
+        aitm_scan_ws::language::build_with(handles.clone(), aitm::wire::ws_tls_policy(&cfg));
     let mut languages: Vec<&dyn aitm_plugin::language::ProtocolLanguage> = Vec::new();
     if let Some(lang) = &l4_language {
         languages.push(lang);
@@ -561,8 +574,16 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         }
         .into());
     }
-    for name in tier.host.set().names() {
-        debug!(target: "aitm::scripts", script = %name, "script loaded into the host");
+    // The loader already logs one `loaded script` line per script (name, path,
+    // hooks; target `aitm_plugin_rhai::loader`), so only the total is logged
+    // here, and nothing at all when no script loaded (quiet default logs).
+    let loaded = tier.host.set().names().len();
+    if loaded > 0 {
+        info!(
+            target: "aitm::scripts",
+            count = loaded,
+            "scripts loaded into the host"
+        );
     }
     // Scripts see bodies up to the proxy's configured cap; the engine's string
     // and blob limits default to the same figure, and must keep up with it.
@@ -595,6 +616,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             .chain(configured_agent_port(&cfg.mcp.transport))
             .collect(),
         system_proxy: system_proxy.clone(),
+        scanner,
         ..Features::default()
     };
     // Whether assembly mints the CA or loads it is read off the key file's
@@ -616,6 +638,10 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             // `findings.*` commands read the configured `findings.dir` from the
             // command host at invocation time (`FindingsPlugin::store_for`).
             commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
+            // The checks every `reg.add_check` in a script declared (call B9).
+            // The scanner is registered over this exact registry, so a scripted
+            // check joins the catalogue and gets its `check.<id>` command.
+            script_checks: Some(tier.checks.clone()),
         },
     );
     let assembled = phase.finish_with(assembled, |assembled| {
@@ -645,6 +671,18 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         // The system-proxy engine: startup recovery before serving, restore on
         // the orderly exit path (system-proxy spec §D8, §D9 (a)/(c)).
         sysproxy,
+        // The one job bus (spec D9.2): handed to every `McpServer` this binary
+        // builds through the shared `tui::services`, so a job started on one
+        // surface publishes where every surface's subscribers listen.
+        job_bus,
+        // The scanner's handle cell: bound below, beside `handles.bind_proxy`,
+        // once the proxy's store, client and guard exist (call B3).
+        scan_late,
+        // The assembled scanner engine. Nothing on the run path reads it — the
+        // verbs hold their own clone of it — so the binding is unused; it is
+        // named rather than absorbed by `..` so a new `Assembled` field cannot
+        // slip in unnoticed.
+        scanner_engine: _scanner_engine,
         // `..` stands only for the private `governance` (taken above). Any new
         // `pub` field of `Assembled` must be named here, not absorbed by it.
         ..
@@ -653,8 +691,19 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     if let Mode::Cli(argv) = &mode {
         // One-shot CLI dispatch (no browser needed): the same service
         // handles the frontends share, without a browser or a log file.
-        let s = tui::services(&proxy, &cfg, None, TuiLog::Off);
+        let s = tui::services(&proxy, &cfg, None, TuiLog::Off, job_bus.clone());
         handles.bind_proxy(s.store.clone(), s.client.clone(), s.guard.clone());
+        // The scanner runs on the proxy's own handles too (spec D5, call B3):
+        // a probe is scoped, rated and recorded exactly like any other request.
+        // No browser on the one-shot CLI path — nothing launches one — so a
+        // browser-crawl lane reports that rather than driving a dead handle.
+        scan_late.bind(scan_services(
+            &s,
+            None,
+            l4_guard.clone(),
+            &agent_state,
+            &cfg,
+        ));
         tier.error_sink
             .bind(Arc::new(Chain::new(s.registry.clone(), s.store.clone())));
         let cli = aitm_cli::Cli::new(s.registry.clone())
@@ -862,7 +911,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         None
     };
     // Shared service handles for the frontends and the replay client.
-    let services = tui::services(&proxy, &cfg, browser.clone(), tui_log);
+    let services = tui::services(&proxy, &cfg, browser.clone(), tui_log, job_bus.clone());
 
     // The scripting tier now reaches exactly the proxy's store, client and
     // guard, and a failed hook's `Event::Error` reaches the chain rather than
@@ -880,6 +929,20 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     if let Some(driver) = browser {
         handles.bind_browser(driver);
     }
+
+    // The scanner's owned handles (spec D5, call B3), bound beside the script
+    // tier's: the proxy's store, client and guard, the browser that launched
+    // (so a crawl drives the same engine `browser.*` does), the live egress
+    // posture a running job holds confined, the live L4 guard when L4 is on,
+    // the one job bus, and a reader for the agent policy so an agent job
+    // re-checks the policy `agent.set` writes at every step.
+    scan_late.bind(scan_services(
+        &services,
+        services.browser.clone(),
+        l4_guard.clone(),
+        &agent_state,
+        &cfg,
+    ));
 
     // The macOS Network/System Extension live-capture feeder: `Some` only on a macOS
     // build with `macos_capture.enabled` (deny-by-default; the config file is the
@@ -1290,6 +1353,37 @@ fn apply_bus_endpoint_file(
     }
 }
 
+/// The scanner's owned handles (spec D5, call B3), built the one way both bind
+/// sites — the one-shot CLI dispatch and the serving path — share: the proxy's
+/// store, client, guard, live egress posture and job bus from `services`, the
+/// `browser` the caller launched (`None` on the CLI path, where nothing does),
+/// the live L4 guard when L4 is on, a reader for the agent policy so an agent
+/// job re-checks what `agent.set` writes at every step, and the config for the
+/// `CommandHost` the worker builds. Spawned on the current runtime.
+fn scan_services(
+    services: &tui::Services,
+    browser: Option<Arc<dyn BrowserDriver>>,
+    l4_guard: Option<Arc<aitm_proto_l4::guard::L4Guard>>,
+    agent_state: &Arc<aitm_core::AgentState>,
+    cfg: &aitm_core::Config,
+) -> ScanServices {
+    ScanServices {
+        store: services.store.clone(),
+        client: services.client.clone(),
+        guard: services.guard.clone(),
+        browser,
+        egress: Some(services.egress.clone()),
+        l4: l4_guard,
+        jobs: services.jobs.clone(),
+        agent_policy: Arc::new({
+            let state = Arc::clone(agent_state);
+            move || state.policy()
+        }),
+        rt: tokio::runtime::Handle::current(),
+        config: Arc::new(cfg.clone()),
+    }
+}
+
 /// Bind one service port up front, turning "address already in use" into a
 /// single clear, actionable error — the port, who most likely holds it, and how
 /// to change it — so a conflict surfaces here, before obscura is spawned and
@@ -1339,7 +1433,7 @@ mod tests {
 
     use super::{
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
-        configured_agent_port, manages_system_proxy, parse_invocation, parse_mode,
+        configured_agent_port, manages_system_proxy, parse_invocation, parse_mode, scan_services,
         split_bus_endpoint_file_arg, split_config_arg, split_script_args, usage_reporter,
         Invocation, Mode, StartupError, TermOpts, OPERATOR_TOKEN_USAGE,
     };
@@ -1483,6 +1577,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn main_logs_loaded_scripts_once_as_a_count() {
+        // Stage-6 fix (scanner-v2 T1b, item 3): the Rhai loader already logs
+        // one `loaded script` line per script (`aitm_plugin_rhai::loader`), so
+        // the binary must not repeat it per script; it logs one summary count.
+        // The literals are split so this test's own source does not match.
+        let src = include_str!("main.rs");
+        let per_script = concat!("script loaded ", "into the host");
+        let summary = concat!("scripts loaded ", "into the host");
+        assert!(
+            !src.contains(per_script),
+            "main.rs still logs a per-script `{per_script}` line"
+        );
+        assert_eq!(
+            src.matches(summary).count(),
+            1,
+            "main.rs must log exactly one `{summary}` summary"
+        );
+    }
+
+    /// Stage-6 fix (scanner-v2 T1b, item 5): the one `ScanServices` builder both
+    /// bind sites call carries the proxy's own handles (store, client, guard,
+    /// egress, job bus), the browser it is given, the L4 guard, a live reader of
+    /// the agent policy, and the config.
+    #[tokio::test]
+    async fn scan_services_carries_the_proxy_handles() {
+        use aitm::scripts::LateHandles;
+        use aitm::tui::{self, TuiLog};
+        use aitm_core::{AgentPolicy, AgentState, JobBus};
+
+        let mut cfg = aitm_core::Config::default();
+        cfg.ca.dir = std::env::temp_dir().join(format!(
+            "aitm-main-scan-services-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let proxy = build_proxy_with(&cfg, &Features::default()).expect("assemble");
+        let job_bus = Arc::new(JobBus::new(8));
+        let s = tui::services(&proxy, &cfg, None, TuiLog::Off, job_bus.clone());
+        let agent_state = Arc::new(AgentState::new(AgentPolicy::ReadOnly));
+
+        let no_browser = scan_services(&s, None, None, &agent_state, &cfg);
+        assert_eq!(
+            format!("{no_browser:?}"),
+            "ScanServices { browser: false, egress: true, l4: false, .. }"
+        );
+        assert!(Arc::ptr_eq(&no_browser.store, &s.store));
+        assert!(Arc::ptr_eq(&no_browser.client, &s.client));
+        assert!(Arc::ptr_eq(&no_browser.guard, &s.guard));
+        assert!(Arc::ptr_eq(&no_browser.jobs, &job_bus));
+        assert!(Arc::ptr_eq(
+            no_browser
+                .egress
+                .as_ref()
+                .expect("the proxy's egress posture"),
+            &s.egress
+        ));
+        assert_eq!((no_browser.agent_policy)(), AgentPolicy::ReadOnly);
+        // A live reader, not a snapshot: `agent.set` must be seen at the next step.
+        agent_state.set_policy(AgentPolicy::Paused);
+        assert_eq!((no_browser.agent_policy)(), AgentPolicy::Paused);
+        assert_eq!(no_browser.config.ssl_insecure, cfg.ssl_insecure);
+
+        let browser: Arc<dyn aitm_core::BrowserDriver> = LateHandles::new();
+        let with_browser = scan_services(&s, Some(browser), None, &agent_state, &cfg);
+        assert_eq!(
+            format!("{with_browser:?}"),
+            "ScanServices { browser: true, egress: true, l4: false, .. }"
+        );
     }
 
     #[test]

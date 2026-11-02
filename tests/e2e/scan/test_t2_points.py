@@ -34,6 +34,7 @@ from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     boot_target,
     map_job,
+    require_crate_lane,
     require_lane,
     require_verbs,
     sitemap,
@@ -74,6 +75,7 @@ def main() -> None:
                 op = BusClient.operator(core)
                 require_verbs(op, "scan.map", "scan.status", "scan.sitemap")
                 require_lane(op, "http")
+                require_crate_lane(op, "http", "needs T2 (aitm-scan-http)")
                 proxy = cfg.proxy_port
 
                 section("real proxied captures of the seeded point routes")

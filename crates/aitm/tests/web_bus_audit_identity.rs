@@ -69,7 +69,13 @@ fn rig(tag: &str) -> Rig {
     cfg.mcp.policy = AgentPolicy::Auto;
     cfg.ca.dir = temp_ca_dir(tag);
     let assembled = assemble(&cfg).expect("assemble");
-    let services = tui::services(&assembled.proxy, &cfg, None, TuiLog::Off);
+    let services = tui::services(
+        &assembled.proxy,
+        &cfg,
+        None,
+        TuiLog::Off,
+        Arc::clone(&assembled.job_bus),
+    );
     let state = &assembled.agent_state;
     let ring = &assembled.audit_ring;
 
@@ -234,7 +240,13 @@ async fn start_bus(tag: &str) -> BusServer {
     cfg.ca.dir = temp_ca_dir(tag);
     cfg.mcp.policy = AgentPolicy::Auto;
     let assembled = assemble(&cfg).expect("assemble");
-    let services = tui::services(&assembled.proxy, &cfg, None, TuiLog::Off);
+    let services = tui::services(
+        &assembled.proxy,
+        &cfg,
+        None,
+        TuiLog::Off,
+        Arc::clone(&assembled.job_bus),
+    );
     let web_server = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
     let web_server =
         tui::with_shared_governance(web_server, &assembled.agent_state, &assembled.audit_ring);

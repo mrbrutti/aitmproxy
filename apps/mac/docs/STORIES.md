@@ -751,7 +751,7 @@ Acceptance:
 UX:
 - Flow: sidebar ▸ Scope (or Proxy ▸ Scope… ⇧⌘O) -> the Scope page: entries table over the in-scope flow list -> "Add Host…" or type in the field at the top -> ⌘⏎ adds -> the row loses its dimming at once
 - Surface: sidebar page with an inline add field; the sheet (⇧⌘O) is the same panel for when the list is elsewhere
-- States: empty -> "No hosts in scope — add one to authorise testing; everything stays read-only until then." with the field focused; invalid entry -> message under the field, Add disabled; live `scope.add` failing -> status-bar error, entry kept pending in tertiary
+- States: empty -> "No hosts in scope — add one to authorise testing; everything stays read-only until then." with the field focused; invalid entry -> message under the field, Add disabled; live `scope.add` failing -> the row carries the outcome (S-081: `queued — added when the core is back` / `not added — <reason>` with Retry and ✕), never a silent pending entry
 - Words: columns "Host · Limit · Back-off · Flows"; button "Add ⌘⏎"; placeholder "host, host:port or *.wildcard"
 - Access: entries are a real table; the field is the only focused control when empty
 Status: done
@@ -1165,6 +1165,24 @@ Acceptance:
 - [live] Dev bundle with a real core, Flows page, intercept armed from the Flow menu: a curl parks and its row appears within a poll; Flow ▸ Resume turns the row to its status within a poll; a second curl's row appears; no page switch (before/after screenshots in `docs/evidence/S-079/`).
 - [live] The same on the Apps page (unchanged).
 Live: 2026-10-31, found on the installed v0.5.6 during the S-041 check (FIXLOG 2026-10-31 "The Flows page stopped redrawing"); S-073 to S-078 are reserved for the Proxyman capture-flow stories drafted in `docs/research/proxyman-capture-flow-gaps.md`.
+Status: done
+
+### S-081 A Scope add that fails says so, and lands after a core restart
+As the operator, when I type a host on the Scope page and the add does not reach the core, the row tells me — "queued — added when the core is back" while the core restarts, "not added — <reason>" with Retry when the core refuses — instead of sitting there as if it were in Scope while the pill, the banner and Status say nothing is.
+Screens: scope
+Depends: S-047
+Acceptance:
+- [unit] `ScopeAddQueue` (Kit): a send that fails with a bus absence (disconnected, transport, timeout) is `queued` and replayable; a core refusal (tool, rpc) is `failed` with the reason; a host `scope.list` names leaves the queue; ✕ drops it; Retry re-sends.
+- [live] Dev bundle + real core, Scope page: Proxy ▸ Restart Core, then type a host and press Return while the core is down — the row reads `queued — added when the core is back`; when the bus reconnects the host is sent again, `scope.list` names it, and the row becomes a real entry (the pill/sidebar count moves) with no further action.
+- [live] A host the core refuses reads `not added — <the core's reason>` with Retry and ✕; the status bar carries the same reason; nothing is persisted to `scope.json`.
+- [live] The same add while the core is up still lands within a poll (regression), and every surface that reads Scope moves with it inside that poll: the status-bar pill, the sidebar Scope badge, the Flows banner's "Nothing is decrypted" line, the Status page's Scope step.
+- [live] A core that is merely busy (bus connected, the call times out: SIGSTOP on the dev bundle's core) leaves the row `queued — added when the core is back`; it lands on its own once the core answers again (the next poll re-sends it), with no reconnect and no operator action.
+- [live] After Proxy ▸ Restart Core, a verb from the page (row ✕, a plain add) reaches the new core on the first try: no "the bus connection closed" under a connected title (the superseded bus run's teardown must not clear the new client; FIXLOG 2026-11-01).
+UX:
+- Surface: inline on the Scope page row (and the Scope sheet, which embeds the page); no alert.
+- Words: "sending…", "queued — added when the core is back", "not added — <reason>", "Retry".
+- Access: the row's accessibility value is the state line; the row is one combined accessibility element, so Retry and ✕ reach VoiceOver as that row's actions (their labels name the host), not as standalone buttons.
+Live: found 2026-11-01 on the installed 0.5.10 ("I added to scope but still claims nothing is in scope": the add never reached the bus, the Scope page kept the host as a silent pending row; FIXLOG 2026-11-01). Proven 2026-11-01 on the dev bundle with the 0.5.10 release core (`docs/evidence/S-081`): an add typed during Proxy ▸ Restart Core reads `queued — added when the core is back` in the first frame after Return (+77 ms by the frame's own timestamp) and is a plain row in the second (+315 ms) with `scope.list` naming it; three restarts in a row, every add landed; a row ✕ and a plain add after the restarts land on the first try (before the fix they failed with "the bus connection closed" under a connected title); a host the core refuses reads `not added — <the core's reason>` with Retry and ✕, and ✕ drops it.
 Status: done
 
 ### S-072 See what is running and what to do first

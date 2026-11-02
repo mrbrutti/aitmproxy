@@ -48,6 +48,7 @@ pub fn crash_meta() -> CheckMeta {
         intensity: Intensity::Intrusive,
         cost: CheckCost::Heavy,
         technique: Technique::Malformed,
+        scope: aitm_scan_model::CheckScope::Point,
         severity: aitm_poc::Severity::Critical,
         confidence_max: Confidence::Firm,
         needs_baseline: true,
@@ -79,6 +80,7 @@ pub fn reaction_meta() -> CheckMeta {
         intensity: Intensity::Intrusive,
         cost: CheckCost::Heavy,
         technique: Technique::Observe,
+        scope: aitm_scan_model::CheckScope::Point,
         severity: aitm_poc::Severity::Info,
         confidence_max: Confidence::Firm,
         needs_baseline: true,
@@ -162,6 +164,8 @@ impl Check for CrashCheck {
                     run.field
                 ),
                 poc_hint: None,
+                location: None,
+                more: Vec::new(),
             }
         })
     }
@@ -235,6 +239,8 @@ fn missing_runner(point_id: &str) -> Verdict {
     Verdict {
         outcome: Outcome::Error,
         confidence: Confidence::Tentative,
+        location: None,
+        more: Vec::new(),
         evidence: Evidence::default(),
         detail: format!(
             "no packet-lane runner registered for point {point_id}; probe_host_for must run first"
@@ -260,6 +266,8 @@ fn crash_verdict(run: &PointRun, crash: &CrashRecord) -> Verdict {
     Verdict {
         outcome: Outcome::Vulnerable,
         confidence: Confidence::Firm,
+        location: None,
+        more: Vec::new(),
         evidence: Evidence {
             payload: Some(crash.evidence.sent_hex.clone()),
             matched: Some(matched),
@@ -280,6 +288,8 @@ fn reaction_verdict(run: &PointRun, scope_entry: &str) -> Verdict {
     let clean = || Verdict {
         outcome: Outcome::Clean,
         confidence: Confidence::Firm,
+        location: None,
+        more: Vec::new(),
         evidence: Evidence::default(),
         detail: format!(
             "{} cases sent on {} field {}; no protocol reaction",
@@ -314,6 +324,8 @@ fn reaction_verdict(run: &PointRun, scope_entry: &str) -> Verdict {
     Verdict {
         outcome: Outcome::Vulnerable,
         confidence: Confidence::Firm,
+        location: None,
+        more: Vec::new(),
         evidence: Evidence {
             payload: Some(evidence.sent_hex.clone()),
             matched: Some(format!("{} x {count}", class.label())),
@@ -333,6 +345,8 @@ fn dry_run_verdict(run: &PointRun) -> Verdict {
     Verdict {
         outcome: Outcome::Clean,
         confidence: Confidence::Firm,
+        location: None,
+        more: Vec::new(),
         evidence: Evidence {
             payload: run.cases.first().map(|case| case.sent_hex.clone()),
             ..Evidence::default()
@@ -374,6 +388,8 @@ fn candidate_verdict(run: &PointRun) -> Option<Verdict> {
     Some(Verdict {
         outcome: Outcome::Inconclusive,
         confidence: Confidence::Tentative,
+        location: None,
+        more: Vec::new(),
         evidence: Evidence {
             payload: Some(case.sent_hex.clone()),
             ..Evidence::default()
@@ -396,6 +412,8 @@ fn stopped_verdict(run: &PointRun) -> Option<Verdict> {
     Some(Verdict {
         outcome: Outcome::Error,
         confidence: Confidence::Tentative,
+        location: None,
+        more: Vec::new(),
         evidence: Evidence::default(),
         detail: format!(
             "the packet lane stopped before any case on {} field {}: {reason}",
