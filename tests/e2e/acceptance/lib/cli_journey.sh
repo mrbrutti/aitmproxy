@@ -47,7 +47,7 @@ finish() { # every id of the half that was never written
 }
 run() { # id secs -- cmd...   (capped; SIGINT at the cap so a serving mode exits orderly)
   local id="$1" secs="$2"; shift 2
-  ( "$@" ) >"$OUT/$id.out" 2>"$OUT/$id.err" & local pid=$!
+  ( trap - INT; exec "$@" ) >"$OUT/$id.out" 2>"$OUT/$id.err" & local pid=$!   # background jobs inherit SIGINT-ignore; reset it so the cap's INT reaches aitm
   ( sleep "$secs"; kill -INT "$pid" 2>/dev/null; sleep 2; kill "$pid" 2>/dev/null ) & local w=$!
   wait "$pid" 2>/dev/null; local rc=$?; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
   echo "$rc" >"$OUT/$id.exit"; return "$rc"
