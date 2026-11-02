@@ -192,6 +192,72 @@ describe('L4_ARG_BUILDERS table', () => {
   });
 });
 
+// ---- not constants (tester): distinct inputs give distinct outputs ----------------------------------
+//
+// The blocks above each call a builder with one input, so a builder replaced by a constant would
+// still pass them. These pin that every builder carries its argument through.
+
+describe('builders carry their arguments (not constants)', () => {
+  it('captureStartArgs / captureStopArgs / verdictArgs / revertArgs / mutateArgs follow their inputs', () => {
+    expect(captureStartArgs('en0', 'outbound')).toEqual({ interface: 'en0', direction: 'outbound' });
+    expect(captureStartArgs('lo', 'inbound')).toEqual({ interface: 'lo', direction: 'inbound' });
+    expect(captureStartArgs('en0', 'outbound')).not.toEqual(captureStartArgs('lo0', 'inbound'));
+    expect(captureStopArgs('C2')).toEqual({ id: 'C2' });
+    expect(stopAllArgs(['Z'])).toEqual([{ id: 'Z' }]);
+    expect(verdictArgs('P2')).toEqual({ id: 'P2' });
+    expect(verdictArgs('P2')).not.toEqual(verdictArgs('P1'));
+    expect(revertArgs('9f3c')).toEqual({ id: '9f3c' });
+    const specA: PacketSpec = { layers: [{ raw: [1] }] };
+    const specB: PacketSpec = { layers: [{ raw: [2] }] };
+    expect(mutateArgs('P2', specA)).toEqual({ id: 'P2', spec: specA });
+    expect(mutateArgs('P2', specA).spec).toBe(specA);
+    expect(mutateArgs('P2', specA)).not.toEqual(mutateArgs('P2', specB));
+  });
+
+  it('scopeAddArgs maps a second, different draft one-to-one (inject / outbound / IPv6)', () => {
+    const draft: L4ScopeDraft = { cidr: '::1/128', ports: '', interface: 'lo', direction: 'outbound', capability: 'inject' };
+    expect(scopeAddArgs(draft)).toEqual({ cidr: '::1/128', ports: '', interface: 'lo', direction: 'outbound', capability: 'inject' });
+    expect(scopeAddArgs(draft)).not.toBe(draft);
+  });
+
+  it('flowGetArgs carries the id and the offset', () => {
+    expect(flowGetArgs('G', 'list', true)).toEqual({ id: 'G', limit: 0 });
+    expect(flowGetArgs('G', 'inspect', true, 512)).toEqual({ id: 'G', offset: 512, limit: 256 });
+    expect(flowGetArgs('G', 'inspect', false, 512)).toEqual({ id: 'G' });
+  });
+
+  it('availabilityFromReply / availabilityFromError carry the reply through, and say so for an unknown shape', () => {
+    expect(availabilityFromReply({ available: false, code: 'unsupported_platform', reason: 'Y', sessions: [] })).toEqual({
+      available: false,
+      code: 'unsupported_platform',
+      reason: 'Y',
+    });
+    // A non-string code / reason is null, not a stringified value.
+    expect(availabilityFromReply({ available: true, code: 7, reason: 0 })).toEqual({ available: true, code: null, reason: null });
+    // Neither shape: unavailable with a visible reason, never a guess of "available".
+    for (const odd of [null, undefined, 'ok', 42, {}, { captures: [] }, { available: 'true' }]) {
+      const a = availabilityFromReply(odd);
+      expect(a.available, JSON.stringify(odd) ?? 'undefined').toBe(false);
+      expect(a.reason, JSON.stringify(odd) ?? 'undefined').toBe('unrecognised L4 status reply');
+    }
+    expect(availabilityFromError('x: L4 unavailable: needs CAP_NET_RAW')).toEqual({ available: false, code: null, reason: 'needs CAP_NET_RAW' });
+    expect(availabilityFromError('L4 unavailable: ')).toEqual({ available: false, code: null, reason: '' });
+    expect(availabilityFromError('')).toBeNull();
+    expect(availabilityFromError('L4 unavailable')).toBeNull();
+    expect(PENDING_AVAILABILITY.code).toBeNull();
+    expect(Object.isFrozen(PENDING_AVAILABILITY)).toBe(true);
+  });
+
+  it('parkedFor / statusIds / supportsOperatorScopeAdd read their inputs, not a fixed answer', () => {
+    expect(parkedFor([parked('Q7', 'Z')], 'Z')?.id).toBe('Q7');
+    expect(statusIds({ available: true, code: 'available', reason: null, captures: ['A', 'B', 'C'] }, 'captures')).toEqual(['A', 'B', 'C']);
+    expect(statusIds({ available: true, code: 'available', reason: null, captures: ['A'] }, 'sessions')).toEqual([]);
+    expect(statusIds({ sessions: [{ id: 'S1' }, { flow: 'S2' }, { neither: 1 }, 3] }, 'sessions')).toEqual(['S1', 'S2']);
+    expect(supportsOperatorScopeAdd([{ name: 'other' }, { name: 'l4.scope.add', confirmable: true }])).toBe(true);
+    expect(supportsOperatorScopeAdd([{ name: 'l4.scope.add', confirmable: 1 }])).toBe(false);
+  });
+});
+
 // ---- store tripwire (task C3) ---------------------------------------------------------------------
 //
 // `store.ts` must reach every argument-taking L4 verb through a C1 builder, never an object literal
