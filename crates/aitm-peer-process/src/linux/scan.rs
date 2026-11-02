@@ -3,8 +3,9 @@
 //! `find_owners`: `/proc/net/tcp{,6}` rows whose `uid` is ours and whose
 //! `(local, remote)` is a wanted `(client, proxy)` give socket inodes; then every
 //! `/proc/<pid>/fd/*` link is read, ascending pid, until each inode has an owner
-//! or the deadline passes. `identity`: `readlink /proc/<pid>/exe` basename, else
-//! `/proc/<pid>/comm`.
+//! or the deadline passes. `find_owners_among` (F2, 2026-11-01) reads the same
+//! tables but walks only the pids it is given, reporting socketless ones as
+//! `gone`. `identity`: `readlink /proc/<pid>/exe` basename, else `/proc/<pid>/comm`.
 //!
 //! The scanner takes its `/proc` root as a path so the walk is tested on any host
 //! against a fixture tree; only [`LinuxScanner::new`] (which reads the real
@@ -17,7 +18,7 @@ use std::time::Instant;
 
 use crate::linux::parse::{exe_basename, fd_socket_inode, parse_stat_starttime, parse_tcp_row};
 use crate::matching::tuple_matches;
-use crate::types::{ProcessKey, SocketScanner, Tuple};
+use crate::types::{Probe, ProcessKey, SocketScanner, Tuple};
 
 /// The uid stored when `/proc/self` could not be read: no `/proc/net/tcp` row can
 /// carry it, so the scanner matches nothing rather than guessing.
@@ -138,24 +139,33 @@ impl LinuxScanner {
     }
 }
 
-impl SocketScanner for LinuxScanner {
-    fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey> {
-        let mut owners = HashMap::new();
-        if wanted.is_empty() {
-            return owners;
-        }
-
+impl LinuxScanner {
+    /// Socket inode → wanted tuple over both tables; empty when nothing matched.
+    fn wanted_inodes(&self, wanted: &[Tuple]) -> HashMap<u64, Tuple> {
         let mut inodes: HashMap<u64, Tuple> = HashMap::new();
+        if wanted.is_empty() {
+            return inodes;
+        }
         self.collect_inodes("tcp", false, wanted, &mut inodes);
         if inodes.len() < wanted.len() {
             self.collect_inodes("tcp6", true, wanted, &mut inodes);
         }
-        if inodes.is_empty() {
-            return owners;
-        }
+        inodes
+    }
 
-        for pid in self.pids() {
-            if Instant::now() >= deadline || inodes.is_empty() {
+    /// The per-pid body shared by the full scan and the targeted probe: walk
+    /// `pids` in order until every inode has an owner or the deadline passes.
+    /// `gone` is filled only when `report_gone` (a probe), never for a full scan.
+    fn walk_pids(
+        &self,
+        mut inodes: HashMap<u64, Tuple>,
+        deadline: Instant,
+        pids: &[u32],
+        report_gone: bool,
+    ) -> Probe {
+        let mut probe = Probe::default();
+        for &pid in pids {
+            if Instant::now() >= deadline || (inodes.is_empty() && !report_gone) {
                 break;
             }
             if Some(pid) == self.skip_pid {
@@ -163,6 +173,9 @@ impl SocketScanner for LinuxScanner {
             }
             let held = self.socket_inodes(pid);
             if held.is_empty() {
+                if report_gone {
+                    probe.gone.push(pid);
+                }
                 continue;
             }
             let mut key: Option<ProcessKey> = None;
@@ -174,10 +187,24 @@ impl SocketScanner for LinuxScanner {
                     pid,
                     start: self.start_time(pid),
                 });
-                owners.insert(tuple, key);
+                probe.owners.insert(tuple, key);
             }
         }
-        owners
+        probe
+    }
+}
+
+impl SocketScanner for LinuxScanner {
+    fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey> {
+        let inodes = self.wanted_inodes(wanted);
+        if inodes.is_empty() {
+            return HashMap::new();
+        }
+        self.walk_pids(inodes, deadline, &self.pids(), false).owners
+    }
+
+    fn find_owners_among(&self, wanted: &[Tuple], deadline: Instant, pids: &[u32]) -> Probe {
+        self.walk_pids(self.wanted_inodes(wanted), deadline, pids, true)
     }
 
     fn identity(&self, key: ProcessKey) -> Option<String> {
@@ -551,5 +578,45 @@ mod tests {
             }),
             None
         );
+    }
+
+    /// F2 (2026-11-01): a targeted probe walks only the pids it is given and
+    /// reports the ones without a socket fd as `gone`.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_targeted_probe_walks_only_the_given_pids_and_reports_the_idle_ones() {
+        let fx = Fixture::new("targeted");
+        fx.table("tcp", &[row(LOOPBACK4, 49864, LOOPBACK4, 8080, UID, 12345)]);
+        fx.table("tcp6", &[]);
+        fx.pid(7).fd(7, 0, "/dev/null"); // alive, no sockets
+        fs::create_dir_all(fx.root().join("9")).unwrap(); // fd dir unreadable
+        fx.pid(100).fd(100, 5, "socket:[999]").stat(100, "other", 1);
+        fx.pid(4242)
+            .fd(4242, 3, "socket:[12345]")
+            .stat(4242, "curl", 98765);
+
+        let wanted = tuple("127.0.0.1:49864", "127.0.0.1:8080");
+        let sc = scanner(&fx, None);
+
+        let probe = sc.find_owners_among(&[wanted], soon(), &[4242]);
+        assert_eq!(
+            probe.owners[&wanted],
+            ProcessKey {
+                pid: 4242,
+                start: 98765
+            }
+        );
+        assert!(probe.gone.is_empty(), "{:?}", probe.gone);
+
+        // The owner is not among the probed pids: nothing found, and only the
+        // socketless pids are reported gone (100 holds a socket, just not ours).
+        let probe = sc.find_owners_among(&[wanted], soon(), &[7, 9, 100]);
+        assert!(probe.owners.is_empty(), "{:?}", probe.owners);
+        assert_eq!(probe.gone, vec![7, 9]);
+
+        // skip_pid holds in a probe too.
+        let probe = scanner(&fx, Some(4242)).find_owners_among(&[wanted], soon(), &[4242]);
+        assert!(probe.owners.is_empty(), "{:?}", probe.owners);
+        assert!(probe.gone.is_empty(), "{:?}", probe.gone);
     }
 }

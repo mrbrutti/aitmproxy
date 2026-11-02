@@ -25,7 +25,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
 
 use crate::matching::{port_from_libproc, tuple_matches};
-use crate::types::{ProcessKey, Tuple};
+use crate::types::{Probe, ProcessKey, Tuple};
 
 // ---------------------------------------------------------------------------
 // Constants (`sys/proc_info.h`, SDK on this Mac; values pinned in research 24).
@@ -410,19 +410,41 @@ pub(crate) fn find_owners_raw(
     deadline: Instant,
     skip_pid: Option<u32>,
 ) -> HashMap<Tuple, ProcessKey> {
-    let mut found: HashMap<Tuple, ProcessKey> = HashMap::with_capacity(wanted.len());
-    let mut starts: HashMap<u32, u64> = HashMap::new();
     if wanted.is_empty() {
-        return found;
+        return HashMap::new();
     }
-    for pid in list_pids() {
-        if found.len() == wanted.len() || Instant::now() >= deadline {
+    walk_pids(wanted, deadline, skip_pid, &list_pids()).owners
+}
+
+/// The same match over **only** `pids` (F2, 2026-11-01: the coalescer's warm
+/// set), in the order given; a pid whose fd table cannot be read or holds no
+/// socket is reported in `gone`. One `proc_pidinfo(PROC_PIDLISTFDS)` plus one
+/// `proc_pidfdinfo` per socket fd per pid; no `proc_listpids`.
+pub(crate) fn find_owners_among_raw(
+    wanted: &[Tuple],
+    deadline: Instant,
+    skip_pid: Option<u32>,
+    pids: &[u32],
+) -> Probe {
+    walk_pids(wanted, deadline, skip_pid, pids)
+}
+
+/// The per-pid body shared by the full scan and the targeted probe.
+fn walk_pids(wanted: &[Tuple], deadline: Instant, skip_pid: Option<u32>, pids: &[u32]) -> Probe {
+    let mut probe = Probe {
+        owners: HashMap::with_capacity(wanted.len()),
+        gone: Vec::new(),
+    };
+    let mut starts: HashMap<u32, u64> = HashMap::new();
+    for &pid in pids {
+        if probe.owners.len() == wanted.len() || Instant::now() >= deadline {
             break;
         }
         if Some(pid) == skip_pid {
             continue;
         }
         let Some(fds) = socket_fds(pid) else {
+            probe.gone.push(pid);
             continue;
         };
         for fd in fds {
@@ -430,19 +452,19 @@ pub(crate) fn find_owners_raw(
                 continue;
             };
             for tuple in wanted {
-                if found.contains_key(tuple) {
+                if probe.owners.contains_key(tuple) {
                     continue;
                 }
                 if tuple_matches(sock.laddr, sock.lport, sock.faddr, sock.fport, tuple) {
                     let start = *starts
                         .entry(pid)
                         .or_insert_with(|| pid_start_micros(pid).unwrap_or(0));
-                    found.insert(*tuple, ProcessKey { pid, start });
+                    probe.owners.insert(*tuple, ProcessKey { pid, start });
                 }
             }
         }
     }
-    found
+    probe
 }
 
 #[cfg(test)]
@@ -452,8 +474,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        find_owners_raw, in_sockinfo, list_pids, pid_name, pid_path, pid_start_micros, proc_fdinfo,
-        socket_fdinfo, socket_fds, socket_info, tcp_sockinfo,
+        find_owners_among_raw, find_owners_raw, in_sockinfo, list_pids, pid_name, pid_path,
+        pid_start_micros, proc_fdinfo, socket_fdinfo, socket_fds, socket_info, tcp_sockinfo,
     };
     use crate::types::Tuple;
 
@@ -565,5 +587,46 @@ mod tests {
         assert_eq!(pid_start_micros(i32::MAX as u32), None);
         assert_eq!(socket_fds(i32::MAX as u32), None);
         let _: Option<SocketAddr> = None;
+    }
+
+    /// AC9 (Terminal: binds a loopback socket). F2: a warm probe of our own pid
+    /// names this process without walking the pid list.
+    #[test]
+    fn warm_probe_names_this_process_without_a_full_scan() {
+        let (_l, _c, _a, tuple) = accepted_pair("127.0.0.1:0");
+        let me = std::process::id();
+        let probe = find_owners_among_raw(
+            &[tuple],
+            Instant::now() + Duration::from_secs(1),
+            None,
+            &[me],
+        );
+        assert_eq!(probe.owners[&tuple].pid, me);
+        assert!(probe.gone.is_empty(), "{:?}", probe.gone);
+    }
+
+    /// F2 (sandbox): launchd's fd table is `EPERM` and an impossible pid is
+    /// `ESRCH`; a probe reports both as `gone` and finds nothing. Our own pid
+    /// has sockets (the test harness), so it is probed, matches a tuple nobody
+    /// owns on nothing, and is not gone.
+    #[test]
+    fn a_targeted_probe_reports_unreadable_pids_gone() {
+        let nobody = Tuple {
+            client: "127.0.0.1:1".parse().unwrap(),
+            proxy: "127.0.0.1:2".parse().unwrap(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let probe = find_owners_among_raw(&[nobody], deadline, None, &[1, i32::MAX as u32]);
+        assert!(probe.owners.is_empty(), "{:?}", probe.owners);
+        assert_eq!(probe.gone, vec![1, i32::MAX as u32]);
+
+        let me = std::process::id();
+        let probe = find_owners_among_raw(&[nobody], deadline, None, &[me]);
+        assert!(probe.owners.is_empty(), "{:?}", probe.owners);
+        assert!(probe.gone.is_empty(), "{:?}", probe.gone);
+
+        // The skipped pid is neither walked nor reported.
+        let probe = find_owners_among_raw(&[nobody], deadline, Some(1), &[1]);
+        assert!(probe.gone.is_empty(), "{:?}", probe.gone);
     }
 }

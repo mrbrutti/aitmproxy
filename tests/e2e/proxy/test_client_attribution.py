@@ -22,7 +22,9 @@ Python process as the two clients, read back over the operator bus. Four proofs:
      `curl` in `source_app`, `capture_interface` null, detail agreeing.
   4. latency (AC13): 20 sequential plain `via_proxy` GETs through the same core; the
      median wall time is printed (`median_ms=<value>`) and must be under 100 ms (an
-     absolute bound: the 25 ms attribution budget is the most a connection can pay).
+     absolute bound: the 25 ms attribution budget is the most a connection can pay),
+     and ALL 20 rows carry a python `source_app` (F2: one client process, so every
+     connection after the first is a warm-set hit, never a rate-limited null).
 
 Identity vocabulary (spec D5), stated honestly so the assertions are not tied to one
 machine: a BUNDLED executable is named by its bundle identifier, a bare one by its
@@ -264,9 +266,14 @@ def main() -> int:
               f"median wall time per proxied GET is {median:.2f} ms, under {LATENCY_BOUND_MS:g} ms "
               f"(attribution adds at most its 25 ms budget per connection)")
         lat_rows = [r for r in rows_for(bus, up.authority) if (r.get("path") or "").startswith(f"/lat-{tag}-")]
+        check(len(lat_rows) == LATENCY_SAMPLES,
+              f"flow.table has all {LATENCY_SAMPLES} latency rows (got {len(lat_rows)})")
         named = [r for r in lat_rows if isinstance(r.get("source_app"), str) and "python" in r["source_app"].lower()]
-        ok(f"{len(named)}/{len(lat_rows)} latency rows carry a python source_app so far "
-           f"(informational: a budget miss is a null, never a placeholder)")
+        unnamed = [brief(r) for r in lat_rows if r not in named]
+        check(len(named) == len(lat_rows),
+              f"ALL {len(lat_rows)} latency rows carry a python source_app (named={len(named)}; "
+              f"one client process, so after the first scan every connection is a warm-set hit; "
+              f"F2 2026-11-01; unnamed={unnamed[:3]})")
         placeholders = [brief(r) for r in lat_rows
                         if isinstance(r.get("source_app"), str) and "python" not in r["source_app"].lower()]
         check(not placeholders, f"no latency row carries a non-python string as source_app (bad={placeholders[:3]})")

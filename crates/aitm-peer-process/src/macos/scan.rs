@@ -1,12 +1,13 @@
-//! The macOS [`SocketScanner`]: libproc scan via `ffi::find_owners_raw`, identity
-//! via `proc_pidpath` → [`identity_for_path`], else `proc_name` (spec D4, D5).
+//! The macOS [`SocketScanner`]: libproc scan via `ffi::find_owners_raw`, warm
+//! probe via `ffi::find_owners_among_raw`, identity via `proc_pidpath` →
+//! [`identity_for_path`], else `proc_name` (spec D4, D5).
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::macos::ffi;
 use crate::macos::identity::identity_for_path;
-use crate::types::{ProcessKey, SocketScanner, Tuple};
+use crate::types::{Probe, ProcessKey, SocketScanner, Tuple};
 
 /// The production scanner on macOS. `skip_pid` is never reported as an owner
 /// (production: our own pid, whose accepted sockets mirror every wanted tuple).
@@ -17,6 +18,10 @@ pub(crate) struct MacScanner {
 impl SocketScanner for MacScanner {
     fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey> {
         ffi::find_owners_raw(wanted, deadline, self.skip_pid)
+    }
+
+    fn find_owners_among(&self, wanted: &[Tuple], deadline: Instant, pids: &[u32]) -> Probe {
+        ffi::find_owners_among_raw(wanted, deadline, self.skip_pid, pids)
     }
 
     fn identity(&self, key: ProcessKey) -> Option<String> {

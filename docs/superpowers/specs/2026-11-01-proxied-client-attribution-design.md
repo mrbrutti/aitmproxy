@@ -204,6 +204,25 @@ consumes a token. A caller that finds no scan running and no token returns `None
 case under a flood: 10 scans/s × 7 ms = 7 % of one core; idle cost zero. A browser page load
 (bursts of a few connections within milliseconds) is one or two scans.
 
+> **Amendment 2026-11-01 (live-proof finding F2, decided by the orchestrator).** The paragraph
+> above under-counted: sequential connections do not coalesce, so every connection paid a full
+> scan and a token, and a 20-request burst from one python process named 14 rows. Two changes:
+>
+> 1. **Warm set first.** The coalescer keeps the most recently matched pids (MRU, capacity 16;
+>    a pid that matches moves to the front; a pid whose probe finds no socket fds is dropped).
+>    The leader first probes **only** the warm pids (`SocketScanner::find_owners_among(wanted,
+>    deadline, pids) -> Probe { owners, gone }`, pids passed ascending so the lowest matching pid
+>    still wins per D4). A warm probe is **not** rate-limited: it costs one
+>    `proc_pidinfo(PROC_PIDLISTFDS)` plus one `proc_pidfdinfo` per socket fd for ≤ 16 processes
+>    (sub-millisecond); on Linux the `/proc/net/tcp{,6}` read plus ≤ 16 `/proc/<pid>/fd` walks.
+> 2. **Full scan only on a miss**, and only then is a token taken; the bucket semantics stay
+>    (dry bucket → `None` at once for the missed tuples) but it is **capacity 20, refill 20/s**.
+>    Worst case under a flood of *new* processes: 20 scans/s × 7 ms = 140 ms/s ≈ 14 % of one
+>    core; zero when idle; a client seen once costs no token on any later connection.
+>
+> `Limits::default()` is therefore (250 ms, 20, 20, 256); the warm capacity is a crate constant,
+> not a knob (D6).
+
 **Scan deadline (Architect's call): 250 ms wall clock**, checked between pids; on expiry the scan
 ends and every tuple it did not match resolves `None`. This bounds a pathological host (tens of
 thousands of fds) and the blocking-pool occupancy.

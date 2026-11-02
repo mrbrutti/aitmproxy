@@ -1,24 +1,39 @@
 //! The spec D3 concurrency shape: one socket scan at a time, callers that arrive
-//! mid-scan join the next one, a token bucket bounds scans per second, and
+//! mid-scan join the next one, a warm set of recently matched pids is probed
+//! before any full scan, a token bucket bounds full scans per second, and
 //! identities go through the per-process cache. Platform-independent; the OS
 //! lives behind [`SocketScanner`].
 //!
 //! Mechanics: a caller registers its tuple as *wanted* and *pending*. If no scan
-//! is running it becomes the leader: it takes a token (or returns `None` at once
-//! if the bucket is dry), drains the pending set, scans once with a deadline of
-//! `now + scan_deadline`, writes a result for every tuple it scanned (absent
-//! from the map = `None`), and wakes everyone. A non-leader sleeps on the
-//! `Condvar` until its result is in or its own deadline passes; when it wakes to
-//! find no scan running and no result it leads the next scan itself, so tuples
-//! that arrived mid-scan are served without anyone spinning.
+//! is running it becomes the leader: it drains the pending set and first probes
+//! only the **warm** pids (the [`WARM_CAPACITY`] most recently matched, an MRU
+//! list; free, no token). Tuples the probe missed cost one token for one full
+//! scan (or resolve `None` at once if the bucket is dry). Every scanned tuple
+//! gets a result (absent from both maps = `None`) and everyone is woken. A
+//! non-leader sleeps on the `Condvar` until its result is in or its own deadline
+//! passes; when it wakes to find no scan running and no result it leads the next
+//! scan itself, so tuples that arrived mid-scan are served without anyone
+//! spinning.
+//!
+//! Why the warm set (live-proof finding F2, 2026-11-01): one client process
+//! opens many connections, a browser dozens per page, and every one of them
+//! used to pay a full scan and a token, so a 20-request burst from one python
+//! process named only 14 rows. A warm probe is one fd-table read plus one
+//! socket read per fd for at most 16 processes, sub-millisecond, so a client
+//! seen once is named on every later connection without touching the bucket.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::cache::IdentityCache;
 use crate::sanitize::sanitize;
 use crate::types::{Limits, ProcessKey, SocketScanner, Tuple};
+
+/// How many recently matched pids are probed before a full scan. Sixteen covers
+/// every client a tester drives at once (browser, its helpers, curl, a script)
+/// while keeping a probe at a handful of `proc_pidinfo` calls.
+pub(crate) const WARM_CAPACITY: usize = 16;
 
 /// Serialises scans over one scanner and resolves tuples to sanitised identities.
 pub(crate) struct Coalescer<S: SocketScanner> {
@@ -39,11 +54,35 @@ struct State {
     tokens: f64,
     last_refill: Instant,
     cache: IdentityCache,
+    /// Recently matched pids, most recent at the front, at most `WARM_CAPACITY`.
+    warm: VecDeque<u32>,
 }
 
 impl State {
+    /// `pid` matched a tuple: it becomes the most recent, evicting the least
+    /// recent if the set is full.
+    fn warm_hit(&mut self, pid: u32) {
+        self.warm.retain(|p| *p != pid);
+        self.warm.push_front(pid);
+        self.warm.truncate(WARM_CAPACITY);
+    }
+
+    /// `pid` had no sockets when probed: forget it.
+    fn warm_drop(&mut self, pid: u32) {
+        self.warm.retain(|p| *p != pid);
+    }
+
+    /// The warm pids ascending, so the lowest matching pid wins as in a full scan.
+    fn warm_sorted(&self) -> Vec<u32> {
+        let mut pids: Vec<u32> = self.warm.iter().copied().collect();
+        pids.sort_unstable();
+        pids
+    }
+
     /// Refill the bucket for the time elapsed, then take one token if there is
-    /// one. Fractional tokens accumulate so a rate of 10/s is 10/s, not 0.
+    /// one. Fractional tokens accumulate so a rate of 20/s is 20/s, not 0.
+    /// Only full scans pay: at the default 20/s and the measured 7 ms per scan
+    /// the worst case is 140 ms of one core per second (14 %); idle cost zero.
     fn take_token(&mut self, limits: &Limits) -> bool {
         let now = Instant::now();
         let elapsed = now
@@ -87,6 +126,7 @@ impl<S: SocketScanner> Coalescer<S> {
             tokens: f64::from(limits.scan_tokens),
             last_refill: Instant::now(),
             cache: IdentityCache::new(limits.cache_entries),
+            warm: VecDeque::with_capacity(WARM_CAPACITY),
         };
         Self {
             scanner,
@@ -115,10 +155,6 @@ impl<S: SocketScanner> Coalescer<S> {
                 return found;
             }
             if !state.scanning {
-                if !state.take_token(&self.limits) {
-                    state.release(&tuple);
-                    return None;
-                }
                 state = self.lead_scan(state);
                 continue;
             }
@@ -135,17 +171,47 @@ impl<S: SocketScanner> Coalescer<S> {
     }
 
     /// Run one scan for everything pending, with the lock released while the
-    /// scanner works; write a result for every tuple scanned and wake waiters.
+    /// scanner works: a free probe of the warm pids first, then, for the tuples
+    /// it missed, one full scan if the bucket has a token. Write a result for
+    /// every tuple scanned (unfound = `None`) and wake waiters.
     fn lead_scan<'a>(&'a self, mut state: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
         state.scanning = true;
+        let deadline = Instant::now() + self.limits.scan_deadline;
         let batch: Vec<Tuple> = state.pending.drain().collect();
+        let warm = state.warm_sorted();
         drop(state);
 
-        let found = self
-            .scanner
-            .find_owners(&batch, Instant::now() + self.limits.scan_deadline);
+        let mut found: HashMap<Tuple, ProcessKey> = HashMap::with_capacity(batch.len());
+        let mut gone: Vec<u32> = Vec::new();
+        if !warm.is_empty() {
+            let probe = self.scanner.find_owners_among(&batch, deadline, &warm);
+            found = probe.owners;
+            gone = probe.gone;
+        }
 
         let mut state = self.lock();
+        for pid in gone {
+            state.warm_drop(pid);
+        }
+        let missed: Vec<Tuple> = batch
+            .iter()
+            .copied()
+            .filter(|t| !found.contains_key(t))
+            .collect();
+        if !missed.is_empty() && state.take_token(&self.limits) {
+            drop(state);
+            let full = self.scanner.find_owners(&missed, deadline);
+            state = self.lock();
+            found.extend(full);
+        }
+
+        // Most recent last so the newest match ends up at the front.
+        let mut matched: Vec<u32> = found.values().map(|k| k.pid).collect();
+        matched.sort_unstable();
+        matched.dedup();
+        for pid in matched {
+            state.warm_hit(pid);
+        }
         for t in batch {
             if state.wanted.contains_key(&t) {
                 state.results.insert(t, found.get(&t).copied());
@@ -181,18 +247,22 @@ impl<S: SocketScanner> Coalescer<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Probe;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
 
-    /// A scanner that records each `find_owners` call, sleeps like a real scan
-    /// would, and, like a real scan, stops at the deadline it was given (a
-    /// scan that ran out of time found nothing).
+    /// A scanner that records each full `find_owners` call (`calls`) and each
+    /// targeted `find_owners_among` call (`targeted`: the tuples and the pids
+    /// probed), sleeps like a real full scan would, and, like a real scan, stops
+    /// at the deadline it was given (a scan that ran out of time found nothing).
+    /// A targeted probe reports a pid as `gone` when it owns no tuple at all.
     struct FakeScanner {
         calls: Mutex<Vec<Vec<Tuple>>>,
+        targeted: Mutex<Vec<(Vec<Tuple>, Vec<u32>)>>,
         delay: Duration,
-        owners: HashMap<Tuple, ProcessKey>,
+        owners: Mutex<HashMap<Tuple, ProcessKey>>,
         identities: Mutex<Vec<ProcessKey>>,
         names: HashMap<ProcessKey, String>,
     }
@@ -201,17 +271,38 @@ mod tests {
         fn new(delay: Duration) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                targeted: Mutex::new(Vec::new()),
                 delay,
-                owners: HashMap::new(),
+                owners: Mutex::new(HashMap::new()),
                 identities: Mutex::new(Vec::new()),
                 names: HashMap::new(),
             }
         }
 
-        fn owned(mut self, tuple: Tuple, key: ProcessKey, name: &str) -> Self {
-            self.owners.insert(tuple, key);
-            self.names.insert(key, name.to_string());
-            self
+        fn owned(self, tuple: Tuple, key: ProcessKey, name: &str) -> Self {
+            self.owners.lock().unwrap().insert(tuple, key);
+            let mut this = self;
+            this.names.insert(key, name.to_string());
+            this
+        }
+
+        /// The process `pid` exits: every socket it owned is gone.
+        fn exit(&self, pid: u32) {
+            self.owners.lock().unwrap().retain(|_, k| k.pid != pid);
+        }
+
+        fn full_scans(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        /// The pid lists of every targeted probe so far.
+        fn probed_pids(&self) -> Vec<Vec<u32>> {
+            self.targeted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, pids)| pids.clone())
+                .collect()
         }
     }
 
@@ -225,10 +316,32 @@ mod tests {
                 return HashMap::new();
             }
             thread::sleep(self.delay);
+            let owners = self.owners.lock().unwrap();
             wanted
                 .iter()
-                .filter_map(|t| self.owners.get(t).map(|k| (*t, *k)))
+                .filter_map(|t| owners.get(t).map(|k| (*t, *k)))
                 .collect()
+        }
+
+        fn find_owners_among(&self, wanted: &[Tuple], _deadline: Instant, pids: &[u32]) -> Probe {
+            self.targeted
+                .lock()
+                .unwrap()
+                .push((wanted.to_vec(), pids.to_vec()));
+            let owners = self.owners.lock().unwrap();
+            let mut probe = Probe::default();
+            for &pid in pids {
+                if !owners.values().any(|k| k.pid == pid) {
+                    probe.gone.push(pid);
+                    continue;
+                }
+                for t in wanted {
+                    if let Some(k) = owners.get(t).filter(|k| k.pid == pid) {
+                        probe.owners.entry(*t).or_insert(*k);
+                    }
+                }
+            }
+            probe
         }
 
         fn identity(&self, key: ProcessKey) -> Option<String> {
@@ -241,6 +354,10 @@ mod tests {
     impl SocketScanner for Arc<FakeScanner> {
         fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey> {
             self.as_ref().find_owners(wanted, deadline)
+        }
+
+        fn find_owners_among(&self, wanted: &[Tuple], deadline: Instant, pids: &[u32]) -> Probe {
+            self.as_ref().find_owners_among(wanted, deadline, pids)
         }
 
         fn identity(&self, key: ProcessKey) -> Option<String> {
@@ -302,12 +419,13 @@ mod tests {
         assert_eq!(coalescer.resolve(tuple(50_100)), None);
         assert!(scanner.calls.lock().unwrap().is_empty());
 
-        // One token and no refill: the first call spends it, the second finds
-        // the bucket dry and returns at once without a second scan.
+        // One token and no refill: the first call spends it, the second (a new
+        // pid, so the warm probe misses) finds the bucket dry and returns at
+        // once without a second full scan.
         let scanner = Arc::new(
             FakeScanner::new(Duration::ZERO)
                 .owned(tuple(50_101), key(1, 1), "curl")
-                .owned(tuple(50_102), key(1, 1), "curl"),
+                .owned(tuple(50_102), key(2, 1), "wget"),
         );
         let limits = Limits {
             scan_tokens: 1,
@@ -322,10 +440,11 @@ mod tests {
 
     #[test]
     fn bucket_refills_over_time() {
+        // Two pids, so the second lookup is a warm miss that needs a token.
         let scanner = Arc::new(
             FakeScanner::new(Duration::ZERO)
                 .owned(tuple(50_110), key(1, 1), "curl")
-                .owned(tuple(50_111), key(1, 1), "curl"),
+                .owned(tuple(50_111), key(2, 1), "wget"),
         );
         let limits = Limits {
             scan_tokens: 1,
@@ -335,8 +454,8 @@ mod tests {
         let coalescer = Coalescer::new(Arc::clone(&scanner), limits);
         assert_eq!(coalescer.resolve(tuple(50_110)), Some("curl".to_string()));
         thread::sleep(Duration::from_millis(5));
-        assert_eq!(coalescer.resolve(tuple(50_111)), Some("curl".to_string()));
-        assert_eq!(scanner.calls.lock().unwrap().len(), 2);
+        assert_eq!(coalescer.resolve(tuple(50_111)), Some("wget".to_string()));
+        assert_eq!(scanner.full_scans(), 2);
     }
 
     #[test]
@@ -384,18 +503,27 @@ mod tests {
 
     #[test]
     fn unnamed_process_is_cached_as_none() {
-        let mut scanner = FakeScanner::new(Duration::ZERO);
-        scanner.owners.insert(tuple(50_400), key(7, 1));
-        scanner.owners.insert(tuple(50_401), key(7, 1));
+        let scanner = FakeScanner::new(Duration::ZERO);
+        scanner
+            .owners
+            .lock()
+            .unwrap()
+            .insert(tuple(50_400), key(7, 1));
+        scanner
+            .owners
+            .lock()
+            .unwrap()
+            .insert(tuple(50_401), key(7, 1));
         let scanner = Arc::new(scanner);
         let coalescer = Coalescer::new(Arc::clone(&scanner), Limits::default());
         assert_eq!(coalescer.resolve(tuple(50_400)), None);
         assert_eq!(coalescer.resolve(tuple(50_401)), None);
         assert_eq!(scanner.identities.lock().unwrap().len(), 1);
+        assert_eq!(scanner.full_scans(), 1, "the first lookup scans");
         assert_eq!(
-            scanner.calls.lock().unwrap().len(),
-            2,
-            "owner lookups still scan"
+            scanner.probed_pids(),
+            vec![vec![7]],
+            "the second is a warm probe of the same pid"
         );
     }
 
@@ -417,5 +545,142 @@ mod tests {
         assert_eq!(coalescer.resolve(tuple(50_600)), None);
         assert_eq!(scanner.calls.lock().unwrap().len(), 1);
         assert!(scanner.identities.lock().unwrap().is_empty());
+    }
+
+    /// F2 (2026-11-01): one client process opening many connections pays one
+    /// full scan, then warm probes only, and the bucket is never touched again.
+    /// With one token and no refill, the 50 later hits would be `None` if any
+    /// of them took a token or ran a full scan.
+    #[test]
+    fn warm_hits_skip_the_full_scan_and_the_bucket() {
+        let mut scanner = FakeScanner::new(Duration::ZERO);
+        for port in 50_000..=50_050u16 {
+            scanner = scanner.owned(tuple(port), key(4242, 1), "python3");
+        }
+        let scanner = Arc::new(scanner);
+        let limits = Limits {
+            scan_tokens: 1,
+            scan_refill_per_s: 0,
+            ..Limits::default()
+        };
+        let coalescer = Coalescer::new(Arc::clone(&scanner), limits);
+        assert_eq!(
+            coalescer.resolve(tuple(50_000)),
+            Some("python3".to_string())
+        );
+        assert_eq!(scanner.full_scans(), 1);
+        assert_eq!(
+            scanner.probed_pids(),
+            Vec::<Vec<u32>>::new(),
+            "empty warm set: no probe"
+        );
+
+        for port in 50_001..=50_050u16 {
+            assert_eq!(
+                coalescer.resolve(tuple(port)),
+                Some("python3".to_string()),
+                "port {port}"
+            );
+        }
+        assert_eq!(scanner.full_scans(), 1, "no further full scan");
+        let probes = scanner.probed_pids();
+        assert_eq!(probes.len(), 50, "one targeted probe per later connection");
+        assert!(probes.iter().all(|p| p == &vec![4242]), "{probes:?}");
+    }
+
+    #[test]
+    fn a_targeted_miss_falls_through_to_one_full_scan() {
+        let scanner = Arc::new(
+            FakeScanner::new(Duration::ZERO)
+                .owned(tuple(50_000), key(4242, 1), "python3")
+                .owned(tuple(50_001), key(4343, 1), "curl"),
+        );
+        let coalescer = Coalescer::new(Arc::clone(&scanner), Limits::default());
+        assert_eq!(
+            coalescer.resolve(tuple(50_000)),
+            Some("python3".to_string())
+        );
+        assert_eq!(coalescer.resolve(tuple(50_001)), Some("curl".to_string()));
+        assert_eq!(scanner.probed_pids(), vec![vec![4242]]);
+        assert_eq!(
+            *scanner.calls.lock().unwrap(),
+            vec![vec![tuple(50_000)], vec![tuple(50_001)]],
+            "the miss ran exactly one full scan, for the missed tuple only"
+        );
+    }
+
+    #[test]
+    fn warm_set_keeps_the_sixteen_most_recently_matched_pids() {
+        // pid i owns port 50_000 + i (i in 1..=18) and pid 1 also owns 50_101.
+        let mut scanner = FakeScanner::new(Duration::ZERO);
+        for pid in 1..=18u32 {
+            scanner = scanner.owned(tuple(50_000 + pid as u16), key(pid, 1), &format!("p{pid}"));
+        }
+        scanner = scanner.owned(tuple(50_101), key(1, 1), "p1");
+        let scanner = Arc::new(scanner);
+        let limits = Limits {
+            scan_tokens: 100,
+            ..Limits::default()
+        };
+        let coalescer = Coalescer::new(Arc::clone(&scanner), limits);
+
+        for pid in 1..=17u32 {
+            assert_eq!(
+                coalescer.resolve(tuple(50_000 + pid as u16)),
+                Some(format!("p{pid}"))
+            );
+        }
+        assert_eq!(scanner.full_scans(), 17, "17 new pids, 17 full scans");
+
+        // pid 1 was the first matched and the 17th push evicted it: the probe
+        // before the next lookup covers exactly 2..=17, ascending.
+        assert_eq!(coalescer.resolve(tuple(50_002)), Some("p2".to_string()));
+        let expected: Vec<u32> = (2..=17).collect();
+        assert_eq!(scanner.probed_pids().last(), Some(&expected));
+        assert_eq!(scanner.full_scans(), 17, "a warm hit");
+
+        // That hit moved pid 2 to the front, so the next eviction (pid 18 is
+        // new) removes pid 3, not pid 2.
+        assert_eq!(coalescer.resolve(tuple(50_018)), Some("p18".to_string()));
+        assert_eq!(scanner.full_scans(), 18);
+        assert_eq!(coalescer.resolve(tuple(50_002)), Some("p2".to_string()));
+        let mut expected: Vec<u32> = (4..=18).collect();
+        expected.insert(0, 2);
+        assert_eq!(scanner.probed_pids().last(), Some(&expected));
+        assert_eq!(scanner.full_scans(), 18);
+
+        // The evicted pid 1 is cold again: its next connection is a full scan.
+        assert_eq!(coalescer.resolve(tuple(50_101)), Some("p1".to_string()));
+        assert_eq!(scanner.full_scans(), 19);
+    }
+
+    #[test]
+    fn a_pid_whose_probe_finds_no_sockets_leaves_the_warm_set() {
+        let scanner = Arc::new(
+            FakeScanner::new(Duration::ZERO)
+                .owned(tuple(50_000), key(7, 1), "short-lived")
+                .owned(tuple(50_001), key(8, 1), "python3")
+                .owned(tuple(50_002), key(8, 1), "python3"),
+        );
+        let coalescer = Coalescer::new(Arc::clone(&scanner), Limits::default());
+        assert_eq!(
+            coalescer.resolve(tuple(50_000)),
+            Some("short-lived".to_string())
+        );
+        scanner.exit(7);
+
+        // Warm probe of [7] finds no fds -> 7 dropped -> full scan names 8.
+        assert_eq!(
+            coalescer.resolve(tuple(50_001)),
+            Some("python3".to_string())
+        );
+        assert_eq!(scanner.full_scans(), 2);
+        // The next probe is of [8] alone: 7 is no longer warm.
+        assert_eq!(
+            coalescer.resolve(tuple(50_002)),
+            Some("python3".to_string())
+        );
+        assert_eq!(scanner.full_scans(), 2);
+        assert_eq!(scanner.probed_pids(), vec![vec![7], vec![8]]);
     }
 }

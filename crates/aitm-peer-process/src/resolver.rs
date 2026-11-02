@@ -29,6 +29,15 @@ impl crate::types::SocketScanner for NoScanner {
         std::collections::HashMap::new()
     }
 
+    fn find_owners_among(
+        &self,
+        _wanted: &[Tuple],
+        _deadline: std::time::Instant,
+        _pids: &[u32],
+    ) -> crate::types::Probe {
+        crate::types::Probe::default()
+    }
+
     fn identity(&self, _key: crate::types::ProcessKey) -> Option<String> {
         None
     }
@@ -54,8 +63,9 @@ fn platform_scanner(skip_pid: Option<u32>) -> PlatformScanner {
 }
 
 /// Names the process behind an accepted loopback connection: one socket scan at
-/// a time, a token bucket of scans, a per-process identity cache, sanitised
-/// output; `None` on any miss, timeout or drained budget (spec D3). Our own pid
+/// a time, a warm probe of recently matched pids before any full scan, a token
+/// bucket of full scans, a per-process identity cache, sanitised output; `None`
+/// on any miss, timeout or drained budget (spec D3). Our own pid
 /// is skipped: the proxy's accepted socket is the mirror image of every tuple.
 pub struct ProcessResolver {
     inner: Coalescer<PlatformScanner>,

@@ -33,9 +33,10 @@ pub struct Limits {
     /// How long one socket scan may run before it gives up on the tuples it has
     /// not found yet.
     pub scan_deadline: Duration,
-    /// Token-bucket capacity: at most this many scans in a burst.
+    /// Token-bucket capacity: at most this many **full** scans in a burst. Warm
+    /// probes (see [`SocketScanner::find_owners_among`]) are not charged.
     pub scan_tokens: u32,
-    /// Token-bucket refill rate, scans per second.
+    /// Token-bucket refill rate, full scans per second.
     pub scan_refill_per_s: u32,
     /// Capacity of the `ProcessKey → identity` cache (FIFO eviction).
     pub cache_entries: usize,
@@ -45,20 +46,39 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             scan_deadline: Duration::from_millis(250),
-            scan_tokens: 10,
-            scan_refill_per_s: 10,
+            scan_tokens: 20,
+            scan_refill_per_s: 20,
             cache_entries: 256,
         }
     }
 }
 
+/// The outcome of a targeted probe ([`SocketScanner::find_owners_among`]).
+#[derive(Default, Debug)]
+pub(crate) struct Probe {
+    /// Owners found among the probed pids; tuples not found are absent.
+    pub owners: HashMap<Tuple, ProcessKey>,
+    /// Probed pids whose socket table could not be read or held no socket at
+    /// all (exited, re-executed as another user, or simply idle): the coalescer
+    /// drops them from its warm set.
+    pub gone: Vec<u32>,
+}
+
 /// One operating system's way of finding socket owners and naming them. The
-/// coalescer calls `find_owners` once per batch and `identity` once per
+/// coalescer calls `find_owners_among` on its warm pids first, `find_owners`
+/// (one full scan, one token) only for what that missed, and `identity` once per
 /// `ProcessKey` cache miss.
 pub(crate) trait SocketScanner: Send + Sync {
-    /// Which process owns the client end of each wanted tuple. Tuples not found by
-    /// `deadline` are absent from the map. Never errors: an unreadable pid is a skip.
+    /// Which process owns the client end of each wanted tuple, over every pid on
+    /// the host. Tuples not found by `deadline` are absent from the map. Never
+    /// errors: an unreadable pid is a skip.
     fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey>;
+
+    /// The same match over **only** `pids`, in the order given (the caller passes
+    /// them ascending so the lowest matching pid still wins). Reports which of
+    /// them had no socket fds. Cost is one fd-table read per pid, so the
+    /// coalescer runs it without taking a token.
+    fn find_owners_among(&self, wanted: &[Tuple], deadline: Instant, pids: &[u32]) -> Probe;
 
     /// The raw, **unsanitised** identity of a process (bundle identifier or
     /// executable basename), or `None` if the OS would not say.

@@ -139,6 +139,17 @@ gates while a wave is in flight, full gate before the panel.
     `get(&key0) == None`, `get(&key1).is_some()`.
   - `sanitised_identity_leaves_the_coalescer`: raw `"cu\u{200E}rl"` → `Some("curl")`.
 - **Done when:** the six tests pass in the sandbox; per-package clippy/fmt clean.
+- **Amendment 2026-11-01 (F2, spec D3 amendment):** `State` gains `warm: VecDeque<u32>` (MRU,
+  `WARM_CAPACITY = 16`); `lead_scan` probes the warm pids via
+  `SocketScanner::find_owners_among(wanted, deadline, pids) -> Probe { owners, gone }` without a
+  token, drops `gone` pids, then takes one token for one `find_owners` over the missed tuples
+  only; matched pids move to the front. `Limits::default()` bucket is 20/20. Tests (fake scanner
+  records full vs targeted calls): `warm_hits_skip_the_full_scan_and_the_bucket` (1 token, no
+  refill: one full scan then 50 warm hits, 50 targeted probes of `[4242]`),
+  `a_targeted_miss_falls_through_to_one_full_scan`,
+  `warm_set_keeps_the_sixteen_most_recently_matched_pids`,
+  `a_pid_whose_probe_finds_no_sockets_leaves_the_warm_set`; the bucket tests use two pids so the
+  second lookup is a warm miss.
 
 ### Task 3: macOS libproc FFI wrappers, layout pins, raw self-resolution
 
@@ -248,8 +259,16 @@ gates while a wave is in flight, full gate before the panel.
   - `non_macos_resolver_is_none` (`cfg(not(any(macos, linux)))`).
 - **Done when:** sandbox tests green; Terminal run quoted; `cargo test --offline -p aitm-peer-process`
   and clippy/fmt clean for the package.
-
-### Task 6: `aitm-core` — `PeerResolver`, builder step, `handle_conn` concurrency and budget
+- **Amendment 2026-11-01 (F2):** `MacScanner::find_owners_among` delegates to
+  `ffi::find_owners_among_raw(wanted, deadline, skip_pid, pids)`, the per-pid body of
+  `find_owners_raw` factored into `walk_pids`; a pid whose `socket_fds` is `None` is `gone`.
+  `LinuxScanner::find_owners_among` reads the tables as before and walks only the given
+  `/proc/<pid>` dirs (`walk_pids(.., report_gone = true)`). Tests: `ffi::tests::
+  a_targeted_probe_reports_unreadable_pids_gone` (sandbox: pid 1 EPERM and `i32::MAX` ESRCH are
+  `gone`), `ffi::tests::warm_probe_names_this_process_without_a_full_scan` (Terminal),
+  `linux::scan::tests::a_targeted_probe_walks_only_the_given_pids_and_reports_the_idle_ones`
+  (fixture). `NoScanner::find_owners_among` → `Probe::default()`. The e2e cell's step 4 becomes a
+  hard check that all 20 latency rows carry a python `source_app`. `aitm-core` — `PeerResolver`, builder step, `handle_conn` concurrency and budget
 
 - **Satisfies:** AC1, AC2, AC3, AC4, AC5
 - **Depends on:** none (parallel with Task 1)
