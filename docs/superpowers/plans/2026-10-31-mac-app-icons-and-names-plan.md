@@ -5,7 +5,9 @@
 (approved 2026-10-31, revision 2, amended 2026-11-01; acceptance criteria AI-AC1 … AI-AC24)
 **Branch / worktree:** `feat/mac-app-icons-and-names` in this worktree
 (`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), cut 2026-11-01 off `main 681dff57`
-(the traffic-route PR #265 merge; the original base was `main 8e19c2e3`)
+(the traffic-route PR #265 merge; the original base was `main 8e19c2e3`). **Kit half merged as PR #268 → `ce854397`.**
+**Wave C branch:** `feat/mac-app-icons-ui`, cut 2026-11-01 off `main c65ed0f2` (system-proxy PR 4 #269 merge, the gate for
+Tasks 5/6 per the orchestrator's ruling); Tasks 5, 6 and 8 ship from it as the second PR.
 (PR #196 `5eac2a50` is the last owner of `Shell/SidebarView.swift` and `Bus/BusService.swift`; PR #197
 `9776a0e6` moved `Session.swift`'s navigation enums out).
 **PR shape:** two PRs from this branch — the traffic-route plan
@@ -29,7 +31,10 @@ traffic-route plan's Tasks 2/2b and run only after them, never concurrently.
    the fixture-removal PR touched last).
 4. **The traffic-route PR is merged** (record its merge SHA here: **`681dff57`**, PR #265, 2026-11-01) and this branch's
    second PR is cut on top of it (`feat/mac-app-icons-and-names` off `681dff57`). Orchestrator ruling 2026-11-01: Tasks 5/6 also
-   wait for system-proxy PR 4 (it owns the `BusService` poll loop Task 6 enriches); the orchestrator says when it is in. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
+   wait for system-proxy PR 4 (it owns the `BusService` poll loop Task 6 enriches) — **merged as #269 `c65ed0f2`**; Wave C runs
+   in readiness order with the L4 parity mac unit (d) phase 2 (`Session.swift`, `Session+Verbs.swift`, `BusService.swift`) and
+   improve-loop S-081 (one `Session.swift` property, `Session+Verbs`, two `BusService` lines, `ScopePanel`), all additive; whoever
+   lands later re-merges. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
    have landed** — they share `Session.swift` (traffic-route: `systemProxy`, `decrypt`) and
    `Bus/BusService.swift` (traffic-route: one `decrypt` line; PR D's `refreshCAStatus()` is also in
    that file by then) — and never concurrently with them; whichever lands second rebases onto the
