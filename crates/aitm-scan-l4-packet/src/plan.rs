@@ -402,24 +402,27 @@ pub fn is_decodable(frame: &[u8]) -> bool {
 /// The field paths the profile asks for — the **only** place the lane reads
 /// the profile for field selection (plan call C1).
 ///
-/// T1b adds `L4Options.fields: Vec<String>`; task 13 flips this body to
-/// `profile.l4.fields.clone()` once `origin/main` carries it. Until then every
-/// job fuzzes the default table, because [`crate::fields::validate_fields`]
-/// reads an empty request as the defaults.
+/// The list is `L4Options.fields` verbatim (spec D2/D8.4): an empty list — the
+/// default — means the lane's own full default field table, because
+/// [`crate::fields::validate_fields`] reads an empty request as the defaults;
+/// a path the lane pins or does not know makes `Lane::discover` fail with
+/// `invalid_profile` before a point is minted.
 pub(crate) fn requested_fields(profile: &ScanProfile) -> Vec<String> {
-    let _ = profile;
-    Vec::new()
+    profile.l4.fields.clone()
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use aitm_proto_l4::backend::CaptureInjectBackend;
     use aitm_proto_l4::craft::{EtherSpec, Layer, PacketSpec};
     use aitm_proto_l4::sendrecv::ReplyMatch;
     use aitm_scan_model::profile::ScanProfile;
     use aitm_scan_model::vocab::L4Transport;
+    use aitm_scan_model::Lane;
 
     use super::{
         is_decodable, link_framing, parse_point_id, point_id, requested_fields, seed_spec,
@@ -427,6 +430,8 @@ mod tests {
         TargetPlan,
     };
     use crate::fields::{FieldPath, IpVersion, Ipv4Field, Ipv6Field};
+    use crate::lane::PacketLane;
+    use crate::testing::{l4_profile, loopback_guard, udp_target, MockBackend, MockReply, TestJob};
 
     const LOCAL_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     const LOCAL_V6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
@@ -455,9 +460,50 @@ mod tests {
         }
     }
 
+    /// Task 4a: the lane reads `L4Options.fields` and nothing else. An empty
+    /// list stays empty, so discovery still reads it as the default table.
     #[test]
-    fn requested_fields_shim_is_empty_until_integration() {
+    fn requested_fields_are_the_profiles_l4_fields() {
         assert!(requested_fields(&ScanProfile::default()).is_empty());
+
+        let mut profile = ScanProfile::default();
+        profile.l4.fields = vec!["raw".to_string(), "udp.src_port".to_string()];
+        assert_eq!(
+            requested_fields(&profile),
+            vec!["raw".to_string(), "udp.src_port".to_string()]
+        );
+    }
+
+    /// The profile's list reaches `Lane::discover`: `fields: ["raw"]` mints the
+    /// one `raw` point (the e2e cell's 105 frames ride on this), and a pinned
+    /// path the lane refuses is `invalid_profile` before any point exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discover_honours_the_profiles_fields_list() {
+        let backend: Arc<dyn CaptureInjectBackend> = MockBackend::new(MockReply::Echo);
+        let lane = PacketLane::with_backend(loopback_guard("*", 1000), None, Arc::clone(&backend))
+            .with_timing(crate::testing::harness::fast_timing());
+
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = vec!["raw".to_string()];
+        let job = TestJob::new(profile.clone());
+        let discovery = lane
+            .discover(&profile.target, job.as_ref())
+            .await
+            .expect("raw is fuzzable");
+        assert_eq!(discovery.points.len(), 1);
+        assert_eq!(discovery.points[0].id, "l4:127.0.0.1:9/udp/raw");
+
+        let mut pinned = l4_profile(vec![udp_target(9)], 10);
+        pinned.l4.fields = vec!["ipv4.src".to_string()];
+        let pinned_job = TestJob::new(pinned.clone());
+        let err = lane
+            .discover(&pinned.target, pinned_job.as_ref())
+            .await
+            .expect_err("a pinned field is refused");
+        assert!(
+            err.to_string().starts_with("invalid_profile:"),
+            "D3 code first: {err}"
+        );
     }
 
     #[test]

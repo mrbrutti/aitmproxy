@@ -34,8 +34,8 @@ use aitm_proto_l4::types::{
     RateCap,
 };
 use aitm_scan_model::{
-    JobCtx, L4Options, L4Seed, L4TargetSpec, L4Transport, LaneKind, ProfileTarget, ScanProfile,
-    SessionMaterial,
+    JobCtx, L4Counters, L4Options, L4Seed, L4TargetSpec, L4Transport, LaneKind, ProfileTarget,
+    ScanProfile, SessionMaterial,
 };
 use futures::future::BoxFuture;
 
@@ -590,6 +590,7 @@ pub struct TestJob {
     charged: AtomicU32,
     deadline: Mutex<Instant>,
     cancelled: AtomicBool,
+    l4_reports: Mutex<Vec<L4Counters>>,
 }
 
 impl fmt::Debug for TestJob {
@@ -619,6 +620,7 @@ impl TestJob {
             charged: AtomicU32::new(0),
             deadline: Mutex::new(Instant::now() + Duration::from_secs(60)),
             cancelled: AtomicBool::new(false),
+            l4_reports: Mutex::new(Vec::new()),
         })
     }
 
@@ -656,6 +658,19 @@ impl TestJob {
     #[must_use]
     pub fn charged(&self) -> u32 {
         self.charged.load(Ordering::SeqCst)
+    }
+
+    /// Every [`L4Counters`] the lane reported through `JobCtx::report_l4`, in
+    /// the order they arrived.
+    #[must_use]
+    pub fn l4_reports(&self) -> Vec<L4Counters> {
+        lock(&self.l4_reports).clone()
+    }
+
+    /// The last counters the lane reported, or `None` when it reported none.
+    #[must_use]
+    pub fn reported_l4(&self) -> Option<L4Counters> {
+        lock(&self.l4_reports).last().copied()
     }
 
     /// Cancel the job, as the engine does when the operator stops a scan.
@@ -734,6 +749,12 @@ impl JobCtx for TestJob {
             .cloned()
             .unwrap_or_else(|| "aitm7f3a".to_string())
     }
+
+    /// Record the counters the lane reports, where the engine's worker folds
+    /// them into `JobStatus.l4`, so a test can assert what the lane reported.
+    fn report_l4(&self, counters: L4Counters) {
+        lock(&self.l4_reports).push(counters);
+    }
 }
 
 /// A UDP target on `127.0.0.1:port`, no grammar (the packet lane never reads
@@ -791,8 +812,8 @@ pub fn with_hex_seed(mut profile: ScanProfile, hex: &str) -> ScanProfile {
     profile
 }
 
-/// The `requested` field list the lane's discovery takes, while
-/// `plan::requested_fields` still returns an empty list (plan call C1).
+/// A `requested` field list for a test that calls the lane's discovery
+/// directly, rather than through a profile's `L4Options.fields` (plan call C1).
 #[must_use]
 pub fn fields(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()

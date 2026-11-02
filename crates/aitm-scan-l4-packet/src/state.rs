@@ -741,12 +741,14 @@ impl LaneState {
 /// Hand the job's L4 counters back to the engine — the **only** place the lane
 /// reports them (plan call C1b).
 ///
-/// T1b adds a default-bodied `JobCtx::report_l4(&self, counters: L4Counters)`;
-/// Task 13 flips this body to `job.report_l4(counters)` once `origin/main`
-/// carries it. Until then the lane's counters still reach the operator through
-/// `PacketLane::counters(job_id)`, which stays either way.
+/// `JobCtx::report_l4` carries them; the engine folds each report into
+/// `JobStatus.l4` by per-field maximum, so a lane that re-tallies never walks
+/// `scan.status` backwards. A context that tracks no L4 counters ignores the
+/// report, and the operator still reads them from
+/// [`LaneState::counters`](LaneState::counters) through
+/// `PacketLane::counters(job_id)`.
 pub(crate) fn report_counters(job: &dyn JobCtx, counters: L4Counters) {
-    let _ = (job, counters);
+    job.report_l4(counters);
 }
 
 #[cfg(test)]
@@ -1202,10 +1204,29 @@ mod tests {
         assert!(state.run("scan-nope", "p0").is_none());
     }
 
+    /// Task 4a: the counters reach the engine through `JobCtx::report_l4`,
+    /// once per call and unchanged, and reporting costs no budget.
     #[test]
-    fn report_counters_shim_is_a_no_op() {
+    fn report_counters_forwards_to_the_job() {
         let job = TestJob::new(ScanProfile::default());
-        report_counters(&*job, L4Counters::default());
+        let counters = L4Counters {
+            cases: 7,
+            crashes: 1,
+            liveness_failures: 2,
+            retired_elements: 1,
+        };
+        report_counters(&*job, counters);
+
+        assert_eq!(job.l4_reports(), vec![counters]);
+        assert_eq!(
+            job.reported_l4(),
+            Some(L4Counters {
+                cases: 7,
+                crashes: 1,
+                liveness_failures: 2,
+                retired_elements: 1,
+            })
+        );
         assert_eq!(job.charged(), 0);
     }
 
