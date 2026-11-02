@@ -71,12 +71,17 @@ check_verbs_gated() {
 # shows `l4.scope.add` confirmable (spec §3 last rule, AC30, task M7) AND the bus session
 # resolved as the operator (plan amendment 7: `tools/list` says confirmable to an agent too,
 # and an agent's add can only be refused, AC33). Any mention of the add verb in
-# ScopePanel.swift must sit beside both the `l4CanAddScope` gate and a `resolvedRole` read,
-# and the page offers no remove action at all (Decision 6).
+# ScopePanel.swift must sit beside the `l4CanAddScope` gate, the role read `session.isOperator`
+# (fix A2: `Session.isOperator` wraps the `resolvedRole` the server echoed; the word
+# `resolvedRole` itself now appears here only in a doc comment, so it is not what we pin), AND
+# the gate expression itself, `if l4IsOperator` (tester finding F1: a role read that is merely
+# defined, while the form renders unconditionally, must not pass). The page offers no remove
+# action at all (Decision 6).
 check_scope_add_gated() {
     local f=Sources/Aitmproxy/Panels/ScopePanel.swift
     [ -f "$f" ] || { fail scope-add-gated "$f"; return; }
-    if grep -q 'l4\.scope\.add' "$f" && { ! grep -q 'l4CanAddScope' "$f" || ! grep -q 'resolvedRole' "$f"; }; then
+    if grep -q 'l4\.scope\.add' "$f" \
+        && { ! grep -q 'l4CanAddScope' "$f" || ! grep -q 'session\.isOperator' "$f" || ! grep -q 'if l4IsOperator' "$f"; }; then
         fail scope-add-gated "$f"
         return
     fi
