@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>aitmproxy — Scan › Jobs (committed)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* tokens: docs/design/tokens.json dark values; depth from the foundation's floating shadow */
+:root{
+  --page:#161618; --surface:#1E1E20; --raised:#2C2C2F; --card:#232326; --active:#2B3344; --hover:#2A2A2C;
+  --border:#2E2E31; --rule:#303033; --control:#45454A;
+  --text:#E6E6E8; --muted:#B4B4B8; --faint:#8E8E93;
+  --accent:#60A5FA; --accent-deep:#3B82F6; --accent-tint:#1E2A44;
+  --intercept:#F5A524; --intercept-tint:#3A2E12; --agent:#2DD4BF; --agent-tint:#113A36;
+  --success:#86EFAC; --success-tint:#14322A; --danger:#FCA5A5; --danger-tint:#3B1C1C; --neutral:#B4B4B8; --neutral-tint:#2A2A2D;
+  --sev-critical:#FCA5A5; --sev-high:#F87171; --sev-medium:#FCD34D; --sev-low:#93C5FD; --sev-info:#B4B4B8;
+  --primary:#E6E6E8; --primary-ink:#161618;
+  --font:"Inter",system-ui,sans-serif; --mono:"JetBrains Mono",ui-monospace,monospace;
+  --shadow-float:0 12px 32px rgba(0,0,0,.42), 0 1px 0 rgba(255,255,255,.04) inset;
+  --shadow-rest:0 4px 14px rgba(0,0,0,.28);
+  --ease-out:cubic-bezier(.23,1,.32,1); --ease-in-out:cubic-bezier(.77,0,.175,1);
+  --t-counter:150ms; --t-progress:250ms; --t-state:160ms; --t-card:220ms; --t-hover:100ms; --t-press:120ms;
+}
+*{box-sizing:border-box;margin:0}
+html,body{min-height:900px}
+body{background:var(--page);color:var(--text);font:13px/20px var(--font);-webkit-font-smoothing:antialiased}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.app{display:grid;grid-template-columns:240px 1fr;min-height:900px}
+.side{border-right:1px solid var(--border);padding:16px 16px 20px}
+.mark{display:flex;align-items:center;gap:8px;font-weight:500;font-size:14px;height:28px}
+.side h2{font-size:12px;font-weight:400;color:var(--faint);margin:24px 0 6px}
+.side a{display:flex;justify-content:space-between;align-items:center;height:28px;padding:0 8px;border-radius:6px;color:var(--text);text-decoration:none;transition:background var(--t-hover)}
+.side a:hover{background:var(--hover)}
+.side a span:last-child{color:var(--faint);font-size:12px}
+.side a.on{background:var(--active)}
+.canvas{background:var(--surface);min-width:0}
+.bar{height:44px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;border-bottom:1px solid var(--border)}
+.bar .dot{width:6px;height:6px;border-radius:50%;background:#4ADE80;display:inline-block;margin-right:8px}
+.page{padding:20px 24px 32px}
+.tabs{display:flex;gap:24px;border-bottom:1px solid var(--border);height:36px;margin-bottom:20px}
+.tabs a{color:var(--muted);text-decoration:none;line-height:35px;position:relative;transition:color var(--t-hover)}
+.tabs a.on{color:var(--text)} .tabs a:hover{color:var(--text)}
+.tabs a.on::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--accent);border-radius:1px}
+/* the job card: raised, real depth; its parts enter once, staggered */
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-float);padding:20px 24px 22px;margin-bottom:20px;position:relative;overflow:hidden}
+.card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);transition:background var(--t-state)}
+.card.state-done::before{background:var(--success)} .card.state-cancelling::before{background:var(--intercept)} .card.state-failed::before{background:var(--danger)}
+.enter{opacity:0;transform:translateY(8px);animation:enter var(--t-card) var(--ease-out) forwards}
+.enter.d1{animation-delay:60ms}.enter.d2{animation-delay:120ms}.enter.d3{animation-delay:180ms}.enter.d4{animation-delay:240ms}
+@keyframes enter{to{opacity:1;transform:none}}
+.titlerow{display:flex;align-items:flex-start;justify-content:space-between}
+h1{font-size:24px;line-height:32px;font-weight:600;letter-spacing:-.01em;display:flex;align-items:center;gap:12px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:999px;font:500 12px/22px var(--font);transition:background var(--t-state),color var(--t-state)}
+.chip.running{background:var(--accent-tint);color:var(--accent)} .chip.done{background:var(--success-tint);color:var(--success)} .chip.cancelling{background:var(--intercept-tint);color:var(--intercept)} .chip.cancelled{background:var(--neutral-tint);color:var(--neutral)} .chip.failed{background:var(--danger-tint);color:var(--danger)}
+.chip i{width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block}
+.chip.running i,.chip.cancelling i{animation:breathe 1200ms cubic-bezier(.42,0,.58,1) infinite alternate}
+@keyframes breathe{from{opacity:1}to{opacity:.4}}
+.finding{color:var(--muted);font-size:14px;line-height:22px;margin-top:6px}
+.finding .num{color:var(--text)} .finding .agent{color:var(--agent)}
+.actions{display:flex;gap:8px;align-items:center;padding-top:2px}
+.btn{height:32px;padding:0 14px;border-radius:6px;border:1px solid var(--control);background:transparent;color:var(--text);font:500 13px var(--font);cursor:pointer;transition:transform var(--t-press) var(--ease-out),background var(--t-hover),box-shadow var(--t-hover)}
+.btn:hover{background:var(--hover)} .btn:active{transform:scale(.97)}
+.btn.primary{background:var(--primary);color:var(--primary-ink);border-color:var(--primary);box-shadow:var(--shadow-rest)}
+.btn.primary:hover{background:#fff}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+/* the scan lane */
+.lane{margin:22px 0 0}
+.track{position:relative;height:64px;background:var(--raised);border-radius:8px;overflow:visible;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+.seg{position:absolute;top:0;bottom:0;transition:width var(--t-progress) var(--ease-out),left var(--t-progress) var(--ease-out)}
+.seg.crawl{background:var(--accent-deep);border-radius:8px 0 0 8px}
+.seg.audit{background:var(--accent)}
+.seg .lbl{position:absolute;top:10px;left:12px;font-size:12px;line-height:16px;color:var(--primary-ink);font-weight:500;white-space:nowrap}
+.seg .sub{position:absolute;bottom:10px;left:12px;font-size:12px;color:var(--primary-ink);opacity:.75;white-space:nowrap}
+.rest{position:absolute;right:12px;top:10px;font-size:12px;color:var(--faint)}
+.rest .big{display:block;font-size:14px;color:var(--muted);margin-top:14px}
+.now{position:absolute;top:-10px;bottom:-10px;width:2px;background:var(--text);border-radius:1px;transition:left var(--t-progress) var(--ease-out);box-shadow:0 0 0 3px rgba(230,230,232,.12)}
+.now::after{content:"";position:absolute;left:-4px;top:-4px;width:10px;height:10px;background:var(--text);border-radius:50%;animation:breathe 1200ms cubic-bezier(.42,0,.58,1) infinite alternate}
+.nowtag{position:absolute;top:76px;transform:translateX(-50%);white-space:nowrap;color:var(--muted);font-size:12px;transition:left var(--t-progress) var(--ease-out)}
+.nowtag .num{color:var(--text)}
+.scale{display:flex;justify-content:space-between;color:var(--faint);font-size:12px;margin-top:40px}
+.ledger{display:flex;align-items:center;gap:16px;margin-top:14px;min-height:20px}
+.group{display:flex;gap:3px;align-items:center}
+.group i{display:block;width:8px;height:16px;border-radius:2px;animation:rise var(--t-card) var(--ease-out) both}
+.group span{font-size:12px;margin-left:6px;font-weight:500}
+@keyframes rise{from{opacity:0;transform:translateY(3px) scaleY(.6)}to{opacity:1;transform:none}}
+.budget{display:flex;align-items:center;gap:12px;color:var(--muted);font-size:12px;margin-top:14px}
+.gauge{flex:1;height:3px;background:var(--raised);border-radius:2px;position:relative;overflow:hidden}
+.gauge i{position:absolute;left:0;top:0;bottom:0;background:var(--faint);border-radius:2px;transition:width var(--t-progress) var(--ease-out),background var(--t-state)}
+.gauge.warn i{background:var(--intercept)}
+/* kpi strip inside the card */
+.kpis{display:grid;grid-template-columns:repeat(5,1fr);border:1px solid var(--border);border-radius:8px;margin-top:20px;background:var(--surface)}
+.kpis div{padding:14px 16px;border-left:1px solid var(--border);transition:background var(--t-hover)}
+.kpis div:hover{background:var(--hover)}
+.kpis div:first-child{border-left:0}
+.kpis .l{display:block;color:var(--muted);font-size:13px;margin-bottom:4px}
+.kpis .v{font-size:28px;line-height:32px;font-weight:400;display:inline-flex;align-items:baseline}
+.kpis .v small{font-size:13px;color:var(--muted);margin-left:8px;font-family:var(--font)}
+.kpis .v.lead{color:var(--accent)}
+.kpis .sev{font-size:13px;margin-left:8px}
+.tick{display:inline-block;transition:transform var(--t-counter) var(--ease-out),opacity var(--t-counter) var(--ease-out)}
+.tick.changing{transform:translateY(-3px);opacity:.35}
+.sev-low{color:var(--sev-low)} .sev-high{color:var(--sev-high)} .sev-medium{color:var(--sev-medium)} .sev-critical{color:var(--sev-critical)}
+/* table */
+.tablewrap{margin-bottom:28px}
+table{width:100%;border-collapse:collapse}
+th{font-weight:400;color:var(--faint);font-size:12px;text-align:left;height:32px;padding:0 10px;white-space:nowrap}
+td{height:46px;padding:0 10px;border-top:1px solid var(--rule);white-space:nowrap;transition:background var(--t-hover)}
+tr:hover td{background:var(--hover)}
+th.r,td.r{text-align:right}
+tr.sel td{background:var(--active)}
+tr.sel td:first-child{box-shadow:inset 3px 0 0 var(--accent);padding-left:12px}
+th:last-child,td:last-child{width:84px;padding-right:0}
+td .sub{display:block;color:var(--muted);font-size:12px;line-height:16px}
+.ring{display:inline-block;vertical-align:middle;margin-right:10px}
+.ring .arc{transition:stroke-dashoffset var(--t-progress) var(--ease-out)}
+.who{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--agent);margin-right:8px;vertical-align:middle;box-shadow:0 0 0 3px var(--agent-tint)}
+.pend{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--intercept);margin-right:8px;vertical-align:middle;animation:breathe 1200ms cubic-bezier(.42,0,.58,1) infinite alternate}
+.ok{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--success);margin-right:8px;vertical-align:middle}
+.cancel{color:var(--muted);text-decoration:none;opacity:0;transition:opacity var(--t-hover)}
+tr:hover .cancel,tr.sel .cancel{opacity:1}
+.wells{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.well{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 20px;box-shadow:var(--shadow-rest)}
+.well h3{font-size:14px;font-weight:500;margin-bottom:6px;display:flex;justify-content:space-between}
+.well h3 span{color:var(--faint);font-weight:400;font-size:12px}
+.kv{display:flex;justify-content:space-between;height:28px;align-items:center;border-top:1px solid var(--rule)}
+.kv span:first-child{color:var(--muted)} .kv .num{color:var(--text)}
+@media (prefers-reduced-motion:reduce){*{transition-duration:0ms!important;animation-duration:0ms!important}.enter{opacity:1;transform:none}}
+@media (max-width:900px){.app{grid-template-columns:1fr}.side{display:none}.kpis{grid-template-columns:repeat(2,1fr)}.kpis div{border-left:0;border-top:1px solid var(--border)}.wells{grid-template-columns:1fr}.titlerow{flex-direction:column;gap:12px}.nowtag{position:static;transform:none;margin-top:8px}.scale{margin-top:8px}.tablewrap{overflow-x:auto}}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="side" aria-label="Pages">
+    <div class="mark"><svg width="20" height="14" viewBox="0 0 20 14" aria-hidden="true"><path d="M1 1l5 6-5 6M19 1l-5 6 5 6" fill="none" stroke="#60A5FA" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="10" cy="7" r="2" fill="#60A5FA"/></svg> aitmproxy</div>
+    <h2>Traffic</h2>
+    <a href="#"><span>Flows</span><span class="num">146</span></a>
+    <a href="#"><span>Apps</span><span class="num">1</span></a>
+    <a href="#"><span>Domains</span><span class="num">4</span></a>
+    <a href="#"><span>Connection Log</span><span></span></a>
+    <a href="#"><span>Overview</span><span></span></a>
+    <h2>Testing</h2>
+    <a href="#"><span>Scope</span><span class="num">5</span></a>
+    <a href="#" class="on"><span>Scan</span><span></span></a>
+    <a href="#"><span>Findings</span><span></span></a>
+    <a href="#"><span>Browser</span><span class="num">0 tabs</span></a>
+    <h2>Automation</h2>
+    <a href="#"><span>Scripts</span><span>0 active</span></a>
+    <a href="#"><span>Agent</span><span class="num">0/min</span></a>
+  </nav>
+  <main class="canvas">
+    <div class="bar"><span class="dot" aria-hidden="true"></span><span class="num">aitmproxy · 127.0.0.1:49396</span></div>
+    <div class="page">
+      <nav class="tabs" aria-label="Scan">
+        <a href="#">Profiles</a><a href="#" class="on" aria-current="page">Jobs <span class="num">5</span></a><a href="#">Site map</a><a href="#">Issues</a>
+      </nav>
+
+      <section class="card state-running" id="card" aria-label="Selected job">
+        <div class="titlerow enter">
+          <div>
+            <h1><span class="chip running" id="chip"><i></i><span id="stateword">Auditing</span></span> <span class="num">127.0.0.1:8117</span></h1>
+            <p class="finding"><span class="num" id="fIssues">4</span><span id="fIssuesTail"> low issues so far</span> · <span class="num" id="fNow">xss-reflected</span> and 3 more checks running now · standard · started 11:32 by <span class="agent">the agent</span></p>
+          </div>
+          <div class="actions">
+            <button class="btn">Show Site Map</button>
+            <button class="btn">Show Issues</button>
+            <button class="btn primary" id="cancel">Cancel Scan</button>
+          </div>
+        </div>
+
+        <div class="lane enter d1" aria-label="Progress of the selected job">
+          <div class="track">
+            <div class="seg crawl" style="width:7%"><span class="lbl">crawl</span><span class="sub num">46 pages</span></div>
+            <div class="seg audit" id="audit" style="left:7%;width:43%"><span class="lbl">audit</span><span class="sub"><span class="num" id="laneDone">3,236</span> checks done</span></div>
+            <div class="rest"><span class="num" id="laneLeft">3,232</span> checks to go</div>
+            <div class="now" id="now" style="left:50%"></div>
+            <div class="nowtag" id="nowtag" style="left:50%">now · <span class="num" id="nowId">xss-reflected</span> and 3 more</div>
+          </div>
+          <div class="scale"><span>started <span class="num">11:32</span></span><span>elapsed <span class="num" id="elapsed">1:04</span></span><span>at this pace, about <span class="num" id="eta">1:05</span> to go</span></div>
+          <div class="ledger" aria-label="4 issues: 4 low">
+            <div class="group"><i style="background:var(--sev-low)"></i><i style="background:var(--sev-low);animation-delay:60ms"></i><i style="background:var(--sev-low);animation-delay:120ms"></i><i style="background:var(--sev-low);animation-delay:180ms"></i><span class="sev-low">4 low</span></div>
+            <div class="group" id="newhigh" hidden><i style="background:var(--sev-high)"></i><span class="sev-high">1 high</span></div>
+          </div>
+          <div class="budget"><span>probe budget</span><div class="gauge" id="gauge"><i id="gaugeFill" style="width:14.35%"></i></div><span class="num" id="budgetText">287 of 2,000</span></div>
+        </div>
+
+        <div class="kpis enter d2" role="list">
+          <div role="listitem"><span class="l">Progress</span><span class="v num lead"><span class="tick" id="kPct">50 %</span></span></div>
+          <div role="listitem"><span class="l">Checks</span><span class="v num"><span class="tick" id="kDone">3,236</span><small>of 6,468</small></span></div>
+          <div role="listitem"><span class="l">Probes</span><span class="v num"><span class="tick" id="kProbes">287</span><small>of 2,000</small></span></div>
+          <div role="listitem"><span class="l">Points audited</span><span class="v num"><span class="tick" id="kPoints">97</span><small>of 1,020</small></span></div>
+          <div role="listitem"><span class="l">Issues</span><span class="v num"><span class="tick" id="kIssues">4</span><span class="sev sev-low" id="kSev">4 low</span></span></div>
+        </div>
+      </section>
+
+      <div class="tablewrap enter d3"><table aria-label="Jobs">
+        <thead><tr><th>State</th><th>Profile</th><th>Target</th><th>Progress</th><th class="r">Probes</th><th class="r">Points</th><th class="r">Issues</th><th class="r">Elapsed</th><th></th></tr></thead>
+        <tbody>
+          <tr><td><svg class="ring" width="18" height="18" viewBox="0 0 18 18"><circle cx="9" cy="9" r="7" fill="none" stroke="#45454A" stroke-width="2.5"/><circle class="arc" cx="9" cy="9" r="7" fill="none" stroke="#60A5FA" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="44" stroke-dashoffset="36" transform="rotate(-90 9 9)"/></svg>Crawling</td><td>thorough</td><td class="num">127.0.0.1:8119</td><td class="num">46 pages, 12 queued</td><td class="r num">11 <span style="color:var(--muted)">of 2,000</span></td><td class="r num">0 of 0</td><td class="r">no issues yet</td><td class="r num">0:05</td><td class="r"><a class="cancel" href="#">Cancel</a></td></tr>
+          <tr class="sel"><td><svg class="ring" width="18" height="18" viewBox="0 0 18 18"><circle cx="9" cy="9" r="7" fill="none" stroke="#45454A" stroke-width="2.5"/><circle class="arc" id="rowRing" cx="9" cy="9" r="7" fill="none" stroke="#60A5FA" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="44" stroke-dashoffset="22" transform="rotate(-90 9 9)"/></svg><span class="who" title="started by the agent"></span>Auditing</td><td>standard</td><td class="num">127.0.0.1:8117</td><td class="num"><span id="rowPct">50 %</span> · <span id="rowDone">3,236</span> of 6,468</td><td class="r num"><span id="rowProbes">287</span> <span style="color:var(--muted)">of 2,000</span></td><td class="r num">97 of 1,020</td><td class="r"><span class="sev-low num" id="rowSev">4 low</span></td><td class="r num" id="rowElapsed">1:04</td><td class="r"><a class="cancel" href="#">Cancel</a></td></tr>
+          <tr><td><span class="ok"></span>Done<span class="sub">Stopped early: too many errors</span></td><td>standard</td><td class="num">127.0.0.1:8121</td><td class="num">49 of 135</td><td class="r num">1 <span style="color:var(--muted)">of 2,000</span></td><td class="r num">0 of 14</td><td class="r">no issues</td><td class="r num">0:30</td><td></td></tr>
+          <tr><td><span class="pend" title="cancelling"></span>Cancelling</td><td>standard</td><td class="num">127.0.0.1:8117</td><td class="num">0 of 0</td><td class="r num">46 <span style="color:var(--muted)">of 2,000</span></td><td class="r num">0 of 0</td><td class="r">no issues</td><td class="r num">0:21</td><td></td></tr>
+          <tr><td><span class="ok"></span>Done</td><td>light-http</td><td class="num">127.0.0.1:8120</td><td class="num">171 of 171</td><td class="r num">143 <span style="color:var(--muted)">of 2,000</span></td><td class="r num">36 of 36</td><td class="r"><span class="sev-high num">1 high</span>, <span class="sev-low num">2 low</span></td><td class="r num">1:35</td><td></td></tr>
+        </tbody>
+      </table></div>
+
+      <div class="wells enter d4">
+        <section class="well" aria-label="Crawl and points">
+          <h3>Crawl and points <span>what the job found to test</span></h3>
+          <div class="kv"><span>Pages fetched</span><span class="num">46</span></div>
+          <div class="kv"><span>Forms submitted</span><span class="num">5</span></div>
+          <div class="kv"><span>Points found</span><span class="num">1,020</span></div>
+          <div class="kv"><span>Skipped as repetitive</span><span class="num">722</span></div>
+          <div class="kv"><span>Lanes</span><span>HTTP, WebSocket</span></div>
+        </section>
+        <section class="well" aria-label="Issues">
+          <h3>Issues <span>by severity and confidence</span></h3>
+          <div class="kv"><span>Critical · High · Medium</span><span class="num">0 · 0 · 0</span></div>
+          <div class="kv"><span>Low</span><span class="num sev-low">4</span></div>
+          <div class="kv"><span>Info</span><span class="num">0</span></div>
+          <div class="kv"><span>Certain · Firm · Tentative</span><span class="num">1 · 2 · 1</span></div>
+          <div class="kv"><span>Probe errors · timeouts · rate waits</span><span class="num">0 · 0 · 0</span></div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+// Motion demo driven by the counters the bus returns (≈48 checks and 2 probes per second, as the live
+// engine ran today). Nothing here invents a number; the end state swaps the card the way PR 2 will.
+(function(){
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const total = 6468, probesBudget = 2000, crawlShare = 0.07;
+  let done = 3236, probes = 287, elapsed = 64, tick = 0, ended = false;
+  const checks = ['xss-reflected','header-reflection','open-redirect','crlf','sqli-error','path-traversal'];
+  const fmt = n => n.toLocaleString('en-US');
+  const mmss = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+  const el = id => document.getElementById(id);
+  function setTick(id, text){ const e = el(id); if (e.textContent === text) return; e.classList.add('changing'); setTimeout(()=>{ e.textContent = text; e.classList.remove('changing'); }, 150); }
+  const timer = setInterval(()=>{
+    if (ended) return;
+    tick++; done = Math.min(total, done + 48 + (tick % 3)); probes += 2; elapsed += 1;
+    const frac = done/total, pct = Math.floor(frac*100);
+    el('audit').style.width = `${(frac*(1-crawlShare))*100}%`;
+    el('now').style.left = el('nowtag').style.left = `${(crawlShare + frac*(1-crawlShare))*100}%`;
+    el('laneDone').textContent = fmt(done); el('laneLeft').textContent = fmt(total-done);
+    setTick('kPct', `${pct} %`); setTick('kDone', fmt(done)); setTick('kProbes', fmt(probes));
+    el('rowPct').textContent = `${pct} %`; el('rowDone').textContent = fmt(done); el('rowProbes').textContent = fmt(probes);
+    el('rowElapsed').textContent = el('elapsed').textContent = mmss(elapsed);
+    el('eta').textContent = mmss(Math.round((total-done)/48));
+    el('rowRing').setAttribute('stroke-dashoffset', (44*(1-frac)).toFixed(1));
+    el('gaugeFill').style.width = `${probes/probesBudget*100}%`; el('budgetText').textContent = `${fmt(probes)} of 2,000`;
+    if (probes/probesBudget > 0.8) el('gauge').classList.add('warn');
+    if (tick % 4 === 0) el('nowId').textContent = el('fNow').textContent = checks[(tick/4) % checks.length];
+    if (tick === 6) { el('newhigh').hidden = false; setTick('kIssues','5'); el('kSev').textContent = '1 high, 4 low'; el('kSev').className = 'sev sev-high'; el('rowSev').textContent = '1 high, 4 low'; el('rowSev').className = 'sev-high num'; el('fIssues').textContent = '5'; el('fIssuesTail').textContent = ' issues so far (1 high)'; }
+    if (done >= total) {
+      ended = true;
+      el('card').className = 'card state-done'; el('chip').className = 'chip done'; el('stateword').textContent = 'Done';
+      el('nowtag').textContent = `done in ${mmss(elapsed)} · 1,020 points · 6,468 checks`; el('now').style.opacity = 0;
+      const b = el('cancel'); b.textContent = 'Scan Again';
+    }
+  }, 1000);
+})();
+</script>
+</body>
+</html>
