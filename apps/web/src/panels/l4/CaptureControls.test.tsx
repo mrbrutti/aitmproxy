@@ -229,6 +229,32 @@ describe('CaptureControls: scope list and the gated add form (AC22, AC39; spec Â
   });
 });
 
+describe('CaptureControls: dialog dismissed while the confirm is in flight (fix 3)', () => {
+  it('a late refusal after the operator dismissed the dialog does not re-open it from the stale snapshot', async () => {
+    const { r, byId, handlers } = mount('operator', { tools: CONFIRMABLE });
+    handlers.onAddScope.mockResolvedValueOnce({ kind: 'confirm', prompt: 'P', token: 'T' });
+    let answer!: (o: GuardedOutcome) => void;
+    handlers.onConfirmAddScope.mockImplementationOnce(() => new Promise<GuardedOutcome>((res) => (answer = res)));
+    fireEvent.submit(byId('l4-scope-add-form')!);
+    const dialog = await waitFor(() => {
+      const d = r.container.querySelector('[role="alertdialog"]');
+      if (!d) throw new Error('no dialog yet');
+      return d;
+    });
+    fireEvent.click([...dialog.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === 'Send to wire')!);
+    await waitFor(() => expect(handlers.onConfirmAddScope).toHaveBeenCalledTimes(1));
+    // The core has not answered; the operator dismisses the dialog (the backdrop click cancels).
+    fireEvent.click(r.container.querySelector('[role="presentation"]')!);
+    await waitFor(() => expect(r.container.querySelector('[role="alertdialog"]')).toBeNull());
+    answer({ kind: 'refused', message: 'late refusal from the core' });
+    await new Promise((res) => setTimeout(res, 10));
+    expect(r.container.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(r.container.textContent).not.toContain('late refusal from the core');
+    // The form is usable again (no pending handshake left behind).
+    expect((byId('l4-scope-add') as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
 describe('CaptureControls: agent role (D12, AC24)', () => {
   it('on an agent connection Start is disabled "operator only" even when capture is available, and a forced click sends nothing', () => {
     const { start, byId, handlers } = mount('agent', { capture: AVAILABLE });

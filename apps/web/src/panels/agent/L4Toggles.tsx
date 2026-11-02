@@ -5,7 +5,8 @@
 // (config + restart). An agent can never flip its own gate — the core refuses `l4.agent.set` from
 // an MCP caller; this panel is the operator's control. Role (parity spec §7(c) D12, AC24): on a
 // connection that is not the operator's (`useApp().bus.role()` is `agent` or unknown) every switch
-// renders disabled with `OPERATOR_ONLY_REASON` and its handler returns before `onSet`.
+// renders disabled with `OPERATOR_ONLY_REASON` and its handler returns before `onSet`. The panel
+// requires `AppProvider` (like the other gated L4 controls): there is no provider-less mount path.
 import { For, Show, type Component } from 'solid-js';
 import { useApp } from '~/state/context';
 import { AGENT_CAPS, AGENT_CAP_LABEL, operatorOnlyReason, type AgentCap, type AgentGates } from '~/panels/l4/model';
@@ -19,24 +20,10 @@ export interface L4TogglesProps {
   onSet: (capability: AgentCap, allowed: boolean) => void;
 }
 
-/**
- * The connection's role accessor, or `null` when this panel is mounted bare — outside `AppProvider`
- * there is no bus connection at all (a unit mount of the switches), so there is nothing to gate and
- * nothing a switch could send. The app always mounts the agent panel under the provider.
- */
-function connectionRole(): (() => 'operator' | 'agent' | null) | null {
-  try {
-    const bus = useApp().bus;
-    return () => bus.role();
-  } catch {
-    return null;
-  }
-}
-
 export const L4Toggles: Component<L4TogglesProps> = (props) => {
-  const role = connectionRole();
-  /** The D12 gate: `null` on an operator connection (or a bare mount), else the reason every switch shows. */
-  const operatorOnly = () => (role ? operatorOnlyReason(role()) : null);
+  const bus = useApp().bus;
+  /** The D12 gate: `null` on an operator connection, else the reason every switch shows. */
+  const operatorOnly = () => operatorOnlyReason(bus.role());
 
   function set(cap: AgentCap, allowed: boolean): void {
     if (operatorOnly() !== null) return; // D12: an agent connection sends nothing

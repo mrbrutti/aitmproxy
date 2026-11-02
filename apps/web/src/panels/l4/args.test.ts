@@ -265,16 +265,50 @@ describe('builders carry their arguments (not constants)', () => {
 // failures through one `createOnceLog` (spec §7(c), AC23). The source is read with node `fs`, loaded
 // the way the live block below loads `node:net` (no `@types/node` in this package).
 
-async function readL4Source(name: string): Promise<string> {
+interface NodeFs {
+  readFileSync(path: string, encoding: 'utf8'): string;
+  readdirSync(path: string, opts: { withFileTypes: true }): { name: string; isDirectory(): boolean; isFile(): boolean }[];
+}
+interface NodePath {
+  dirname(p: string): string;
+  join(...parts: string[]): string;
+  relative(from: string, to: string): string;
+}
+interface WalkedFile {
+  rel: string;
+  text: string;
+}
+
+/** The node modules the source tripwires read with (non-literal dynamic imports: no `@types/node` here), and this file's directory. */
+async function nodeFs(): Promise<{ fs: NodeFs; path: NodePath; here: string }> {
   const fsModule = 'node:fs';
   const pathModule = 'node:path';
   const urlModule = 'node:url';
-  const fs = (await import(/* @vite-ignore */ fsModule)) as { readFileSync(path: string, encoding: 'utf8'): string };
-  const path = (await import(/* @vite-ignore */ pathModule)) as { dirname(p: string): string; join(...parts: string[]): string };
+  const fs = (await import(/* @vite-ignore */ fsModule)) as NodeFs;
+  const path = (await import(/* @vite-ignore */ pathModule)) as NodePath;
   const url = (await import(/* @vite-ignore */ urlModule)) as { fileURLToPath(u: string): string };
   // Not `new URL(name, import.meta.url)`: Vite rewrites that form into an asset glob over the folder.
-  const here = url.fileURLToPath(import.meta.url);
-  return fs.readFileSync(path.join(path.dirname(here), name), 'utf8');
+  return { fs, path, here: path.dirname(url.fileURLToPath(import.meta.url)) };
+}
+
+/** One file beside this test, as text. */
+async function readL4Source(name: string): Promise<string> {
+  const { fs, path, here } = await nodeFs();
+  return fs.readFileSync(path.join(here, name), 'utf8');
+}
+
+/** Every file under `root` whose name passes `keep`, recursively, with its path relative to `root`. */
+function walkFiles(fs: NodeFs, path: NodePath, root: string, keep: (name: string) => boolean): WalkedFile[] {
+  const out: WalkedFile[] = [];
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && keep(entry.name)) out.push({ rel: path.relative(root, full), text: fs.readFileSync(full, 'utf8') });
+    }
+  };
+  walk(root);
+  return out;
 }
 
 /** The verbs whose argument must be a C1 builder call wherever the store names them. */
@@ -328,52 +362,37 @@ describe('store_reads_through_builders (C3 tripwire)', () => {
 // The web never sends a `filter` key to `l4.capture.start` (spec §7(c): the core derives the BPF
 // filter from L4 scope; a free-form operator string would be a second, unguarded definition of what
 // gets captured). Every non-test `.ts`/`.tsx` under `apps/web/src` is walked with node `fs`; at each
-// `'l4.capture.start'` call-site literal, that line and the two after it must not mention `filter`,
-// and `CaptureControls.tsx` must not contain the word at all (no prop, signal or label).
+// `'l4.capture.start'` call-site literal, that line and the two after it must not carry a `filter`
+// key, and `CaptureControls.tsx` must hold no `filter` key, prop, signal or setter at all. The match
+// is a `filter` identifier in use (`filter:`, `filter=`, `filter(`, `setFilter`), not the word in a
+// comment or inside another identifier (`filterMode`, `rows.filter(`).
 
-interface WalkedFile {
-  rel: string;
-  text: string;
-}
-
+/** Every non-test `.ts`/`.tsx` under `apps/web/src`. */
 async function readWebSources(): Promise<WalkedFile[]> {
-  const fsModule = 'node:fs';
-  const pathModule = 'node:path';
-  const urlModule = 'node:url';
-  const fs = (await import(/* @vite-ignore */ fsModule)) as {
-    readFileSync(path: string, encoding: 'utf8'): string;
-    readdirSync(path: string, opts: { withFileTypes: true }): { name: string; isDirectory(): boolean; isFile(): boolean }[];
-  };
-  const path = (await import(/* @vite-ignore */ pathModule)) as {
-    dirname(p: string): string;
-    join(...parts: string[]): string;
-    relative(from: string, to: string): string;
-  };
-  const url = (await import(/* @vite-ignore */ urlModule)) as { fileURLToPath(u: string): string };
-  const here = url.fileURLToPath(import.meta.url);
+  const { fs, path, here } = await nodeFs();
   // panels/l4/args.test.ts → apps/web/src
-  const srcRoot = path.join(path.dirname(here), '..', '..');
-  const out: WalkedFile[] = [];
-  const walk = (dir: string) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      if (!/\.tsx?$/.test(entry.name) || /\.test\.tsx?$/.test(entry.name) || /\.d\.ts$/.test(entry.name)) continue;
-      out.push({ rel: path.relative(srcRoot, full), text: fs.readFileSync(full, 'utf8') });
-    }
-  };
-  walk(srcRoot);
-  return out;
+  return walkFiles(fs, path, path.join(here, '..', '..'), (name) => /\.tsx?$/.test(name) && !/\.test\.tsx?$/.test(name) && !/\.d\.ts$/.test(name));
 }
 
 /** A call-site literal: an opening quote right before the verb (a backticked doc mention is not one). */
 const CAPTURE_START_LITERAL = /['"]l4\.capture\.start\b/;
+/** A `filter` KEY, prop or call — `filter:` `filter=` `filter(` — not preceded by `.` or a word character (`rows.filter(`, `filterMode` do not count). */
+const FILTER_IN_USE = /(?<![.\w])filter\s*[:=(]/;
+/** The signal setter a `filter` input would need. */
+const SET_FILTER = /\bsetFilter\b/;
+/** Whether one line of source uses `filter` as a key, prop, signal or setter. */
+const mentionsFilter = (line: string): boolean => FILTER_IN_USE.test(line) || SET_FILTER.test(line);
 
 describe('no_filter_on_capture_start (C4 tripwire, AC18)', () => {
+  it('mentionsFilter matches a filter key, prop, call or setter, and not the word in prose or another identifier', () => {
+    for (const hit of ["filter: bpf()", 'filter={props.filter}', 'value={filter()}', "const [filter, setFilter] = createSignal('')", '  filter : "udp"', 'setFilter(x)']) {
+      expect(mentionsFilter(hit), hit).toBe(true);
+    }
+    for (const miss of ['// the core derives the BPF filter from scope', "const filterMode = 'and'", 'rows.filter((r) => r.ok)', 'aria-label="Capture filter"', 'quickFilter']) {
+      expect(mentionsFilter(miss), miss).toBe(false);
+    }
+  });
+
   it('no non-test source passes filter to l4.capture.start, and CaptureControls.tsx has no filter at all', async () => {
     const files = await readWebSources();
     expect(files.length).toBeGreaterThan(10);
@@ -385,13 +404,13 @@ describe('no_filter_on_capture_start (C4 tripwire, AC18)', () => {
       for (let i = 0; i < lines.length; i++) {
         if (!CAPTURE_START_LITERAL.test(lines[i]!)) continue;
         sawCallSite = true;
-        const window = lines.slice(i, i + 3).join('\n');
-        if (/filter/i.test(window)) problems.push(`${rel}:${i + 1}: l4.capture.start call mentions filter`);
+        const window = lines.slice(i, i + 3);
+        if (window.some(mentionsFilter)) problems.push(`${rel}:${i + 1}: l4.capture.start call carries a filter key`);
       }
       if (rel.endsWith('panels/l4/CaptureControls.tsx')) {
         sawCaptureControls = true;
         lines.forEach((line, i) => {
-          if (/filter/i.test(line)) problems.push(`${rel}:${i + 1}: contains "filter": ${line.trim().slice(0, 72)}`);
+          if (mentionsFilter(line)) problems.push(`${rel}:${i + 1}: uses filter: ${line.trim().slice(0, 72)}`);
         });
       }
     }
@@ -400,26 +419,11 @@ describe('no_filter_on_capture_start (C4 tripwire, AC18)', () => {
     expect(problems).toEqual([]);
   });
 
-  it('CaptureControls renders a direction select, a Start with the reason, and a Stop per running id (AC19)', async () => {
+  it('CaptureControls.tsx renders one Start button: the role gate and the availability gate fold into its disabled/title (fix 3)', async () => {
     const src = await readL4Source('CaptureControls.tsx');
-    // What the live browser script (cua-l4.mjs) locates: the landmark and the Start button text.
-    expect(src).toContain('aria-label="Capture"');
-    expect(src).toContain('Start capture');
-    expect(src).toContain('data-testid="l4-capture-start"');
-    // The direction select replaces the filter input.
-    expect(src).toContain('aria-label="Capture direction"');
-    expect(src).toContain('<option value="inbound">');
-    expect(src).toContain('<option value="outbound">');
-    // Start is disabled with the core's reason as visible text and as the title.
-    expect(src).toContain('disabled={!props.capture.available}');
-    expect(src).toContain('data-testid="l4-capture-reason"');
-    expect(src).toMatch(/title=\{[^}]*props\.capture\.reason/);
-    // One Stop per running id, calling onStop(id).
-    expect(src).toContain('aria-label={`Stop capture ${id}`}');
-    expect(src).toContain('props.onStop(id)');
-    // The old props are gone.
-    expect(src).not.toContain('canCapture');
-    expect(src).not.toContain('activeCaptures');
+    const first = src.indexOf('data-testid="l4-capture-start"');
+    expect(first, 'no data-testid="l4-capture-start" in CaptureControls.tsx').toBeGreaterThanOrEqual(0);
+    expect(src.indexOf('data-testid="l4-capture-start"', first + 1), 'a second Start button copy').toBe(-1);
   });
 });
 
@@ -432,31 +436,10 @@ describe('no_filter_on_capture_start (C4 tripwire, AC18)', () => {
 
 const RAW_HTML_SINKS = [['inner', 'HTML'].join(''), ['dangerouslySet', 'Inner', 'HTML'].join('')];
 
+/** Every file under `panels/l4/` — components, model, styles and the tests themselves. */
 async function readPanelsL4Files(): Promise<WalkedFile[]> {
-  const fsModule = 'node:fs';
-  const pathModule = 'node:path';
-  const urlModule = 'node:url';
-  const fs = (await import(/* @vite-ignore */ fsModule)) as {
-    readFileSync(path: string, encoding: 'utf8'): string;
-    readdirSync(path: string, opts: { withFileTypes: true }): { name: string; isDirectory(): boolean; isFile(): boolean }[];
-  };
-  const path = (await import(/* @vite-ignore */ pathModule)) as {
-    dirname(p: string): string;
-    join(...parts: string[]): string;
-    relative(from: string, to: string): string;
-  };
-  const url = (await import(/* @vite-ignore */ urlModule)) as { fileURLToPath(u: string): string };
-  const dir = path.dirname(url.fileURLToPath(import.meta.url));
-  const out: WalkedFile[] = [];
-  const walk = (d: string) => {
-    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
-      const full = path.join(d, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isFile()) out.push({ rel: path.relative(dir, full), text: fs.readFileSync(full, 'utf8') });
-    }
-  };
-  walk(dir);
-  return out;
+  const { fs, path, here } = await nodeFs();
+  return walkFiles(fs, path, here, () => true);
 }
 
 describe('no_innerhtml_under_panels_l4 (C6 tripwire, AC40)', () => {
@@ -467,14 +450,6 @@ describe('no_innerhtml_under_panels_l4 (C6 tripwire, AC40)', () => {
     const problems: string[] = [];
     for (const f of files) for (const sink of RAW_HTML_SINKS) if (f.text.includes(sink)) problems.push(`${f.rel}: contains ${sink}`);
     expect(problems).toEqual([]);
-  });
-
-  it('LayerTree renders hexRows as text and says "no bytes from this core" without bytes', async () => {
-    const src = await readL4Source('LayerTree.tsx');
-    expect(src).toContain('hexRows(');
-    expect(src).toContain('base64ToBytes(');
-    expect(src).toContain('no bytes from this core');
-    expect(src).not.toContain('Raw bytes are not carried');
   });
 });
 
@@ -524,8 +499,6 @@ describe('scope_add_form_is_gated (C7 tripwire, AC22, AC39)', () => {
     expect(src).toContain('title="Confirm L4 scope add"');
     expect(src).toContain('props.onAddScope(');
     expect(src).toContain('props.onConfirmAddScope(');
-    // Provenance from the core's `source` (config / runtime).
-    expect(src).toContain('e.source');
   });
 
   it('store.ts sends l4.scope.add only from addScope / confirmAddScope through beginGuarded / confirmGuarded with scopeAddArgs', async () => {

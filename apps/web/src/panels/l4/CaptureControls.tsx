@@ -111,6 +111,8 @@ export const CaptureControls: Component<CaptureControlsProps> = (props) => {
     if (!p || p.busy) return;
     setPending({ ...p, busy: true, refusal: null });
     const outcome = await props.onConfirmAddScope(p.draft, p.token);
+    // The operator dismissed the dialog while the core was answering: nothing to show or re-open.
+    if (pending() === null) return;
     if (outcome.kind === 'done') {
       setPending(null);
       return;
@@ -143,26 +145,16 @@ export const CaptureControls: Component<CaptureControlsProps> = (props) => {
             <option value="outbound">outbound</option>
           </select>
         </label>
-        <Show
-          when={operatorOnly()}
-          fallback={
-            <Button
-              variant="outline"
-              data-testid="l4-capture-start"
-              disabled={!props.capture.available}
-              title={props.capture.available ? undefined : (props.capture.reason ?? undefined)}
-              onClick={() => start()}
-            >
-              Start capture
-            </Button>
-          }
+        <Button
+          variant="outline"
+          data-testid="l4-capture-start"
+          disabled={operatorOnly() !== null || !props.capture.available}
+          title={operatorOnly() ?? (props.capture.available ? undefined : (props.capture.reason ?? undefined))}
+          data-operator-only={operatorOnly() !== null ? 'true' : undefined}
+          onClick={() => start()}
         >
-          {(reason) => (
-            <Button variant="outline" data-testid="l4-capture-start" data-operator-only="true" disabled title={reason()}>
-              Start capture
-            </Button>
-          )}
-        </Show>
+          Start capture
+        </Button>
       </div>
       <Show when={operatorOnly() ?? (props.capture.available ? null : props.capture.reason)}>
         {(reason) => (
