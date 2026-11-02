@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -822,6 +822,9 @@ pub(crate) struct FakeJob {
     /// Every `JobCtx::report_crawl_error` call as `(origin, reason)`, in order
     /// (amendment 39b: the engine counts these into `crawl.errors`).
     pub crawl_errors: Mutex<Vec<(String, String)>>,
+    /// The sum of every `JobCtx::report_forms_submitted` call (amendment 53:
+    /// the engine accumulates these into `crawl.forms_submitted`).
+    pub forms_submitted: AtomicU64,
 }
 
 impl FakeJob {
@@ -850,6 +853,7 @@ impl FakeJob {
             session_lost: AtomicU32::new(0),
             browser_partials: Mutex::new(Vec::new()),
             crawl_errors: Mutex::new(Vec::new()),
+            forms_submitted: AtomicU64::new(0),
         }
     }
 
@@ -895,6 +899,11 @@ impl FakeJob {
     /// The cookie-name lists reported as browser-partial, in order.
     pub(crate) fn reported_browser_partials(&self) -> Vec<Vec<String>> {
         self.browser_partials.lock().unwrap().clone()
+    }
+
+    /// How many submitted forms the lane reported, summed over every call.
+    pub(crate) fn reported_forms_submitted(&self) -> u64 {
+        self.forms_submitted.load(Ordering::SeqCst)
     }
 }
 
@@ -975,6 +984,10 @@ impl JobCtx for FakeJob {
             .lock()
             .unwrap()
             .push((origin.to_string(), reason.to_string()));
+    }
+
+    fn report_forms_submitted(&self, count: u64) {
+        self.forms_submitted.fetch_add(count, Ordering::SeqCst);
     }
 }
 

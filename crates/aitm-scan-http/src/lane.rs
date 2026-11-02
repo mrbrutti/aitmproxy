@@ -413,6 +413,11 @@ async fn crawl_origin(
     if report.forms_skipped > 0 {
         job.report_forms_skipped(u64::from(report.forms_skipped));
     }
+    // Forms it did submit are told the same way, so `crawl.forms_submitted`
+    // is written at all: the counter existed but no hook fed it (amendment 53).
+    if report.forms_submitted > 0 {
+        job.report_forms_submitted(u64::from(report.forms_submitted));
+    }
     if let Some(reason) = report.stopped_reason {
         tracing::info!(
             job = job.job_id(),
@@ -683,6 +688,30 @@ mod tests {
             assert_eq!(point.frequency, 1);
         }
         assert_eq!(store.count(), 8);
+    }
+
+    /// Amendment 53: the one form the client crawl submits (`fixture_pages`'
+    /// `GET /search`) reaches the job through `JobCtx::report_forms_submitted`,
+    /// so the engine's `crawl.forms_submitted` is written at all; it had no
+    /// hook before, and `test_t2_crawl` SKIPped on it.
+    #[tokio::test]
+    async fn client_crawl_reports_submitted_forms_to_the_job() {
+        let client = Arc::new(site(&fixture_pages()));
+        let job = FakeJob::new(
+            profile(|p| p.crawl.use_browser = UseBrowser::Never),
+            Arc::clone(&client),
+        );
+
+        discover(&job, &[ORIGIN]).await;
+
+        assert!(
+            client
+                .sent_paths()
+                .contains(&"/search?q=aitm-aitm7f3a".to_string()),
+            "the crawl submitted the search form: {:?}",
+            client.sent_paths()
+        );
+        assert_eq!(job.reported_forms_submitted(), 1);
     }
 
     #[tokio::test]
