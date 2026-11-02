@@ -1723,7 +1723,7 @@ mod tests {
         )
         .expect("the job starts");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.points.found, 0, "the lane discovered nothing");
@@ -1759,7 +1759,7 @@ mod tests {
         )
         .expect("the job starts");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.points.found, 2);
         assert_eq!(status.points.audited, 2, "the two discovered points");
@@ -1892,7 +1892,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.error, None);
@@ -1921,7 +1921,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.crawl.errors, 1);
         assert!(status.crawl.pages >= 1, "pages: {}", status.crawl.pages);
@@ -1943,7 +1943,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.crawl.forms_submitted, 3, "{:?}", status.crawl);
         assert_eq!(status.crawl.forms_skipped, 0, "a submit is not a skip");
