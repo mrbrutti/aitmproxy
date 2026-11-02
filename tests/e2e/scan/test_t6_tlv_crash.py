@@ -129,7 +129,11 @@ def main() -> int:
         full = issue(op, "operator", summary["id"])
         ev_l4 = (full.get("evidence") or {}).get("l4") or {}
         chain = ev_l4.get("mutation_chain")
-        check(isinstance(chain, list) and "len_desync" in chain,
+        # Chain entries are `mutator(path,params)` (T6 S6.3; the shared contract
+        # note), e.g. `len_desync(length,+1)`: match the mutator name, not the
+        # whole entry.
+        check(isinstance(chain, list)
+              and any(isinstance(m, str) and m.split("(", 1)[0] == "len_desync" for m in chain),
               f"evidence.l4.mutation_chain names `len_desync` (got {chain!r})")
         check(ev_l4.get("reproduced") == [3, 3],
               f"evidence.l4.reproduced is [3, 3] (got {ev_l4.get('reproduced')!r})")
