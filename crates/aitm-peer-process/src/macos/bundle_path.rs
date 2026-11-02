@@ -99,4 +99,32 @@ mod tests {
         assert_eq!(innermost_bundle("/x/Fooapp/bin/foo"), None);
         assert_eq!(innermost_bundle("/x/Foo.application/bin/foo"), None);
     }
+
+    /// Nothing to split, or a hidden directory literally named `.app`: no bundle.
+    #[test]
+    fn degenerate_paths_have_no_bundle() {
+        assert_eq!(innermost_bundle(""), None);
+        assert_eq!(innermost_bundle("curl"), None);
+        assert_eq!(innermost_bundle("/"), None);
+        assert_eq!(innermost_bundle("/x/.app/bin/foo"), None);
+    }
+
+    /// `proc_pidpath` is absolute, but the rule does not depend on it.
+    #[test]
+    fn a_relative_path_works_from_its_first_component() {
+        assert_eq!(
+            innermost_bundle("Foo.app/Contents/MacOS/Foo"),
+            Some("Foo.app")
+        );
+    }
+
+    /// The suffix match is case-sensitive: `Foo.APP` is left to the basename
+    /// fallback rather than guessed at (fail closed).
+    #[test]
+    fn the_suffix_match_is_case_sensitive() {
+        assert_eq!(
+            innermost_bundle("/Applications/Foo.APP/Contents/MacOS/Foo"),
+            None
+        );
+    }
 }

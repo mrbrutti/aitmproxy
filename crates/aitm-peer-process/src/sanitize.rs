@@ -93,4 +93,35 @@ mod tests {
             Some("Google Chrome Helper (Renderer)".to_string())
         );
     }
+
+    /// D5: the limit is 256 *bytes*, not scalars — 128 two-byte scalars pass,
+    /// 129 do not.
+    #[test]
+    fn the_length_limit_is_bytes_not_chars() {
+        assert_eq!(sanitize(&"é".repeat(128)), Some("é".repeat(128)));
+        assert_eq!(sanitize(&"é".repeat(129)), None);
+    }
+
+    /// Stripping runs before the length check: 256 letters plus an invisible
+    /// scalar is 259 bytes raw and exactly 256 after, so it is kept.
+    #[test]
+    fn stripping_happens_before_the_length_check() {
+        let raw = format!("{}\u{200B}", "a".repeat(256));
+        assert_eq!(sanitize(&raw), Some("a".repeat(256)));
+    }
+
+    /// Only ASCII whitespace is trimmed (spec D5); a no-break space is content.
+    #[test]
+    fn only_ascii_whitespace_is_trimmed() {
+        assert_eq!(
+            sanitize("\u{A0}node\u{A0}"),
+            Some("\u{A0}node\u{A0}".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_are_none() {
+        assert_eq!(sanitize(""), None);
+        assert_eq!(sanitize(" \t\r\n"), None);
+    }
 }

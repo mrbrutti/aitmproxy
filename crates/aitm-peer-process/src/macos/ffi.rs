@@ -474,8 +474,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        find_owners_among_raw, find_owners_raw, in_sockinfo, list_pids, pid_name, pid_path,
-        pid_start_micros, proc_fdinfo, socket_fdinfo, socket_fds, socket_info, tcp_sockinfo,
+        decode_addr, find_owners_among_raw, find_owners_raw, in_sockinfo, list_pids, pid_name,
+        pid_path, pid_start_micros, proc_fdinfo, socket_fdinfo, socket_fds, socket_info,
+        tcp_socket, tcp_sockinfo, utf8_prefix, INI_IPV4, INI_IPV6,
     };
     use crate::types::Tuple;
 
@@ -628,5 +629,81 @@ mod tests {
         // The skipped pid is neither walked nor reported.
         let probe = find_owners_among_raw(&[nobody], deadline, Some(1), &[1]);
         assert!(probe.gone.is_empty(), "{:?}", probe.gone);
+    }
+
+    /// D4: the 16-byte address unions decode by `insi_vflag` — `INI_IPV4` reads
+    /// the `in_addr` at bytes 12..16 of `in4in6_addr`, `INI_IPV6` the whole
+    /// `in6_addr`, and an unknown flag is `None` (fail closed), never a guess.
+    #[test]
+    fn decode_addr_follows_insi_vflag() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let mut v4 = [0xAAu8; 16];
+        v4[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        assert_eq!(
+            decode_addr(INI_IPV4, &v4),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        let mut v6 = [0u8; 16];
+        v6[15] = 1;
+        assert_eq!(
+            decode_addr(INI_IPV6, &v6),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(decode_addr(0, &v4), None);
+        assert_eq!(decode_addr(0x4, &v4), None);
+        // Both bits set: the v4 arm wins, as in the header's `in4in6_addr` use.
+        assert_eq!(
+            decode_addr(INI_IPV4 | INI_IPV6, &v4),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+    }
+
+    /// D4: a vnode descriptor is never listed as a socket and `tcp_socket` on
+    /// it (or on a bad fd, or on another user's pid) is `None`, not a panic.
+    #[test]
+    fn a_vnode_fd_is_neither_listed_nor_a_tcp_socket() {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = file.as_raw_fd();
+        let me = std::process::id();
+        assert_eq!(tcp_socket(me, fd), None);
+        assert!(
+            !socket_fds(me).unwrap_or_default().contains(&fd),
+            "a vnode fd must be filtered out of the socket list"
+        );
+        assert_eq!(tcp_socket(me, i32::MAX), None); // EBADF
+        assert_eq!(tcp_socket(1, 0), None); // EPERM (launchd)
+    }
+
+    /// The byte strings libproc writes are read up to the first NUL and only
+    /// if they are UTF-8; a length past the buffer is a short read.
+    #[test]
+    fn utf8_prefix_stops_at_nul_and_rejects_invalid_bytes() {
+        assert_eq!(utf8_prefix(b"curl\0junk", 9), Some("curl".to_string()));
+        assert_eq!(utf8_prefix(b"curl", 4), Some("curl".to_string()));
+        assert_eq!(utf8_prefix(b"cu\xffrl", 5), None);
+        assert_eq!(utf8_prefix(b"curl", 10), None);
+    }
+
+    /// The deadline is checked before every pid: an already-expired deadline
+    /// walks nothing and so reports nothing gone (sandbox: no sockets bound).
+    #[test]
+    fn an_expired_deadline_walks_no_pid() {
+        let nobody = Tuple {
+            client: "127.0.0.1:1".parse().unwrap(),
+            proxy: "127.0.0.1:2".parse().unwrap(),
+        };
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let probe = find_owners_among_raw(&[nobody], past, None, &[1, i32::MAX as u32]);
+        assert!(probe.owners.is_empty());
+        assert!(
+            probe.gone.is_empty(),
+            "nothing was probed: {:?}",
+            probe.gone
+        );
+        assert!(find_owners_raw(&[nobody], past, None).is_empty());
+        assert!(find_owners_raw(&[], Instant::now() + Duration::from_secs(1), None).is_empty());
     }
 }

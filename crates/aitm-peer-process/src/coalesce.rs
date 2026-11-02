@@ -683,4 +683,171 @@ mod tests {
         assert_eq!(scanner.full_scans(), 2);
         assert_eq!(scanner.probed_pids(), vec![vec![7], vec![8]]);
     }
+
+    /// Refill is capped at the capacity: 300 ms idle at 10/s would be 3 tokens
+    /// uncapped, but with capacity 1 the second new pid in a row still finds the
+    /// bucket dry.
+    #[test]
+    fn the_bucket_never_exceeds_its_capacity() {
+        let scanner = Arc::new(
+            FakeScanner::new(Duration::ZERO)
+                .owned(tuple(50_700), key(1, 1), "curl")
+                .owned(tuple(50_701), key(2, 1), "wget"),
+        );
+        let limits = Limits {
+            scan_tokens: 1,
+            scan_refill_per_s: 10,
+            ..Limits::default()
+        };
+        let coalescer = Coalescer::new(Arc::clone(&scanner), limits);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(coalescer.resolve(tuple(50_700)), Some("curl".to_string()));
+        assert_eq!(coalescer.resolve(tuple(50_701)), None);
+        assert_eq!(scanner.full_scans(), 1);
+    }
+
+    /// D5: a name the sanitiser rejects is `None`, and that `None` is cached so
+    /// the process is asked about once, not once per connection.
+    #[test]
+    fn an_unprintable_identity_is_none_and_asked_once() {
+        let scanner = Arc::new(
+            FakeScanner::new(Duration::ZERO)
+                .owned(tuple(50_800), key(5, 1), "\u{7}\u{200B}")
+                .owned(tuple(50_801), key(5, 1), "\u{7}\u{200B}"),
+        );
+        let coalescer = Coalescer::new(Arc::clone(&scanner), Limits::default());
+        assert_eq!(coalescer.resolve(tuple(50_800)), None);
+        assert_eq!(coalescer.resolve(tuple(50_801)), None);
+        assert_eq!(scanner.identities.lock().unwrap().len(), 1);
+    }
+
+    /// `cache_entries: 0` disables caching without disabling resolution.
+    #[test]
+    fn a_zero_capacity_cache_still_resolves() {
+        let scanner = Arc::new(
+            FakeScanner::new(Duration::ZERO)
+                .owned(tuple(50_850), key(6, 1), "curl")
+                .owned(tuple(50_851), key(6, 1), "curl"),
+        );
+        let limits = Limits {
+            cache_entries: 0,
+            ..Limits::default()
+        };
+        let coalescer = Coalescer::new(Arc::clone(&scanner), limits);
+        assert_eq!(coalescer.resolve(tuple(50_850)), Some("curl".to_string()));
+        assert_eq!(coalescer.resolve(tuple(50_851)), Some("curl".to_string()));
+        assert_eq!(scanner.identities.lock().unwrap().len(), 2);
+    }
+
+    /// D3: a caller that arrives while a scan is running is not folded into
+    /// that scan (its tuple was not in the leader's batch); it waits, then leads
+    /// the next one itself. Two callers, two single-tuple scans, both named.
+    #[test]
+    fn a_late_arrival_joins_the_next_scan_not_the_running_one() {
+        let scanner = Arc::new(
+            FakeScanner::new(Duration::from_millis(30))
+                .owned(tuple(50_950), key(1, 1), "first")
+                .owned(tuple(50_951), key(2, 1), "second"),
+        );
+        let coalescer = Arc::new(Coalescer::new(Arc::clone(&scanner), Limits::default()));
+        let barrier = Arc::new(Barrier::new(2));
+        let early = {
+            let c = Arc::clone(&coalescer);
+            let b = Arc::clone(&barrier);
+            thread::spawn(move || {
+                b.wait();
+                c.resolve(tuple(50_950))
+            })
+        };
+        barrier.wait();
+        thread::sleep(Duration::from_millis(5));
+        let late = coalescer.resolve(tuple(50_951));
+        assert_eq!(early.join().unwrap(), Some("first".to_string()));
+        assert_eq!(late, Some("second".to_string()));
+
+        let calls = scanner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls.iter().all(|c| c.len() == 1),
+            "each scan carried exactly one tuple: {calls:?}"
+        );
+        let mut seen: Vec<Tuple> = calls.iter().flatten().copied().collect();
+        seen.sort_by_key(|t| t.client.port());
+        assert_eq!(seen, vec![tuple(50_950), tuple(50_951)]);
+    }
+
+    /// Panics on every full scan.
+    struct PanickingScanner {
+        calls: Mutex<usize>,
+    }
+
+    impl SocketScanner for PanickingScanner {
+        fn find_owners(&self, _wanted: &[Tuple], _deadline: Instant) -> HashMap<Tuple, ProcessKey> {
+            *self.calls.lock().unwrap() += 1;
+            panic!("scanner blew up");
+        }
+
+        fn find_owners_among(&self, _wanted: &[Tuple], _deadline: Instant, _pids: &[u32]) -> Probe {
+            Probe::default()
+        }
+
+        fn identity(&self, _key: ProcessKey) -> Option<String> {
+            None
+        }
+    }
+
+    impl SocketScanner for Arc<PanickingScanner> {
+        fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey> {
+            self.as_ref().find_owners(wanted, deadline)
+        }
+
+        fn find_owners_among(&self, wanted: &[Tuple], deadline: Instant, pids: &[u32]) -> Probe {
+            self.as_ref().find_owners_among(wanted, deadline, pids)
+        }
+
+        fn identity(&self, key: ProcessKey) -> Option<String> {
+            self.as_ref().identity(key)
+        }
+    }
+
+    /// Tester finding T-F1 (stage 5, 2026-11-01): `lead_scan` sets `scanning`
+    /// and releases the lock before calling the scanner; if the scanner
+    /// panics, nothing resets the flag, so every later caller waits out its
+    /// full deadline behind a scan that is not running and resolves `None`.
+    /// In production (`spawn_blocking`) that is one wedged resolver for the
+    /// life of the process plus the full 25 ms budget on every connection.
+    /// Fails today (`calls == 1`, elapsed == deadline); un-ignore with the fix
+    /// (a drop guard that clears `scanning` and notifies).
+    #[test]
+    #[ignore = "T-F1: a scanner panic wedges the coalescer; needs a production fix"]
+    fn a_scanner_panic_does_not_wedge_later_callers() {
+        let scanner = Arc::new(PanickingScanner {
+            calls: Mutex::new(0),
+        });
+        let limits = Limits {
+            scan_deadline: Duration::from_millis(30),
+            ..Limits::default()
+        };
+        let coalescer = Arc::new(Coalescer::new(Arc::clone(&scanner), limits));
+        let c = Arc::clone(&coalescer);
+        let first = thread::spawn(move || c.resolve(tuple(50_900))).join();
+        assert!(
+            first.is_err(),
+            "the leader's thread panics with the scanner"
+        );
+
+        let started = Instant::now();
+        let got = coalescer.resolve(tuple(50_901));
+        let elapsed = started.elapsed();
+        assert_eq!(got, None);
+        assert_eq!(
+            *scanner.calls.lock().unwrap(),
+            2,
+            "the second caller must lead a new scan, not wait behind a dead one"
+        );
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "took {elapsed:?}: waited out the deadline behind a scan that is not running"
+        );
+    }
 }

@@ -214,4 +214,62 @@ mod tests {
         // No task at all: `None` without waiting.
         assert_eq!(finish_attribution(None, Duration::from_secs(5)).await, None);
     }
+
+    /// Panics instead of answering.
+    struct PanickingResolver;
+
+    impl PeerResolver for PanickingResolver {
+        fn resolve(&self, _peer: SocketAddr, _local: SocketAddr) -> Option<String> {
+            panic!("resolver blew up");
+        }
+    }
+
+    /// D1 ("nothing on this path can return an error to `handle_conn`"): a
+    /// resolver that panics on its blocking thread costs the connection only its
+    /// identity — the join error is flattened to `None`, never propagated.
+    #[tokio::test]
+    async fn a_panicking_resolver_yields_none_not_an_error() {
+        let resolver: Arc<dyn PeerResolver> = Arc::new(PanickingResolver);
+        let task = start_attribution(
+            Some(&resolver),
+            addr("127.0.0.1:5000"),
+            Some(addr("127.0.0.1:8080")),
+        );
+        assert!(task.is_some(), "a loopback peer spawns the task");
+        assert_eq!(finish_attribution(task, Duration::from_secs(5)).await, None);
+    }
+
+    /// Hands back exactly what it was asked about.
+    struct EchoResolver;
+
+    impl PeerResolver for EchoResolver {
+        fn resolve(&self, peer: SocketAddr, local: SocketAddr) -> Option<String> {
+            Some(format!("{peer}->{local}"))
+        }
+    }
+
+    /// The resolver sees the accepted socket's peer and local addresses as the
+    /// acceptor saw them (client first, proxy second), and the answer reaches
+    /// `finish_attribution` unchanged.
+    #[tokio::test]
+    async fn resolver_receives_the_peer_and_local_addresses_as_given() {
+        let resolver: Arc<dyn PeerResolver> = Arc::new(EchoResolver);
+        let task = start_attribution(
+            Some(&resolver),
+            addr("[::ffff:127.0.0.1]:50000"),
+            Some(addr("127.0.0.1:8080")),
+        );
+        assert_eq!(
+            finish_attribution(task, Duration::from_secs(5))
+                .await
+                .as_deref(),
+            Some("[::ffff:127.0.0.1]:50000->127.0.0.1:8080")
+        );
+    }
+
+    /// D3: the acceptor waits the spec's 25 ms after the peek, no more.
+    #[test]
+    fn attribution_budget_is_the_spec_value() {
+        assert_eq!(super::ATTRIBUTION_BUDGET, Duration::from_millis(25));
+    }
 }

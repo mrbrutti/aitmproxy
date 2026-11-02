@@ -246,4 +246,43 @@ mod tests {
         assert_eq!(fd_socket_inode("socket:[abc]"), None);
         assert_eq!(fd_socket_inode("socket:[12345"), None);
     }
+
+    #[test]
+    fn a_port_of_the_wrong_width_is_none() {
+        let three = "   0: 0100007F:C2C 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 20 4 30 10 -1";
+        let five = "   0: 0100007F:C2C80 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 20 4 30 10 -1";
+        assert_eq!(parse_tcp_row(three, false), None);
+        assert_eq!(parse_tcp_row(five, false), None);
+    }
+
+    #[test]
+    fn non_numeric_uid_or_inode_is_none() {
+        let bad_uid = "   0: 0100007F:C2C8 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  abcd        0 12345 1 0000000000000000 20 4 30 10 -1";
+        let bad_inode = "   0: 0100007F:C2C8 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 -1 1 0000000000000000 20 4 30 10 -1";
+        assert_eq!(parse_tcp_row(bad_uid, false), None);
+        assert_eq!(parse_tcp_row(bad_inode, false), None);
+    }
+
+    #[test]
+    fn a_v6_address_in_a_v4_table_is_none() {
+        let row = "   1: 00000000000000000000000001000000:C2C8 00000000000000000000000001000000:1F90 01 00000000:00000000 00:00000000 00000000   501        0 777 1 0000000000000000 20 4 30 10 -1";
+        assert_eq!(parse_tcp_row(row, false), None);
+    }
+
+    #[test]
+    fn starttime_that_is_not_a_number_is_none() {
+        assert_eq!(
+            parse_stat_starttime(
+                "1234 (my proc) S 1 1234 1234 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 abc 1000 2"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn exe_basename_without_a_directory_is_the_name_itself() {
+        assert_eq!(exe_basename("curl"), Some("curl".to_string()));
+        assert_eq!(exe_basename(" (deleted)"), None);
+        assert_eq!(exe_basename("/usr/bin/ (deleted)"), None);
+    }
 }

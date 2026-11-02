@@ -149,4 +149,54 @@ mod tests {
         assert_eq!(port_from_libproc(0x901F), 8080);
         assert_eq!(port_from_libproc(0x7FFF_0050), 20480); // high half is ignored
     }
+
+    /// `insi_lport` is a C `int`; garbage in the high half (including the sign
+    /// bit) must never reach the port.
+    #[test]
+    fn libproc_port_ignores_the_high_half_even_with_the_sign_bit_set() {
+        assert_eq!(port_from_libproc(-1), 0xFFFF);
+        assert_eq!(port_from_libproc(i32::MIN | 0x901F), 8080);
+        assert_eq!(port_from_libproc(0), 0);
+    }
+
+    /// `::1` is not `127.0.0.1`: only the IPv4-mapped form folds (spec D4).
+    #[test]
+    fn a_v6_loopback_client_is_not_folded_onto_v4() {
+        let wanted = Tuple {
+            client: "[::1]:49864".parse::<SocketAddr>().unwrap(),
+            proxy: "[::1]:8080".parse::<SocketAddr>().unwrap(),
+        };
+        assert!(tuple_matches(v6("::1"), 49864, v6("::1"), 8080, &wanted));
+        assert!(!tuple_matches(
+            v4("127.0.0.1"),
+            49864,
+            v4("127.0.0.1"),
+            8080,
+            &wanted
+        ));
+        assert!(!tuple_matches(
+            v6("::ffff:127.0.0.1"),
+            49864,
+            v6("::ffff:127.0.0.1"),
+            8080,
+            &wanted
+        ));
+    }
+
+    /// A dual-stack listener hands the core a mapped peer; the client's own
+    /// socket may be plain v4. Canonicalisation applies to the wanted side too.
+    #[test]
+    fn a_mapped_v4_wanted_tuple_matches_a_plain_v4_socket() {
+        let wanted = Tuple {
+            client: "[::ffff:127.0.0.1]:49864".parse::<SocketAddr>().unwrap(),
+            proxy: "[::ffff:127.0.0.1]:8080".parse::<SocketAddr>().unwrap(),
+        };
+        assert!(tuple_matches(
+            v4("127.0.0.1"),
+            49864,
+            v4("127.0.0.1"),
+            8080,
+            &wanted
+        ));
+    }
 }

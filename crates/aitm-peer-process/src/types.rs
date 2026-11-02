@@ -84,3 +84,21 @@ pub(crate) trait SocketScanner: Send + Sync {
     /// executable basename), or `None` if the OS would not say.
     fn identity(&self, key: ProcessKey) -> Option<String>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Limits;
+    use std::time::Duration;
+
+    /// Spec D3 as amended by F2 (2026-11-01): a 250 ms scan deadline, a bucket
+    /// of 20 full scans refilled at 20/s, 256 cached identities. A knob that
+    /// drifts from these numbers changes the proxy's worst-case CPU budget.
+    #[test]
+    fn default_limits_match_spec_d3() {
+        let limits = Limits::default();
+        assert_eq!(limits.scan_deadline, Duration::from_millis(250));
+        assert_eq!(limits.scan_tokens, 20);
+        assert_eq!(limits.scan_refill_per_s, 20);
+        assert_eq!(limits.cache_entries, 256);
+    }
+}

@@ -619,4 +619,69 @@ mod tests {
         assert!(probe.owners.is_empty(), "{:?}", probe.owners);
         assert!(probe.gone.is_empty(), "{:?}", probe.gone);
     }
+
+    /// A garbage line (a header, a truncated row, a non-hex address) is skipped,
+    /// not fatal: the rows after it are still read.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_malformed_row_does_not_abort_the_table() {
+        let fx = Fixture::new("malformed");
+        fx.table(
+            "tcp",
+            &[
+                "garbage".to_string(),
+                "   0: ZZZZZZZZ:C2C8 0100007F:1F90 01".to_string(),
+                row(LOOPBACK4, 49864, LOOPBACK4, 8080, UID, 12345),
+            ],
+        );
+        fx.table("tcp6", &[]);
+        fx.pid(4242)
+            .fd(4242, 3, "socket:[12345]")
+            .stat(4242, "curl", 98765);
+
+        let wanted = tuple("127.0.0.1:49864", "127.0.0.1:8080");
+        let owners = scanner(&fx, None).find_owners(&[wanted], soon());
+
+        assert_eq!(
+            owners[&wanted],
+            ProcessKey {
+                pid: 4242,
+                start: 98765
+            }
+        );
+    }
+
+    /// Two connections from one process resolve to one `ProcessKey`, so the
+    /// identity cache is asked once for both (spec D3).
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn two_tuples_of_one_process_share_one_key() {
+        let fx = Fixture::new("twotuples");
+        fx.table(
+            "tcp",
+            &[
+                row(LOOPBACK4, 49864, LOOPBACK4, 8080, UID, 1001),
+                row(LOOPBACK4, 49865, LOOPBACK4, 8080, UID, 1002),
+            ],
+        );
+        fx.table("tcp6", &[]);
+        fx.pid(4242)
+            .fd(4242, 3, "socket:[1001]")
+            .fd(4242, 4, "socket:[1002]")
+            .stat(4242, "python3", 777);
+
+        let a = tuple("127.0.0.1:49864", "127.0.0.1:8080");
+        let b = tuple("127.0.0.1:49865", "127.0.0.1:8080");
+        let owners = scanner(&fx, None).find_owners(&[a, b], soon());
+
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[&a], owners[&b]);
+        assert_eq!(
+            owners[&a],
+            ProcessKey {
+                pid: 4242,
+                start: 777
+            }
+        );
+    }
 }
