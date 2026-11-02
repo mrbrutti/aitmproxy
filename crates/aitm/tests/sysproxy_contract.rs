@@ -1,16 +1,13 @@
 //! Tester (stage 5), SP-AC17 over the REAL assembly (`build_proxy`, no
 //! injected engine): the three `proxy.system.*` verbs are registered with
 //! the spec's sensitivities, `set` takes exactly one optional
-//! `bypass: Array(Str)`, MCP `tools/list` exposes that schema, the TUI's
-//! `CORE_TOOLS` lists the three names, and `bus-fixture.json` (while it
-//! exists) carries the same names and descriptions, so the fixture cannot
-//! drift from the core. Detection runs no command (plan C2), so building the
-//! real engine here touches nothing on the host.
+//! `bypass: Array(Str)`, MCP `tools/list` exposes that schema, and the TUI's
+//! `CORE_TOOLS` lists the three names. Detection runs no command (plan C2),
+//! so building the real engine here touches nothing on the host.
 //!
 //! Spec: docs/superpowers/specs/2026-10-31-system-proxy-automation-design.md
 //! Plan: docs/superpowers/plans/2026-10-31-system-proxy-automation-plan.md (Tasks 8, 9, 11)
 
-use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use aitm::wire::build_proxy;
@@ -117,62 +114,5 @@ fn proxy_system_verbs_over_the_real_assembly() {
             "CORE_TOOLS lists {name}"
         );
     }
-    let _ = std::fs::remove_dir_all(&cfg.ca.dir);
-}
-
-/// While `crates/aitm-tui/fixtures/bus-fixture.json` exists, its three
-/// `proxy.system.*` entries must carry the core's own names, descriptions
-/// and the `set` param description, so a fixture-driven UI shows the same
-/// words as a live core. (A fixture is a consistency pin, never evidence.)
-#[test]
-fn bus_fixture_mirrors_the_real_verb_descriptions() {
-    let fixture: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("aitm-tui")
-        .join("fixtures")
-        .join("bus-fixture.json");
-    if !fixture.is_file() {
-        println!("NOTE: {} is gone; nothing to pin", fixture.display());
-        return;
-    }
-    let text = std::fs::read_to_string(&fixture).expect("read fixture");
-    let doc: Value = serde_json::from_str(&text).expect("fixture is JSON");
-    let tools = doc["tools"].as_array().expect("fixture tools array");
-
-    let cfg = config("fixture");
-    let proxy = build_proxy(&cfg).expect("build proxy");
-    let reg = proxy.registry();
-    for name in VERBS {
-        let real = reg.command(name).expect("registered");
-        let entry = tool(tools, name);
-        assert_eq!(
-            entry["description"].as_str(),
-            Some(real.schema().description.as_str()),
-            "{name}: fixture description drifted from the core"
-        );
-        let props = entry["inputSchema"]["properties"]
-            .as_object()
-            .unwrap_or_else(|| panic!("{name}: fixture inputSchema.properties"));
-        let real_params = real.schema().params;
-        assert_eq!(
-            props.len(),
-            real_params.len(),
-            "{name}: fixture param count drifted"
-        );
-        for p in &real_params {
-            let fp = props
-                .get(&p.name)
-                .unwrap_or_else(|| panic!("{name}: fixture lacks param {}", p.name));
-            assert_eq!(
-                fp["description"].as_str(),
-                Some(p.description.as_str()),
-                "{name}.{}: fixture param description drifted",
-                p.name
-            );
-        }
-    }
-    let set_props = &tool(tools, "proxy.system.set")["inputSchema"]["properties"];
-    assert_eq!(set_props["bypass"]["type"], "array");
-    assert_eq!(set_props["bypass"]["items"]["type"], "string");
     let _ = std::fs::remove_dir_all(&cfg.ca.dir);
 }

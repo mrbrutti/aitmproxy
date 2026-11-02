@@ -222,6 +222,7 @@ def main() -> int:
 
     child_env = dict(os.environ)
     child_env["PYTHONPATH"] = E2E_DIR + os.pathsep + child_env.get("PYTHONPATH", "")
+    child_env.setdefault("AITM_AUDIT_LOG", "off")
     if manual:
         child_env["AITM_E2E_MANUAL"] = "1"
     ledger_dir = tempfile.mkdtemp(prefix="aitm-e2e-ledger-")

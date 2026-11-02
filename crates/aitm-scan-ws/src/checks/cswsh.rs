@@ -19,9 +19,9 @@ use std::sync::{Arc, OnceLock};
 
 use aitm_core::redact::scrub_text;
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
-    Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, ProbeResponse, Technique,
-    Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Evidence, InsertionKind,
+    InsertionPoint, Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, ProbeResponse,
+    Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -60,6 +60,7 @@ impl Check for Cswsh {
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
+            scope: CheckScope::Point,
             cwe: Some(1385),
             description:
                 "Re-dials the handshake with a foreign Origin and the session cookies to see \
@@ -195,6 +196,8 @@ fn verdict(
         evidence,
         detail: detail.into(),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 

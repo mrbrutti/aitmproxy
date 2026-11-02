@@ -129,6 +129,8 @@ class Aitm:
         self._stdout_file = open(self._stdout_path, "wb")
         env = dict(os.environ)
         env.setdefault("RUST_LOG", "info")
+        # Audit is on by default: this sends the default file into the workdir so a run never touches the operator's own (a path, not `off`, so the cells still exercise the real writer).
+        env["AITM_AUDIT_LOG"] = os.environ.get("AITM_E2E_AUDIT_LOG") or os.path.join(self.workdir, "audit.jsonl")
         self.proc = subprocess.Popen(
             argv, stdout=self._stdout_file, stderr=self._stderr_file,
             stdin=subprocess.DEVNULL, env=env,

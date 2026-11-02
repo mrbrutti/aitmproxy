@@ -11,9 +11,13 @@ import Testing
     }
 
     @Test func harnessRunsReadAWipedIsolatedSuite() {
-        for variable in ["APP_STORE", "APP_LIVE", "APP_SNAPSHOT", "APP_FIXTURES"] {
+        #expect(SettingsDomain.harnessVariables == ["APP_STORE", "APP_LIVE"])
+        for variable in ["APP_STORE", "APP_LIVE"] {
             #expect(SettingsDomain.select(environment: [variable: "1"]) == .suite(name: SettingsDomain.harnessSuite, wipe: true), "\(variable)")
         }
+        // The fixture and snapshot modes are gone (2026-10-31): their variables no longer mark a harness run.
+        #expect(SettingsDomain.select(environment: ["APP_SNAPSHOT": "/tmp/x"]) == .standard)
+        #expect(SettingsDomain.select(environment: ["APP_FIXTURES": "1"]) == .standard)
     }
 
     @Test func anExplicitSuiteIsKeptAsIs() {

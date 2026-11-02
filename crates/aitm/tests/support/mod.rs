@@ -37,7 +37,7 @@ pub fn config(tag: &str) -> Config {
 pub fn assemble_services(cfg: &Config) -> (Proxy, Services, Governance) {
     let assembled = assemble(cfg).expect("assemble");
     let governance = assembled.governance();
-    let Assembled { proxy, .. } = assembled;
-    let services = tui::services(&proxy, cfg, None, TuiLog::Off);
+    let Assembled { proxy, job_bus, .. } = assembled;
+    let services = tui::services(&proxy, cfg, None, TuiLog::Off, job_bus);
     (proxy, services, governance)
 }

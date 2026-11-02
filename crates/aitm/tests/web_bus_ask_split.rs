@@ -72,7 +72,13 @@ fn rig(tag: &str) -> Rig {
     cfg.mcp.policy = AgentPolicy::Ask;
     cfg.ca.dir = temp_ca_dir(tag);
     let assembled = assemble(&cfg).expect("assemble");
-    let services = tui::services(&assembled.proxy, &cfg, None, TuiLog::Off);
+    let services = tui::services(
+        &assembled.proxy,
+        &cfg,
+        None,
+        TuiLog::Off,
+        Arc::clone(&assembled.job_bus),
+    );
     let state = &assembled.agent_state;
     let ring = &assembled.audit_ring;
 

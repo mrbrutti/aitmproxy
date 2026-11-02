@@ -46,11 +46,6 @@ final class ActivityState {
 
     init(session: Session) {
         self.session = session
-        if Store.usesFixtures {
-            for entry in Fixtures.activity { add(entry) }
-            connectedClients = 1
-            busFed = true
-        }
     }
 
     /// The rows the panel shows, newest first, pending on top.
@@ -63,7 +58,7 @@ final class ActivityState {
     /// Live before F2: the panel lists this app's own commands only.
     var note: String? {
         // F2: notifications/aitm/agent feeds every frontend's commands.
-        !Store.usesFixtures && !busFed ? "This app's own commands only — other frontends' commands arrive once the core publishes them" : nil
+        !busFed ? "This app's own commands only — other frontends' commands arrive once the core publishes them" : nil
     }
 
     func ingest(_ params: JSONValue) {
@@ -85,12 +80,24 @@ final class ActivityState {
         // A completed agent command settles its pending request.
         if entry.origin == .agent { pending.removeAll { $0.command == entry.command && $0.origin == .agent } }
         ring.append(entry)
-        if entry.origin == .agent, !Store.usesFixtures { session.agentActionsLastMinute = ring.actionsLastMinute() }
+        if entry.origin == .agent { session.agentActionsLastMinute = ring.actionsLastMinute() }
     }
 
     /// Runs the gated command with this app's (operator) identity, then logs the outcome.
     func approve(_ entry: ActivityEntry) {
         pending.removeAll { $0.id == entry.id }
+        if Session.isCATrustVerb(entry.command) {
+            record(command: entry.command, args: entry.args, result: .error(CATrustFacts.operatorOnlyNote))
+            session.lastError = "\(entry.command): \(CATrustFacts.operatorOnlyNote)"
+            return
+        }
+        // The system-proxy verbs have one call path too (spec D13); the core never parks them, so
+        // this is belt-and-braces against a notification that names them.
+        if Session.isSystemProxyVerb(entry.command) {
+            record(command: entry.command, args: entry.args, result: .error(SystemProxyFacts.operatorOnlyNote))
+            session.lastError = "\(entry.command): \(SystemProxyFacts.operatorOnlyNote)"
+            return
+        }
         Task {
             do {
                 _ = try await session.runCommand(entry.command, entry.args)
@@ -131,11 +138,6 @@ final class ActivityState {
     func setL4Capability(_ capability: L4AgentGates.Capability, _ allowed: Bool) {
         let args: [String: JSONValue] = ["capability": .string(capability.rawValue), "allowed": .bool(allowed)]
         Task {
-            if Store.usesFixtures {
-                session.setL4Gate(capability.rawValue, allowed)
-                record(command: "l4.agent.set", args: args, result: .ok)
-                return
-            }
             guard hasTool("l4.agent.set") else {
                 session.lastError = "l4.agent.set needs an operator-gated core setter"
                 return
@@ -160,11 +162,6 @@ final class ActivityState {
 
     /// `agent.set {policy}` then `agent.status`; the toggle changes only when the bus confirms.
     func setPolicy(_ policy: AgentPolicy) async {
-        if Store.usesFixtures {
-            session.agentPolicy = policy
-            record(command: "agent.set", args: ["policy": .string(policy.wire)], result: .ok)
-            return
-        }
         guard hasTool("agent.set") else {
             intendedPolicy = policy
             session.lastError = "The core cannot change the agent policy yet" // core F1
@@ -212,7 +209,7 @@ struct AgentPanel: View {
 
     private var busOnline: Bool {
         if case .connected = session.bus { return true }
-        return Store.usesFixtures
+        return false
     }
 
     var body: some View {

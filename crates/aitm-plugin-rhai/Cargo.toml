@@ -8,6 +8,10 @@ description = "Rhai scripting tier: a .rhai file becomes an ordered-chain Plugin
 
 [dependencies]
 aitm-core.workspace = true
+# Scanner v2 (T1b): `CheckMeta`/`Verdict`/`CheckRegistry` the `reg.add_check`
+# bridge (Task 13) produces a `ScriptCheck` against, and `probe.*` reads. Added
+# here (Task 4) so Task 13 need not touch this manifest.
+aitm-scan-model.workspace = true
 # The `ProtocolLanguage` / `ScriptHostRegistry` / `Guarded` seam a protocol
 # crate registers its `<ns>.*` host fns against (acyclic: aitm-plugin depends
 # only on aitm-core).
@@ -42,10 +46,16 @@ base64 = "0.22"
 regex = "1"
 sha2 = "0.10"
 md-5 = "0.10"
+# A Rhai check's `poc_hint` map and the `CheckMeta` map cross into the model's
+# wire types through serde_json (the model has no rhai dependency; Task 13).
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serde_yaml = "0.9"
+# The model's test scaffolding (null client/job/host/check/lane, recording probe
+# host) the check-bridge and probe tests (Task 13) build against.
+aitm-scan-model = { workspace = true, features = ["testing"] }
 # The seam's test consumer: proves a protocol crate registers `test.*` host fns
 # and a script calls them with no edit to this crate (acyclic dev-dep).
 aitm-proto-test.workspace = true

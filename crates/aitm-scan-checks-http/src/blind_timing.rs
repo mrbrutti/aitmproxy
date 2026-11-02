@@ -135,6 +135,7 @@ pub fn sqli_time() -> Arc<dyn Check> {
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
+            scope: aitm_scan_model::CheckScope::Point,
             cwe: Some(89),
             description: "Asks the database for a bounded pause through the point, in an \
                           alternating long/short schedule, and reports when the observed \
@@ -190,6 +191,7 @@ pub fn cmdi_time() -> Arc<dyn Check> {
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
+            scope: aitm_scan_model::CheckScope::Point,
             cwe: Some(78),
             description: "Asks the operating system for a bounded pause through the point, \
                           in an alternating long/short schedule, and reports when the \
@@ -298,6 +300,8 @@ fn tracked(
         // A blind differential has no stable response assertion to reproduce, so
         // no PoC hint and no `FindingRecord` (spec D6).
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 

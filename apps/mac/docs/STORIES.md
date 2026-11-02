@@ -15,7 +15,7 @@ Acceptance:
 - [snap] Sidebar 240 px with Traffic / Testing / Automation groups in tracked small caps; brand mark `›•‹ aitmproxy` top-left (a label, no status); filter field at the bottom.
 - [snap] Toolbar holds sidebar toggle, compose, clear; the connection cluster (pill, Proxy switch, Capture switch) in the centre; Agent toggle, palette and layout glyphs on the right; no glass capsules behind any group.
 - [snap] Chip bar 36 px with `All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON … Other` and the `Filters ▾` affordance; status bar 28 px on `raised` with the list's facts only.
-- [self] Fixtures load 14 rows; the window opens at 1440×900 with a 1100×640 minimum.
+- [live] The rows come from the core over the bus (none are seeded); the window opens at 1440×900 with a 1100×640 minimum.
 Status: done
 
 ### S-002 Watch the flow list
@@ -62,14 +62,16 @@ Acceptance:
 - [snap] Status bar shows `● bus 127.0.0.1:9090` green when connected, amber connecting, red with the error, grey offline; the listening pill reads `listen:` from the same config.
 Status: done
 
-### S-006 Run the app on fixtures, snapshots and the self-test
-As the operator (or an agent), I run the app in fixture, snapshot or self-test mode and get the mockup's state without a proxy.
+### S-006 Run the app on the live self-test and the dev bundle
+As the operator (or an agent), I verify the app against a real core with real traffic and the live self-test, never against sample data.
 Screens: apps, domains, scope, findings, browser, scripts, agent, settings-general, settings-bus, settings-appearance
 Depends: S-001
 Acceptance:
-- [self] `APP_FIXTURES=1` loads the mockup's 14 flows, armed intercept, two paused, login selected; `APP_LIVE=1` captures the live bus instead.
-- [snap] `tools/snap.sh` writes `<page>-light/dark.png` for every sidebar page and `settings-<tab>-*.png`, plus `-layout.json` grid probes; refuses to run without `APP_STORE` in /tmp.
-- [self] `tools/selftest.sh` exits 0 with 9/9 checks; `swift test` passes 35/35; `tools/grid-lint.sh` and `check-layout.swift` print PASS.
+- [unit] `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build` reports 0 failures.
+- [structural] `tools/grid-lint.sh` and the three tripwires `tools/check-connection-words.sh`, `tools/check-capture-operator-only.sh` and `tools/check-capture-toggle.sh` exit 0.
+- [live] `DEV_TAG=<tag> CORE_DIR=<dir with aitm> tools/snap-dev.sh` builds the dev bundle and launches it LIVE on an isolated `APP_STORE`, printing the pid, the store path and the `kill <pid>` line; `NO_LAUNCH=1` only builds.
+- [live] Real traffic through the bundle: `python3 -m http.server 8099 --bind 127.0.0.1` upstream, `curl -x 127.0.0.1:<listen> http://127.0.0.1:8099/` (Safari for HTTPS once the CA is trusted) shows the row in the list; `swift tools/winshot.swift <pid printed by snap-dev.sh> /tmp/claude/<name>.png` reads the real window.
+- [live] `AITM_CONFIG=… tools/selftest-live.sh` (external core) and `tools/selftest-live-embedded.sh` end with `LIVE SELFTEST PASS`.
 Status: done
 
 ### S-007 See flat icons and an editorial hierarchy
@@ -238,7 +240,7 @@ Depends: S-010
 Core: F6
 Acceptance:
 - [snap] The mark menu shows 11 system-colour swatches and Clear; the row's 6 px swatch and the Comment column update at once.
-- [self] `flow.mark {id, marks}` and `flow.comment {id, text}` are sent; on fixtures the row updates locally.
+- [self] `flow.mark {id, marks}` and `flow.comment {id, text}` are sent over the bus.
 - [unit] A comment longer than the column truncates with an ellipsis and shows in full in the Summary tab.
 UX:
 - Flow: `m` (or Flow ▸ Mark ▸, or row context menu ▸ Mark) -> popover of 11 swatches + Clear -> click -> swatch appears in the Mark column; `c` / ⌘L -> inline comment field in the status bar's left slot? No — a small popover anchored to the row with one field -> Return saves, Esc cancels -> Comment column shows it
@@ -247,7 +249,7 @@ UX:
 - Words: "Mark ▸ Red … Pink, Clear Mark", "Comment…", popover title "Comment", button "Save"
 - Access: swatches have colour names for VoiceOver; the comment field is the only control focused on open (typing-only surface)
 Status: done
-(Fixtures update locally; live `flow.mark`/`flow.comment` wait on S-core-F6 and surface a status-bar error until then.)
+(Marks and comments go over the bus as `flow.mark` / `flow.comment`; a core without S-core-F6 surfaces a status-bar error.)
 
 ### S-018 Pause the proxy and clear the session
 As the operator, I flip the Proxy switch in the toolbar to stop recording and click clear to drop every flow; both are real proxy state, read back from the core.
@@ -261,11 +263,11 @@ Acceptance:
 UX:
 - Flow: toolbar Proxy switch (or View ▸ Pause Proxy ⇧⌘R) -> switch grey, pill reads "paused" -> click again to resume; toolbar trash (File ▸ Clear Session ⌘⌫) -> list empties -> empty state returns
 - Surface: inline toolbar toggles; Clear asks "Clear 2 paused flows too?" (confirmation dialog, destroys data) only when flows are paused, buttons "Clear" / "Cancel"
-- States: paused + new client traffic -> rows still flow? No: a paused proxy records nothing; the pill says so, and a pause from any other client shows within one poll (`proxy.status`). Live bus without F7 -> status-bar error "pause proxy: …"; fixtures toggle locally
+- States: paused + new client traffic -> rows still flow? No: a paused proxy records nothing; the pill says so, and a pause from any other client shows within one poll (`proxy.status`). Live bus without F7 -> status-bar error "pause proxy: …"
 - Words: "Proxy" (the switch), "Pause Proxy" / "Resume Proxy", "Clear Session", tooltip "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
 - Access: both in the menu bar; the pill is a status, not a control, to VoiceOver
 Status: done
-(Fixtures toggle locally; live `proxy.pause/resume`/`flow.clear` wait on S-core-F7 and surface a status-bar error until then.)
+(Pause, resume and clear go over the bus as `proxy.pause` / `proxy.resume` / `flow.clear`; a core without S-core-F7 surfaces a status-bar error.)
 
 ---
 
@@ -749,7 +751,7 @@ Acceptance:
 UX:
 - Flow: sidebar ▸ Scope (or Proxy ▸ Scope… ⇧⌘O) -> the Scope page: entries table over the in-scope flow list -> "Add Host…" or type in the field at the top -> ⌘⏎ adds -> the row loses its dimming at once
 - Surface: sidebar page with an inline add field; the sheet (⇧⌘O) is the same panel for when the list is elsewhere
-- States: empty -> "No hosts in scope — add one to authorise testing; everything stays read-only until then." with the field focused; invalid entry -> message under the field, Add disabled; live `scope.add` failing -> status-bar error, entry kept pending in tertiary
+- States: empty -> "No hosts in scope — add one to authorise testing; everything stays read-only until then." with the field focused; invalid entry -> message under the field, Add disabled; live `scope.add` failing -> the row carries the outcome (S-081: `queued — added when the core is back` / `not added — <reason>` with Retry and ✕), never a silent pending entry
 - Words: columns "Host · Limit · Back-off · Flows"; button "Add ⌘⏎"; placeholder "host, host:port or *.wildcard"
 - Access: entries are a real table; the field is the only focused control when empty
 Status: done
@@ -1165,6 +1167,24 @@ Acceptance:
 Live: 2026-10-31, found on the installed v0.5.6 during the S-041 check (FIXLOG 2026-10-31 "The Flows page stopped redrawing"); S-073 to S-078 are reserved for the Proxyman capture-flow stories drafted in `docs/research/proxyman-capture-flow-gaps.md`.
 Status: done
 
+### S-081 A Scope add that fails says so, and lands after a core restart
+As the operator, when I type a host on the Scope page and the add does not reach the core, the row tells me — "queued — added when the core is back" while the core restarts, "not added — <reason>" with Retry when the core refuses — instead of sitting there as if it were in Scope while the pill, the banner and Status say nothing is.
+Screens: scope
+Depends: S-047
+Acceptance:
+- [unit] `ScopeAddQueue` (Kit): a send that fails with a bus absence (disconnected, transport, timeout) is `queued` and replayable; a core refusal (tool, rpc) is `failed` with the reason; a host `scope.list` names leaves the queue; ✕ drops it; Retry re-sends.
+- [live] Dev bundle + real core, Scope page: Proxy ▸ Restart Core, then type a host and press Return while the core is down — the row reads `queued — added when the core is back`; when the bus reconnects the host is sent again, `scope.list` names it, and the row becomes a real entry (the pill/sidebar count moves) with no further action.
+- [live] A host the core refuses reads `not added — <the core's reason>` with Retry and ✕; the status bar carries the same reason; nothing is persisted to `scope.json`.
+- [live] The same add while the core is up still lands within a poll (regression), and every surface that reads Scope moves with it inside that poll: the status-bar pill, the sidebar Scope badge, the Flows banner's "Nothing is decrypted" line, the Status page's Scope step.
+- [live] A core that is merely busy (bus connected, the call times out: SIGSTOP on the dev bundle's core) leaves the row `queued — added when the core is back`; it lands on its own once the core answers again (the next poll re-sends it), with no reconnect and no operator action.
+- [live] After Proxy ▸ Restart Core, a verb from the page (row ✕, a plain add) reaches the new core on the first try: no "the bus connection closed" under a connected title (the superseded bus run's teardown must not clear the new client; FIXLOG 2026-11-01).
+UX:
+- Surface: inline on the Scope page row (and the Scope sheet, which embeds the page); no alert.
+- Words: "sending…", "queued — added when the core is back", "not added — <reason>", "Retry".
+- Access: the row's accessibility value is the state line; the row is one combined accessibility element, so Retry and ✕ reach VoiceOver as that row's actions (their labels name the host), not as standalone buttons.
+Live: found 2026-11-01 on the installed 0.5.10 ("I added to scope but still claims nothing is in scope": the add never reached the bus, the Scope page kept the host as a silent pending row; FIXLOG 2026-11-01). Proven 2026-11-01 on the dev bundle with the 0.5.10 release core (`docs/evidence/S-081`): an add typed during Proxy ▸ Restart Core reads `queued — added when the core is back` in the first frame after Return (+77 ms by the frame's own timestamp) and is a plain row in the second (+315 ms) with `scope.list` naming it; three restarts in a row, every add landed; a row ✕ and a plain add after the restarts land on the first try (before the fix they failed with "the bus connection closed" under a connected title); a host the core refuses reads `not added — <the core's reason>` with Retry and ✕, and ✕ drops it.
+Status: done
+
 ### S-072 See what is running and what to do first
 As the operator, on a fresh launch I land on a Status page that shows the core, the bus and the capture extension — each with a state word, one fact and its control — and a live Getting-started list, so I never have to guess which sidebar item to look at or why no flows appear.
 Screens: status, status-ok, status-fresh, status-external, status-core-starting, status-core-stopped, status-core-failed, status-bus-connecting, status-bus-agent, status-bus-token, status-scope-empty, status-waiting, status-degraded
@@ -1172,8 +1192,8 @@ Depends: S-063, S-070, core F1
 Spec: `docs/superpowers/specs/2026-10-31-macos-status-page-and-first-run-design.md`
 Acceptance:
 - [unit] `ConnectionSummary.make` yields the spec's word table for every core × bus × capture state; no lane word says "Capturing" while the scope is empty (ST-AC1/2).
-- [snapshot] The Status page renders every lane state in light + dark with no clipping; grid-lint + check-layout PASS (ST-AC3).
-- [self-test] A fixture session's lanes read "not running / connected / no extension"; Open Scope, Open Browser and Core Log from Status call the same entries as their menu items; Proxy ▸ Status (⌘0) is in the menu bar and the command map (ST-AC4/6).
+- [live] The Status page renders every lane state the real core produces, light + dark, on the dev bundle with no clipping; grid-lint PASS (ST-AC3).
+- [live] In the live self-test the lanes read the real core's and extension's state; Open Scope, Open Browser and Core Log from Status call the same entries as their menu items; Proxy ▸ Status (⌘0) is in the menu bar and the command map (ST-AC4/6).
 - [structural] The toolbar cluster, Status page, Core Log header and Settings rows take their words only from `ConnectionSummary` (ST-AC5); the sidebar and the status bar carry no connection state (ST-AC10).
 - [self-test] The toolbar's Proxy switch is live only while the bus is connected as operator and flips through `setCapturing`; its position and the pill's "paused" / "intercept armed" are the core's facts from `proxy.status`. The Capture switch's position is the lane's fact (in-flight choice overriding); it stands down, with the reason in its help, when the extension is not in the build, the core is external or a switch is in flight (ST-AC9).
 - [manual] On the notarized app: fresh launch lands on Status; the cards read the real state; Turn Off/On Capture from the card changes Settings ▸ Capture within one poll; adding a host ticks the step; the first flow ticks the last step (ST-AC7).

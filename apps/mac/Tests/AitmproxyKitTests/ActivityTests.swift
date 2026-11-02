@@ -46,6 +46,17 @@ import Testing
         #expect(ActivityEntry.summary(of: .null) == "")
     }
 
+    /// A confirm token is a capability: the log names the key and elides the value.
+    @Test func summaryElidesConfirmTokens() {
+        let summary = ActivityEntry.summary(of: ["_confirm": "7f3a9c1e-token", "scope": "user"])
+        #expect(summary == "_confirm=… scope=user")
+        #expect(!summary.contains("7f3a9c1e"))
+        let entry = ActivityEntry(origin: .operator, command: "ca.install", args: ["_confirm": "7f3a9c1e-token"], result: .ok)
+        #expect(entry.argsSummary == "_confirm=…")
+        #expect(entry.args["_confirm"] == "7f3a9c1e-token")
+        #expect(ActivityEntry.summary(of: ["l4_confirm": "abc", "id": "1"]) == "id=1 l4_confirm=…")
+    }
+
     @Test func ringKeepsTheLastFiveHundredAndCountsAgentActions() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         var ring = ActivityRing()
@@ -65,13 +76,6 @@ import Testing
         #expect(small.entries.map(\.command) == ["b", "c"])
     }
 
-    @Test func fixturesMatchTheStories() {
-        #expect(Fixtures.activity.count == 12)
-        #expect(Fixtures.activity.filter { $0.result == .pending }.map(\.command) == ["ca.install"])
-        #expect(Fixtures.activity.contains { if case .error = $0.result { return true } else { return false } })
-        #expect(Set(Fixtures.activity.map(\.origin)) == [.agent, .operator, .cli])
-    }
-
     @Test func readsAgentStatus() {
         let status = AgentStatus(json: ["policy": "readonly", "actions_last_minute": 14, "connected_clients": 2])
         #expect(status == AgentStatus(policy: "readonly", actionsLastMinute: 14, connectedClients: 2))
@@ -79,12 +83,28 @@ import Testing
     }
 }
 
+/// Three scripts as `script.list` could report them — one active, one switched off, one that
+/// failed to compile — for `ScriptInfoTests.statusTextFollowsEnabledAndError`.
+private enum ScriptInfoInputs {
+    static let active = ScriptInfo(id: "strip-hsts", name: "Strip HSTS", ruleSummary: "*.shop-staging.test · response",
+                                   phases: ["response"], enabled: true)
+    static let disabled = ScriptInfo(id: "tag-agent-replays", name: "Tag agent replays",
+                                     ruleSummary: "api.shop-staging.test/api/* · GET POST", phases: ["request", "response"],
+                                     enabled: false)
+    static let broken = ScriptInfo(id: "ws-logger", name: "WebSocket frame logger",
+                                   ruleSummary: "wss://api.shop-staging.test/ws/*", phases: ["websocket"], enabled: true,
+                                   error: "line 12: unknown function 'frame.len' — did you mean 'frame.length'?")
+}
+
 @Suite struct ScriptInfoTests {
     @Test func statusTextFollowsEnabledAndError() {
-        #expect(Fixtures.scripts[0].statusText == "Saved and active")
-        #expect(Fixtures.scripts[1].statusText == "Disabled")
-        #expect(Fixtures.scripts[2].statusText.hasPrefix("Error: line 12"))
-        #expect(Fixtures.scripts.filter(\.isActive).count == 1)
+        #expect(ScriptInfoInputs.active.statusText == "Saved and active")
+        #expect(ScriptInfoInputs.disabled.statusText == "Disabled")
+        #expect(ScriptInfoInputs.broken.statusText.hasPrefix("Error: line 12"))
+        // Enabled with an error is not active: the Scripts page and the sidebar must agree.
+        #expect(ScriptInfoInputs.active.isActive)
+        #expect(!ScriptInfoInputs.disabled.isActive)
+        #expect(!ScriptInfoInputs.broken.isActive)
     }
 
     @Test func decodesAScriptListItem() throws {

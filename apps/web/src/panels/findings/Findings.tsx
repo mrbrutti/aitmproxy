@@ -3,7 +3,7 @@
 // survive the panel unmounting when the inspector takes the lower region.
 
 import { createEffect, createMemo, createSignal, For, on, onCleanup, Show, type Component } from 'solid-js';
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import { Icon } from '~/components';
 import { useApp } from '~/state/context';
 import { FindingDetail } from './FindingDetail';
