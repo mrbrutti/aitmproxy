@@ -254,7 +254,8 @@ export function parseOperatorUrl(stdout) {
   const candidates = [];
   const legacy = text.match(/web UI \(operator\):\s*(\S+)/);
   if (legacy) candidates.push(legacy[1]);
-  for (const m of text.matchAll(/^\s*Operator\s+(\S+)\s*$/gm)) candidates.push(m[1]);
+  // `Operator   <url>` (TTY block) or `Operator: <url>` (the ready card on a pipe).
+  for (const m of text.matchAll(/^\s*Operator:?\s+(\S+)\s*$/gm)) candidates.push(m[1]);
   return candidates.find((u) => u.includes('#t=')) ?? null;
 }
 
@@ -275,10 +276,13 @@ export async function startAitm({
   const dir = mkdtempSync(join(tmpdir(), 'aitm-live-'));
   const token = 'live-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   // Configuring `mcp.operator_token` (any non-empty secret) ENABLES operator access: the server then
-  // mints a FRESH per-run operator *bridge* token and prints `  Operator   http://…/#t=<tok>&expect=operator`
-  // on stdout (older builds: `web UI (operator): <url>`; the secret itself never appears in a URL/log).
-  // We parse that URL + token below (`parseOperatorUrl`) so the
-  // CUA can drive the web surface as a real `Frontend::Operator` (vs the agent `--token` = Mcp).
+  // mints a FRESH per-run operator *bridge* token and prints it in its ready card on stderr. A spawn
+  // pipe is not a TTY, so the card arrives in the plain `Label: value` form: the row
+  // `Operator: http://…/#t=<tok>&expect=operator`, next to the agent `Web UI: http://…/#t=<tok>`
+  // row (older builds: `  Operator   <url>` on stdout, or `web UI (operator): <url>`); the secret
+  // itself never appears in a URL/log. We parse that URL + token below (`parseOperatorUrl`, over
+  // both streams) so a script can connect to /bus as a real `Frontend::Operator` (vs the agent
+  // `--token` = Mcp), exactly as the UI opened from that URL does.
   const operatorSecret = 'opsecret-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   const pocDir = join(dir, 'poc');
   const pocOut = join(dir, 'poc-out');
@@ -297,13 +301,13 @@ export async function startAitm({
     log(String(d).trimEnd());
   });
   await new Promise((res, rej) => {
-    // Readiness: the server logs "web UI listening" via tracing (stderr) and prints the agent +
-    // operator URLs on stdout (current builds: a `  Web UI     http://…` startup block line).
-    // Resolve once the operator URL is captured, or on the generic listen/agent/Web UI line
-    // (older builds / operator disabled).
+    // Readiness: the server logs "web UI listening" via tracing (stderr) and prints the ready
+    // card with the `Web UI` and `Operator` rows, also on stderr (older builds: on stdout).
+    // Resolve once the operator URL is captured, or on the listening log / the `Web UI` row
+    // (operator access not configured).
     const check = () => {
-      operatorUiUrl ??= parseOperatorUrl(out);
-      if (operatorUiUrl || /web UI (listening|: http|\(agent\))/i.test(out + stderr) || /^\s*Web UI\s+http/m.test(out)) res();
+      operatorUiUrl ??= parseOperatorUrl(out + stderr);
+      if (operatorUiUrl || /web UI (listening|: http|\(agent\))/i.test(out + stderr) || /^\s*Web UI:?\s+https?:\/\//m.test(out + stderr)) res();
     };
     child.stdout.on('data', (d) => {
       out += d;
@@ -313,9 +317,10 @@ export async function startAitm({
     child.on('exit', (code) => rej(new Error(`aitm exited ${code}\n${stderr}`)));
     setTimeout(() => rej(new Error('aitm did not start in 20 s\n' + stderr)), 20000);
   });
-  // The operator URL println can trail the stderr "listening" log we resolved on; give stdout a beat.
+  // The ready card follows the `binding ports` line on the same stream (stderr), so its `Operator` row
+  // can trail the "listening" log we resolved on; give the card a beat.
   for (let i = 0; i < 20 && !operatorUiUrl; i++) {
-    operatorUiUrl = parseOperatorUrl(out);
+    operatorUiUrl = parseOperatorUrl(out + stderr);
     if (!operatorUiUrl) await new Promise((r) => setTimeout(r, 50));
   }
   // The operator URL fragment is query-shaped: `#t=<token>&expect=operator`. The bus token is only `t`.

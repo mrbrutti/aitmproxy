@@ -399,6 +399,8 @@ pub struct ObscuraProcess {
     spawned_at: Instant,
     stop_timeout: Duration,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// The binary's probed `--version` (trimmed); informational, never a pin.
+    version: String,
 }
 
 impl ObscuraProcess {
@@ -516,11 +518,19 @@ impl ObscuraProcess {
             spawned_at,
             stop_timeout: config.obscura.stop_timeout,
             stderr_tail,
+            version: probed.version,
         };
         process
             .wait_ready(config.obscura.start_timeout, stderr_pump)
             .await?;
         Ok((process, format!("ws://127.0.0.1:{cdp_port}{CDP_WS_PATH}")))
+    }
+
+    /// The probed `--version` of the binary this child runs (trimmed);
+    /// informational, never a pin. Crate-private: only `ObscuraDriver::launch`
+    /// reads it, and `LaunchedBrowser::version` is the public surface.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
     }
 
     /// Poll until the child writes its ready-file; a child that exits first is
@@ -654,6 +664,9 @@ pub struct ObscuraDriver {
     /// `nav_timeout`: the bound on every primitive other than `navigate`,
     /// which `CdpSession` already bounds with the same value.
     op_timeout: Duration,
+    /// The child's probed `--version`, for the startup reporter's
+    /// `obscura probed <version>` line (spec T7).
+    version: String,
 }
 
 /// Run one primitive under `limit` (Global Constraint: every operation is
@@ -707,11 +720,19 @@ impl ObscuraDriver {
             }
         };
         info!(pid = process.pid, %ws_url, "obscura CDP attached");
+        let version = process.version().to_string();
         Ok(Self {
             session,
             process: Mutex::new(Some(process)),
             op_timeout: config.nav_timeout,
+            version,
         })
+    }
+
+    /// The probed `--version` of the obscura binary this driver launched
+    /// (trimmed; informational, never a pin).
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     /// Graceful shutdown: CDP `Browser.close`, then SIGTERM, then SIGKILL after

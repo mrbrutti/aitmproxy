@@ -15,6 +15,7 @@ pub mod macos_capture;
 pub mod operator_token;
 pub mod render;
 pub mod scripts;
+pub mod startup;
 pub mod tui;
 pub mod web;
 pub mod wire;

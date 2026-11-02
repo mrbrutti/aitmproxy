@@ -355,6 +355,25 @@ pub fn store_for(platform: &Platform) -> Box<dyn TrustStore> {
     }
 }
 
+/// What every trust store on `platform` says about `cert`, one
+/// [`StoreStatus`] per scope in [`Platform::scopes`] order (least privileged
+/// first); empty on an unsupported platform, which has no scopes. The one
+/// code path behind `ca.status` and the CLI's `checking CA trust` phase, so
+/// the two can never disagree on the word (CLI terminal reporting plan C16).
+/// Blocking: every store shells out to the OS tools through `exec`.
+pub fn trust_statuses(
+    cert: &CaCert,
+    platform: &Platform,
+    exec: &dyn Executor,
+) -> anyhow::Result<Vec<StoreStatus>> {
+    let store = store_for(platform);
+    platform
+        .scopes()
+        .iter()
+        .map(|scope| store.status(cert, *scope, exec))
+        .collect()
+}
+
 /// Why a store operation failed; the message carries the user-facing hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrustErrorKind {
@@ -414,3 +433,120 @@ impl fmt::Display for TrustError {
 }
 
 impl std::error::Error for TrustError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::ScriptedExecutor;
+    use std::path::PathBuf;
+
+    /// A certificate by value: `trust_statuses` never reads it from disk.
+    fn cert() -> CaCert {
+        CaCert {
+            path: PathBuf::from("/ca/ca.crt"),
+            pem: String::new(),
+            der: Vec::new(),
+            sha256: [0; 32],
+            sha1: [0; 20],
+        }
+    }
+
+    #[test]
+    fn trust_statuses_on_an_unsupported_platform_is_empty() {
+        let exec = ScriptedExecutor::new();
+        let got =
+            trust_statuses(&cert(), &Platform::Unsupported("plan9".to_string()), &exec).unwrap();
+        assert_eq!(got, Vec::<StoreStatus>::new());
+        assert!(exec.runs().is_empty(), "ran {:?}", exec.runs());
+        assert!(exec.reads().is_empty(), "read {:?}", exec.reads());
+    }
+
+    #[test]
+    fn trust_statuses_visits_every_scope_in_platform_order() {
+        // macOS has two scopes, user first (`Platform::scopes`); the scripted
+        // host answers every `security` query with exit 0 and no output, so
+        // each store reports the certificate absent.
+        let exec = ScriptedExecutor::new();
+        let got = trust_statuses(&cert(), &Platform::MacOs, &exec).unwrap();
+        let scopes: Vec<Scope> = got.iter().map(|s| s.scope).collect();
+        assert_eq!(scopes, vec![Scope::User, Scope::System]);
+        assert!(got.iter().all(|s| s.trusted == Trust::No), "{got:?}");
+
+        // Linux has one scope.
+        let exec = ScriptedExecutor::new();
+        let got = trust_statuses(&cert(), &Platform::Linux(LinuxFamily::Debian), &exec).unwrap();
+        let scopes: Vec<Scope> = got.iter().map(|s| s.scope).collect();
+        assert_eq!(scopes, vec![Scope::System]);
+    }
+
+    // ---- tester, whole-branch pass (plan C16) ----
+
+    #[test]
+    fn trust_statuses_windows_and_fedora_scope_orders() {
+        let exec = ScriptedExecutor::new();
+        let got = trust_statuses(&cert(), &Platform::Windows, &exec).unwrap();
+        assert_eq!(
+            got.iter().map(|s| s.scope).collect::<Vec<_>>(),
+            vec![Scope::User, Scope::System]
+        );
+        let exec = ScriptedExecutor::new();
+        let got = trust_statuses(&cert(), &Platform::Linux(LinuxFamily::Fedora), &exec).unwrap();
+        assert_eq!(
+            got.iter().map(|s| s.scope).collect::<Vec<_>>(),
+            vec![Scope::System]
+        );
+    }
+
+    /// The first store that cannot answer fails the whole read: the error
+    /// propagates, the later scope is never queried, and so `read_ca_trust`
+    /// (which maps `Err` to no word) never shows a half-read verdict.
+    #[test]
+    fn trust_statuses_stops_at_the_first_failing_store() {
+        let exec = ScriptedExecutor::new().unspawnable("find-certificate");
+        let err = trust_statuses(&cert(), &Platform::MacOs, &exec).unwrap_err();
+        assert!(
+            err.to_string().contains("find-certificate"),
+            "the error names the tool that could not start: {err}"
+        );
+        assert_eq!(
+            exec.runs(),
+            vec![
+                "security find-certificate -a -Z /Users/t/Library/Keychains/login.keychain-db"
+                    .to_string()
+            ],
+            "fail fast: the System keychain is never queried after the user one failed"
+        );
+    }
+
+    /// The word the ready card and `ca.status` share: a certificate present
+    /// in the login keychain and passing `verify-cert` is `Yes` there and
+    /// `No` in the (empty) System keychain, in scope order.
+    #[test]
+    fn trust_statuses_reports_a_trusted_user_store() {
+        let c = cert();
+        let present = format!("SHA-256 hash: {}\n", c.sha256_hex());
+        let exec = ScriptedExecutor::new()
+            .respond(
+                "security find-certificate -a -Z /Users/t/Library/Keychains/login.keychain-db",
+                0,
+                &present,
+                "",
+            )
+            .respond(crate::testing::VERIFY_CMD, 0, crate::testing::VERIFY_OK, "");
+        let got = trust_statuses(&c, &Platform::MacOs, &exec).unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|s| (s.scope, s.installed, s.trusted))
+                .collect::<Vec<_>>(),
+            vec![
+                (Scope::User, Presence::Present, Trust::Yes),
+                (Scope::System, Presence::Absent, Trust::No),
+            ]
+        );
+        assert_eq!(
+            got[0].location,
+            "/Users/t/Library/Keychains/login.keychain-db"
+        );
+        assert_eq!(got[1].location, "/Library/Keychains/System.keychain");
+    }
+}
