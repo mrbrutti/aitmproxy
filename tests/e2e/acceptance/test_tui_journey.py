@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import time
 
 E2E = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +50,12 @@ from aitm_e2e.installed import (  # noqa: E402
     yes_set,
 )
 from aitm_e2e.tui_pty import Terminal  # noqa: E402
+
+
+def pgrep_lines(pattern: str) -> str:
+    """`pgrep -fl` matches, or "" when there are none (exit 1 is not an error here)."""
+    r = subprocess.run(["pgrep", "-fl", pattern], capture_output=True, text=True, check=False)
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 OUT = os.environ.get("ACCEPT_OUT", "/tmp/claude/acceptance/tui")
 os.makedirs(OUT, exist_ok=True)
@@ -268,7 +275,9 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         term.press("q")
         rc = term.wait_exit(10)
         after = scutil()
-        left = sh("pgrep", "-fl", f"{AITM} tui").strip()
+        # `pgrep` exits 1 with nothing on either stream when no process matches; `sh()` would
+        # render that exit as a `[stderr]` marker and fail the step with nothing left behind.
+        left = pgrep_lines(f"{AITM} tui")
         if rc == 0 and after == before_scutil and not left:
             step("TUI-8", "PASS", "exit 0, no child left, scutil unchanged", "audit: last entries from this pid")
         else:
