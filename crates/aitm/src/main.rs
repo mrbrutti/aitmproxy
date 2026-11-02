@@ -4,8 +4,10 @@
 //! Config comes from `--config <path>` (a leading flag stripped before CLI
 //! dispatch), else `AITM_CONFIG`, else the default path (spec §D10); the env
 //! bridge (`aitm::env`) is applied on top. Invoked with a subcommand (`aitm flow
-//! list`, `aitm scope add --host ex.test`) it dispatches once over the CLI
-//! frontend, prints via `render_cli_value`, and exits. Invoked bare it starts
+//! list`, `aitm scope add --host ex.test`) it hands the verb to
+//! `aitm::oneshot::run` — a local verb runs in-process, a live one on the
+//! running core (R14 spec D6/D8) — writes the rendered bytes to stdout, and
+//! exits. Invoked bare it starts
 //! the proxy accept loop and the MCP server (stdio or loopback-TCP per config),
 //! with the configured browser engine attached when it launches, and closes
 //! the browser on every orderly exit path including SIGINT/SIGTERM (spec §D6).
@@ -274,7 +276,7 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
     let (bus_endpoint_file, argv) = split_bus_endpoint_file_arg(argv)?;
     let (bus_args, argv) = match oneshot::args::split_bus_args(argv) {
         Ok(split) => split,
-        Err(text) => exit_with(&ErrorReport::usage(text), None),
+        Err(text) => exit_with(&ErrorReport::usage(text), Some(&usage_reporter(&term))),
     };
     // `aitm web …` is the server path with the web UI attached; its options
     // are resolved before any config is loaded so `--help` and bad flags are
@@ -475,7 +477,8 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
     // R14 spec D3/D4, serving modes only: a first run mints `mcp.operator_token`
     // into the config (a failure only turns the operator bus off); the pointer
-    // context is published whatever the mint did, with an absolute config path.
+    // context is published whatever the mint did, with the config path made
+    // absolute (observation b).
     let mut mint_failure = None;
     if manages_system_proxy(&mode) {
         if cfg.mcp.operator_bus.enabled
@@ -501,8 +504,14 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
                 }
             }
         }
-        pointer::publish(PointerContext {
-            config: std::path::absolute(&effective_path).unwrap_or_else(|_| effective_path.clone()),
+        // `run()` publishes once per process, so the first-publish answer is
+        // not read. The path is absolute unless the cwd is unreadable, when the
+        // pointer keeps it as typed and says so in the log.
+        let _ = pointer::publish(PointerContext {
+            config: std::path::absolute(&effective_path).unwrap_or_else(|err| {
+                warn!(%err, "core pointer keeps the config path as typed");
+                effective_path.clone()
+            }),
             run_dir: pointer::run_dir(&|k| std::env::var(k).ok()),
         });
     }
@@ -827,8 +836,9 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     // returned above. Blocking shell-outs, but nothing is served yet.
     //
     // The bound addresses are read inside this block too: after the startup set,
-    // no `?` remains before the `select!`, so the §D9 (a) restore below is reached
-    // on every path.
+    // the only fallible step before the `select!` is `operator_bus::start`, whose
+    // error arm restores the system proxy itself (security S8), so the §D9 (a)
+    // restore is reached on every path.
     let config_display = effective_path.display().to_string();
     let phase = reporter.phase("binding ports");
     let bound = bind_then_recover_system_proxy(&mode, &sysproxy, system_proxy.auto, async {
@@ -920,7 +930,8 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         .as_ref()
         .map(|shared| shared.guard.clone());
     // Bound addresses from the pre-bind step: nothing fallible may run between
-    // the system-proxy auto-set and the `select!` (its restore-on-exit depends on it).
+    // the system-proxy auto-set and the `select!` (its restore-on-exit depends on
+    // it) except `operator_bus::start` below, which restores on its error arm.
     if let Some(guard) = &l4_live_guard {
         guard.add_self_ports(
             [proxy_addr.port(), browser_addr.port()]
@@ -980,7 +991,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     // The operator bus (R14 spec D2): before the ready card and the TUI handover
     // (a fixed-port conflict is the M2 panel through `report_for`), bound outside
     // both branches so its drop, which removes the core pointer (D4), is `run()`'s end.
-    let mut operator_bus = operator_bus::start(
+    let mut operator_bus = match operator_bus::start(
         &cfg,
         &effective_path,
         &services,
@@ -990,7 +1001,19 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         l4_live_guard.clone().map(self_port_hook),
         mint_failure,
     )
-    .await?;
+    .await
+    {
+        Ok(bus) => bus,
+        Err(err) => {
+            // The one fallible step after the system-proxy auto-set (security
+            // S8): give the OS its proxy back before the M2 panel, as the §D9 (a)
+            // restore below would have.
+            if manages_system_proxy(&mode) {
+                log_recovery("exit", &sysproxy.on_orderly_exit());
+            }
+            return Err(err);
+        }
+    };
 
     // The scripting tier now reaches exactly the proxy's store, client and
     // guard, and a failed hook's `Event::Error` reaches the chain rather than

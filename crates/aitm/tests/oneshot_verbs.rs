@@ -69,8 +69,7 @@ const EXPECTED: &[(&str, Placement)] = &[
     ("scan.profile.delete", Live),
     ("scan.session.preview", Live),
     // check.<id> — one check by hand on the core (natives since #232, three
-    // more L4 ones with #301; the
-    // `check.` prefix puts them on the long lane).
+    // more L4 ones with #301; the `check.` prefix puts them on the long lane).
     ("check.cmdi-time", Live),
     ("check.cookie-flag", Live),
     ("check.cswsh", Live),
