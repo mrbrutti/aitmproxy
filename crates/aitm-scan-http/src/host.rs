@@ -60,7 +60,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use aitm_core::{Body, Flow, HeaderMap, HttpRequest, RecordPolicy, SendOptions};
+use aitm_core::{Body, Flow, HeaderMap, HttpFlow, HttpRequest, RecordPolicy, SendOptions};
 use aitm_scan_model::{
     FlowRef, InsertionPoint, JobCtx, Payload, ProbeHost, ProbeResponse, RawProbe, RecordProbes,
     ScanProfile, SessionMode, MAX_MATCH_BODY,
@@ -83,6 +83,10 @@ use crate::{mutate, redact, session, url_norm};
 pub(crate) struct HttpProbeHost {
     /// The captured request, session already applied, every probe starts from.
     source: HttpRequest,
+    /// The stored flow the point came from, as the proxy captured it, for the
+    /// engine's passive checks ([`ProbeHost::captured`]): they read the
+    /// operator's own request and response and send nothing.
+    captured: HttpFlow,
     /// The one point this host mutates.
     point: InsertionPoint,
     /// The source's origin; a raw probe may not leave it.
@@ -122,6 +126,7 @@ impl HttpProbeHost {
             return Err(anyhow!("scan: source flow {flow_ref} is gone"));
         };
 
+        let captured = flow.clone();
         let mut source = flow.request;
         match job.profile().session.mode {
             // The capture may itself be authenticated; an unauthenticated job
@@ -142,6 +147,7 @@ impl HttpProbeHost {
 
         Ok(Self {
             source,
+            captured,
             point: point.clone(),
             origin,
             job,
@@ -429,6 +435,10 @@ impl ProbeHost for HttpProbeHost {
             let (answer, _peer) = self.send_bounded(built, "probe_raw").await?;
             Ok(answer)
         })
+    }
+
+    fn captured(&self) -> Option<HttpFlow> {
+        Some(self.captured.clone())
     }
 
     fn baseline_peer_addr(&self) -> Option<SocketAddr> {
@@ -771,6 +781,31 @@ mod tests {
         let mut profile = ScanProfile::default();
         profile.http.record_probes = RecordProbes::All;
         profile
+    }
+
+    /// The engine's shipped passive checks (`reflection`, `security-header`,
+    /// `cookie-flag`) read the point's captured flow through the host and send
+    /// nothing; a host that answered `None` would leave every passive check
+    /// Inconclusive on this lane (integration regression, 2026-11-01).
+    #[tokio::test]
+    async fn captured_is_the_points_stored_flow() {
+        let fx = fixture(ok_200());
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        let captured = host.captured().expect("the point came from a stored flow");
+        assert_eq!(captured.id, fx.point.flow.unwrap().0);
+        assert_eq!(captured.request.path, "/search?q=hello&x=1");
+        assert_eq!(
+            captured.response.as_ref().map(|r| r.status),
+            Some(200),
+            "the capture carries the operator's response"
+        );
+        assert_eq!(
+            captured.request.headers.get("cookie"),
+            Some("theme=dark"),
+            "the capture is the flow as proxied, not the session-applied source"
+        );
+        assert!(fx.sent().is_empty(), "reading the capture sends nothing");
     }
 
     #[tokio::test]
