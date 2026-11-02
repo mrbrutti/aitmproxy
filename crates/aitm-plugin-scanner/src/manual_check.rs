@@ -31,8 +31,8 @@ use aitm_core::{
     ProxyClient, Registry, Sensitivity, TypeDesc, Value,
 };
 use aitm_scan_model::{
-    scan_error, Check, InsertionKind, JobCtx, LaneKind, ProfileTarget, ScanErrorCode, ScanProfile,
-    SessionMaterial,
+    scan_error, Check, Evidence, InsertionKind, JobCtx, LaneKind, ProfileTarget, ScanErrorCode,
+    ScanProfile, SessionMaterial, Verdict,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -238,8 +238,34 @@ impl Command for ManualCheck {
                 })
         })?;
 
-        result_of(&verdict)
+        // The verdict goes straight back to the bus caller, so it gets the
+        // scrub the job path's worker applies when it files an issue (spec
+        // D8.1, amendment 56); a native check that echoes a credential from a
+        // response leaks nothing through `check.<id>`.
+        result_of(&scrubbed(verdict))
     }
+}
+
+/// `verdict` with its evidence — and every `more` sibling's — scrubbed through
+/// [`util::scrub`] and `matched` bounded, in that order (amendment 16): a cut
+/// before the scrub could leave a credential fragment the scrubber no longer
+/// recognises. Idempotent, so a Rhai verdict the bridge already scrubbed comes
+/// through unchanged.
+fn scrubbed(mut verdict: Verdict) -> Verdict {
+    scrub_evidence(&mut verdict.evidence);
+    for sibling in &mut verdict.more {
+        scrub_evidence(&mut sibling.evidence);
+    }
+    verdict
+}
+
+/// Scrub one [`Evidence`]'s two free-text fields in place.
+fn scrub_evidence(evidence: &mut Evidence) {
+    evidence.matched = evidence
+        .matched
+        .as_deref()
+        .map(|text| Evidence::excerpt(&util::scrub(text)));
+    evidence.payload = evidence.payload.as_deref().map(util::scrub);
 }
 
 /// The request a manual run probes: `url` with `param` set to `value`.
@@ -423,12 +449,63 @@ mod tests {
         HttpRequest, HttpResponse, HttpVersion, JobBus, MemFlowStore, Params, ProxyClient,
         Registry, ScopeEntry, ScopeRateGuard, SendOptions, Sensitivity, StdGuard, Value,
     };
+    use aitm_scan_model::check::{CheckMeta, Evidence, Verdict};
+    use aitm_scan_model::point::InsertionPoint;
+    use aitm_scan_model::testing::null_meta;
+    use aitm_scan_model::traits::{Check, ProbeHost};
+    use aitm_scan_model::vocab::{Confidence, Outcome};
     use aitm_scan_model::{ScanErrorCode, ScanRefusal};
     use futures::future::BoxFuture;
 
     use crate::config::ScannerConfig;
     use crate::jobs::ScanServices;
     use crate::plugin::ScannerPlugin;
+
+    /// A native check whose evidence echoes what a target's response carried —
+    /// a session cookie and a bearer token — the way a real check's `matched`
+    /// excerpt and `payload` would. It sends nothing; the leak is in the verdict.
+    struct LeakyCheck {
+        meta: CheckMeta,
+    }
+
+    impl LeakyCheck {
+        fn new() -> Self {
+            Self {
+                meta: null_meta("leaky-echo"),
+            }
+        }
+    }
+
+    impl Check for LeakyCheck {
+        fn meta(&self) -> &CheckMeta {
+            &self.meta
+        }
+
+        fn run<'a>(
+            &'a self,
+            _point: &'a InsertionPoint,
+            _host: &'a dyn ProbeHost,
+        ) -> BoxFuture<'a, Verdict> {
+            Box::pin(async {
+                Verdict {
+                    outcome: Outcome::Vulnerable,
+                    confidence: Confidence::Firm,
+                    evidence: Evidence {
+                        payload: Some("q=1&access_token=tok-123".to_string()),
+                        matched: Some(
+                            "Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi"
+                                .to_string(),
+                        ),
+                        ..Evidence::default()
+                    },
+                    detail: "echoed the response".to_string(),
+                    poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
+                }
+            })
+        }
+    }
 
     /// A client that answers every request with an HTML page echoing the
     /// decoded query values, so the interim `xss-reflected` check sees its
@@ -507,12 +584,19 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_checks(Vec::new())
+        }
+
+        /// A harness whose catalogue also holds `extra`, for a test that needs a
+        /// check with a particular verdict beside the legacy natives.
+        fn with_checks(extra: Vec<Arc<dyn Check>>) -> Self {
             let cfg = ScannerConfig::default();
             // The native slot holds the lane's two legacy active checks, standing
             // in for the T3 natives the binary puts there (PR 2a), so
             // `check.xss-reflected` exists to drive these tests with.
-            let plugin = ScannerPlugin::new(cfg.clone())
-                .with_native_checks(crate::interim_lane::legacy_active_checks());
+            let mut natives = crate::interim_lane::legacy_active_checks();
+            natives.extend(extra);
+            let plugin = ScannerPlugin::new(cfg.clone()).with_native_checks(natives);
             let late = plugin.late();
             let mut reg = Registry::new();
             reg.add_plugin(Box::new(plugin));
@@ -605,6 +689,32 @@ mod tests {
             before,
             "the synthetic flow never entered the store"
         );
+    }
+
+    /// Amendment 56 (D8.1): the manual path returns a verdict straight to the bus
+    /// caller, so it scrubs `evidence.matched` and `evidence.payload` the way the
+    /// job path's worker does — a native check that echoes a session cookie or a
+    /// bearer token from a response hands neither to the caller. The literals
+    /// are `scrub_text_wide`'s own form: a secret pair's value and the whole of
+    /// an `Authorization` line become `[redacted]`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manual_verdict_evidence_is_scrubbed() {
+        let h = Harness::with_checks(vec![Arc::new(LeakyCheck::new()) as Arc<dyn Check>]);
+
+        let result = h
+            .call(
+                "check.leaky-echo",
+                &[("url", s("http://ex.test/search")), ("param", s("q"))],
+            )
+            .expect("the manual check runs");
+
+        assert_eq!(obj(&result, "outcome"), &s("vulnerable"));
+        let evidence = obj(&result, "evidence");
+        assert_eq!(
+            obj(evidence, "matched"),
+            &s("Cookie: [redacted]; Authorization: [redacted]")
+        );
+        assert_eq!(obj(evidence, "payload"), &s("q=1&access_token=[redacted]"));
     }
 
     /// Deny-by-default: a URL outside the HTTP scope is refused before anything

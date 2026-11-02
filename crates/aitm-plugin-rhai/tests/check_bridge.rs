@@ -484,6 +484,58 @@ async fn evidence_matched_is_bounded() {
     );
 }
 
+/// Amendment 56 (D8.1 / amendment 16): the bridge scrubs `evidence.matched` and
+/// `evidence.payload` with `aitm_core::redact::scrub_text_wide` where the verdict
+/// is built, so a closure that echoes a session cookie or a bearer token from a
+/// target's response hands neither to the job path nor to the manual `check.<id>`
+/// path. The exact form is the scrubber's: a secret pair's value and the whole
+/// of an `Authorization` line become `[redacted]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evidence_matched_and_payload_are_scrubbed() {
+    let (verdict, _host) = verdict_of(
+        r#"#{ outcome: "vulnerable",
+             evidence: #{ payload: "q=1&access_token=tok-123",
+                          matched: "Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi" } }"#,
+        200,
+        "body",
+    )
+    .await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable);
+    assert_eq!(
+        verdict.evidence.matched.as_deref(),
+        Some("Cookie: [redacted]; Authorization: [redacted]")
+    );
+    assert_eq!(
+        verdict.evidence.payload.as_deref(),
+        Some("q=1&access_token=[redacted]")
+    );
+}
+
+/// Amendment 16's order: scrub first, then bound. 230 bytes of padding followed
+/// by the two secrets scrubs to 276 bytes, which the bound cuts to exactly
+/// `MAX_EXCERPT_BYTES`; bounded first, the cut would land inside the cookie value
+/// and the scrub would then shrink the text to 249 bytes. The literal pins both
+/// the redaction and the cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scrubbed_evidence_matched_is_still_bounded() {
+    let (verdict, _host) = verdict_of(
+        r#"{ let pad = ""; pad.pad(230, 'a');
+             #{ outcome: "vulnerable",
+                evidence: #{ matched: pad + " Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi" } } }"#,
+        200,
+        "body",
+    )
+    .await;
+
+    let matched = verdict.evidence.matched.as_deref().expect("matched is set");
+    assert_eq!(matched.len(), MAX_EXCERPT_BYTES);
+    assert_eq!(
+        matched,
+        format!("{} Cookie: [redacted]; Autho", "a".repeat(230))
+    );
+}
+
 /// What every `ProbeHost` method below returns: the model's `BoxFuture` spelled
 /// with std types, because this crate does not depend on `futures`.
 type ProbeFuture<'a> = Pin<

@@ -29,6 +29,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aitm_core::redact::scrub_text_wide;
 use aitm_core::{CallerTrust, Value};
 use aitm_scan_model::check::{CheckMeta, ControlHint, Evidence, PocHint, Verdict, VerdictLocation};
 use aitm_scan_model::point::InsertionPoint;
@@ -477,13 +478,22 @@ fn verdict_from_map(map: &Map) -> Verdict {
         let Some(fields) = value.read_lock::<Map>() else {
             return error_verdict("a verdict's `evidence` must be a map of payload and matched");
         };
-        evidence.payload = fields.get("payload").and_then(token);
+        // Scrubbed here, where the verdict is built, so a closure that echoes a
+        // session cookie or a bearer token from a response hands it neither to
+        // the job path nor to the manual `check.<id>` path (spec D8.1,
+        // amendment 56). Scrubbed *before* the bound (amendment 16): cutting
+        // first could leave a fragment of a credential the scrubber no longer
+        // recognises.
+        evidence.payload = fields
+            .get("payload")
+            .and_then(token)
+            .map(|text| scrub_text_wide(&text));
         // Bounded by the model: the script chooses what matched, never how much
         // of it an issue carries.
         evidence.matched = fields
             .get("matched")
             .and_then(token)
-            .map(|text| Evidence::excerpt(&text));
+            .map(|text| Evidence::excerpt(&scrub_text_wide(&text)));
     }
 
     let poc_hint = match map.get("poc_hint").filter(|v| !v.is_unit()) {
