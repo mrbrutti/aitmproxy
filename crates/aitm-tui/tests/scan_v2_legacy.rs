@@ -13,13 +13,10 @@ use aitm_tui::app::{App, Mode, SidebarItem};
 use aitm_tui::keys;
 use aitm_tui::scan::legacy::InjectionPointRow;
 use aitm_tui::scan::ScanTab;
-use common::{legacy_app, line_with, press, text_of};
+use common::{legacy_app, line_with, press, screen, toast};
 use crossterm::event::KeyCode;
 use serde_json::{json, Value};
 
-fn screen(app: &App) -> String {
-    text_of(app, app.width, app.height)
-}
 /// Open the view and show the Site map tab, where the legacy
 /// `scan.discover` result lives on a v2-shaped surface (spec D12).
 fn open_site_map(app: &mut App) {
@@ -186,22 +183,12 @@ fn explicit_launch_emits_discover_and_result_populates_state() {
     assert_eq!(app.scan.legacy.error.as_deref(), Some("out of scope"));
 }
 
-/// `:scan <target>` launches against that target, scope-gated: an in-scope
-/// host (in any spelling) is crawled, an out-of-scope host is refused with a
-/// toast and nothing reaches the wire (deny-by-default).
+/// `:scan <target>` on the legacy bus is scope-gated (deny-by-default): an
+/// out-of-scope host is refused with the toast that names it and nothing
+/// reaches the wire. The v2-bus case and the in-scope legacy launch are
+/// `tests/robustness.rs` `scan_command_with_target_is_scope_gated`'s.
 #[test]
 fn scan_command_with_target_is_scope_gated() {
-    let mut app = legacy_app(200, 50);
-    let reqs = app.run_command("scan https://api.shop-staging.test:8443/admin?x=1");
-    assert_eq!(app.mode, Mode::Scan);
-    assert!(app.scan.legacy.running);
-    // D8: the typed scheme and port are kept, the path dropped.
-    assert_eq!(
-        discover_targets(&reqs),
-        vec!["https://api.shop-staging.test:8443".to_string()],
-        "the typed target keeps its scheme and port, authority only: {reqs:?}"
-    );
-
     let mut app = legacy_app(200, 50);
     let reqs = app.run_command("scan evil.example");
     assert_eq!(app.mode, Mode::Scan, "the view still opens");
@@ -213,14 +200,9 @@ fn scan_command_with_target_is_scope_gated() {
         discover_targets(&reqs).is_empty(),
         "nothing reaches the wire for an out-of-scope host: {reqs:?}"
     );
-    let toast = app
-        .toasts
-        .back()
-        .map(|t| t.text.clone())
-        .unwrap_or_default();
-    assert!(
-        toast.contains("Out of scope") && toast.contains("evil.example"),
-        "the refusal names the host: {toast:?}"
+    assert_eq!(
+        toast(&app),
+        "Out of scope: add `evil.example` to scope to scan it"
     );
 }
 
@@ -236,7 +218,7 @@ fn scan_sidebar_row_and_view_regions_render() {
     // offered.
     let sidebar = screen(&app);
     assert!(
-        sidebar.lines().any(|l| l.contains("Scan")),
+        line_with(&sidebar, "  Scan").is_some(),
         "the sidebar lists a Scan row: {sidebar}"
     );
 

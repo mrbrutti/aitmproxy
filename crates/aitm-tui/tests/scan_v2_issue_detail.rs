@@ -373,6 +373,10 @@ fn open_poc_switches_to_findings_or_toasts() {
     assert!(reqs.is_empty(), "{reqs:?}");
     assert_eq!(app.mode, Mode::Findings);
     assert_eq!(app.finding_cursor, 1);
+    // The Findings overlay's title (fix round H, H40, re-homed here from
+    // the deleted fixture suite; fix round I, I9).
+    let text = screen(&app);
+    assert!(text.contains("Findings · PoCs and runs"), "{text}");
 
     let mut app = app_with_xss_read();
     app.findings.clear();
@@ -1094,6 +1098,10 @@ fn the_job_line_is_bounded_at_fold_with_a_plus_n() {
         "{} +{}",
         jobs[..DETAIL_LIST_MAX].join(", "),
         20 - DETAIL_LIST_MAX
+    );
+    assert!(
+        want.ends_with(", scan-00000007 +12"),
+        "the eighth id then +12: {want}"
     );
     let lines = aitm_tui::scan::issue_detail_lines(read);
     assert!(
