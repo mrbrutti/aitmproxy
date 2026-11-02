@@ -95,10 +95,14 @@ pub fn settings_for_help(config_path: Option<&Path>, reporter: &Reporter) -> Set
 ///   [`settings_for_help`]; a registry that cannot be built (the scripting
 ///   engine or its runtime, never a script) is `Answer::Error` as a failure;
 /// - topic `[]`: the top page;
-/// - else `Cli::locate(topic)`: a group is its group page, a command its verb
-///   page (anything after the verb is ignored, so `aitm scope add --host
-///   --help` is `scope add`'s page), and a usage error is `NotHelp` for an
-///   implicit request and `Error` for an explicit one (plan C33).
+/// - else `Cli::locate(topic)`: a group is its group page; a command is its
+///   verb page for an explicit request only (anything after the verb is
+///   ignored, so `aitm scope add --host --help` is `scope add`'s page); a
+///   usage error is `Error` for an explicit request. An implicit request (a
+///   single bare token, plan C33) answers only when the token names a group:
+///   a command (`aitm flow.list`, the dispatcher's dotted compatibility form)
+///   or a usage error is `NotHelp`, and the invocation continues as
+///   `Mode::Cli`.
 pub fn answer(req: &HelpRequest, inputs: &HelpInputs, reporter: &Reporter) -> Answer {
     let topic: Vec<&str> = req.topic.iter().map(String::as_str).collect();
     match topic.as_slice() {
@@ -132,7 +136,14 @@ pub fn answer(req: &HelpRequest, inputs: &HelpInputs, reporter: &Reporter) -> An
                 "no help page for the group `{name}`"
             ))),
         },
-        Ok(Located::Command { cmd, .. }) => page(inputs.caps, &pages::verb(cmd.as_ref())),
+        Ok(Located::Command { cmd, .. }) if req.explicit => {
+            page(inputs.caps, &pages::verb(cmd.as_ref()))
+        }
+        // An implicit single token answers only when it names a group (C33):
+        // `aitm flow.list` locates a command through the dispatcher's dotted
+        // compatibility form, and that invocation must run the verb, not
+        // print its page.
+        Ok(Located::Command { .. }) => Answer::NotHelp,
         Err(report) if req.explicit => Answer::Error(report),
         Err(_) => Answer::NotHelp,
     }
@@ -673,7 +684,6 @@ mod tests {
     /// runs — not the verb's page; `aitm help flow.list` (explicit) is the
     /// page.
     #[test]
-    #[ignore = "DEFECT (tester, wave-2 pass 1): `answer` renders the verb page for an implicit dotted token; plan C33 says an implicit request that names no group is NotHelp. Un-ignore with the fix."]
     fn implicit_dotted_verb_token_is_not_help() {
         let (answer, warned) = ask("implicit-dotted", &implicit("flow.list"), NO_CATALOGUE_ENV);
         assert_eq!(
