@@ -35,6 +35,14 @@ public enum SettingsDomain: Equatable, Sendable {
     /// The variables that mark a harness run (a dev bundle, the live self-test).
     static let harnessVariables = ["APP_STORE", "APP_LIVE"]
 
+    /// The isolated store a harness launch points at (`APP_STORE`, non-empty), else nil: the one
+    /// reading of that variable, pure on the environment so the core spawner can call it off the
+    /// main actor (`EmbeddedCoreLaunch.isolatedRunDir`) and `Store.url` can call it on it.
+    public static func overriddenStoreURL(environment env: [String: String]) -> URL? {
+        guard let path = env["APP_STORE"], !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
     public static func select(environment env: [String: String]) -> SettingsDomain {
         if let name = env[suiteVariable], !name.isEmpty {
             return .suite(name: name, wipe: false)

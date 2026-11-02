@@ -229,3 +229,14 @@ The 22 files of `crates/aitm-scan-model/fixtures/` are read by `swift test` from
 ## Open questions
 
 None. Numbering of the new stories starts at S-085 to leave S-073..S-079 to the sibling macOS sessions.
+
+## Review log
+
+Dispositions live in the plan's Review log (`docs/superpowers/plans/2026-10-31-scanner-v2-mac-scan-surface-plan.md`,
+rows MS-R1 and MS-R2, post-release 0.5.14). Design consequence recorded here: **D8 amendment (MS-R1)** — the
+page's `surface` is one `@Observable` value, so every non-gesture write (poll tick, push line) compares the
+model before assigning and publishes only on a real change; the `ScanCheckTree` is derived once per distinct
+(catalogue, selection, intensity, query), not per body pass. The tick cadence, the flag semantics and D11 are
+unchanged. The run-dir isolation of dev-bundle cores (MS-R2) is owned by the one-shot spec
+(`2026-11-01-cli-oneshot-live-core-design.md` §D4 `AITM_RUN_DIR`, §D11 mac follow-up) and is recorded in that
+plan's Review log; it travelled in the same PR because the 0.5.14 acceptance run surfaced both.

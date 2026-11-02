@@ -117,6 +117,40 @@ final class ScanPanelState {
     /// injection-point list the sidebar counts.
     var surface = ScanSurfaceModel()
 
+    /// Every non-gesture write to `surface` (poll ticks, push lines) goes through here. The surface is ONE `@Observable`
+    /// property, so a mutation that changes nothing would still publish the whole page — on
+    /// 0.5.14 the 250 ms tick's `clearRefreshFlags()` did exactly that, and the Profiles check
+    /// tree (one FlatMenu per check) rebuilt four times a second at idle: 31–45 % CPU, AX reads of
+    /// 150–570 ms (spec Review log MS-R1). Compare, then assign only on a real change.
+    private func updateSurface(_ body: (inout ScanSurfaceModel) -> Void) {
+        var next = surface
+        body(&next)
+        if next != surface { surface = next }
+    }
+
+    /// The Checks block's tree, built once per distinct input, not once per body evaluation
+    /// (MS-R1): the catalogue, the edited selection, the intensity and the query are its only
+    /// inputs, so an equal key returns the cached tree. The cache is not observed state — the
+    /// inputs are, and reading them here keeps the view's dependency on them.
+    @ObservationIgnored private var checkTreeKey: CheckTreeKey?
+    @ObservationIgnored private var checkTreeCached: ScanCheckTree?
+
+    private struct CheckTreeKey: Equatable {
+        let checks: [ScanCheckMeta]
+        let selection: ScanCheckSelection
+        let intensity: ScanIntensity
+        let query: String
+    }
+
+    func checkTree(selection: ScanCheckSelection, intensity: ScanIntensity) -> ScanCheckTree {
+        let key = CheckTreeKey(checks: surface.checks, selection: selection, intensity: intensity, query: surface.checkQuery)
+        if let cached = checkTreeCached, checkTreeKey == key { return cached }
+        let tree = ScanCheckTree(checks: key.checks, selection: key.selection, intensity: key.intensity, query: key.query)
+        checkTreeKey = key
+        checkTreeCached = tree
+        return tree
+    }
+
     /// Restarts the page's poll task (`.task(id:)`). A launch bumps it so the new
     /// job is read at once instead of at the next whole tick.
     var pollGeneration = 0
@@ -190,9 +224,11 @@ final class ScanPanelState {
         }
         do {
             let value = try await session.runCommand("scan.profile.list", [:])
-            surface.applyProfiles(try ScanProfileListResult(json: value))
+            let result = try ScanProfileListResult(json: value)
+            updateSurface { $0.applyProfiles(result) }
         } catch {
-            surface.profilesError = scanUnableText("load profiles", BusService.describe(error))
+            let text = scanUnableText("load profiles", BusService.describe(error))
+            updateSurface { $0.profilesError = text }
         }
     }
 
@@ -201,10 +237,11 @@ final class ScanPanelState {
     func loadProfile(_ name: String) async {
         do {
             let value = try await session.runCommand("scan.profile.get", ["name": .string(name)])
-            surface.applyProfile(try ScanProfile(json: value))
-            surface.profilesError = nil
+            let profile = try ScanProfile(json: value)
+            updateSurface { $0.applyProfile(profile); $0.profilesError = nil }
         } catch {
-            surface.profilesError = scanUnableText("load profile \(name)", BusService.describe(error))
+            let text = scanUnableText("load profile \(name)", BusService.describe(error))
+            updateSurface { $0.profilesError = text }
             return
         }
         await refreshSessionPreview()
@@ -214,8 +251,9 @@ final class ScanPanelState {
     func refreshChecks() async {
         do {
             let value = try await session.runCommand("scan.checks", [:])
-            surface.applyChecks(try ScanChecksResult(json: value))
-            checksError = nil
+            let result = try ScanChecksResult(json: value)
+            updateSurface { $0.applyChecks(result) }
+            if checksError != nil { checksError = nil }
         } catch {
             checksError = scanUnableText("load checks", BusService.describe(error))
         }
@@ -227,16 +265,16 @@ final class ScanPanelState {
     func refreshSessionPreview() async {
         guard let profile = surface.editedProfile, profile.session.mode == .observed,
               let origin = profile.target.origins.first else {
-            surface.sessionPreview = nil
+            updateSurface { $0.sessionPreview = nil }
             return
         }
         guard let value = try? await session.runCommand("scan.session.preview", ["target": .string(origin)]),
               let preview = try? ScanSessionProfile(json: value),
               !(preview.cookies.isEmpty && preview.headers.isEmpty) else {
-            surface.sessionPreview = nil
+            updateSurface { $0.sessionPreview = nil }
             return
         }
-        surface.sessionPreview = preview
+        updateSurface { $0.sessionPreview = preview }
     }
 
     /// `l4.scope.list {}`, and only when the bus lists it: an L4 lane needs a scope
@@ -244,15 +282,16 @@ final class ScanPanelState {
     /// launch gate reads as "not available" — deny by default.
     func refreshL4Scope() async {
         guard ScanSurface.has("l4.scope.list", in: session.tools) else {
-            surface.l4InjectScopeKnown = nil
+            updateSurface { $0.l4InjectScopeKnown = nil }
             return
         }
         do {
             let value = try await session.runCommand("l4.scope.list", [:])
             let entries = value["entries"]?.arrayValue ?? value.arrayValue ?? []
-            surface.l4InjectScopeKnown = entries.contains { $0["capability"]?.stringValue == "inject" }
+            let known = entries.contains { $0["capability"]?.stringValue == "inject" }
+            updateSurface { $0.l4InjectScopeKnown = known }
         } catch {
-            surface.l4InjectScopeKnown = nil
+            updateSurface { $0.l4InjectScopeKnown = nil }
         }
     }
 
@@ -260,10 +299,12 @@ final class ScanPanelState {
     func refreshList() async {
         do {
             let value = try await session.runCommand("scan.list", [:])
-            surface.applyList(try ScanListResult(json: value))
+            let result = try ScanListResult(json: value)
+            updateSurface { $0.applyList(result) }
             statusRequested.formIntersection(Set(surface.jobs.map(\.job)))
         } catch {
-            surface.jobsError = scanUnableText("list jobs", BusService.describe(error))
+            let text = scanUnableText("list jobs", BusService.describe(error))
+            updateSurface { $0.jobsError = text }
         }
     }
 
@@ -271,10 +312,11 @@ final class ScanPanelState {
     func refreshStatus(_ job: String) async {
         do {
             let value = try await session.runCommand("scan.status", ["job": .string(job)])
-            surface.applyStatus(try ScanJobStatus(json: value))
-            surface.jobsError = nil
+            let status = try ScanJobStatus(json: value)
+            updateSurface { $0.applyStatus(status); $0.jobsError = nil }
         } catch {
-            surface.jobsError = scanUnableText("read job \(job)", BusService.describe(error))
+            let text = scanUnableText("read job \(job)", BusService.describe(error))
+            updateSurface { $0.jobsError = text }
         }
     }
 
@@ -285,9 +327,11 @@ final class ScanPanelState {
         if append, let cursor = surface.issuesCursor { args["cursor"] = .string(cursor) }
         do {
             let value = try await session.runCommand("scan.issues", args)
-            surface.applyIssues(try ScanIssuesResult(json: value), append: append)
+            let result = try ScanIssuesResult(json: value)
+            updateSurface { $0.applyIssues(result, append: append) }
         } catch {
-            surface.issuesError = scanUnableText("load issues", BusService.describe(error))
+            let text = scanUnableText("load issues", BusService.describe(error))
+            updateSurface { $0.issuesError = text }
         }
     }
 
@@ -295,9 +339,11 @@ final class ScanPanelState {
     func loadIssue(_ id: String) async {
         do {
             let value = try await session.runCommand("scan.issue", ["id": .string(id)])
-            surface.applyIssue(try ScanIssue(json: value))
+            let issue = try ScanIssue(json: value)
+            updateSurface { $0.applyIssue(issue) }
         } catch {
-            surface.issuesError = scanUnableText("load issue \(id)", BusService.describe(error))
+            let text = scanUnableText("load issue \(id)", BusService.describe(error))
+            updateSurface { $0.issuesError = text }
         }
     }
 
@@ -310,8 +356,9 @@ final class ScanPanelState {
         if append, let cursor = surface.sitemap?.nextCursor { args["cursor"] = .string(cursor) }
         do {
             let value = try await session.runCommand("scan.sitemap", args)
-            surface.applySitemap(try ScanSitemapResult(json: value), append: append)
-            sitemapError = nil
+            let result = try ScanSitemapResult(json: value)
+            updateSurface { $0.applySitemap(result, append: append) }
+            if sitemapError != nil { sitemapError = nil }
         } catch {
             sitemapError = scanUnableText("load the site map", BusService.describe(error))
         }
@@ -358,7 +405,9 @@ final class ScanPanelState {
         let flagged = surface.refreshNeeded
         let listFlagged = surface.listRefreshNeeded
         let issuesFlagged = surface.issuesRefreshNeeded
-        surface.clearRefreshFlags()
+        // Only a tick that actually clears a flag publishes (MS-R1); an idle tick leaves the
+        // surface, and so every view on the page, untouched.
+        updateSurface { $0.clearRefreshFlags() }
         // A page leave or a launch's `pollGeneration` bump cancels this task between
         // reads; every await below is a point where the next read must not start.
         for job in flagged.sorted() {
@@ -692,7 +741,9 @@ final class ScanPanelState {
     /// A `notifications/aitm/job` line: a trigger for the poll loop, never a value
     /// on screen. The sink that calls this is the follow-on PR's.
     func noteJobEvent(_ params: JSONValue) {
-        surface.noteJobEvent(params)
+        // A stale or duplicate line changes nothing in the Kit (`noteJobEvent` says so); the
+        // compare keeps it from republishing the page (MS-R1, quality P4-1).
+        updateSurface { $0.noteJobEvent(params) }
     }
 
     /// The legacy Add Host to Scope… path, reused by an out-of-scope origin row.
