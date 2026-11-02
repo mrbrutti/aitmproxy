@@ -1,0 +1,7 @@
+app pid=21099
+window 33643 origin 461 -1264 size 1848 1126
+17:36:00.216 shot 41-not-added
+core 21147 "structuredContent":["ok.test"],"isError":false}
+67:130: execution error: System Events got an error: Can’t get button 1 of window 1 of process "Aitmproxy-il" whose name starts with "Retry". Invalid index. (-1719)
+17:36:02.388 shot 42-after-retry
+/tmp/claude/mac-il/s081-proof6.sh:31: bad math expression: operand expected at `/var/folde...'

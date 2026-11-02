@@ -751,7 +751,7 @@ Acceptance:
 UX:
 - Flow: sidebar ▸ Scope (or Proxy ▸ Scope… ⇧⌘O) -> the Scope page: entries table over the in-scope flow list -> "Add Host…" or type in the field at the top -> ⌘⏎ adds -> the row loses its dimming at once
 - Surface: sidebar page with an inline add field; the sheet (⇧⌘O) is the same panel for when the list is elsewhere
-- States: empty -> "No hosts in scope — add one to authorise testing; everything stays read-only until then." with the field focused; invalid entry -> message under the field, Add disabled; live `scope.add` failing -> status-bar error, entry kept pending in tertiary
+- States: empty -> "No hosts in scope — add one to authorise testing; everything stays read-only until then." with the field focused; invalid entry -> message under the field, Add disabled; live `scope.add` failing -> the row carries the outcome (S-081: `queued — added when the core is back` / `not added — <reason>` with Retry and ✕), never a silent pending entry
 - Words: columns "Host · Limit · Back-off · Flows"; button "Add ⌘⏎"; placeholder "host, host:port or *.wildcard"
 - Access: entries are a real table; the field is the only focused control when empty
 Status: done
@@ -1167,6 +1167,24 @@ Acceptance:
 Live: 2026-10-31, found on the installed v0.5.6 during the S-041 check (FIXLOG 2026-10-31 "The Flows page stopped redrawing"); S-073 to S-078 are reserved for the Proxyman capture-flow stories drafted in `docs/research/proxyman-capture-flow-gaps.md`.
 Status: done
 
+### S-081 A Scope add that fails says so, and lands after a core restart
+As the operator, when I type a host on the Scope page and the add does not reach the core, the row tells me — "queued — added when the core is back" while the core restarts, "not added — <reason>" with Retry when the core refuses — instead of sitting there as if it were in Scope while the pill, the banner and Status say nothing is.
+Screens: scope
+Depends: S-047
+Acceptance:
+- [unit] `ScopeAddQueue` (Kit): a send that fails with a bus absence (disconnected, transport, timeout) is `queued` and replayable; a core refusal (tool, rpc) is `failed` with the reason; a host `scope.list` names leaves the queue; ✕ drops it; Retry re-sends.
+- [live] Dev bundle + real core, Scope page: Proxy ▸ Restart Core, then type a host and press Return while the core is down — the row reads `queued — added when the core is back`; when the bus reconnects the host is sent again, `scope.list` names it, and the row becomes a real entry (the pill/sidebar count moves) with no further action.
+- [live] A host the core refuses reads `not added — <the core's reason>` with Retry and ✕; the status bar carries the same reason; nothing is persisted to `scope.json`.
+- [live] The same add while the core is up still lands within a poll (regression), and every surface that reads Scope moves with it inside that poll: the status-bar pill, the sidebar Scope badge, the Flows banner's "Nothing is decrypted" line, the Status page's Scope step.
+- [live] A core that is merely busy (bus connected, the call times out: SIGSTOP on the dev bundle's core) leaves the row `queued — added when the core is back`; it lands on its own once the core answers again (the next poll re-sends it), with no reconnect and no operator action.
+- [live] After Proxy ▸ Restart Core, a verb from the page (row ✕, a plain add) reaches the new core on the first try: no "the bus connection closed" under a connected title (the superseded bus run's teardown must not clear the new client; FIXLOG 2026-11-01).
+UX:
+- Surface: inline on the Scope page row (and the Scope sheet, which embeds the page); no alert.
+- Words: "sending…", "queued — added when the core is back", "not added — <reason>", "Retry".
+- Access: the row's accessibility value is the state line; the row is one combined accessibility element, so Retry and ✕ reach VoiceOver as that row's actions (their labels name the host), not as standalone buttons.
+Live: found 2026-11-01 on the installed 0.5.10 ("I added to scope but still claims nothing is in scope": the add never reached the bus, the Scope page kept the host as a silent pending row; FIXLOG 2026-11-01). Proven 2026-11-01 on the dev bundle with the 0.5.10 release core (`docs/evidence/S-081`): an add typed during Proxy ▸ Restart Core reads `queued — added when the core is back` in the first frame after Return (+77 ms by the frame's own timestamp) and is a plain row in the second (+315 ms) with `scope.list` naming it; three restarts in a row, every add landed; a row ✕ and a plain add after the restarts land on the first try (before the fix they failed with "the bus connection closed" under a connected title); a host the core refuses reads `not added — <the core's reason>` with Retry and ✕, and ✕ drops it.
+Status: done
+
 ### S-072 See what is running and what to do first
 As the operator, on a fresh launch I land on a Status page that shows the core, the bus and the capture extension — each with a state word, one fact and its control — and a live Getting-started list, so I never have to guess which sidebar item to look at or why no flows appear.
 Screens: status, status-ok, status-fresh, status-external, status-core-starting, status-core-stopped, status-core-failed, status-bus-connecting, status-bus-agent, status-bus-token, status-scope-empty, status-waiting, status-degraded
@@ -1188,7 +1206,7 @@ UX:
 Notes: the capture lane maps PR #181's `CaptureAdvice` 1:1; until the provider stops claiming DNS, the scope step says to add `host:443`. A core `capture.status` verb (proposed) will sharpen the capture detail through `CoreCaptureStatus` without a UI change.
 Status: in progress
 
-### S-080 Start a scan from a profile
+### S-085 Start a scan from a profile
 As the operator, I open Scan, pick a profile on the Profiles tab with its origins seeded from scope, press Start Scan or Map Only, answer the engine's confirm sheet when an L4 lane or Intrusive intensity calls for one, and land on the Jobs tab with the new job selected and reading "Queued".
 Screens: scan
 Depends: S-047, S-050, core scanner v2 T1b
@@ -1197,7 +1215,7 @@ Acceptance:
 - [unit] `ScanSurfaceModel.launchRefusal` returns nil for an in-scope `standard` profile; "Out of scope — …" for an origin not in scope; the L4 hint for a profile with an L4 lane when no Inject L4 scope entry is known; "scan.start is not on this bus" when the tool is absent; nothing reaches `commandRunner` in the refused cases (MS-AC2).
 - [unit] Given a `needs_confirmation` result, the model exposes `confirm` with the prompt text and the re-sent arguments equal the original plus `_confirm: token`; given a `StartResult`, the job appears first in `jobs` and is selected, the tab is Jobs (MS-AC3).
 - [unit] `scan.profile.get.json` decodes to `ScanProfile`, re-encodes to JSON equal to the file after normalisation, and `checks.include = ["http.sqli-error"]` edits survive the round trip (MS-AC6).
-- [live] The real `.app` (snap-dev bundle, `APP_LIVE=1`) against a live core with the engine and `aitm-testtarget` in `vulnerable` mode: Profiles → `standard` with the testtarget origin seeded from scope → Start Scan → the Jobs tab opens with the new job selected and its row's counters start moving (MS-AC9, launch half; the counters, Cancel and the harness cross-check are S-081).
+- [live] The real `.app` (snap-dev bundle, `APP_LIVE=1`) against a live core with the engine and `aitm-testtarget` in `vulnerable` mode: Profiles → `standard` with the testtarget origin seeded from scope → Start Scan → the Jobs tab opens with the new job selected and its row's counters start moving (MS-AC9, launch half; the counters, Cancel and the harness cross-check are S-086).
 - [live] Launching `l4-stream-safe` shows the sheet with the engine's prompt text (recorded), and Cancel sends nothing further (audit log shows one `scan.start` without `_confirm`); without an L4 scope entry the Start Scan button is disabled with the hint (MS-AC11).
 UX:
 - Flow: Proxy ▸ Scan (⌥⌘S) or sidebar Scan → Profiles tab → pick `standard` (or any) → origins seeded from scope (first concrete host) → Start Scan (⌘⏎) → [L4 or Intrusive: sheet shows the engine's prompt → Start Scan / Cancel (⎋)] → Jobs tab opens with the new job selected, phase "Queued" → counters rise → Done. Way back: ⎋ cancels the sheet; Cancel Scan (⌥⌘.) stops the job. Map only: same, Map Only button → `scan.map` → Jobs tab. Edit a profile: pick a custom profile (or Duplicate… a builtin) → change fields → Save Profile (⌘S on the tab) → `scan.profile.save` → list updates; Delete Profile… → dialog "Delete Profile “my-api”?" Delete / Cancel.
@@ -1205,13 +1223,13 @@ UX:
 - States: Profiles list empty → "No profiles — the core lists none." (cannot happen with builtins; shown if `scan.profile.list` fails: "Unable to load profiles: …" with Retry); loading → cached list first, a thin `ProgressView` in the header only past 500 ms; error → inline under the header; long names middle-truncate, help shows the full name. Editor: error → inline under the field; long origin lists scroll; Save Profile → the row updates, status line "Saved my-api" for 4 s; an edited builtin → "Edited builtin — Start Scan uses these values; Duplicate… to keep them." Confirm sheet: the Start Scan button shows a spinner while the confirmed call is in flight; error → the sheet closes and the status line shows the error; the prompt wraps; done → the sheet closes, Jobs opens.
 - Words: Start Scan, Map Only, Save Profile, Duplicate…, Delete Profile…, Add in-scope host, Add Host to Scope…, Retry; intensity Passive, Light, Medium, Intrusive; confirm title "Start Scan?", body = the engine's prompt verbatim, buttons Start Scan / Cancel; delete "Delete Profile “<name>”?" / "This removes the saved profile file. Jobs that used it keep their results." / Delete / Cancel; errors "Unable to load profiles: <reason>", "Out of scope — add <host> to scope to scan it", "A scan on this origin is already running", "The L4 lanes need an L4 scope entry with interface *, direction outbound, the target CIDR and port range and the Inject capability."; hint "Intrusive checks may disrupt the target; the engine asks before starting."; idle status line "Opening this page never scans. Start Scan sends probes to the origins above."
 - Access: ⌘⏎ Start Scan on the Profiles tab; ⌘S Save Profile on the tab; ⎋ closes the sheet; the L4 hint and every refusal are read inline under the launch buttons, never by colour or an alert; Tab order header → tabs → list → detail, ↑↓ move the profile selection; help strings start with a verb and end with the shortcut ("Start a scan with this profile (⌘⏎)"); the three segmented controls are the system `Picker(.segmented)`.
-Notes: `[live]` in S-080..S-084 means the real `.app` (`DEV_TAG=t9 tools/snap-dev.sh`, `APP_LIVE=1`) against a live core built from `main` carrying the engine (T1b), with window-id recording and harness reads over the bus; never a snapshot, a fixture scene or a fixture-bus answer (claim ruling 2026-10-31: no `Fixtures.scanV2`, no `scan.*` in `Fixtures.tools`). The fixture pack in `crates/aitm-scan-model/fixtures/` is read by `swift test` only, as the parsing contract.
+Notes: `[live]` in S-085..S-089 means the real `.app` (`DEV_TAG=t9 tools/snap-dev.sh`, `APP_LIVE=1`) against a live core built from `main` carrying the engine (T1b), with window-id recording and harness reads over the bus; never a snapshot, a fixture scene or a fixture-bus answer (claim ruling 2026-10-31: no `Fixtures.scanV2`, no `scan.*` in `Fixtures.tools`). The fixture pack in `crates/aitm-scan-model/fixtures/` is read by `swift test` only, as the parsing contract.
 Status: in progress
 
-### S-081 Watch a job and cancel it
+### S-086 Watch a job and cancel it
 As the operator, I open the Jobs tab and read each job's state or phase word, its probes and points counters and its severity bar as `scan.status` values that move on their own while the page is visible, and I press Cancel on a running job to stop it while its issues stay.
 Screens: scan
-Depends: S-080, core scanner v2 T1b
+Depends: S-085, core scanner v2 T1b
 Spec: `docs/superpowers/specs/2026-10-31-scanner-v2-mac-scan-surface-design.md`
 Acceptance:
 - [unit] `noteJobEvent` with the `job.progress.json` line sets `refreshNeeded[job]` and changes no counter; a line with a `seq` ≤ the last seen is ignored; `issue` and terminal events also set `issuesRefreshNeeded` (MS-AC4).
@@ -1226,14 +1244,14 @@ UX:
 Notes: MS-AC12 (the `flow.subscribe` handshake and the hands-off 30 s update) ships in the follow-on PR (plan Task 12) with `Session.swift` and `BusService.swift`; in this PR the row moves through D8's poll alone.
 Status: in progress
 
-### S-082 Triage issues
+### S-087 Triage issues
 As the operator, I open the Issues tab, read the issues grouped by severity as they arrive, select one to read its evidence, open a probe flow in the inspector or its PoC in Findings, and set its status to Open, Confirmed or False positive.
 Screens: scan
-Depends: S-003, S-050, S-081, core scanner v2 T1b
+Depends: S-003, S-050, S-086, core scanner v2 T1b
 Spec: `docs/superpowers/specs/2026-10-31-scanner-v2-mac-scan-surface-design.md`
 Acceptance:
 - [unit] `issuesGroupedBySeverity` over `scan.issues.json` yields sections High(1) and Medium(1) in severity order with Critical/Low/Info absent; the status filter `false_positive` hides both (MS-AC5, issues half).
-- [live] During the same run as S-081, issues appear in the Issues tab grouped by severity without a click; opening a probe flow selects it in the inspector; Open PoC lands on Findings; setting False positive is visible in a harness `scan.issue {id}` read (MS-AC10).
+- [live] During the same run as S-086, issues appear in the Issues tab grouped by severity without a click; opening a probe flow selects it in the inspector; Open PoC lands on Findings; setting False positive is visible in a harness `scan.issue {id}` read (MS-AC10).
 UX:
 - Flow: Issues tab → list grouped by severity → click → detail → Open Flow on a probe flow (inspector) / Open PoC (Findings) → Status: Open | Confirmed | False positive → `scan.issue.update` → pill updates in list. Way back: set Status back to Open. While any job is running and the page is visible, `scan.issues` is read every 2 s (and at once on an `issue` or terminal job event), so new issues appear without a click. Save Note → `scan.issue.update { id, status: <current>, note }`.
 - Surface: Issues tab. Top bar: filters as `FlatMenu`s — Job (All), Severity ≥ (Info…Critical), Confidence ≥, Lane, Class (from the loaded issues), Status (Open / Confirmed / False positive / All). Left (360 pt): sections per severity with a tracked header "HIGH 1" in the severity fg colour (the one place the header carries hue, because it is the datum); rows `Badge(severity)`, name, second line `GET /search · query q · firm`, a `checkmark.seal` glyph when `confirmed`, `xmark.seal` when `false_positive`, `flag.checkered` when `finding_id` is set. Right: the issue detail inline pane (details of the selection while people keep working) from `scan.issue {id}` — header name, `Badge(severity)`, `Badge(confidence)`, `Badge(lane)`, trailing Status segmented Open · Confirmed · False positive; Where; Description; Remediation when present; Evidence (Payload, Matched, Timing as a 3-column table, Diff as three numbers, L4 fields when present); Probe flows and Baseline flow with Open Flow; Links `FlatButton("Open PoC")` when `poc_ref` and `finding_id` shown as text; Note with Save Note; meta line `first seen · last seen · occurrences · check id · job`. A probe flow opens in the flow inspector (Apps page, flow selected); a PoC opens the Findings page with that finding selected.
@@ -1242,10 +1260,10 @@ UX:
 - Access: every row is one element whose label reads the row's words (severity word, name, method and path, point, confidence; the status word closes the label and the glyphs carry the help "Confirmed" / "False positive" / "Has a finding"); the pill carries the severity word so severity is never by colour alone; ↑↓ move the selection (the Findings list pattern); Payload and Matched are selectable text in raised boxes; all text ≥ 11 pt and the severity pills use the kit pairs, which pass in Increase Contrast.
 Status: in progress
 
-### S-083 Browse the site map
+### S-088 Browse the site map
 As the operator, I open the Site map tab, pick a job, expand a host and select a node to read its insertion points and the flows the crawl recorded there, and open any flow in the inspector.
 Screens: scan
-Depends: S-003, S-081, core scanner v2 T1b
+Depends: S-003, S-086, core scanner v2 T1b
 Spec: `docs/superpowers/specs/2026-10-31-scanner-v2-mac-scan-surface-design.md`
 Acceptance:
 - [unit] `sitemapGroupedByOrigin` over `scan.sitemap.json` yields one origin `http://127.0.0.1:8080` with node `/account/{id}` carrying 2 points (MS-AC5, sitemap half).
@@ -1258,7 +1276,7 @@ UX:
 - Access: every origin row and node row is one element whose label reads the row's words (method, path template, points count, "audited", "needs auth"); the `checkmark` and `lock` glyphs never stand alone; ↑↓ move the node selection, disclosure state is announced; the example text is selectable; no entrance motion.
 Status: in progress
 
-### S-084 The scanner's surface follows the core
+### S-089 The scanner's surface follows the core
 As the operator, I see the Scan page match what the connected core offers — the four-tab surface when the bus lists `scan.start`, the shipped one-shot `scan.discover` form unchanged when it lists only that, and one plain sentence when it lists neither — and I reach Scan, Start Scan… and Cancel Scan from the Proxy menu and the palette.
 Screens: scan
 Depends: S-035, S-036, S-069, core scanner v2 T1b

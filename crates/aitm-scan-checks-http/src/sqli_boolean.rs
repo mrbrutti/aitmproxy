@@ -172,6 +172,7 @@ impl SqliBoolean {
                 needs_baseline: true,
                 wants_traits: None,
                 targets_session: false,
+                scope: aitm_scan_model::CheckScope::Point,
                 cwe: Some(89),
                 description: "Re-sends the point's own value as a control, then appends an \
                               always-true and an always-false SQL condition and compares the \
@@ -301,6 +302,8 @@ fn confirmed(
             false_len = run.false_len,
         ),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 

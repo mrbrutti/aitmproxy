@@ -3,7 +3,7 @@
 **Status:** approved (2026-10-31, self-approved under Matt's autonomous mode; child of the approved umbrella spec)
 **Parent spec:** `docs/superpowers/specs/2026-10-31-aitmproxy-scanner-v2-design.md` (D3, D5, D6, D10, D12; ACs UI-1..UI-5)
 **Research inputs:** `docs/research/20-scanner-v2-current-state.md` §3.8 and §3.10 (mac: `running` bool, `http://` seed, never subscribes), `docs/research/17-burp-style-scanner-architecture.md` (the four-surface model)
-**UX pass:** this document is the `ux-design` pass for stories S-080..S-084 in `apps/mac/docs/STORIES.md`; new terms are in `apps/mac/docs/GLOSSARY.md`
+**UX pass:** this document is the `ux-design` pass for stories S-085..S-089 in `apps/mac/docs/STORIES.md`; new terms are in `apps/mac/docs/GLOSSARY.md`
 
 ## Intent
 
@@ -228,4 +228,4 @@ The 22 files of `crates/aitm-scan-model/fixtures/` are read by `swift test` from
 
 ## Open questions
 
-None. Numbering of the new stories starts at S-080 to leave S-073..S-079 to the sibling macOS sessions.
+None. Numbering of the new stories starts at S-085 to leave S-073..S-079 to the sibling macOS sessions.

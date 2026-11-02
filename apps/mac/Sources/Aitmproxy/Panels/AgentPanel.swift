@@ -86,6 +86,18 @@ final class ActivityState {
     /// Runs the gated command with this app's (operator) identity, then logs the outcome.
     func approve(_ entry: ActivityEntry) {
         pending.removeAll { $0.id == entry.id }
+        if Session.isCATrustVerb(entry.command) {
+            record(command: entry.command, args: entry.args, result: .error(CATrustFacts.operatorOnlyNote))
+            session.lastError = "\(entry.command): \(CATrustFacts.operatorOnlyNote)"
+            return
+        }
+        // The system-proxy verbs have one call path too (spec D13); the core never parks them, so
+        // this is belt-and-braces against a notification that names them.
+        if Session.isSystemProxyVerb(entry.command) {
+            record(command: entry.command, args: entry.args, result: .error(SystemProxyFacts.operatorOnlyNote))
+            session.lastError = "\(entry.command): \(SystemProxyFacts.operatorOnlyNote)"
+            return
+        }
         Task {
             do {
                 _ = try await session.runCommand(entry.command, entry.args)

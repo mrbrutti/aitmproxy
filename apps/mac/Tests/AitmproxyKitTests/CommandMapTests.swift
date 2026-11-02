@@ -53,6 +53,28 @@ import Testing
         #expect(deferred.map(\.brief) == ["Save Session", "Focus Inspector"])
     }
 
+    @Test func systemProxyToggleIsOnTheProxyMenuWithOptionCommandP() throws {
+        // Spec §D13 "Menu": one Proxy item whose title flips between the two system-proxy
+        // verbs, on ⌥⌘P. The palette learns the titles here and nothing else (the verbs
+        // live in the app's Session+SystemProxy.swift only).
+        let entry = try #require(CommandMap.all.first { $0.brief == "Set as / Restore System Proxy" })
+        #expect(entry.menu == "Proxy")
+        #expect(entry.briefShortcut == "⌥⌘P")
+        #expect(entry.scope == .menu)
+        #expect(entry.items.count == 1)
+        let item = try #require(entry.items.first)
+        #expect(item.titles == ["Set as System Proxy", "Restore System Proxy"])
+        #expect(item.shortcut == Shortcut("p", command: true, option: true))
+        #expect(item.shortcut?.display == "⌥⌘P")
+        // It sits directly after the CA row, as the menu does.
+        let briefs = CommandMap.all.map(\.brief)
+        let ca = try #require(briefs.firstIndex(of: "Trust the aitmproxy CA"))
+        #expect(briefs[ca + 1] == "Set as / Restore System Proxy")
+        // ⌥⌘P is bound once across the whole map.
+        let optionCommandP = CommandMap.all.flatMap(\.items).filter { $0.shortcut == Shortcut("p", command: true, option: true) }
+        #expect(optionCommandP.count == 1)
+    }
+
     @Test func rowsDescribeThemselvesForVoiceOver() {
         let login = Make.row(seq: 1, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login",
                              state: .paused, edited: true)

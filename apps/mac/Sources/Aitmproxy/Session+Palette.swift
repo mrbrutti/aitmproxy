@@ -25,7 +25,8 @@ extension Session {
 
     func paletteItems(for query: String) -> [PaletteItem] {
         var all: [PaletteItem] = []
-        for tool in tools {
+        // The confirm-gated CA verbs are not generic commands: Proxy ▸ Trust the aitmproxy CA and the CA panel carry them.
+        for tool in tools where !Self.isCATrustVerb(tool.name) && !Self.isSystemProxyVerb(tool.name) {
             all.append(PaletteItem(id: "cmd:\(tool.name)", section: .commands, title: tool.name, subtitle: tool.description,
                                    shortcut: nil, method: nil, kind: .command(tool)))
         }

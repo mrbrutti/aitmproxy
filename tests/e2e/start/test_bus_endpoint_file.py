@@ -249,6 +249,7 @@ def shim(port: int, agent_token: str, operator_token: str | None) -> SimpleNames
 def child_env(level: str) -> dict:
     env = {k: v for k, v in os.environ.items() if k != "AITM_CONFIG"}
     env["RUST_LOG"] = level
+    env.setdefault("AITM_AUDIT_LOG", "off")
     return env
 
 

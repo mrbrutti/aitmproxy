@@ -1,9 +1,14 @@
 import Foundation
 
-/// A sidebar narrowing: one client or one host (foundation §2.6 Apps / Domains).
+/// A sidebar narrowing: one host, one client, or one host under one client
+/// (foundation §2.6 Apps / Domains; spec 2026-10-31-mac-app-icons-and-names D4).
 public enum FlowGroup: Hashable, Sendable {
+    /// An authority, any app.
     case host(String)
+    /// A group key (`ClientInfo.groupKey`), any host.
     case client(String)
+    /// A group key ∧ an authority: a domain row under an app in the Apps tree.
+    case clientHost(client: String, host: String)
 }
 
 /// Everything that decides which rows a flow list shows, in which order
@@ -54,12 +59,14 @@ public struct FlowQuery: Hashable, Sendable {
             if query.inScopeOnly { out = out.filter(\.inScope) }
             switch query.group {
             case .host(let host)?: out = out.filter { $0.authority == host }
-            case .client(let name)?: out = out.filter { $0.client?.name == name }
+            case .client(let key)?: out = out.filter { $0.client?.groupKey == key }
+            case .clientHost(let key, let host)?:
+                out = out.filter { $0.client?.groupKey == key && $0.authority == host }
             case nil: break
             }
             if let pins = query.pins {
                 let hosts = Set(pins.hosts), apps = Set(pins.apps)
-                out = out.filter { hosts.contains($0.authority) || $0.client.map { apps.contains($0.name) } == true }
+                out = out.filter { hosts.contains($0.authority) || $0.client.map { apps.contains($0.groupKey) } == true }
             }
             if query.chip != .all {
                 out = out.filter { row in

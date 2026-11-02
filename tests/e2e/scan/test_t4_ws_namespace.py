@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # e2e: tier=T1 surface=scan needs=ws
+# Integration-shared edit, sanctioned by the coordinator (2026-11-01): a script-registered
+# command declares exactly ONE optional param, the `args` object (ScriptCommand::schema in
+# crates/aitm-plugin-rhai/src/command.rs), so the call nests `url` under `args` instead of
+# passing it at top level, which the MCP schema refused ("unknown param `url`").
 """AC T4-4: a Rhai command using `ws.dial/send/recv/close` round-trips a frame to the
 in-scope target, is refused (`OutOfScope`) for an out-of-scope URL, and may open at
 most 4 handles.
@@ -10,17 +14,21 @@ core's `rhai_scripts_dir`, so a real `aitm` core loads two custom commands over 
 scope guard, sends one echo frame, and returns the reply frames; `e2e.ws_many`
 opens five handles to exercise the 4-handle cap.
 
-- `e2e.ws_probe {url: ws://<V>/ws}` -> a result naming the echoed frame (`type` /
+- `e2e.ws_probe {args: {url: ws://<V>/ws}}` -> a result naming the echoed frame (`type` /
   `echo`), and the target's own WS log (the independent observer) shows the probe's
   handshake and frames.
-- `e2e.ws_probe {url: ws://<Canary>/ws}` -> refused with `OutOfScope`; the Canary
+- `e2e.ws_probe {args: {url: ws://<Canary>/ws}}` -> refused with `OutOfScope`; the Canary
   (an out-of-scope loopback listener) records ZERO hits — the scope guard stopped the
   dial before it left.
-- `e2e.ws_many {url: ws://<V>/ws}` -> an error (the fifth dial refused) or a result
+- `e2e.ws_many {args: {url: ws://<V>/ws}}` -> an error (the fifth dial refused) or a result
   naming the 4-handle cap; either way the target's own WS log, reset just before the
   call, shows exactly four handshakes: four dials reached the target and the fifth
   never did. (An error for any OTHER reason -- a script fault, a scope refusal -- would
   leave fewer than four handshakes and fail here instead of passing as "the cap".)
+
+Every script command takes one free-form `args` object (spec section 9): `tools/call`
+carries `{"args": {"url": ...}}` and the script body reads it as `args.url`. A flat
+`{"url": ...}` is refused at the schema with "unknown param `url` for `e2e.ws_probe`".
 
 SKIP 77 when: the `ws` lane / namespace is not live on this build (`require_lane`).
 
@@ -99,7 +107,7 @@ def main() -> int:
                       "the ws-namespace script registered e2e.ws_probe")
 
                 section("in-scope round-trip")
-                res = op.call("e2e.ws_probe", {"url": f"ws://{v.authority}/ws"})
+                res = op.call("e2e.ws_probe", {"args": {"url": f"ws://{v.authority}/ws"}})
                 blob = res if isinstance(res, str) else json.dumps(res)
                 check("echo" in blob and "type" in blob,
                       f"e2e.ws_probe returned the echoed frame ({blob[:80]!r})")
@@ -109,14 +117,16 @@ def main() -> int:
                       "the target's WS log shows the probe's handshake and frames")
 
                 section("out-of-scope dial is refused, the canary is never hit")
-                status, payload = op.try_call("e2e.ws_probe", {"url": f"ws://{canary.authority}/ws"})
+                status, payload = op.try_call(
+                    "e2e.ws_probe", {"args": {"url": f"ws://{canary.authority}/ws"}})
                 check(status == "error" and "OutOfScope" in str(payload),
                       f"an out-of-scope ws.dial is refused with OutOfScope ({str(payload)[:80]!r})")
                 check(canary.hits == [], f"the out-of-scope canary recorded zero hits ({len(canary.hits)})")
 
                 section("the 4-handle cap holds")
                 seq_many = v.logs.reset()  # every WS entry from here is ws_many's
-                status, payload = op.try_call("e2e.ws_many", {"url": f"ws://{v.authority}/ws"})
+                status, payload = op.try_call(
+                    "e2e.ws_many", {"args": {"url": f"ws://{v.authority}/ws"}})
                 if status == "error":
                     check("OutOfScope" not in str(payload),
                           f"the ws_many error is not a scope refusal ({str(payload)[:80]!r})")
