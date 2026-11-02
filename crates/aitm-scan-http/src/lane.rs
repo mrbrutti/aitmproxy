@@ -704,7 +704,7 @@ mod tests {
         .with_store(Arc::clone(&store))
         .with_browser(Arc::clone(&browser));
 
-        let _ = discover(&job, &[ORIGIN]).await;
+        discover(&job, &[ORIGIN]).await;
 
         assert!(
             browser
@@ -791,7 +791,7 @@ mod tests {
         .with_store(Arc::clone(&store))
         .with_session(material());
 
-        let _ = discover(&job, &[ORIGIN]).await;
+        discover(&job, &[ORIGIN]).await;
 
         // Copied out of the guard: the browser half below awaits, and a
         // `MutexGuard` may not be held across an await.
@@ -830,7 +830,7 @@ mod tests {
         .with_browser(Arc::clone(&browser))
         .with_session(material());
 
-        let _ = discover(&browser_job, &[ORIGIN]).await;
+        discover(&browser_job, &[ORIGIN]).await;
 
         assert!(
             browser.log_lines().contains(&"cookie-set sid".to_string()),
@@ -1117,7 +1117,7 @@ mod tests {
             Arc::clone(&client),
         );
 
-        let _ = discover(&job, &[ORIGIN]).await;
+        discover(&job, &[ORIGIN]).await;
 
         let sent = client.sent.lock().unwrap();
         let marks_of = |path: &str| -> Vec<String> {
@@ -1151,7 +1151,7 @@ mod tests {
             Arc::clone(&client),
         );
 
-        let _ = discover(&job, &[ORIGIN]).await;
+        discover(&job, &[ORIGIN]).await;
 
         let sent = client.sent.lock().unwrap();
         assert!(sent.iter().any(|(req, _)| req.path == "/robots.txt"));

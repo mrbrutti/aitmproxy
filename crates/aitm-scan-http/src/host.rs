@@ -951,15 +951,11 @@ mod tests {
     async fn charge_spends_the_jobs_budget() {
         let fx = fixture(ok_200());
         let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
-        let before = host.budget_left();
 
         assert!(host.charge(3), "the job can afford three units");
 
-        assert_eq!(
-            host.budget_left(),
-            before - 3,
-            "the job's own budget was spent"
-        );
+        // `FakeJob::new` starts at 1000 units; three were spent.
+        assert_eq!(host.budget_left(), 997, "the job's own budget was spent");
         assert_eq!(fx.job.charges.load(Ordering::SeqCst), 1);
         assert!(fx.sent().is_empty(), "a charge sends nothing");
     }
