@@ -6,11 +6,12 @@ holds the default ports.
 N5-TUI: the installed `aitm-tui --bus <app bus> --token-file <wrong>` must show
 `bus refused the token: it matched neither the agent nor the operator token (check the token you
 supplied)` and stop retrying. N4-TUI / N4-WEB: `aitm tui` / `aitm web` started for at most 5 s
-while 8080 is held must print `cannot start: the proxy port 127.0.0.1:8080 is already in use.`
-before any screen and exit by themselves (read-only: a refused start changes nothing; the only
-process touched is the child this cell started). N5-WEB is judged by the web cell when `aitm web`
-runs (it owns the agent URL; spec D7 places it there), so this cell writes no N5-WEB row. N5-CLI
-is CLI-6's one-shot refusal: `N/A` here (spec D1). SKIP when the app's core is not running.
+while 8080 is held must print `cannot start: the proxy port 127.0.0.1:8080 is already in use`
+(wave 1's M2 panel, `N4_PANEL`) before any screen and exit by themselves (read-only: a refused
+start changes nothing; the only process touched is the child this cell started). N5-WEB is
+judged by the web cell when `aitm web` runs (it owns the agent URL; spec D7 places it there), so
+this cell writes no N5-WEB row. N5-CLI is CLI-6's one-shot refusal: `N/A` here (spec D1). SKIP
+when the app's core is not running.
 Steps → negatives-steps.tsv.
 """
 from __future__ import annotations
@@ -34,8 +35,9 @@ AITM = os.environ.get("AITM", INSTALLED_CLI)
 REFUSAL = "bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)"
 # Wave 1's M2 panel (spec 2026-11-01-cli-terminal-reporting-design, M2 "after"): the headline has no
 # trailing period, the two why sentences follow, and the holder command is the panel's `fix:` line
-# on a pipe / `▸` on a TTY (0.5.10 said "Find the holder with:"). On a TTY the why lines wrap at 80
-# columns, so the words are matched across any whitespace (`n4_words`).
+# on a pipe / `▸` on a TTY (0.5.10 said "Find the holder with:"). The TTY form wraps the why lines at
+# the terminal's width (80 in the spec's M2 drawing), so the words are matched across any whitespace
+# (`n4_words`).
 N4_PANEL = "cannot start: the proxy port 127.0.0.1:8080 is already in use"
 N4_HOLDER_LINE = "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program."
 N4_FREE_LINE = "Free it, or set `listen:` to another address in"
