@@ -2147,17 +2147,19 @@ mod tests {
     /// moves to `cancelled` with its issues intact and sends nothing more.
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_moves_to_cancelled_and_keeps_issues() {
-        let h = Harness::new().with_lane(
-            FakeLane::http()
-                // The catalogue is id-sorted, so `fake.hit` is scheduled
-                // before `fake.wait` and the issue exists before the block.
-                .with_check(FakeCheck::scripted(
-                    "fake.hit",
-                    "demo",
-                    vec![FakeRun::vulnerable()],
-                ))
-                .with_check(FakeCheck::blocking("fake.wait")),
-        );
+        let h = Harness::new()
+            .with_lane(
+                FakeLane::http()
+                    // The catalogue is id-sorted, so `fake.hit` is scheduled
+                    // before `fake.wait` and the issue exists before the block.
+                    .with_check(FakeCheck::scripted(
+                        "fake.hit",
+                        "demo",
+                        vec![FakeRun::vulnerable()],
+                    ))
+                    .with_check(FakeCheck::blocking("fake.wait")),
+            )
+            .with_egress();
         h.bind();
 
         let started = crate::jobs::start(
@@ -2178,6 +2180,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        // A running job holds the egress posture: race-free here because the
+        // blocking check keeps the job open until the cancel below (the
+        // panicking-lane test used to read this and raced its own finaliser).
+        assert!(h.egress_confined(), "a running job holds the posture");
+
         let cancelling = h
             .engine
             .registry
@@ -2185,9 +2192,10 @@ mod tests {
             .expect("the job is in the registry");
         // `cancel` answers with the status as it stands: `Cancelling` while the
         // worker is still unwinding, or already `Cancelled` when the finaliser
-        // beat this read on the multi-thread runtime (CI flake, amendment 71b:
-        // "left: Cancelled, right: Cancelling"). Either says the cancel took;
-        // the terminal facts are asserted after the signal below.
+        // beat this read on the multi-thread runtime (CI Rust gate on #229,
+        // #287, #290, #292, 2026-11-02: "left: Cancelled, right: Cancelling";
+        // coordinator's amendment 71b, test determinism). Either says the cancel
+        // took; the terminal facts are asserted after the signal below.
         assert!(
             matches!(cancelling.state, JobState::Cancelling | JobState::Cancelled),
             "cancel answered {:?}",
@@ -2198,6 +2206,13 @@ mod tests {
         assert_eq!(status.state, JobState::Cancelled);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Cancelled));
         assert_eq!(h.engine.issues.for_job(&started.job).len(), 1);
+        // Spec D5 "Cancellation": the confinement token drops with the entry;
+        // `finish` clears it before flipping the terminal signal, so this read
+        // is deterministic (PR 2a spec panel Minor).
+        assert!(
+            !h.egress_confined(),
+            "the egress hold outlived the cancelled job"
+        );
 
         let finished_at = status
             .finished_at
@@ -3476,10 +3491,9 @@ mod tests {
         .expect("the job starts");
         // No pre-terminal read of the hold here: on the multi-thread runtime
         // the lane's panic can end the job before this line runs, so "a
-        // running job holds the posture" raced the supervisor (CI flake,
-        // amendment 71). That property is pinned without a race by
-        // `commands::tests::discover_wait_answers_on_finish_not_on_a_terminal_status`
-        // (an entry whose `finish` has not run still holds its egress hold).
+        // running job holds the posture" raced the supervisor (CI Rust gate on
+        // #289, 2026-11-02; coordinator's amendment 71b). The cancel test above
+        // pins that property race-free behind its blocking check.
 
         // The terminal signal decides when the job is over; `TERMINAL_NET` is
         // the only net (the old 2 s bound tripped on a loaded gate machine).
