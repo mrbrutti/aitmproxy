@@ -306,7 +306,6 @@ Verbs:
   add --host <host>         Add a host, host:port or *.wildcard to Scope.
   remove --host <host>      Remove a host from Scope.
   list                      List the Scope entries.
-  example                   Print an example Scope entry.
 
 Examples:
   $ aitm scope add --host app.example.test
