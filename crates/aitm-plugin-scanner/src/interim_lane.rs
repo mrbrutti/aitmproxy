@@ -418,41 +418,17 @@ impl Lane for InterimHttpLane {
     }
 
     fn checks(&self) -> Vec<Arc<dyn Check>> {
-        // The three passive checks only. The two active ones this lane used to
-        // ship (`xss-reflected`, `open-redirect`) are owned by the T3 natives in
-        // `aitm-scan-checks-http` since T3 PR 2a: the catalogue gives lanes
+        // This lane registers no check of its own. The two active ones it used
+        // to ship (`xss-reflected`, `open-redirect`) are owned by the T3 natives
+        // in `aitm-scan-checks-http` since T3 PR 2a: the catalogue gives lanes
         // precedence over the native slot, so listing them here would refuse
-        // the natives as id conflicts. `LegacyActiveCheck` stays as the test
-        // vehicle for this lane's probe host until T2 retires the lane.
-        vec![
-            Arc::new(LegacyPassiveCheck {
-                class: crate::passive::CLASS_REFLECTION,
-                meta: passive_meta(
-                    crate::passive::CLASS_REFLECTION,
-                    "Reflected parameter value",
-                    Confidence::Tentative,
-                    "A request parameter value is echoed in the response body.",
-                ),
-            }),
-            Arc::new(LegacyPassiveCheck {
-                class: crate::passive::CLASS_SECURITY_HEADER,
-                meta: passive_meta(
-                    crate::passive::CLASS_SECURITY_HEADER,
-                    "Missing security header",
-                    Confidence::Firm,
-                    "A response is missing a security header the browser relies on.",
-                ),
-            }),
-            Arc::new(LegacyPassiveCheck {
-                class: crate::passive::CLASS_COOKIE_FLAG,
-                meta: passive_meta(
-                    crate::passive::CLASS_COOKIE_FLAG,
-                    "Cookie without Secure or HttpOnly",
-                    Confidence::Firm,
-                    "A `Set-Cookie` is missing the `Secure` and/or `HttpOnly` attribute.",
-                ),
-            }),
-        ]
+        // the natives as id conflicts. The three passive ones are engine-shipped
+        // since T2 ([`shipped_passive_checks`]): the engine puts them in the
+        // catalogue whatever lane holds the http slot, so listing them here too
+        // would make them id conflicts the moment a lane crate's HTTP lane
+        // displaces this one. `LegacyActiveCheck` stays as the test vehicle for
+        // this lane's probe host until T2 retires the lane.
+        Vec::new()
     }
 }
 
@@ -504,6 +480,48 @@ fn origin_request(point: &InsertionPoint) -> Option<HttpFlow> {
         metadata: aitm_core::FlowMeta::default(),
         intercept: aitm_core::InterceptState::Observed,
     })
+}
+
+/// The three shipped passive checks (`reflection`, `security-header`,
+/// `cookie-flag`; call B19), in the plan's order.
+///
+/// Spec amendment 24: "the interim lane drops its two legacy active checks,
+/// the passives stay". The **engine** ships these, whatever lane holds the
+/// http slot — the interim lane while no lane crate supplies one, T2's
+/// `aitm-scan-http` lane once it does — so they are part of every build's
+/// `scan.checks` and `check.<id>` surface. They read the captured flow a
+/// point came from through the host and never send (see
+/// [`LegacyPassiveCheck`]).
+pub fn shipped_passive_checks() -> Vec<Arc<dyn Check>> {
+    vec![
+        Arc::new(LegacyPassiveCheck {
+            class: crate::passive::CLASS_REFLECTION,
+            meta: passive_meta(
+                crate::passive::CLASS_REFLECTION,
+                "Reflected parameter value",
+                Confidence::Tentative,
+                "A request parameter value is echoed in the response body.",
+            ),
+        }),
+        Arc::new(LegacyPassiveCheck {
+            class: crate::passive::CLASS_SECURITY_HEADER,
+            meta: passive_meta(
+                crate::passive::CLASS_SECURITY_HEADER,
+                "Missing security header",
+                Confidence::Firm,
+                "A response is missing a security header the browser relies on.",
+            ),
+        }),
+        Arc::new(LegacyPassiveCheck {
+            class: crate::passive::CLASS_COOKIE_FLAG,
+            meta: passive_meta(
+                crate::passive::CLASS_COOKIE_FLAG,
+                "Cookie without Secure or HttpOnly",
+                Confidence::Firm,
+                "A `Set-Cookie` is missing the `Secure` and/or `HttpOnly` attribute.",
+            ),
+        }),
+    ]
 }
 
 /// The [`ProbeHost`] the interim lane builds for one insertion point.
@@ -1788,8 +1806,7 @@ mod tests {
     }
 
     fn check_named(id: &str) -> Arc<dyn aitm_scan_model::Check> {
-        lane()
-            .checks()
+        shipped_passive_checks()
             .into_iter()
             .find(|c| c.meta().id == id)
             .unwrap_or_else(|| legacy_active(id))
@@ -2863,11 +2880,14 @@ mod tests {
         assert_eq!(client.calls(), 1, "only the https baseline was sent");
     }
 
-    /// The lane ships its three passive checks (call B19), in the plan's order,
-    /// with a native origin, covering every HTTP kind and no WebSocket or L4
-    /// one. Its two legacy active checks left `checks()` with T3 PR 2a (the
-    /// natives in `aitm-scan-checks-http` own `xss-reflected` and
-    /// `open-redirect`) but still carry the metadata the plan pinned.
+    /// The engine ships the three passive checks (call B19, spec amendment 24
+    /// "the passives stay") through [`shipped_passive_checks`], in the plan's
+    /// order, with a native origin, covering every HTTP kind and no WebSocket
+    /// or L4 one. The lane's own `checks()` is empty since T2: its two legacy
+    /// active checks left with T3 PR 2a (the natives in `aitm-scan-checks-http`
+    /// own `xss-reflected` and `open-redirect`) and the passives moved to the
+    /// engine so they survive the `aitm-scan-http` lane taking the http slot.
+    /// The legacy actives still carry the metadata the plan pinned.
     ///
     /// Coordinator ruling 2026-11-01: an **id** is spec D8.2's literal name
     /// (`xss-reflected`), a **class** is the issue class the check emits
@@ -2875,7 +2895,11 @@ mod tests {
     /// coincide for the other four.
     #[test]
     fn the_three_interim_checks_carry_the_pinned_metadata() {
-        let checks = lane().checks();
+        assert!(
+            lane().checks().is_empty(),
+            "the interim lane registers no check of its own: the passives are engine-shipped"
+        );
+        let checks = shipped_passive_checks();
         let ids: Vec<&str> = checks.iter().map(|c| c.meta().id.as_str()).collect();
         assert_eq!(ids, ["reflection", "security-header", "cookie-flag"]);
         let classes: Vec<&str> = checks.iter().map(|c| c.meta().class.as_str()).collect();

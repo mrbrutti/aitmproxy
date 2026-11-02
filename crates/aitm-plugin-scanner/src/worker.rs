@@ -1851,12 +1851,17 @@ mod tests {
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.points.found, 2);
         assert_eq!(status.points.audited, 2, "the two discovered points");
+        // Two points x (the lane's point check + the engine's three shipped
+        // passive checks, spec amendment 24) plus the one origin item.
         assert_eq!(
-            status.checks.scheduled, 3,
-            "one point check per point plus one origin item"
+            status.checks.scheduled, 9,
+            "four point checks per point plus one origin item"
         );
-        assert_eq!(status.points.queued, 3);
-        assert_eq!(status.checks.done, 3);
+        assert_eq!(
+            status.points.queued, 9,
+            "every scheduled item is queued work"
+        );
+        assert_eq!(status.checks.done, 9);
         assert_eq!(
             origin.points_seen(),
             vec!["origin:http://scan.test:80".to_string()]
@@ -1888,9 +1893,11 @@ mod tests {
         let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.stopped_reason, None);
-        assert_eq!(status.checks.scheduled, 2);
+        // Two points x (the erroring check + the engine's three shipped
+        // passive checks, spec amendment 24); only the erroring check errors.
+        assert_eq!(status.checks.scheduled, 8);
         assert_eq!(
-            status.checks.done, 2,
+            status.checks.done, 8,
             "an erroring run is still a finished run"
         );
         assert_eq!(
@@ -2057,8 +2064,12 @@ mod tests {
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.points.found, 2);
         assert_eq!(status.points.audited, 2);
-        assert_eq!(status.checks.scheduled, 2);
-        assert_eq!(status.checks.done, 2);
+        // Two points x (the lane's one check + the engine's three shipped
+        // passive checks, which run on every http point whatever lane holds
+        // the slot; spec amendment 24). The passives read the captured flow
+        // and send nothing, so the probe count is the fake check's alone.
+        assert_eq!(status.checks.scheduled, 8);
+        assert_eq!(status.checks.done, 8);
         assert!(status.checks.running.is_empty());
         assert_eq!(status.probes.sent, 2, "one probe per point");
         assert!(status.finished_at.is_some());
@@ -3485,10 +3496,11 @@ mod tests {
         assert_eq!(status.state, JobState::Done, "{:?}", status.error);
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.error, None);
-        // Two points x two checks: every item, the panicking ones included,
-        // counts as done, and the point count follows.
-        assert_eq!(status.checks.scheduled, 4);
-        assert_eq!(status.checks.done, 4);
+        // Two points x (two lane checks + the engine's three shipped passive
+        // checks): every item, the panicking ones included, counts as done,
+        // and the point count follows.
+        assert_eq!(status.checks.scheduled, 10);
+        assert_eq!(status.checks.done, 10);
         assert_eq!(status.points.audited, 2);
         assert!(status.checks.running.is_empty());
         // `fake.hit` still ran after `fake.boom` panicked on the same point.

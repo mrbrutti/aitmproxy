@@ -2890,6 +2890,7 @@ mod tests {
                 late: ScanLate::new(),
                 lanes: self.lanes,
                 native_checks: Vec::new(),
+                passive_checks: crate::interim_lane::shipped_passive_checks(),
                 script_checks: Arc::new(CheckRegistry::new()),
                 interim: InterimHttpLane::new(self.cfg.clone()),
                 registry: JobRegistry::new(self.cfg.history),

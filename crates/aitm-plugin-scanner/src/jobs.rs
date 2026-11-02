@@ -639,6 +639,11 @@ pub struct Engine {
     pub lanes: Vec<Arc<dyn Lane>>,
     /// The native checks `aitm_scan_checks_http::checks()` handed the binary.
     pub native_checks: Vec<Arc<dyn Check>>,
+    /// The three passive checks the engine itself ships
+    /// ([`crate::interim_lane::shipped_passive_checks`]), in the catalogue
+    /// beside `native_checks` whatever lane holds the http slot (spec
+    /// amendment 24: "the passives stay").
+    pub passive_checks: Vec<Arc<dyn Check>>,
     /// The checks the scripting tier registered through `reg.add_check`.
     pub script_checks: Arc<CheckRegistry>,
     /// The interim HTTP lane, used only while no HTTP lane crate is built in.
@@ -659,6 +664,7 @@ impl std::fmt::Debug for Engine {
                 &self.lanes.iter().map(|l| l.lane()).collect::<Vec<_>>(),
             )
             .field("native_checks", &self.native_checks.len())
+            .field("passive_checks", &self.passive_checks.len())
             .field("script_checks", &self.script_checks.len())
             .field("bound", &self.late.is_bound())
             .finish_non_exhaustive()
@@ -699,12 +705,20 @@ impl Engine {
 
     /// The catalogue as this engine would run it, assembled fresh so a script
     /// added since the last call is in it (spec D4).
+    ///
+    /// The native slot is the engine's own shipped passive checks followed by
+    /// the checks the binary handed it: the passives come first because they
+    /// held that precedence (a lane's) before T2 moved them off the interim
+    /// lane, so a build that put a same-id check in `native_checks` sees the
+    /// same first-claim-wins conflict it always did.
     pub fn catalogue(&self) -> Catalogue {
-        assemble(
-            &self.lanes_for_run(),
-            &self.native_checks,
-            &self.script_checks,
-        )
+        let native: Vec<Arc<dyn Check>> = self
+            .passive_checks
+            .iter()
+            .chain(self.native_checks.iter())
+            .cloned()
+            .collect();
+        assemble(&self.lanes_for_run(), &native, &self.script_checks)
     }
 
     /// Resolve `requested` against the lanes this build has, reporting the ones
@@ -2080,6 +2094,7 @@ pub(crate) mod test_support {
             late: ScanLate::new(),
             lanes,
             native_checks: Vec::new(),
+            passive_checks: crate::interim_lane::shipped_passive_checks(),
             script_checks: Arc::new(CheckRegistry::new()),
             interim: crate::interim_lane::InterimHttpLane::new(cfg.clone()),
             registry: crate::jobs::JobRegistry::new(cfg.history),
@@ -2406,6 +2421,38 @@ mod tests {
             Arc::ptr_eq(&run[0], &bare.engine.interim),
             "with no lane crate the interim lane runs"
         );
+    }
+
+    /// Spec amendment 24 ("the passives stay"): the three shipped passive
+    /// checks are engine-native, so the catalogue holds `reflection`,
+    /// `security-header` and `cookie-flag` exactly once and without a conflict
+    /// whichever lane holds the http slot — a lane crate's (T2's
+    /// `aitm-scan-http`) or the interim fallback.
+    #[test]
+    fn the_shipped_passive_checks_are_in_the_catalogue_whatever_lane_holds_http() {
+        for (label, h) in [
+            ("crate lane", Harness::new()),
+            ("interim lane", Harness::bare()),
+        ] {
+            let catalogue = h.engine.catalogue();
+            let ids: Vec<String> = catalogue
+                .all()
+                .iter()
+                .map(|c| c.meta().id.clone())
+                .collect();
+            for id in ["reflection", "security-header", "cookie-flag"] {
+                assert_eq!(
+                    ids.iter().filter(|have| have.as_str() == id).count(),
+                    1,
+                    "{label}: `{id}` is in the catalogue exactly once; ids were {ids:?}"
+                );
+            }
+            assert!(
+                catalogue.conflicts().is_empty(),
+                "{label}: the passives claim no id twice: {:?}",
+                catalogue.conflicts()
+            );
+        }
     }
 
     /// `scan.checks` tells a client which lane is the interim one: with a lane

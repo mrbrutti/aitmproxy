@@ -4,8 +4,10 @@
 //! Against a real in-process target (`TestTarget::builder(mode)`) over real
 //! loopback sockets: the two TLS listeners negotiate ALPN as advertised and
 //! log a `tls_handshake` entry each; one h2 connection carrying five requests
-//! shows up as one `/log/conns` row with `requests: 5` and `conn_req_index`
-//! 1..5; `/ws` behaves per D4 in both modes (origin, login, subprotocol echo,
+//! shows up as one `/log/conns` row with `requests: 5`, `streams: 5` and
+//! `conn_req_index` 1..5, and a raw h2 client whose one HEADERS frame hyper
+//! rejects leaves a row with `streams: 1`, `requests: 0` (amendment 51);
+//! `/ws` behaves per D4 in both modes (origin, login, subprotocol echo,
 //! escaping, the 1009 close) and logs the handshake and the close; `/ws` over
 //! h2 is a 400; the control origin is a separate 404-everything-else origin
 //! whose `/log/http` never stores a raw cookie or authorization value; the
@@ -694,7 +696,8 @@ async fn tls_listener_negotiates_h2_and_h1() {
 }
 
 /// S3: five requests over one h2 connection are one `/log/conns` row with
-/// `requests: 5` and `conn_req_index` 1..5 on `version: "h2"` entries.
+/// `requests: 5`, `streams: 5` (amendment 51: five HEADERS frames on ids
+/// 1, 3, 5, 7, 9) and `conn_req_index` 1..5 on `version: "h2"` entries.
 #[tokio::test]
 async fn h2_connection_counts_requests() {
     let target = TestTarget::builder(Vulnerable)
@@ -722,6 +725,7 @@ async fn h2_connection_counts_requests() {
     let conn = tls_conns[0];
     assert_eq!(conn["alpn"], json!("h2"));
     assert_eq!(conn["requests"], json!(5));
+    assert_eq!(conn["streams"], json!(5), "{conn}");
     assert_eq!(conn["closed_ms"], Value::Null, "still open: {conn}");
     let conn_id = conn["conn_id"].as_str().expect("conn_id");
     assert!(
@@ -750,6 +754,195 @@ async fn h2_connection_counts_requests() {
         assert_eq!(e["path"], json!("/preview"), "{e}");
         assert_eq!(e["query"], json!("msg=x"), "{e}");
         assert_eq!(e["status"], json!(200), "{e}");
+    }
+}
+
+/// One HTTP/2 frame: 9-byte header (24-bit length, type, flags, 31-bit stream
+/// id) followed by `payload`.
+fn h2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len()).expect("frame payload fits 24 bits");
+    let mut f = Vec::with_capacity(9 + payload.len());
+    f.extend_from_slice(&len.to_be_bytes()[1..]);
+    f.push(kind);
+    f.push(flags);
+    f.extend_from_slice(&stream_id.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// S3 (amendment 51): a stream hyper never dispatches still counts. A raw h2
+/// client sends the preface, an empty SETTINGS and one HEADERS frame
+/// (END_HEADERS | END_STREAM, stream 1) whose header block is not valid HPACK,
+/// reads whatever comes back (a GOAWAY, an RST_STREAM or EOF; the bytes are
+/// hyper's business) and closes. The connection row says `alpn: "h2"`,
+/// `streams: 1`, `requests: 0`.
+#[tokio::test]
+async fn h2_rejected_header_block_counts_a_stream_but_no_request() {
+    let target = TestTarget::builder(Vulnerable)
+        .tls(0)
+        .control(0)
+        .start()
+        .await
+        .expect("start target");
+    let tls = target.tls_url().expect("tls listener");
+    let control = target.control_url().expect("control origin");
+
+    let (mut stream, negotiated) = tls_connect(tls, &["h2"]).await;
+    assert_eq!(negotiated.as_deref(), Some(&b"h2"[..]), "ALPN h2");
+
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    wire.extend(h2_frame(0x4, 0x0, 0, &[]));
+    // 0xFF: an indexed representation whose index (127 + 0) is outside the
+    // static table with an empty dynamic table, then a truncated literal:
+    // hyper's HPACK decoder rejects the block, so no request is dispatched.
+    wire.extend(h2_frame(0x1, 0x05, 1, &[0xff, 0x00, 0x00]));
+    stream.write_all(&wire).await.expect("raw h2 write");
+    stream.flush().await.expect("raw h2 flush");
+
+    // Drain the server's answer for up to a second; EOF, an error or the
+    // deadline all end the read. Nothing about its bytes is asserted.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut buf = [0u8; 1024];
+        match tokio::time::timeout(left, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(_)) => {}
+        }
+    }
+    drop(stream);
+
+    let conns = wait_for(control, "/log/conns", "the tls h2 row", |body| {
+        entries(body)
+            .iter()
+            .any(|c| c["listener"] == "tls" && c["streams"] == json!(1))
+    })
+    .await;
+    let tls_conns: Vec<&Value> = entries(&conns)
+        .iter()
+        .filter(|c| c["listener"] == "tls")
+        .collect();
+    assert_eq!(tls_conns.len(), 1, "one tls connection: {conns}");
+    let conn = tls_conns[0];
+    assert_eq!(conn["alpn"], json!("h2"), "{conn}");
+    assert_eq!(conn["streams"], json!(1), "{conn}");
+    assert_eq!(conn["requests"], json!(0), "{conn}");
+
+    // And `/log/http` has the handshake but no `request` entry for it.
+    let http = control_get(control, "/log/http").await;
+    assert_eq!(
+        tls_handshakes(&http),
+        vec![("tls".to_string(), "h2".to_string())]
+    );
+    let conn_id = conn["conn_id"].as_str().expect("conn_id");
+    assert!(
+        !entries(&http)
+            .iter()
+            .any(|e| e["kind"] == "request" && e["conn_id"] == conn_id),
+        "no request was dispatched for the rejected stream: {http}"
+    );
+}
+
+/// T3-3 oracle shape (amendment 51; tester, stage 5): one raw h2 connection
+/// carrying 8 HEADERS frames (a valid HPACK `GET /` on ids 1, 3, ..., 15),
+/// each immediately followed by `RST_STREAM(CANCEL)`. The wire opened exactly
+/// eight client streams, so the row says `streams: 8` whatever hyper managed
+/// to dispatch before each cancel: `requests` is bounded by 8 and printed,
+/// never asserted exactly (that race is hyper's, not the observer's).
+#[tokio::test]
+async fn h2_eight_cancelled_streams_count_eight_streams() {
+    let target = TestTarget::builder(Vulnerable)
+        .tls(0)
+        .control(0)
+        .start()
+        .await
+        .expect("start target");
+    let tls = target.tls_url().expect("tls listener");
+    let control = target.control_url().expect("control origin");
+
+    let (mut stream, negotiated) = tls_connect(tls, &["h2"]).await;
+    assert_eq!(negotiated.as_deref(), Some(&b"h2"[..]), "ALPN h2");
+
+    // HPACK: `:method GET` (0x82), `:scheme https` (0x87), `:path /` (0x84),
+    // `:authority` as a literal without indexing on static index 1 (0x01),
+    // 9-byte non-Huffman value "localhost". No dynamic-table state, so the
+    // same block is valid on every stream.
+    let mut block = vec![0x82, 0x87, 0x84, 0x01, 0x09];
+    block.extend_from_slice(b"localhost");
+
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    wire.extend(h2_frame(0x4, 0x0, 0, &[]));
+    for n in 0..8u32 {
+        let id = 2 * n + 1;
+        // END_HEADERS | END_STREAM, then CANCEL (error code 0x8) on the same id.
+        wire.extend(h2_frame(0x1, 0x05, id, &block));
+        wire.extend(h2_frame(0x3, 0x0, id, &[0, 0, 0, 8]));
+    }
+    stream.write_all(&wire).await.expect("raw h2 write");
+    stream.flush().await.expect("raw h2 flush");
+
+    // Drain whatever hyper answers (SETTINGS, responses for streams it won
+    // the race on, RST_STREAMs) for up to a second; nothing in it is asserted.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut buf = [0u8; 4096];
+        match tokio::time::timeout(left, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(_)) => {}
+        }
+    }
+    drop(stream);
+
+    let conns = wait_for(
+        control,
+        "/log/conns",
+        "the tls h2 row at 8 streams",
+        |body| {
+            entries(body)
+                .iter()
+                .any(|c| c["listener"] == "tls" && c["streams"] == json!(8))
+        },
+    )
+    .await;
+    let tls_conns: Vec<&Value> = entries(&conns)
+        .iter()
+        .filter(|c| c["listener"] == "tls")
+        .collect();
+    assert_eq!(tls_conns.len(), 1, "one tls connection: {conns}");
+    let conn = tls_conns[0];
+    assert_eq!(conn["alpn"], json!("h2"), "{conn}");
+    assert_eq!(conn["streams"], json!(8), "{conn}");
+    let requests = conn["requests"].as_u64().expect("requests is a number");
+    assert!(
+        requests <= 8,
+        "requests never exceed the streams opened: {conn}"
+    );
+    eprintln!("T3 shape: streams = 8, requests (hyper's race with CANCEL) = {requests}");
+
+    // Each dispatched request, if any, is logged against this conn_id with
+    // a `conn_req_index` no larger than 8; nothing else references it.
+    let http = control_get(control, "/log/http").await;
+    let conn_id = conn["conn_id"].as_str().expect("conn_id");
+    let logged: Vec<&Value> = entries(&http)
+        .iter()
+        .filter(|e| e["kind"] == "request" && e["conn_id"] == conn_id)
+        .collect();
+    assert_eq!(
+        logged.len() as u64,
+        requests,
+        "/log/http request rows match the row's requests: {http}"
+    );
+    for e in logged {
+        assert_eq!(e["version"], json!("h2"), "{e}");
+        let idx = e["conn_req_index"].as_u64().expect("conn_req_index");
+        assert!((1..=8).contains(&idx), "{e}");
     }
 }
 
