@@ -518,4 +518,249 @@ mod tests {
             serde_json::json!({"poc_path": "", "path": 3, "name": "x.yaml"})
         );
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Tester — C10 edge cases: a value is JSON only when the whole token
+    /// parses (`123abc`, `1.2.3.4`, `0x10`, `example.com` stay strings;
+    /// `123`, `-1`, `1e3`, `true`, `null`, `[1,2]` do not), a quoted JSON
+    /// string loses its quotes, `--k=` is the empty string, `--k=a=b` splits
+    /// once, a bare flag before another flag or at the end is `true`, and
+    /// `--`, `-x` and a loose word are refused with the one sentence.
+    #[test]
+    fn tester_generic_arguments_json_lookalikes_stay_strings() {
+        let got = generic_arguments(&strs(&[
+            "--a",
+            "123abc",
+            "--b",
+            "123",
+            "--c",
+            "1.2.3.4",
+            "--d",
+            "true",
+            "--e",
+            "null",
+            "--f",
+            "[1,2]",
+            "--g=",
+            "--h=a=b",
+            "--i",
+            "-1",
+            "--j",
+            "example.com",
+            "--k",
+            "0x10",
+            "--l",
+            "1e3",
+            "--m",
+            "--n",
+            " spaced ",
+            "--o",
+            "\"quoted\"",
+            "--p",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            JsonValue::Object(got),
+            serde_json::json!({
+                "a": "123abc", "b": 123, "c": "1.2.3.4", "d": true, "e": null,
+                "f": [1, 2], "g": "", "h": "a=b", "i": -1, "j": "example.com",
+                "k": "0x10", "l": 1000.0, "m": true, "n": " spaced ", "o": "quoted",
+                "p": true
+            })
+        );
+        for bad in [
+            strs(&["--"]),
+            strs(&["-x", "1"]),
+            strs(&["--k", "1", "loose"]),
+        ] {
+            let err = generic_arguments(&bad).expect_err("refused");
+            assert!(
+                err.to_string().starts_with("unexpected argument `")
+                    && err.to_string().ends_with("`; flags are `--name value`"),
+                "{bad:?}: {err}"
+            );
+        }
+        let err = generic_arguments(&strs(&["--k=1", "--k", "2"])).expect_err("repeated");
+        assert_eq!(err.to_string(), "flag --k given more than once");
+        assert!(generic_arguments(&[]).expect("empty").is_empty());
+    }
+
+    /// Tester — C11: only a non-empty relative string under `poc_path` or
+    /// `path` at the top level is joined to `cwd` (`./x` and `~/x` included,
+    /// verbatim); absolute, empty, null, numeric, nested and non-object
+    /// values are untouched.
+    #[test]
+    fn tester_absolutize_touches_only_relative_nonempty_top_level_strings() {
+        let mut v = serde_json::json!({
+            "poc_path": "./x.yaml",
+            "path": "~/y",
+            "nested": {"path": "z"},
+            "list": ["path"],
+            "name": "q.yaml"
+        });
+        absolutize_paths(&mut v, Path::new("/w"));
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "poc_path": "/w/./x.yaml",
+                "path": "/w/~/y",
+                "nested": {"path": "z"},
+                "list": ["path"],
+                "name": "q.yaml"
+            })
+        );
+        let untouched = serde_json::json!({"poc_path": "/abs/x.yaml", "path": null, "other": 1});
+        let mut same = untouched.clone();
+        absolutize_paths(&mut same, Path::new("/w"));
+        assert_eq!(same, untouched);
+        let mut root = serde_json::json!({"path": "x"});
+        absolutize_paths(&mut root, Path::new("/"));
+        assert_eq!(root, serde_json::json!({"path": "/x"}));
+        for mut other in [
+            serde_json::json!("x.yaml"),
+            serde_json::json!(null),
+            serde_json::json!(["poc_path"]),
+        ] {
+            let before = other.clone();
+            absolutize_paths(&mut other, Path::new("/w"));
+            assert_eq!(other, before);
+        }
+    }
+
+    /// Tester — D8 step 10 edges: zero bytes render as zero bytes; a nested
+    /// object through `TypeDesc::Any` (a verb the registry lacks) prints the
+    /// pretty JSON with sorted keys; a scalar through `Any` prints as the
+    /// in-process path would; a bytes answer through `Any` is its base64
+    /// text (the schema is unknown); shape mismatches are errors.
+    #[test]
+    fn tester_render_empty_bytes_and_any_values() {
+        assert_eq!(
+            render(&serde_json::json!(""), &TypeDesc::Bytes).expect("empty bytes"),
+            Vec::<u8>::new()
+        );
+        let nested = serde_json::json!({"b": [1, {"c": null, "d": 2.5}], "a": "x", "e": true});
+        assert_eq!(
+            String::from_utf8(render(&nested, &TypeDesc::Any).expect("any")).unwrap(),
+            "{\n  \"a\": \"x\",\n  \"b\": [\n    1,\n    {\n      \"c\": null,\n      \"d\": 2.5\n    }\n  ],\n  \"e\": true\n}\n"
+        );
+        assert_eq!(
+            render(&serde_json::json!("plain"), &TypeDesc::Any).expect("str"),
+            b"plain\n"
+        );
+        assert_eq!(
+            render(&serde_json::json!([]), &TypeDesc::Any).expect("empty array"),
+            b"[]\n"
+        );
+        assert_eq!(
+            render(&serde_json::json!(null), &TypeDesc::Any).expect("null"),
+            b"null\n"
+        );
+        assert_eq!(
+            render(&serde_json::json!("iVBORw=="), &TypeDesc::Any).expect("base64 as text"),
+            b"iVBORw==\n"
+        );
+        assert_eq!(
+            render(&serde_json::json!("iVBORw=="), &TypeDesc::Bytes).expect("bytes"),
+            [0x89, 0x50, 0x4e, 0x47]
+        );
+        assert!(render(&serde_json::json!(5), &TypeDesc::Bytes).is_err());
+        assert!(render(&serde_json::json!("not base64!"), &TypeDesc::Bytes).is_err());
+        assert!(render(
+            &serde_json::json!({}),
+            &TypeDesc::Array(Box::new(TypeDesc::Str))
+        )
+        .is_err());
+        assert!(render(&serde_json::json!("x"), &TypeDesc::Int).is_err());
+    }
+
+    /// Tester — `prepare` edges: `--yes` anywhere is stripped from the flags
+    /// of a typed and an unresolved verb; a three-segment path is the dotted
+    /// name; `--` alone is a path token (not a flag), so `aitm --` is an
+    /// unknown command, and an empty argv is the usage line.
+    #[test]
+    fn tester_prepare_strips_yes_anywhere_and_treats_dashdash_as_a_word() {
+        let registry = Registry::new();
+        match prepare(&registry, &strs(&["--yes", "custom", "verb", "--k", "1"])) {
+            Err(err) => assert!(
+                err.to_string()
+                    .starts_with("expected a command before flags, got `--yes`"),
+                "{err}"
+            ),
+            Ok(other) => panic!("a leading --yes is a flag before the command: {other:?}"),
+        }
+        match prepare(
+            &registry,
+            &strs(&["a", "b", "c", "--yes", "--k", "1", "--yes"]),
+        )
+        .expect("unresolved")
+        {
+            Prepared::Unresolved { dotted, flags, yes } => {
+                assert_eq!(dotted, "a.b.c");
+                assert_eq!(flags, strs(&["--k", "1"]));
+                assert!(yes);
+            }
+            Prepared::Typed { .. } => panic!("an empty registry knows nothing"),
+        }
+        let err = prepare(&registry, &strs(&["--"])).expect_err("-- alone");
+        assert_eq!(
+            err.to_string(),
+            "unknown command `--`; run with no arguments to list commands"
+        );
+        let err = prepare(&registry, &[]).expect_err("empty argv");
+        assert_eq!(err.to_string(), "usage: aitm <command> [--flag value]...");
+        let err = prepare(&registry, &strs(&["-x"])).expect_err("single dash");
+        assert_eq!(
+            err.to_string(),
+            "unknown command `-x`; run with no arguments to list commands"
+        );
+    }
+
+    /// Tester — `RemoteError`'s `Display` and `Debug` carry what the bus
+    /// said and nothing of what the client sent: no variant has a token
+    /// field, and the connect error for a refused socket is the one word.
+    #[test]
+    fn tester_remote_error_texts_are_the_bus_words() {
+        let cases: Vec<(RemoteError, &str)> = vec![
+            (
+                RemoteError::Timeout(Duration::from_secs(2)),
+                "no answer within 2000 ms",
+            ),
+            (RemoteError::Refused, "the core refused the operator token"),
+            (
+                RemoteError::Lost(REFUSED.to_string()),
+                "connection lost: refused",
+            ),
+            (
+                RemoteError::Agent,
+                "the core would treat this connection as an agent",
+            ),
+            (RemoteError::Tool("x failed".into()), "x failed"),
+            (
+                RemoteError::Rpc {
+                    code: -32601,
+                    message: "no such method".into(),
+                },
+                "bus rpc error -32601: no such method",
+            ),
+            (
+                RemoteError::Protocol("odd".into()),
+                "bus protocol error: odd",
+            ),
+            (
+                RemoteError::Aborted("aborted: scope add not run".into()),
+                "aborted: scope add not run",
+            ),
+        ];
+        for (err, text) in cases {
+            assert_eq!(err.to_string(), text);
+            assert!(!format!("{err:?}").is_empty());
+        }
+        let confirm = RemoteError::Confirm(anyhow::anyhow!("inner").context("outer"));
+        assert_eq!(confirm.to_string(), "outer: inner");
+    }
 }

@@ -1113,4 +1113,121 @@ error: no running core found
         ));
         assert!(!is_cli_only_gate(""));
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// Tester — D10: every panel that names a token's *locator* prints the
+    /// path or the variable name, never the token. The real file beside the
+    /// panel holds `optoken-test-r7`; R7 for a config, a token file and the
+    /// env, R6/R8/R15 for the config, rendered plain, rich and `Debug`.
+    #[test]
+    fn tester_token_refused_names_the_locator_never_the_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "aitm-oneshot-refuse-tester-{}-{}",
+            std::process::id(),
+            NOW
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok = dir.join("tok");
+        std::fs::write(&tok, "optoken-test-r7\n").unwrap();
+        let cfg = dir.join("config.yaml");
+        std::fs::write(&cfg, "mcp:\n  operator_token: optoken-test-r7\n").unwrap();
+
+        let reports = [
+            token_refused(lo(9090), &TokenSource::Config(cfg.clone())),
+            token_refused(lo(9090), &TokenSource::TokenFile(tok.clone())),
+            token_refused(lo(9090), &TokenSource::Env),
+            no_operator_token(lo(9090), &cfg, true),
+            connected_as_agent(lo(9090), &cfg),
+            foreign_config(&cfg),
+        ];
+        for report in &reports {
+            let report = report.clone().with_log(Some(PathBuf::from(LOG)));
+            for text in [
+                report.render_plain(&RICH),
+                report.render(&tty_100(), Some(Path::new("/Users/matt"))),
+                format!("{report:?}"),
+            ] {
+                assert!(!text.contains("optoken-test"), "{text}");
+            }
+        }
+        let plain = reports[0].render_plain(&RICH);
+        assert!(plain.contains(cfg.to_str().unwrap()), "{plain}");
+        let plain = reports[1].render_plain(&RICH);
+        assert!(plain.contains(tok.to_str().unwrap()), "{plain}");
+        assert_eq!(
+            reports[2].what,
+            "the core at 127.0.0.1:9090 refused the operator token in AITM_BUS_TOKEN"
+        );
+        assert_eq!(
+            format!("{:?}", TokenSource::TokenFile(tok.clone())),
+            format!("TokenFile({tok:?})")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tester — R2 with a pointer that knows nothing but its address (a
+    /// `CoreRef` with every option `None`) prints no empty parenthesis; R11
+    /// with such a core prints the address alone on its line.
+    #[test]
+    fn tester_bare_core_refs_print_no_empty_details() {
+        let bare = CoreRef {
+            addr: lo(50512),
+            pid: None,
+            started_unix: None,
+            config: None,
+        };
+        let r2 = not_listening_config_port(
+            "scope.add",
+            lo(9090),
+            Path::new(CFG),
+            false,
+            std::slice::from_ref(&bare),
+            NOW,
+        );
+        assert_eq!(
+            r2.why[1],
+            "A different core is running at 127.0.0.1:50512; pass --bus 127.0.0.1:50512 to use it."
+        );
+        let r11 = two_cores(
+            "scope.list",
+            &[bare.clone(), bare],
+            Path::new(CFG),
+            NOW,
+            &args(&["scope", "list"]),
+        );
+        assert_eq!(r11.why[0], "127.0.0.1:50512");
+        assert_eq!(r11.why[1], "127.0.0.1:50512");
+        assert!(
+            r11.why[2].starts_with("Neither was started from"),
+            "{:?}",
+            r11.why
+        );
+    }
+
+    /// Tester — the R11 command keeps argv exactly as typed (a value with a
+    /// space is not re-quoted; the renderer sanitizes control bytes later),
+    /// and an empty argv leaves the bare placeholder.
+    #[test]
+    fn tester_two_cores_command_keeps_argv_verbatim() {
+        let cores = [other_core(), other_core()];
+        let with_space = two_cores(
+            "scope.add",
+            &cores,
+            Path::new(CFG),
+            NOW,
+            &args(&["scope", "add", "--host", "a b"]),
+        );
+        assert_eq!(
+            with_space.command,
+            Some(FixCommand(
+                "aitm --bus <addr> scope add --host a b".to_string()
+            ))
+        );
+        let none = two_cores("scope.add", &cores, Path::new(CFG), NOW, &[]);
+        assert_eq!(
+            none.command,
+            Some(FixCommand("aitm --bus <addr>".to_string()))
+        );
+    }
 }

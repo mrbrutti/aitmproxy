@@ -568,4 +568,233 @@ mod tests {
         let own = default_run_dir().join(format!("{}.json", std::process::id()));
         assert!(!own.exists(), "{} must not exist", own.display());
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// Tester — D4 trust: the mask is `0o077`, so a group-only (`0640`) and
+    /// an other-only (`0604`) bit are each `Wide` on their own; `0600`,
+    /// `0400` and `0700` pass. Kills a widened mask (`0o007`, `0o070`).
+    #[test]
+    fn tester_scan_rejects_group_and_other_bits_separately() {
+        let root = temp_root("tester-bits");
+        let cores = root.join("cores");
+        fs::create_dir_all(&cores).expect("cores");
+        let owner_uid = fs::metadata(&cores).expect("cores metadata").uid();
+        let line = sample().to_json_line();
+        let mk = |name: &str, mode: u32| {
+            let p = cores.join(name);
+            fs::write(&p, &line).expect("write pointer");
+            fs::set_permissions(&p, fs::Permissions::from_mode(mode)).expect("chmod");
+            p
+        };
+        let group = mk("1.json", 0o640);
+        let other = mk("2.json", 0o604);
+        let tight = mk("3.json", 0o600);
+        let read_only = mk("4.json", 0o400);
+        let owner_exec = mk("5.json", 0o700);
+        assert_eq!(
+            scan(&cores, owner_uid),
+            vec![
+                Err((group, PointerProblem::Wide(0o640))),
+                Err((other, PointerProblem::Wide(0o604))),
+                Ok(Found {
+                    path: tight,
+                    pointer: sample()
+                }),
+                Ok(Found {
+                    path: read_only,
+                    pointer: sample()
+                }),
+                Ok(Found {
+                    path: owner_exec,
+                    pointer: sample()
+                }),
+            ]
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — D4 trust: `scan` reads each entry's own metadata (symlinks
+    /// are not followed), so a symlink named `<pid>.json` is `NotRegular`
+    /// even when its target is a perfect `0600` pointer, and the target is
+    /// left untouched. A planted link can never redirect a reader.
+    #[test]
+    fn tester_scan_never_follows_a_symlinked_pointer() {
+        let root = temp_root("tester-symlink");
+        let cores = root.join("cores");
+        fs::create_dir_all(&cores).expect("cores");
+        let owner_uid = fs::metadata(&cores).expect("cores metadata").uid();
+        let elsewhere = root.join("elsewhere.json");
+        fs::write(&elsewhere, sample().to_json_line()).expect("target");
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let link = cores.join("9.json");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+
+        assert_eq!(
+            scan(&cores, owner_uid),
+            vec![Err((link.clone(), PointerProblem::NotRegular))]
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the link is kept"
+        );
+        assert_eq!(
+            fs::read_to_string(&elsewhere).expect("target kept"),
+            sample().to_json_line()
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — `scan` keys on the `.json` extension alone: a non-numeric
+    /// name is still a pointer (the content, not the name, carries the pid),
+    /// a `.json.tmp` leftover is not, an empty file is `NotJson`, and an
+    /// unreadable (`0000`) file is skipped without a report.
+    #[test]
+    fn tester_scan_takes_any_json_name_skips_tmp_and_unreadable_reports_empty() {
+        let root = temp_root("tester-names");
+        let cores = root.join("cores");
+        fs::create_dir_all(&cores).expect("cores");
+        let owner_uid = fs::metadata(&cores).expect("cores metadata").uid();
+        let named = cores.join("not-a-pid.json");
+        fs::write(&named, sample().to_json_line()).expect("named pointer");
+        fs::set_permissions(&named, fs::Permissions::from_mode(0o600)).expect("chmod");
+        fs::write(cores.join("12.json.tmp"), sample().to_json_line()).expect("tmp leftover");
+        let empty = cores.join("13.json");
+        fs::write(&empty, "").expect("empty pointer");
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let unreadable = cores.join("14.json");
+        fs::write(&unreadable, sample().to_json_line()).expect("unreadable pointer");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read(&unreadable).is_ok() {
+            eprintln!("skipping: this user can read a 0000 file (root)");
+            fs::remove_dir_all(&root).expect("cleanup");
+            return;
+        }
+
+        let got = scan(&cores, owner_uid);
+        assert_eq!(got.len(), 2, "{got:?}");
+        match &got[0] {
+            Err((path, PointerProblem::NotJson(_))) => assert_eq!(path, &empty),
+            other => panic!("expected NotJson for the empty file, got {other:?}"),
+        }
+        assert_eq!(
+            got[1],
+            Ok(Found {
+                path: named.clone(),
+                pointer: sample()
+            })
+        );
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).expect("restore");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — C3: a probe that cannot open the file is `Unknown` (the
+    /// reader treats it as alive and never deletes it): a `0000` file, and a
+    /// path that vanished between the scan and the probe. Once readable
+    /// again the same unlocked file reads `Dead`.
+    #[test]
+    fn tester_liveness_is_unknown_when_the_file_cannot_be_opened() {
+        let root = temp_root("tester-liveness");
+        let p = root.join("1.json");
+        fs::write(&p, sample().to_json_line()).expect("write");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read(&p).is_ok() {
+            eprintln!("skipping: this user can read a 0000 file (root)");
+            fs::remove_dir_all(&root).expect("cleanup");
+            return;
+        }
+        assert_eq!(liveness(&p), Liveness::Unknown);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).expect("restore");
+        assert_eq!(liveness(&p), Liveness::Dead);
+        assert_eq!(liveness(&root.join("gone.json")), Liveness::Unknown);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — the writer given a run dir that is a symlink: `create_dir_all`
+    /// accepts the link, the `0700` tightening and the `0600` pointer land in
+    /// the link's target, `liveness` reads `Alive` through either path, and
+    /// the drop removes the file from the target. Pinned as observed: spec D4
+    /// does not rule on a symlinked run dir (it sits inside the user's own
+    /// `0700` data dir, or wherever `AITM_RUN_DIR` points by the operator's
+    /// choice).
+    #[test]
+    fn tester_write_through_a_symlinked_run_dir_lands_in_the_target() {
+        let root = temp_root("tester-linkdir");
+        let real = root.join("real-cores");
+        fs::create_dir_all(&real).expect("real dir");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let link = root.join("cores");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink the run dir");
+
+        let published = write(&link, &sample()).expect("write through the link");
+        assert_eq!(published.path, link.join("4821.json"));
+        let mode = |p: &Path| fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&real.join("4821.json")), 0o600);
+        assert_eq!(mode(&real), 0o700, "the target dir is tightened");
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the link is not replaced"
+        );
+        assert_eq!(liveness(&published.path), Liveness::Alive);
+        assert_eq!(liveness(&real.join("4821.json")), Liveness::Alive);
+        drop(published);
+        assert!(
+            !real.join("4821.json").exists(),
+            "drop removes the target's file"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — the pointer line is built from the struct alone: a config
+    /// path is the only free text in it, and it is JSON-escaped (a quote or a
+    /// newline in the path cannot break the one-line contract).
+    #[test]
+    fn tester_json_line_escapes_the_config_path_and_stays_one_line() {
+        let odd = CorePointer {
+            config: PathBuf::from("/tmp/we\"ird\npath/config.yaml"),
+            ..sample()
+        };
+        let line = odd.to_json_line();
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(line.ends_with('\n'));
+        assert!(line.contains("\\\"ird\\npath"), "{line:?}");
+        assert_eq!(CorePointer::parse(&line), Ok(odd));
+    }
+
+    /// Tester — D4 trust (AC-R14-31's sibling for pointers): a FIFO named
+    /// `<pid>.json` is `NotRegular` from its own metadata and is never
+    /// opened — `scan` returns at once even though nobody writes the pipe
+    /// (opening it would block forever). Run on a helper thread with a
+    /// deadline so a regression hangs the probe, not the suite.
+    #[test]
+    fn tester_scan_never_opens_a_fifo_pointer() {
+        let root = temp_root("tester-fifo");
+        let cores = root.join("cores");
+        fs::create_dir_all(&cores).expect("cores");
+        let owner_uid = fs::metadata(&cores).expect("cores metadata").uid();
+        let fifo = cores.join("7.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo {}", fifo.display());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_dir = cores.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan(&probe_dir, owner_uid));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("scan must not block on a FIFO pointer");
+        assert_eq!(got, vec![Err((fifo.clone(), PointerProblem::NotRegular))]);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
 }

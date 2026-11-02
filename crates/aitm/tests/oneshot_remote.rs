@@ -741,3 +741,575 @@ fn connect_and_call_failures_map_by_source_and_stage() {
         OneShotError::Report(r) => panic!("an abort is not a panel: {r:?}"),
     }
 }
+
+// ------------------------------------------------ tester additions (stage 5)
+
+/// A `BusClient` over a scripted handler: `reply` sees the parsed request and
+/// answers (or stays silent). The id is the request's, so the client pairs
+/// the reply; nothing here is a socket.
+fn scripted(reply: impl Fn(&JsonValue) -> Option<String> + Send + Sync + 'static) -> BusClient {
+    let handler: InProcessHandler = Arc::new(move |line: &str| {
+        let req: JsonValue = serde_json::from_str(line).expect("the client sends JSON");
+        reply(&req)
+    });
+    BusClient::new(Box::new(InProcessTransport::new(handler)))
+}
+
+fn id_of(req: &JsonValue) -> JsonValue {
+    req.get("id").cloned().unwrap_or(JsonValue::Null)
+}
+
+fn ok_reply(req: &JsonValue, result: JsonValue) -> Option<String> {
+    Some(json!({"jsonrpc": "2.0", "id": id_of(req), "result": result}).to_string())
+}
+
+fn initialize_result(role: Option<&str>) -> JsonValue {
+    let mut result = json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "serverInfo": {"name": "aitmproxy", "version": "0.0.0"},
+    });
+    if let Some(role) = role {
+        result["role"] = json!(role);
+    }
+    result
+}
+
+/// Tester — the handshake failures a real core or a stranger on the port can
+/// produce, without a socket: a listener that accepts and answers too late
+/// is `Timeout` and its panel is the handshake form (`2 s`, no verb)
+/// whatever budget elapsed; a `-32001` is `Refused` and R7 names the
+/// locator, never the token; garbage, silence, an empty line, a result with
+/// no `serverInfo` and a mis-paired id are `Protocol` (control bytes
+/// replaced, never a panic); a server that predates the role echo or says
+/// `agent` is `Agent` (R8); an absurdly long server name is just a name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tester_handshake_failures_without_a_socket() {
+    let bus = BusArgs::default();
+    let env = target("127.0.0.1:1", Source::ExplicitEnv, None);
+
+    let late = scripted(|req| {
+        std::thread::sleep(Duration::from_millis(300));
+        ok_reply(req, initialize_result(Some("operator")))
+    });
+    let err = remote::handshake(&late, Duration::from_millis(40))
+        .await
+        .expect_err("a late answer is a timeout");
+    assert!(
+        matches!(err, RemoteError::Timeout(d) if d == Duration::from_millis(40)),
+        "{err:?}"
+    );
+    let r10 = report(refusal(
+        err,
+        Stage::Handshake,
+        &site(&env, "scope.list", &bus),
+        &[],
+        None,
+    ));
+    assert_eq!(
+        r10.what,
+        "the core at 127.0.0.1:1 accepted the connection but did not answer within 2 s"
+    );
+
+    let refusing = scripted(|req| {
+        Some(
+            json!({"jsonrpc": "2.0", "id": id_of(req), "error": {"code": -32001, "message": "unauthorized"}})
+                .to_string(),
+        )
+    });
+    let err = remote::handshake(&refusing, HANDSHAKE)
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, RemoteError::Refused), "{err:?}");
+    let r7 = report(refusal(
+        err,
+        Stage::Handshake,
+        &site(&env, "scope.list", &bus),
+        &[],
+        None,
+    ));
+    assert_eq!(
+        r7.what,
+        "the core at 127.0.0.1:1 refused the operator token in AITM_BUS_TOKEN"
+    );
+    assert!(!r7.render_plain(&aitm_term::glyphs::RICH).contains(OP_TOKEN));
+
+    // The client's complaint names the method and the parser's position; it
+    // does not quote the raw line, so nothing of the garbage reaches a panel.
+    let garbage = scripted(|_| Some("garbage\x1b[2J\x07".to_string()));
+    match remote::handshake(&garbage, HANDSHAKE).await {
+        Err(RemoteError::Protocol(text)) => {
+            assert!(
+                text.starts_with("reply to `initialize` is not JSON"),
+                "{text:?}"
+            );
+            assert!(!text.contains("garbage"), "{text:?}");
+            assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
+        }
+        other => panic!("garbage is a protocol error, got {other:?}"),
+    }
+    // A JSON-RPC error whose message carries control bytes: sanitized on entry.
+    let shouty = scripted(|req| {
+        Some(
+            json!({"jsonrpc": "2.0", "id": id_of(req), "error": {"code": -32600, "message": "bad\x1b[2J\u{202E}"}})
+                .to_string(),
+        )
+    });
+    match remote::handshake(&shouty, HANDSHAKE).await {
+        Err(RemoteError::Rpc { code, message }) => {
+            assert_eq!(code, -32600);
+            assert_eq!(message, "bad\u{FFFD}[2J\u{FFFD}");
+        }
+        other => panic!("expected the sanitized rpc error, got {other:?}"),
+    }
+    let silent = scripted(|_| None);
+    assert!(matches!(
+        remote::handshake(&silent, HANDSHAKE).await,
+        Err(RemoteError::Protocol(_))
+    ));
+    let empty_line = scripted(|_| Some(String::new()));
+    assert!(matches!(
+        remote::handshake(&empty_line, HANDSHAKE).await,
+        Err(RemoteError::Protocol(_))
+    ));
+    let shapeless = scripted(|req| ok_reply(req, json!({})));
+    assert!(matches!(
+        remote::handshake(&shapeless, HANDSHAKE).await,
+        Err(RemoteError::Protocol(_))
+    ));
+    let no_result = scripted(|req| Some(json!({"jsonrpc": "2.0", "id": id_of(req)}).to_string()));
+    assert!(matches!(
+        remote::handshake(&no_result, HANDSHAKE).await,
+        Err(RemoteError::Protocol(_))
+    ));
+
+    let roleless = scripted(|req| ok_reply(req, initialize_result(None)));
+    assert!(matches!(
+        remote::handshake(&roleless, HANDSHAKE).await,
+        Err(RemoteError::Agent)
+    ));
+    let agent = scripted(|req| ok_reply(req, initialize_result(Some("agent"))));
+    assert!(matches!(
+        remote::handshake(&agent, HANDSHAKE).await,
+        Err(RemoteError::Agent)
+    ));
+    let shouting = scripted(|req| ok_reply(req, initialize_result(Some("OPERATOR"))));
+    assert!(matches!(
+        remote::handshake(&shouting, HANDSHAKE).await,
+        Err(RemoteError::Agent)
+    ));
+
+    let long_name = "n".repeat(1 << 20);
+    let verbose = scripted(move |req| {
+        let mut result = initialize_result(Some("operator"));
+        result["serverInfo"]["name"] = json!(long_name);
+        ok_reply(req, result)
+    });
+    let info = remote::handshake(&verbose, HANDSHAKE)
+        .await
+        .expect("a long name is just a name");
+    assert_eq!(info.name.len(), 1 << 20);
+    assert_eq!(info.role.as_deref(), Some("operator"));
+}
+
+/// Tester — the call failures without a socket: a handler that dies
+/// mid-call (the in-process analogue of the connection dropping) is `Lost`
+/// and the panel is R12 with the outcome unknown; a core that asks to
+/// confirm twice, or asks when the arguments were not an object, is a
+/// `Protocol` error and the confirmer is asked once at most; a `-32001`
+/// mid-call is still `Refused`; `tools/list` with thousands of entries still
+/// resolves the exact name and nothing that merely resembles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tester_call_failures_without_a_socket() {
+    let bus = BusArgs::default();
+    let pointer = target(
+        "127.0.0.1:50512",
+        Source::Pointer {
+            path: "/r/4821.json".into(),
+            pid: 4821,
+            started_unix: NOW - 720,
+        },
+        Some("/y/config.yaml"),
+    );
+    let yes = Always::new(true);
+
+    // The handler panics on `tools/call`: the transport reports the loss.
+    let dying = scripted(|req| {
+        if req["method"] == "tools/call" {
+            panic!("the core went away mid-call (simulated)");
+        }
+        ok_reply(req, initialize_result(Some("operator")))
+    });
+    remote::handshake(&dying, HANDSHAKE)
+        .await
+        .expect("handshake before the drop");
+    let err = remote::call(&dying, "scope.add", json!({"host": "x"}), CALL, &yes, false)
+        .await
+        .expect_err("the drop is an error");
+    let detail = match err {
+        RemoteError::Lost(detail) => detail,
+        other => panic!("expected Lost, got {other:?}"),
+    };
+    assert!(
+        detail.contains("the in-process bus handler panicked"),
+        "{detail}"
+    );
+    let r12 = report(refusal(
+        RemoteError::Lost(detail.clone()),
+        Stage::Call,
+        &site(&pointer, "scope.add", &bus),
+        &[],
+        Some(PathBuf::from(LOG)),
+    ));
+    assert_eq!(
+        r12.what,
+        "lost the core at 127.0.0.1:50512 while running scope add"
+    );
+    assert!(
+        r12.why[0].ends_with(" Whether anything changed is unknown."),
+        "{:?}",
+        r12.why
+    );
+    assert!(yes.prompts().is_empty());
+
+    // A core that answers `needs_confirmation` to the confirmed call too.
+    let asks_forever = scripted(|req| {
+        if req["method"] == "tools/call" {
+            return ok_reply(
+                req,
+                json!({"structuredContent": {"status": "needs_confirmation", "prompt": "sure?", "confirm_token": "t"}}),
+            );
+        }
+        ok_reply(req, initialize_result(Some("operator")))
+    });
+    let counting = Always::new(true);
+    let err = remote::call(
+        &asks_forever,
+        "scope.add",
+        json!({"host": "x"}),
+        CALL,
+        &counting,
+        false,
+    )
+    .await
+    .expect_err("asked twice");
+    match err {
+        RemoteError::Protocol(text) => {
+            assert_eq!(text, "the core asked to confirm scope add twice");
+        }
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+    assert_eq!(counting.prompts(), vec!["sure?".to_string()]);
+
+    // Non-object arguments cannot carry `_confirm`: refused before the resend.
+    let counting = Always::new(true);
+    let err = remote::call(
+        &asks_forever,
+        "scope.add",
+        json!([1]),
+        CALL,
+        &counting,
+        true,
+    )
+    .await
+    .expect_err("arguments must be an object");
+    match err {
+        RemoteError::Protocol(text) => {
+            assert_eq!(
+                text,
+                "the arguments of a confirm-gated call must be an object"
+            );
+        }
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+    assert!(counting.prompts().is_empty(), "--yes asks nobody");
+
+    // `-32001` mid-call (a token rotated between handshake and call on a
+    // server that re-checks) is still the refusal.
+    let late_refusal = scripted(|req| {
+        if req["method"] == "tools/call" {
+            return Some(
+                json!({"jsonrpc": "2.0", "id": id_of(req), "error": {"code": -32001, "message": "unauthorized"}})
+                    .to_string(),
+            );
+        }
+        ok_reply(req, initialize_result(Some("operator")))
+    });
+    assert!(matches!(
+        remote::call(&late_refusal, "scope.list", json!({}), CALL, &yes, false).await,
+        Err(RemoteError::Refused)
+    ));
+
+    // A large `tools/list`: the exact name resolves, look-alikes do not, and a
+    // tool whose real name carries an escape never passes for the clean name
+    // (its sanitized form is compared, so `custom.verb\x1b[2J` is not
+    // `custom.verb`).
+    let crowded = scripted(|req| {
+        if req["method"] == "tools/list" {
+            let mut tools: Vec<JsonValue> = (0..5_000)
+                .map(|i| json!({"name": format!("filler.verb{i}")}))
+                .collect();
+            tools.push(json!({"name": "custom.verb"}));
+            return ok_reply(req, json!({"tools": tools}));
+        }
+        ok_reply(req, initialize_result(Some("operator")))
+    });
+    assert!(
+        remote::resolve_remote_name(&crowded, "custom.verb", HANDSHAKE)
+            .await
+            .expect("tools/list")
+    );
+    for miss in ["custom.verbs", "custom", "CUSTOM.VERB", "custom.verb ", ""] {
+        assert!(
+            !remote::resolve_remote_name(&crowded, miss, HANDSHAKE)
+                .await
+                .expect("tools/list"),
+            "{miss:?} must not resolve"
+        );
+    }
+    let escaped_only = scripted(|req| {
+        if req["method"] == "tools/list" {
+            return ok_reply(req, json!({"tools": [{"name": "custom.verb\u{1b}[2J"}]}));
+        }
+        ok_reply(req, initialize_result(Some("operator")))
+    });
+    assert!(
+        !remote::resolve_remote_name(&escaped_only, "custom.verb", HANDSHAKE)
+            .await
+            .expect("tools/list"),
+        "an escaped tool name must not pass for the clean one"
+    );
+    let no_tools = scripted(|req| ok_reply(req, json!({"nope": []})));
+    assert!(matches!(
+        remote::resolve_remote_name(&no_tools, "custom.verb", HANDSHAKE).await,
+        Err(RemoteError::Protocol(_))
+    ));
+}
+
+/// `custom.verb`: a verb only the core knows, answering an object.
+struct CustomVerb;
+
+impl Command for CustomVerb {
+    fn name(&self) -> &str {
+        "custom.verb"
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "a verb the local registry lacks".into(),
+            params: vec![ParamDef {
+                name: "n".into(),
+                ty: TypeDesc::Int,
+                required: false,
+                description: "a number".into(),
+            }],
+            result: TypeDesc::Any,
+        }
+    }
+    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        let n = args.get("n").cloned().unwrap_or(Value::Int(0));
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("n".to_string(), n);
+        fields.insert("ok".to_string(), Value::Bool(true));
+        Ok(Value::Object(fields))
+    }
+}
+
+/// Tester — spec D8 step 6 for a verb the local registry lacks, against a
+/// real `McpServer`: `tools/list` names it, generically parsed flags reach
+/// it (`--n 3` → an integer), the core validates names (`--bogus` is the
+/// core's own error, verbatim) and types (`--n x` likewise), and the answer
+/// renders through `TypeDesc::Any` as pretty JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tester_unknown_verb_round_trips_through_the_generic_path() {
+    let rig = rig_with("remote-custom", vec![Arc::new(CustomVerb)]);
+    remote::handshake(&rig.client, HANDSHAKE)
+        .await
+        .expect("handshake");
+    assert!(
+        remote::resolve_remote_name(&rig.client, "custom.verb", HANDSHAKE)
+            .await
+            .expect("tools/list")
+    );
+    assert!(
+        !remote::resolve_remote_name(&rig.client, "custom.other", HANDSHAKE)
+            .await
+            .expect("tools/list")
+    );
+
+    let yes = Always::new(true);
+    let typed = generic_arguments(&args(&["--n", "3"])).expect("flags");
+    let result = remote::call(
+        &rig.client,
+        "custom.verb",
+        JsonValue::Object(typed),
+        CALL,
+        &yes,
+        false,
+    )
+    .await
+    .expect("custom.verb");
+    assert_eq!(result, json!({"n": 3, "ok": true}));
+    assert_eq!(
+        remote::render(&result, &TypeDesc::Any).expect("render"),
+        b"{\n  \"n\": 3,\n  \"ok\": true\n}\n"
+    );
+
+    let bogus = generic_arguments(&args(&["--bogus", "1"])).expect("flags");
+    let err = remote::call(
+        &rig.client,
+        "custom.verb",
+        JsonValue::Object(bogus),
+        CALL,
+        &yes,
+        false,
+    )
+    .await
+    .expect_err("the core refuses an unknown flag");
+    let text = match err {
+        RemoteError::Tool(text) | RemoteError::Rpc { message: text, .. } => text,
+        other => panic!("expected the core's own validation error, got {other:?}"),
+    };
+    assert!(text.contains("bogus"), "{text}");
+
+    let wrong_type = generic_arguments(&args(&["--n", "x"])).expect("flags");
+    let err = remote::call(
+        &rig.client,
+        "custom.verb",
+        JsonValue::Object(wrong_type),
+        CALL,
+        &yes,
+        false,
+    )
+    .await
+    .expect_err("the core refuses a string for an integer");
+    assert!(
+        matches!(err, RemoteError::Tool(_) | RemoteError::Rpc { .. }),
+        "{err:?}"
+    );
+    assert!(yes.prompts().is_empty());
+}
+
+/// The parameterless, read-only live verbs a fresh assembly can answer
+/// without a browser, a network or the OS (spec D6 table; nothing here
+/// pauses, clears or sets anything).
+const READ_ONLY_LIVE_VERBS: &[&str] = &[
+    "flow.list",
+    "flow.table",
+    "proxy.status",
+    "capture.status",
+    "scope.list",
+    "tls.passthrough.list",
+    "map.list",
+    "agent.status",
+    "agent.activity",
+    "script.list",
+    "script.findings",
+    "config.get",
+];
+
+/// Tester — spec D8 step 10 across the verb table: every read-only live verb
+/// the registry declares must render through its *declared* result schema,
+/// because that is the schema the one-shot rebuilds the core's answer with
+/// (`from_json(&result, &schema.result)`). A verb whose declared result is
+/// narrower than what it returns (an `Object(Vec::new())` that returns keys)
+/// prints an error against a healthy core instead of its answer.
+///
+/// Recorded 2026-11-01 (tester, pass 1) against a bare assembly: `proxy.status`
+/// (`control.rs:105`, `result: Object(Vec::new())`) → `unknown param
+/// `address` for `object``; `config.get` (`control.rs:263`, the same) →
+/// `unknown param `browser` for `object``; `capture.status` (its schema
+/// declares `provider.attached_at: Int, required: false`, the core answers
+/// `null`) → `param `provider`: param `attached_at`: expected an integer,
+/// got null`. Root cause: `remote::render` rebuilds with the strict
+/// `aitm_mcp::json::from_json` (`json.rs:117-131`), which refuses undeclared
+/// keys and `null` for an optional field, while thirteen commands declare
+/// `Object(Vec::new())` as "some object" and many optional fields are
+/// answered `null`. The local path never rebuilds, so only the one-shot's
+/// remote path is affected. Un-ignore once the render boundary is fixed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "DEFECT: remote::render rejects a healthy core's answer for proxy.status, config.get (result: Object([]) → `unknown param … for object`) and capture.status (optional field answered null → `expected an integer, got null`); see the test's doc comment and the tester report"]
+async fn tester_every_read_only_live_verb_renders_through_its_declared_schema() {
+    let rig = rig("remote-schemas", Some(OP_TOKEN), Frontend::Operator);
+    remote::handshake(&rig.client, HANDSHAKE)
+        .await
+        .expect("handshake");
+    let yes = Always::new(true);
+    let mut unrenderable = Vec::new();
+    let mut skipped = Vec::new();
+    for dotted in READ_ONLY_LIVE_VERBS {
+        // The bare assembly registers neither `script.*` nor `findings.*`
+        // (those arrive with the script tier); they are recorded, not failed.
+        let Some(cmd) = rig.services.registry.command(dotted).cloned() else {
+            skipped.push(format!("{dotted}: not registered in a bare assembly"));
+            continue;
+        };
+        let answer = match remote::call(&rig.client, dotted, json!({}), CALL, &yes, false).await {
+            Ok(answer) => answer,
+            Err(RemoteError::Tool(text)) if text.contains("missing required param") => {
+                skipped.push(format!("{dotted}: {text}"));
+                continue;
+            }
+            Err(err) => {
+                unrenderable.push(format!("{dotted}: the call failed: {err}"));
+                continue;
+            }
+        };
+        if let Err(err) = remote::render(&answer, &cmd.schema().result) {
+            unrenderable.push(format!(
+                "{dotted}: declared result {:?}; answer {answer}; render error: {err:#}",
+                cmd.schema().result
+            ));
+        }
+    }
+    assert!(
+        unrenderable.is_empty(),
+        "live verbs whose answer does not render through their declared result schema \
+         (skipped for a missing param: {skipped:?}):\n  {}",
+        unrenderable.join("\n  ")
+    );
+}
+
+/// Tester — AC-R14-24 parity beyond the Scope list, on the read-only live
+/// verbs whose declared schema does match their answer: the remote bytes
+/// equal `render_cli_value` of the local `Cli` over the same registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tester_parity_holds_for_more_shapes() {
+    let rig = rig("remote-parity", Some(OP_TOKEN), Frontend::Operator);
+    remote::handshake(&rig.client, HANDSHAKE)
+        .await
+        .expect("handshake");
+    let yes = Always::new(true);
+    let cli = Cli::new(rig.services.registry.clone()).with_services(
+        rig.services.store.clone(),
+        rig.services.client.clone(),
+        rig.services.guard.clone(),
+        None,
+    );
+    for verb in [
+        &["flow", "list"][..],
+        &["flow", "table"][..],
+        &["scope", "list"][..],
+        &["tls", "passthrough", "list"][..],
+        &["map", "list"][..],
+        &["agent", "activity"][..],
+    ] {
+        let dotted = verb.join(".");
+        let cmd = rig
+            .services
+            .registry
+            .command(&dotted)
+            .expect("registered")
+            .clone();
+        let remote_json = remote::call(&rig.client, &dotted, json!({}), CALL, &yes, false)
+            .await
+            .unwrap_or_else(|e| panic!("{dotted}: {e}"));
+        let remote_bytes = remote::render(&remote_json, &cmd.schema().result)
+            .unwrap_or_else(|e| panic!("{dotted}: render remote: {e:#}"));
+        let local = cli.dispatch(&args(verb)).expect("local dispatch");
+        assert_eq!(
+            String::from_utf8_lossy(&remote_bytes),
+            String::from_utf8_lossy(&render_cli_value(&local)),
+            "{dotted}"
+        );
+    }
+}

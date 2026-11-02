@@ -1528,4 +1528,128 @@ mod tests {
         );
         assert_eq!(rich.lines().nth(4), Some("  CA            untrusted"));
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// Tester — AC-R14-2/5 on the Web and TUI cards (D5 says every surface):
+    /// the `Operator bus` row follows `Bus` on both; `Off` carries the reason
+    /// as a warning and drops the Scope next step on both; the Web card on
+    /// the shared plan says `Bus: ready · operator` and nothing else moves;
+    /// the rich Web card pads the label like every other row.
+    #[test]
+    fn tester_web_and_tui_cards_carry_the_operator_bus_row() {
+        let off_proxy = summary(State::Off);
+        let base = m1_inputs(&off_proxy, None, None);
+
+        let web_off = ReadyInputs {
+            mode: ModeWord::Web,
+            web_url: Some(WEB_URL),
+            operator_bus: OperatorBusWord::Off("no mcp.operator_token".to_string()),
+            ..base.clone()
+        };
+        let card = ready_card(&web_off);
+        assert_eq!(
+            labels(&card.rows),
+            vec![
+                "Web UI",
+                "Proxy",
+                "Browser",
+                "Bus",
+                "Operator bus",
+                "Scope",
+                "CA",
+                "System proxy"
+            ]
+        );
+        assert_eq!(
+            card.rows[4],
+            row(
+                "Operator bus",
+                "off · no mcp.operator_token",
+                Role::Warning,
+                None
+            )
+        );
+        let plain = card.render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(lines[3], "Bus: ready");
+        assert_eq!(lines[4], "Operator bus: off · no mcp.operator_token");
+        assert_eq!(
+            lines[5],
+            "Scope: Nothing is decrypted until a host is in Scope."
+        );
+        assert!(!plain.contains("aitm scope add"), "{plain:?}");
+        let rich = card.render_rich(&tty_no_color(), &RICH);
+        assert!(
+            rich.contains("\n  Bus           ready\n  Operator bus  off · no mcp.operator_token\n  Scope         Nothing is decrypted until a host is in Scope.\n"),
+            "{rich:?}"
+        );
+
+        let tui_dedicated = ReadyInputs {
+            mode: ModeWord::Tui,
+            operator_bus: OperatorBusWord::Dedicated(addr("127.0.0.1:50512")),
+            ..base.clone()
+        };
+        let plain = ready_card(&tui_dedicated).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "Bus: stdio (MCP)",
+                "Operator bus: 127.0.0.1:50512",
+                "Scope: Nothing is decrypted until a host is in Scope. · aitm scope add --host <host>",
+            ]
+        );
+
+        let tui_off = ReadyInputs {
+            mode: ModeWord::Tui,
+            operator_bus: OperatorBusWord::Off("mcp.operator_bus.enabled: false".to_string()),
+            ..base.clone()
+        };
+        let plain = ready_card(&tui_off).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "Bus: stdio (MCP)",
+                "Operator bus: off · mcp.operator_bus.enabled: false",
+                "Scope: Nothing is decrypted until a host is in Scope.",
+            ]
+        );
+
+        // Scope non-empty with the bus off: the count, no next step, the
+        // reason still on its own row.
+        let tui_off_scoped = ReadyInputs {
+            scope_hosts: 3,
+            ..tui_off.clone()
+        };
+        let plain = ready_card(&tui_off_scoped).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(lines[2], "Scope: 3 hosts in Scope");
+        assert!(!plain.contains("aitm scope add"), "{plain:?}");
+    }
+
+    /// Tester — the `off` reason is printed as given, in full: the long
+    /// mint-failure form with a path containing a space stays on the row
+    /// unshortened in the plain render (panels and cards never shorten a
+    /// path they were given in a reason).
+    #[test]
+    fn tester_off_reason_prints_in_full() {
+        let reason =
+            "could not write mcp.operator_token to /Users/matt/Library/Application Support/aitmproxy/config.yaml";
+        let row = operator_bus_row(&OperatorBusWord::Off(reason.to_string())).expect("a row");
+        assert_eq!(row.value, format!("off · {reason}"));
+        assert_eq!(row.value_role, Role::Warning);
+        assert_eq!(row.next, None);
+        let off_proxy = summary(State::Off);
+        let i = ReadyInputs {
+            operator_bus: OperatorBusWord::Off(reason.to_string()),
+            ..m1_inputs(&off_proxy, None, None)
+        };
+        let plain = ready_card(&i).render_plain(&RICH);
+        assert!(
+            plain.contains(&format!("Operator bus: off · {reason}\n")),
+            "{plain:?}"
+        );
+    }
 }

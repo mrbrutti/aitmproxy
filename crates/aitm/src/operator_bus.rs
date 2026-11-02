@@ -292,4 +292,72 @@ mod tests {
             "Free it, or set mcp.operator_bus.port to another port in /x/config.yaml."
         );
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// Tester — spec D2 table rows 1–2 say `any` for the opt-out on a
+    /// loopback transport: `enabled: false` with a token is still `Shared`
+    /// (that transport carries operator access by itself, whatever
+    /// `operator_bus.port` says), without a token `Off("no
+    /// mcp.operator_token")`; an empty token is none; on stdio and HTTP the
+    /// opt-out word wins over a mint failure (the mint never runs when the
+    /// bus is disabled).
+    #[test]
+    fn tester_plan_opt_out_is_ignored_on_a_loopback_transport() {
+        let mint_failed = Some("could not write mcp.operator_token to /p");
+        assert_eq!(
+            plan(&mcp(loopback(), false, 0, Some("optoken-test-a")), None),
+            Plan::Shared
+        );
+        assert_eq!(
+            plan(
+                &mcp(loopback(), false, 9091, Some("optoken-test-a")),
+                mint_failed
+            ),
+            Plan::Shared
+        );
+        assert_eq!(
+            plan(&mcp(loopback(), false, 0, None), None),
+            Plan::Off("no mcp.operator_token".to_string())
+        );
+        assert_eq!(
+            plan(&mcp(loopback(), true, 0, Some("")), mint_failed),
+            Plan::Off("no mcp.operator_token".to_string())
+        );
+        assert_eq!(
+            plan(&mcp(McpTransport::Stdio, true, 0, Some("")), mint_failed),
+            Plan::Off("could not write mcp.operator_token to /p".to_string())
+        );
+        assert_eq!(
+            plan(&mcp(McpTransport::Stdio, false, 0, None), mint_failed),
+            Plan::Off("mcp.operator_bus.enabled: false".to_string())
+        );
+        assert_eq!(
+            plan(
+                &mcp(
+                    McpTransport::streamable_http_default("bearer-test-token".into()),
+                    false,
+                    9091,
+                    Some("optoken-test-c")
+                ),
+                None
+            ),
+            Plan::Off("mcp.operator_bus.enabled: false".to_string())
+        );
+        assert_eq!(
+            plan(
+                &mcp(
+                    McpTransport::streamable_http_default("bearer-test-token".into()),
+                    true,
+                    0,
+                    None
+                ),
+                None
+            ),
+            Plan::Off("no mcp.operator_token".to_string())
+        );
+        // The plan's Debug names reasons and ports, never a token.
+        let shared = plan(&mcp(loopback(), true, 0, Some("optoken-test-dbg")), None);
+        assert!(!format!("{shared:?}").contains("optoken-test"));
+    }
 }

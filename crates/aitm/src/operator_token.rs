@@ -832,4 +832,231 @@ mod tests {
         assert!(!dbg.contains("optoken-test-abc"), "token leaked: {dbg}");
         assert!(dbg.contains("/tmp/x/config.yaml"), "path missing: {dbg}");
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// The env var the umask re-exec child reads: the directory to mint into.
+    const UMASK_CHILD_ENV: &str = "AITM_TESTER_UMASK_CHILD_DIR";
+
+    /// Tester — AC-R14-3/4, research F7: `write_atomically` creates `0600`
+    /// whatever the umask. The umask is process-global and `libc::umask`
+    /// needs `unsafe` (forbidden), so this test re-executes the test binary
+    /// under `sh -c 'umask <m>; exec …'` for a permissive (`000`), a
+    /// restrictive (`077`) and a middling (`027`) mask. The child mints into a
+    /// fresh dir, rotates with `generate_and_store(.., true)`, writes a plain
+    /// control file (whose mode proves the mask was in force) and asserts the
+    /// modes; the parent asserts the child passed and re-reads every mode.
+    #[test]
+    fn tester_mint_and_generate_are_0600_under_any_umask() {
+        if let Ok(dir) = std::env::var(UMASK_CHILD_ENV) {
+            let dir = PathBuf::from(dir);
+            let parent = dir.join("aitmproxy");
+            let p = parent.join("config.yaml");
+            std::fs::File::create(dir.join("control")).expect("control file");
+            assert!(
+                matches!(mint_if_absent(&p, true), Minted::Written { .. }),
+                "child: first run writes"
+            );
+            assert_eq!(mode_of(&p), 0o600, "child: minted mode {:o}", mode_of(&p));
+            assert_eq!(
+                mode_of(&parent),
+                0o700,
+                "child: parent mode {:o}",
+                mode_of(&parent)
+            );
+            generate_and_store(&p, true).expect("child: rotate");
+            assert_eq!(mode_of(&p), 0o600, "child: rotated mode {:o}", mode_of(&p));
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary path");
+        for (mask, control_mode) in [("000", 0o666), ("077", 0o600), ("027", 0o640)] {
+            let dir = mint_dir();
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "umask {mask} && exec \"$0\" --exact \
+                     operator_token::tests::tester_mint_and_generate_are_0600_under_any_umask \
+                     --test-threads=1 --nocapture"
+                ))
+                .arg(&exe)
+                .env(UMASK_CHILD_ENV, &dir)
+                .output()
+                .expect("re-exec the test binary under a umask");
+            assert!(
+                out.status.success(),
+                "umask {mask}: the child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                mode_of(&dir.join("control")),
+                control_mode,
+                "umask {mask} was not in force in the child"
+            );
+            let p = dir.join("aitmproxy").join("config.yaml");
+            assert_eq!(
+                mode_of(&p),
+                0o600,
+                "umask {mask}: config mode {:o}",
+                mode_of(&p)
+            );
+            assert_eq!(
+                mode_of(&dir.join("aitmproxy")),
+                0o700,
+                "umask {mask}: parent mode"
+            );
+            let text = std::fs::read_to_string(&p).unwrap();
+            token_line_after(&text, "mcp:\n  operator_token: ");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Tester — spec D3 "never fatal": in a read-only directory the first run
+    /// skips with `cannot write <path>: …`, creates nothing; an existing
+    /// token-less config there is left byte-identical, its `0644` mode kept,
+    /// no temp sibling behind; a parent that cannot be created skips too.
+    #[test]
+    fn tester_mint_skips_in_a_read_only_directory_and_changes_nothing() {
+        let dir = mint_dir();
+        let ro = dir.join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        let missing = ro.join("config.yaml");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(ro.join("probe")).is_ok() {
+            eprintln!("skipping: this user can write a 0500 directory (root)");
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        match mint_if_absent(&missing, true) {
+            Minted::Skipped { reason } => assert!(
+                reason.starts_with(&format!("cannot write {}: ", missing.display())),
+                "{reason}"
+            ),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(
+            std::fs::read_dir(&ro).unwrap().next().is_none(),
+            "nothing was created in the read-only dir"
+        );
+
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let existing = ro.join("existing.yaml");
+        let before = "# keep me\nlisten: 127.0.0.1:8080\n";
+        std::fs::write(&existing, before).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        match mint_if_absent(&existing, false) {
+            Minted::Skipped { reason } => assert!(
+                reason.starts_with(&format!("cannot write {}: ", existing.display())),
+                "{reason}"
+            ),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), before);
+        assert_eq!(mode_of(&existing), 0o644, "the mode is not touched either");
+        let names: Vec<String> = std::fs::read_dir(&ro)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["existing.yaml".to_string()], "no temp sibling");
+
+        let deep = ro.join("sub").join("config.yaml");
+        match mint_if_absent(&deep, true) {
+            Minted::Skipped { reason } => assert!(
+                reason.starts_with(&format!("cannot write {}: ", deep.display())),
+                "{reason}"
+            ),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(!ro.join("sub").exists());
+
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tester — AC-R14-3: a `Present` run only reads the file, so its bytes
+    /// and its mtime are unchanged; a single-quoted empty value (`''`) is as
+    /// absent as `""` and is replaced, an inline comment on that line kept.
+    #[test]
+    fn tester_present_keeps_the_mtime_and_quoted_empty_values_are_absent() {
+        let dir = mint_dir();
+        let p = dir.join("config.yaml");
+        let text = "mcp:\n  operator_token: optoken-test-present\n";
+        std::fs::write(&p, text).unwrap();
+        let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(matches!(mint_if_absent(&p, true), Minted::Present));
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+
+        let single = dir.join("single.yaml");
+        std::fs::write(&single, "mcp:\n  operator_token: ''\n").unwrap();
+        match mint_if_absent(&single, false) {
+            Minted::Written { token, .. } => assert_eq!(
+                std::fs::read_to_string(&single).unwrap(),
+                format!("mcp:\n  operator_token: {}\n", token.expose())
+            ),
+            other => panic!("expected Written over '', got {other:?}"),
+        }
+        assert_eq!(mode_of(&single), 0o600);
+
+        let commented = dir.join("commented.yaml");
+        std::fs::write(&commented, "mcp:\n  operator_token: \"\" # none yet\n").unwrap();
+        match mint_if_absent(&commented, false) {
+            Minted::Written { token, .. } => {
+                let out = std::fs::read_to_string(&commented).unwrap();
+                assert_eq!(
+                    out,
+                    format!("mcp:\n  operator_token: {} # none yet\n", token.expose())
+                );
+                let cfg = config_file::parse(&out).unwrap();
+                assert_eq!(cfg.mcp.operator_token.as_deref(), Some(token.expose()));
+            }
+            other => panic!("expected Written over \"\", got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tester — spec D3 "a non-regular file at the path": a FIFO is
+    /// `Skipped(<path> is not a regular file)` from its metadata alone and
+    /// is never opened (nobody writes the pipe, so a read would block
+    /// forever). Run on a helper thread with a deadline so a regression
+    /// hangs the probe, not the suite.
+    #[test]
+    fn tester_mint_skips_a_fifo_without_opening_it() {
+        let dir = mint_dir();
+        let fifo = dir.join("config.yaml");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo {}", fifo.display());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let reason = match mint_if_absent(&probe, true) {
+                Minted::Skipped { reason } => Some(reason),
+                _ => None,
+            };
+            let _ = tx.send(reason);
+        });
+        let reason = rx
+            .recv_timeout(std::time::Duration::from_millis(5_000))
+            .expect("mint_if_absent must not block on a FIFO")
+            .expect("a FIFO is Skipped");
+        assert_eq!(reason, format!("{} is not a regular file", fifo.display()));
+        assert!(
+            std::os::unix::fs::FileTypeExt::is_fifo(
+                &std::fs::symlink_metadata(&fifo).unwrap().file_type()
+            ),
+            "the FIFO was replaced"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -263,4 +263,100 @@ mod tests {
         assert_eq!(report.fix, None);
         assert_eq!(report.command, Some(FixCommand("aitm --help".to_string())));
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// Tester — look-alike flags are not the one-shot's: `--bus-endpoint-file`
+    /// (main's own flag, split before this), `--busy`, `--token-filename`,
+    /// `--bus-` and a verb value that merely contains `bus` stay in argv, in
+    /// order; a verb's value that *is* `--bus` is consumed as the flag and
+    /// so wants a value (the `--config` precedent).
+    #[test]
+    fn tester_split_bus_args_leaves_lookalike_flags_alone() {
+        let argv = args(&[
+            "--bus-endpoint-file",
+            "/x/bus.addr",
+            "scope",
+            "add",
+            "--host",
+            "--busy",
+            "--token-filename",
+            "t",
+            "--bus-",
+            "--note",
+            "the bus",
+        ]);
+        let (bus, rest) = split_bus_args(argv.clone()).unwrap();
+        assert_eq!(bus, BusArgs::default());
+        assert_eq!(rest, argv);
+
+        assert_eq!(
+            split_bus_args(args(&["scope", "add", "--host", "--bus"])),
+            Err("--bus requires a host:port".to_string())
+        );
+        // An empty argv is handed back empty.
+        let (bus, rest) = split_bus_args(Vec::new()).unwrap();
+        assert_eq!(bus, BusArgs::default());
+        assert!(rest.is_empty());
+        // Whitespace is a value, not an absence; `parse_bus` refuses it later.
+        let (bus, _) = split_bus_args(args(&["--bus", " "])).unwrap();
+        assert_eq!(bus.bus.as_deref(), Some(" "));
+        assert_eq!(
+            parse_bus(" "),
+            Err("--bus  : invalid socket address syntax".to_string())
+        );
+    }
+
+    /// Tester — D10: `BusArgs` carries the token file's *path*; nothing here
+    /// reads the file, so its `Debug` names the path and never the content
+    /// (`optoken-test-…` on disk beside it).
+    #[test]
+    fn tester_bus_args_debug_names_the_path_never_the_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "aitm-oneshot-args-tester-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tfile = dir.join("token");
+        std::fs::write(&tfile, "optoken-test-busargs\n").unwrap();
+        let (bus, _) = split_bus_args(args(&[
+            "--bus",
+            "127.0.0.1:1",
+            "--token-file",
+            tfile.to_str().unwrap(),
+            "scope",
+            "list",
+        ]))
+        .unwrap();
+        let debug = format!("{bus:?}");
+        assert!(debug.contains(tfile.to_str().unwrap()), "{debug}");
+        assert!(!debug.contains("optoken-test"), "{debug}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tester — the usage reports exit 2 and carry no `why` beyond the one
+    /// loopback sentence; `parse_bus` keeps the parse error's own words for
+    /// an empty host, a bad port and an IPv6 address without brackets.
+    #[test]
+    fn tester_usage_reports_and_parse_errors_are_literal() {
+        assert_eq!(needs_token().exit_code(), 2);
+        assert_eq!(token_file_needs_bus().exit_code(), 2);
+        assert_eq!(
+            parse_bus(":9090"),
+            Err("--bus :9090: invalid socket address syntax".to_string())
+        );
+        assert_eq!(
+            parse_bus("127.0.0.1:99999"),
+            Err("--bus 127.0.0.1:99999: invalid socket address syntax".to_string())
+        );
+        assert_eq!(
+            parse_bus("::1:9090"),
+            Err("--bus ::1:9090: invalid socket address syntax".to_string())
+        );
+        assert_eq!(
+            parse_bus("localhost:9090"),
+            Err("--bus localhost:9090: invalid socket address syntax".to_string())
+        );
+    }
 }

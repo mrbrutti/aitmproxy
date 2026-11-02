@@ -1462,4 +1462,297 @@ mod tests {
 
         fs::remove_dir_all(&root).expect("cleanup");
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// A width-100 TTY with no colour, for the rich render of a panel.
+    fn tty_100() -> aitm_term::caps::Caps {
+        aitm_term::caps::Caps {
+            tty: true,
+            color: false,
+            unicode: true,
+            animate: true,
+            width: 100,
+            ci: false,
+        }
+    }
+
+    /// Tester — D7 step 1 "nothing else is consulted": with `--bus` given, a
+    /// live pointer and a dead pointer in the run dir and a configured
+    /// loopback port with its own token are all ignored: the liveness probe
+    /// never runs, the dead pointer is not deleted, the flag beats
+    /// `AITM_BUS`, the file beats `AITM_BUS_TOKEN`, and no config is named.
+    #[test]
+    fn tester_explicit_address_consults_neither_pointers_nor_config() {
+        let root = temp_root("tester-explicit");
+        let cores = root.join("cores");
+        let cfg_a = root.join("a.yaml");
+        write_config(&cfg_a, "optoken-test-pointer", 0o600);
+        let live = pointer::write(&cores, &ptr(200, 50512, &cfg_a)).expect("live pointer");
+        let dead = write_unlocked(
+            &cores,
+            &ptr(100, 50511, &cfg_a).to_json_line(),
+            "100.json",
+            0o600,
+        );
+        let tfile = root.join("token");
+        fs::write(&tfile, "optoken-test-file\n").expect("token file");
+        fs::set_permissions(&tfile, Permissions::from_mode(0o600)).expect("chmod");
+        let cfg = loopback_cfg(9090, None, Some("optoken-test-cfg"));
+        let never = |path: &Path| -> Liveness {
+            panic!(
+                "the liveness probe ran on {} with --bus given",
+                path.display()
+            )
+        };
+        let env = env_of(&[
+            ("AITM_BUS", "127.0.0.1:7"),
+            ("AITM_BUS_TOKEN", "optoken-test-env"),
+        ]);
+        let r = resolver(&env, &never, &cores);
+        let flag = BusArgs {
+            bus: Some("127.0.0.1:1".to_string()),
+            token_file: Some(tfile.clone()),
+        };
+        let argv = args(&["scope", "add", "--host", "x"]);
+        let (target, warnings) =
+            resolve(&r, &flag, &cfg, &cfg_a, false, "scope.add", &argv).expect("explicit");
+        assert_eq!(target.addr, lo(1));
+        assert_eq!(target.token, "optoken-test-file");
+        assert_eq!(target.source, Source::ExplicitFlag);
+        assert_eq!(target.config, None);
+        assert!(warnings.is_empty());
+        assert!(dead.exists(), "no pointer is deleted on the explicit path");
+        assert!(live.path.exists());
+
+        // The token never reaches a `Debug` through the containers the entry
+        // point holds.
+        let wrapped: Result<(Target, Vec<Warning>), ()> = Ok((target.clone(), warnings));
+        assert!(!format!("{wrapped:?}").contains("optoken-test"));
+        assert!(!format!("{:?}", vec![&target]).contains("optoken-test"));
+        assert!(format!("{:?}", Some(&target)).contains("<redacted>"));
+
+        drop(live);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — D7 rule 6, R13: a token-bearing config that fails to parse
+    /// (a type error in another key, an unknown key, a wrong shape) is W1's
+    /// `report_for` shape, names the file, and never prints the token that
+    /// sits beside the broken key, plain, rich or `Debug`. A live pointer
+    /// naming a config that does not exist is `reading config file <path>`.
+    #[test]
+    fn tester_r13_panels_never_print_the_token() {
+        let root = temp_root("tester-r13");
+        let cores = root.join("cores");
+        let cfg = root.join("broken.yaml");
+        let argv = args(&["scope", "list"]);
+        let docs = [
+            "mcp:\n  operator_token: optoken-test-leak\n  operator_bus:\n    port: 99999\n",
+            "mcp:\n  operator_token: optoken-test-leak\n  bogus_key: 1\n",
+            "mcp:\n  operator_token: optoken-test-leak\n  operator_bus: [1, 2]\n",
+            "mcp:\n  operator_token: optoken-test-leak\nlisten: [not, an, addr]\n",
+        ];
+        for doc in docs {
+            fs::write(&cfg, doc).expect("config");
+            fs::set_permissions(&cfg, Permissions::from_mode(0o644)).expect("chmod");
+            let live = pointer::write(&cores, &ptr(200, 50512, &cfg)).expect("live pointer");
+            let r = resolver(&no_env, &pointer::liveness, &cores);
+            let report = what(resolve(
+                &r,
+                &BusArgs::default(),
+                &Config::default(),
+                &cfg,
+                false,
+                "scope.list",
+                &argv,
+            ));
+            assert_eq!(report.kind, ErrorKind::Failure, "{doc:?}");
+            let plain = report.render_plain(&aitm_term::glyphs::RICH);
+            let rich = report.render(&tty_100(), Some(Path::new("/Users/matt")));
+            assert!(
+                plain.contains(cfg.to_str().unwrap()),
+                "{doc:?}: the panel names the file: {plain}"
+            );
+            for text in [plain, rich, format!("{report:?}")] {
+                assert!(!text.contains("optoken-test"), "{doc:?}: {text}");
+            }
+            drop(live);
+        }
+
+        let gone = root.join("gone.yaml");
+        let _live = pointer::write(&cores, &ptr(300, 50513, &gone)).expect("live pointer");
+        let r = resolver(&no_env, &pointer::liveness, &cores);
+        let report = what(resolve(
+            &r,
+            &BusArgs::default(),
+            &Config::default(),
+            &gone,
+            false,
+            "scope.list",
+            &argv,
+        ));
+        assert_eq!(report.kind, ErrorKind::Failure);
+        assert_eq!(
+            report.what,
+            format!("reading config file {}", gone.display())
+        );
+        assert_eq!(report.why.len(), 1, "{:?}", report.why);
+        assert!(report.why[0].contains("os error 2"), "{:?}", report.why);
+        assert_eq!(report.command, None);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — `read_operator_token`: `''` is as absent as `""`; a token
+    /// with surrounding spaces or an inline comment is the bare value; a
+    /// `0000` config (no group or other bit) draws no wide warning and, being
+    /// unreadable, is reported by kind rather than read around.
+    #[test]
+    fn tester_read_operator_token_quoting_and_unreadable_modes() {
+        let root = temp_root("tester-token-quoting");
+        let cores = root.join("cores");
+        let uid = owner_uid(&cores);
+
+        let single = root.join("single.yaml");
+        write_config(&single, "''", 0o600);
+        assert_eq!(read_operator_token(&single, uid).expect("reads").0, None);
+        let commented = root.join("commented.yaml");
+        fs::write(
+            &commented,
+            "mcp:\n  operator_token: optoken-test-c   # rotate me\n",
+        )
+        .expect("config");
+        fs::set_permissions(&commented, Permissions::from_mode(0o600)).expect("chmod");
+        assert_eq!(
+            read_operator_token(&commented, uid).expect("reads").0,
+            Some("optoken-test-c".to_string())
+        );
+        let quoted = root.join("quoted.yaml");
+        write_config(&quoted, "\"optoken-test-q\"", 0o600);
+        assert_eq!(
+            read_operator_token(&quoted, uid).expect("reads").0,
+            Some("optoken-test-q".to_string())
+        );
+
+        let dark = root.join("dark.yaml");
+        write_config(&dark, "optoken-test-dark", 0o000);
+        if fs::read(&dark).is_ok() {
+            eprintln!("skipping the 0000 case: this user can read a 0000 file (root)");
+            fs::remove_dir_all(&root).expect("cleanup");
+            return;
+        }
+        match read_operator_token(&dark, uid) {
+            Err(TokenProblem::Parse(err)) => {
+                let text = format!("{err:#}");
+                assert!(text.contains(dark.to_str().unwrap()), "{text}");
+                assert!(!text.contains("optoken-test"), "{text}");
+            }
+            other => panic!("expected Parse (unreadable), got {other:?}"),
+        }
+        fs::set_permissions(&dark, Permissions::from_mode(0o600)).expect("restore");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — `owner_uid` on a run dir that cannot be created (its parent
+    /// is a file) is `u32::MAX`, so nothing passes trust and the resolution
+    /// is R1 rather than a dial of someone else's pointer.
+    #[test]
+    fn tester_owner_uid_trusts_nothing_when_the_run_dir_cannot_exist() {
+        let root = temp_root("tester-owner-uid");
+        let blocker = root.join("file");
+        fs::write(&blocker, "not a dir").expect("blocker");
+        let impossible = blocker.join("cores");
+        assert_eq!(owner_uid(&impossible), u32::MAX);
+        let r = Resolver {
+            env: &no_env,
+            liveness: &pointer::liveness,
+            owner_uid: owner_uid(&impossible),
+            now_unix: NOW,
+            run_dir: impossible.clone(),
+        };
+        let report = what(resolve(
+            &r,
+            &BusArgs::default(),
+            &Config::default(),
+            &root.join("config.yaml"),
+            false,
+            "scope.list",
+            &args(&["scope", "list"]),
+        ));
+        assert_eq!(report.what, "no running core found");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester — AC-R14-31, the FIFO half: a FIFO at the token-bearing path is
+    /// `TokenProblem::NotRegular` from its metadata alone; it is never
+    /// opened (nobody writes the pipe, so an open would block forever), and
+    /// through `resolve` it is R15. Run on a helper thread with a deadline so
+    /// a regression hangs the probe, not the suite.
+    #[test]
+    fn tester_read_operator_token_refuses_a_fifo_without_opening_it() {
+        let root = temp_root("tester-fifo");
+        let cores = root.join("cores");
+        let fifo = root.join("fifo.yaml");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo {}", fifo.display());
+        let uid = owner_uid(&cores);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(matches!(
+                read_operator_token(&probe, uid),
+                Err(TokenProblem::NotRegular)
+            ));
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("read_operator_token must not block on a FIFO"),
+            "a FIFO is NotRegular"
+        );
+
+        // Through `resolve`: a live pointer naming the FIFO as its config is R15.
+        let _live = pointer::write(&cores, &ptr(200, 50512, &fifo)).expect("live pointer");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cores_t, fifo_t) = (cores.clone(), fifo.clone());
+        std::thread::spawn(move || {
+            let r = Resolver {
+                env: &no_env,
+                liveness: &pointer::liveness,
+                owner_uid: uid,
+                now_unix: NOW,
+                run_dir: cores_t,
+            };
+            let report = what(resolve(
+                &r,
+                &BusArgs::default(),
+                &Config::default(),
+                &fifo_t,
+                false,
+                "scope.list",
+                &args(&["scope", "list"]),
+            ));
+            let _ = tx.send((report.what.clone(), report.why.clone()));
+        });
+        let (what_line, why) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("resolve must not block on a FIFO config");
+        assert_eq!(
+            what_line,
+            format!(
+                "the config {} is not a regular file owned by this user",
+                fifo.display()
+            )
+        );
+        assert_eq!(
+            why,
+            vec!["aitm reads an operator token only from a regular file it owns. Nothing was changed.".to_string()]
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
 }

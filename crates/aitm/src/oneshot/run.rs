@@ -412,4 +412,263 @@ mod tests {
             OneShotError::Other(e) => panic!("expected a panel: {e:#}"),
         }
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    const TOKEN: &str = "optoken-test-run";
+    const LOG: &str = "/l/aitm.log";
+
+    fn tty_100() -> aitm_term::caps::Caps {
+        aitm_term::caps::Caps {
+            tty: true,
+            color: false,
+            unicode: true,
+            animate: true,
+            width: 100,
+            ci: false,
+        }
+    }
+
+    fn sources() -> Vec<Source> {
+        vec![
+            Source::ExplicitFlag,
+            Source::ExplicitEnv,
+            Source::ConfigPort,
+            Source::ConfigEndpointFile(PathBuf::from("/e/bus.addr")),
+            Source::Pointer {
+                path: PathBuf::from("/r/4821.json"),
+                pid: 4821,
+                started_unix: 0,
+            },
+        ]
+    }
+
+    fn errors() -> Vec<(RemoteError, Stage)> {
+        vec![
+            (RemoteError::Timeout(Duration::from_secs(30)), Stage::Call),
+            (RemoteError::Timeout(Duration::from_secs(2)), Stage::Connect),
+            (
+                RemoteError::Timeout(Duration::from_millis(5)),
+                Stage::Handshake,
+            ),
+            (
+                RemoteError::Lost(remote::REFUSED.to_string()),
+                Stage::Connect,
+            ),
+            (
+                RemoteError::Lost("reset by peer".to_string()),
+                Stage::Handshake,
+            ),
+            (RemoteError::Lost("eof".to_string()), Stage::Call),
+            (RemoteError::Refused, Stage::Handshake),
+            (RemoteError::Agent, Stage::Handshake),
+            (
+                RemoteError::Tool("x refused: y from an agent frontend is off".to_string()),
+                Stage::Call,
+            ),
+            (RemoteError::Tool("plain failure".to_string()), Stage::Call),
+            (
+                RemoteError::Rpc {
+                    code: -32601,
+                    message: "no such method".to_string(),
+                },
+                Stage::Call,
+            ),
+            (RemoteError::Protocol("odd reply".to_string()), Stage::Call),
+        ]
+    }
+
+    /// Tester — D10: no panel the entry point builds carries the token, for
+    /// every `RemoteError` × `Stage` × `Source`, with and without a token
+    /// file, rendered plain and rich and `Debug`; every panel gets the log
+    /// footer; an abort and an unaskable question are plain errors without
+    /// the token too.
+    #[test]
+    fn tester_refusals_never_carry_the_token() {
+        let others = [CoreRef {
+            addr: "127.0.0.1:50512".parse().expect("addr"),
+            pid: Some(4821),
+            started_unix: Some(0),
+            config: Some(PathBuf::from("/y/c.yaml")),
+        }];
+        let bus_variants = [
+            BusArgs::default(),
+            BusArgs {
+                bus: Some("127.0.0.1:1".to_string()),
+                token_file: Some(PathBuf::from("/t/tok")),
+            },
+        ];
+        let mut panels = 0;
+        for source in sources() {
+            let explicit = matches!(source, Source::ExplicitFlag | Source::ExplicitEnv);
+            let target = Target {
+                addr: "127.0.0.1:1".parse().expect("addr"),
+                token: TOKEN.to_string(),
+                source,
+                config: (!explicit).then(|| PathBuf::from("/x/c.yaml")),
+            };
+            for bus in &bus_variants {
+                let site = Site {
+                    dotted: "tls.passthrough.add",
+                    target: &target,
+                    bus_args: bus,
+                    effective_path: Path::new("/x/config.yaml"),
+                    explicit_config: true,
+                    budget: Duration::from_secs(600),
+                    now_unix: 720,
+                };
+                for (err, stage) in errors() {
+                    let label = format!("{err:?} at {stage:?} from {:?}", target.source);
+                    match refusal(err, stage, &site, &others, Some(PathBuf::from(LOG))) {
+                        OneShotError::Report(report) => {
+                            assert_eq!(report.log, Some(PathBuf::from(LOG)), "{label}");
+                            assert_eq!(report.exit_code(), 1, "{label}");
+                            for text in [
+                                report.render_plain(&aitm_term::glyphs::RICH),
+                                report.render(&tty_100(), Some(Path::new("/Users/matt"))),
+                                format!("{report:?}"),
+                            ] {
+                                assert!(!text.contains(TOKEN), "{label}: {text}");
+                                assert!(!text.contains("optoken"), "{label}: {text}");
+                            }
+                            panels += 1;
+                        }
+                        OneShotError::Other(e) => panic!("{label}: expected a panel, got {e:#}"),
+                    }
+                }
+                for err in [
+                    RemoteError::Aborted("aborted: tls passthrough add not run".to_string()),
+                    RemoteError::Confirm(anyhow::anyhow!("no terminal")),
+                ] {
+                    match refusal(err, Stage::Call, &site, &[], None) {
+                        OneShotError::Other(e) => {
+                            assert!(!format!("{e:#} {e:?}").contains("optoken"));
+                        }
+                        OneShotError::Report(r) => panic!("not a panel: {r:?}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(panels, 5 * 2 * 12);
+    }
+
+    /// Tester — the panels not pinned elsewhere: a JSON-RPC error other than
+    /// `-32001` and a protocol complaint are bare `Failure` reports whose
+    /// headline is the bus text, no why, no fix, the log footer on; a
+    /// handshake timeout at the connect stage is the handshake form; a lost
+    /// connection at the handshake stage is the not-listening family; R2
+    /// from a configured port lists every other core it was given.
+    #[test]
+    fn tester_rpc_protocol_and_stage_mapping_edges() {
+        let target = Target {
+            addr: "127.0.0.1:9090".parse().expect("addr"),
+            token: TOKEN.to_string(),
+            source: Source::ConfigPort,
+            config: Some(PathBuf::from("/x/c.yaml")),
+        };
+        let bus = BusArgs::default();
+        let site = Site {
+            dotted: "scope.list",
+            target: &target,
+            bus_args: &bus,
+            effective_path: Path::new("/x/config.yaml"),
+            explicit_config: false,
+            budget: Duration::from_secs(30),
+            now_unix: 1_000,
+        };
+        let report = |err, stage, others: &[CoreRef]| match refusal(
+            err,
+            stage,
+            &site,
+            others,
+            Some(PathBuf::from(LOG)),
+        ) {
+            OneShotError::Report(r) => r,
+            OneShotError::Other(e) => panic!("expected a panel: {e:#}"),
+        };
+
+        let rpc = report(
+            RemoteError::Rpc {
+                code: -32601,
+                message: "no such method".to_string(),
+            },
+            Stage::Call,
+            &[],
+        );
+        assert_eq!(rpc.what, "no such method");
+        assert!(rpc.why.is_empty());
+        assert_eq!(rpc.fix, None);
+        assert_eq!(rpc.command, None);
+        assert_eq!(rpc.log, Some(PathBuf::from(LOG)));
+
+        let protocol = report(
+            RemoteError::Protocol("reply to `tools/call` is not JSON".to_string()),
+            Stage::Call,
+            &[],
+        );
+        assert_eq!(protocol.what, "reply to `tools/call` is not JSON");
+        assert!(protocol.why.is_empty());
+
+        let connect_timeout = report(
+            RemoteError::Timeout(Duration::from_secs(2)),
+            Stage::Connect,
+            &[],
+        );
+        assert_eq!(
+            connect_timeout.what,
+            "the core at 127.0.0.1:9090 accepted the connection but did not answer within 2 s"
+        );
+
+        let two_others = [
+            CoreRef {
+                addr: "127.0.0.1:50512".parse().expect("addr"),
+                pid: Some(1),
+                started_unix: Some(1_000 - 60),
+                config: Some(PathBuf::from("/a.yaml")),
+            },
+            CoreRef {
+                addr: "127.0.0.1:50513".parse().expect("addr"),
+                pid: Some(2),
+                started_unix: Some(1_000),
+                config: Some(PathBuf::from("/b.yaml")),
+            },
+        ];
+        let lost = report(
+            RemoteError::Lost("reset by peer".to_string()),
+            Stage::Handshake,
+            &two_others,
+        );
+        assert_eq!(lost.what, "no running core at 127.0.0.1:9090");
+        assert_eq!(lost.why.len(), 3, "{:?}", lost.why);
+        assert_eq!(
+            lost.why[0],
+            "/x/c.yaml sets mcp.transport.loopback_tcp.port 9090, but nothing is listening there, so scope list has nothing to change. Nothing was changed."
+        );
+        assert_eq!(
+            lost.why[1],
+            "A different core is running at 127.0.0.1:50512 (pid 1, started 1 min ago, config /a.yaml); pass --bus 127.0.0.1:50512 to use it."
+        );
+        assert_eq!(
+            lost.why[2],
+            "A different core is running at 127.0.0.1:50513 (pid 2, started just now, config /b.yaml); pass --bus 127.0.0.1:50513 to use it."
+        );
+        assert_eq!(lost.command.as_ref().map(|c| c.0.as_str()), Some("aitm"));
+    }
+
+    /// Tester — the wide-config warning and the bus-ignored warning are the
+    /// only two; `warning_text` prints a path with a space unquoted (the
+    /// reporter sanitizes, never quotes) and the verb in its space form.
+    #[test]
+    fn tester_warning_texts_edges() {
+        assert_eq!(
+            warning_text(&Warning::WideConfig(PathBuf::from(
+                "/Users/matt/Library/Application Support/aitmproxy/config.yaml"
+            ))),
+            "/Users/matt/Library/Application Support/aitmproxy/config.yaml is readable by other users · chmod 600 /Users/matt/Library/Application Support/aitmproxy/config.yaml"
+        );
+        assert_eq!(
+            warning_text(&Warning::BusIgnored(verb_words("proxy.system.unset"))),
+            "--bus ignored · proxy system unset runs on this machine, not on a core"
+        );
+    }
 }

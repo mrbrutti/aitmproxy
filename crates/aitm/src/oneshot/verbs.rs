@@ -128,4 +128,48 @@ mod tests {
         assert_eq!(budget("l4.recon", true), Duration::from_secs(600));
         assert_eq!(budget("custom.verb", false), Duration::from_secs(600));
     }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// Tester — the long lane by prefix and by local knowledge: every
+    /// `check.*` and `l4.intercept.*` name is long; a bundled script verb is
+    /// long by name; a dotted name the table does not list is long only when
+    /// the local registry does not know it (`known_locally == false`); the
+    /// prefix is `check.` with its dot, so `checker.x` is on the short lane.
+    #[test]
+    fn tester_budget_prefixes_and_locally_known_unknowns() {
+        assert_eq!(budget("check.anything", true), LONG_CALL_BUDGET);
+        assert_eq!(budget("check.anything.deep", true), LONG_CALL_BUDGET);
+        assert_eq!(budget("l4.intercept.start", true), LONG_CALL_BUDGET);
+        assert_eq!(budget("l4.intercept.status", true), LONG_CALL_BUDGET);
+        assert_eq!(budget("l4.tcp_probe", true), LONG_CALL_BUDGET);
+        assert_eq!(budget("l4.udp_probe", true), LONG_CALL_BUDGET);
+        assert_eq!(budget("l4.interfaces", true), CALL_BUDGET);
+        assert_eq!(budget("l4.capture.start", true), CALL_BUDGET);
+        assert_eq!(budget("custom.verb", true), CALL_BUDGET);
+        assert_eq!(budget("checker.x", true), CALL_BUDGET);
+        assert_eq!(budget("check", true), CALL_BUDGET);
+        assert_eq!(budget("scope.add", false), LONG_CALL_BUDGET);
+        assert_eq!(budget("", true), CALL_BUDGET);
+        assert_eq!(HANDSHAKE_BUDGET, Duration::from_secs(2));
+        assert_eq!(CALL_BUDGET, Duration::from_secs(30));
+        assert_eq!(LONG_CALL_BUDGET, Duration::from_secs(600));
+    }
+
+    /// Tester — `placement` is an exact-name lookup: a prefix, a parent
+    /// group, a different case, a trailing dot and the empty name are all
+    /// live (the safe side of the rule).
+    #[test]
+    fn tester_placement_is_an_exact_match_only() {
+        assert_eq!(placement("proxy.system.unset"), Placement::Local);
+        assert_eq!(placement("proxy.system"), Placement::Live);
+        assert_eq!(placement("proxy.system.unset.now"), Placement::Live);
+        assert_eq!(placement("ca"), Placement::Live);
+        assert_eq!(placement("ca.status."), Placement::Live);
+        assert_eq!(placement("Ca.Status"), Placement::Live);
+        assert_eq!(placement(" ca.status"), Placement::Live);
+        assert_eq!(placement(""), Placement::Live);
+        assert_eq!(LOCAL_VERBS.len(), 13);
+        assert_eq!(ONE_SHOT_FLAG_NAMES, &["bus", "token-file"]);
+    }
 }
