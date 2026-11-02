@@ -38,15 +38,24 @@
 #     and a pty `script` can allocate;
 #   - section 13 needs AITM_OLD_BIN (executable);
 #   - section 12 needs apps/web/node_modules and `node`;
-#   - the `obscura probed` check needs `obscura` beside AITM_BIN;
+#   - the `obscura probed` check and the AC-W1-33 "the log records the
+#     browser's teardown error" check need `obscura` beside AITM_BIN;
 #   - the `aitm-tui --help` check needs `aitm-tui` beside AITM_BIN.
+#
+# Section 6's browser-unavailable run executes a hard copy of AITM_BIN from a
+# scratch dir under the temp dir that holds no `obscura`, with
+# `PATH=/usr/bin:/bin` (~130 MB for a debug build; removed with the scratch
+# dir). Engine discovery falls through a missing `AITM_OBSCURA_BIN` to the
+# engine beside the real binary and ends with a PATH lookup, so the env
+# override cannot stand in for that (live dry-run finding D3).
 #
 # Tokens are generated into 0600 files, read into variables and only ever
 # compared with `grep -c -F`; nothing here prints one. Failure-context dumps
 # redact `#t=` URL fragments. The script never uses a global `pkill`: the
 # aitm child of a `script` recording is found through `pgrep -P`, and the
-# recordings' stdin feeders write into named pipes under the scratch dir and
-# are tracked by PID, so no `sleep` outlives the run.
+# recordings' stdin feeders write into anonymous pipes (never FIFOs: BSD
+# `script` refuses a FIFO stdin, dry-run D5) and are tracked by PID, so no
+# `sleep` outlives the run.
 #
 # Exit status is non-zero if any assertion fails.
 # shellcheck disable=SC2016  # the single-quoted `…` below are literal texts the binary prints
@@ -114,7 +123,7 @@ if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
   exit 2
 fi
 PASS=0; FAIL=0; SKIP=0
-SERVER_PID=""; SERVER_RC=""; RC=""; SCRIPT_PID=""; REC_PID=""; FEEDER_PID=""; FEEDER_FIFO=""; SECTION_FAIL0=0
+SERVER_PID=""; SERVER_RC=""; RC=""; SCRIPT_PID=""; REC_PID=""; FEEDER_PID=""; FEEDER_FD=""; SECTION_FAIL0=0
 HOME_DIR=""; CFG=""; CFG_STDIO=""; PROXY_PORT=""; BROWSER_PORT=""; WEB_PORT=""; BUS_PORT=""
 
 cleanup() {
@@ -196,6 +205,33 @@ log_path_for() {
 thread_count() {
   if [ "$OS" = Darwin ]; then ps -M -p "$1" | awk 'NR > 1' | wc -l | tr -d ' '
   else find "/proc/$1/task" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' '; fi
+}
+# thread_names <pid> <out-file>: one OS thread name per line (unnamed threads
+# as `<unnamed>`), from `sample <pid> 1 -mayDie` on macOS — its call-graph
+# headers `Thread_<n>: <name>` / `Thread_<n>   DispatchQueue_<k>: <name>
+# (serial)`; the raw report is kept at <out-file>.sample, and the sampling is
+# bounded to 60 s (symbolication of a debug binary is slow) — or from
+# `/proc/<pid>/task/*/comm` on Linux. Returns 1 when neither source is
+# available or `sample` fails (a hardened-runtime target, say): the caller
+# SKIPs instead of asserting on nothing.
+thread_names() {
+  local pid="$1" out="$2"
+  if [ "$OS" = Darwin ]; then
+    command -v sample >/dev/null 2>&1 || return 1
+    sample "$pid" 1 -mayDie -file "$out.sample" >/dev/null 2>&1 &
+    local sp=$! i=0
+    while kill -0 "$sp" 2>/dev/null; do
+      [ "$i" -ge 240 ] && { kill -9 "$sp" 2>/dev/null; wait "$sp" 2>/dev/null; return 1; }
+      sleep 0.25; i=$((i+1))
+    done
+    wait "$sp" 2>/dev/null || return 1
+    sed -n -E 's/^ *[0-9]+ Thread_[0-9]+(: | +DispatchQueue_[0-9]+: )?//p' "$out.sample" \
+      | sed -E -e 's/ +\(serial\)$//' -e 's/^$/<unnamed>/' > "$out"
+  else
+    [ -d "/proc/$pid/task" ] || return 1
+    cat /proc/"$pid"/task/*/comm > "$out" 2>/dev/null
+  fi
+  [ -s "$out" ]
 }
 grow_file() { python3 -c 'import sys; f = open(sys.argv[1], "ab"); f.truncate(int(sys.argv[2])); f.close()' "$1" "$2"; }
 gen_secret() { python3 -c 'import secrets; print(secrets.token_hex(16))'; }
@@ -315,21 +351,26 @@ median_of() {
 # TTY recordings through `script` (section 14).
 # ---------------------------------------------------------------------------
 
-# start_recording <cast> <stdin-file> <cmd...>: run the command inside a pty
-# recorded to <cast>. The pty is sized 40x120 by `stty` inside the wrapper
-# (a pipe-fed `script` would otherwise hand the child a 0x0 window) and the
-# wrapper `exec`s the command, so the aitm process is `script`'s direct
-# child; it is found through `pgrep -P` (never a global pkill). Sets
-# SCRIPT_PID and REC_PID (empty when the child was not found in 10 s).
+# start_recording <cast> <cmd...>: run the command inside a pty recorded to
+# <cast>, its stdin the feeder pipe `start_feeder` opened (FEEDER_FD). The
+# pty is sized 40x120 by `stty` inside the wrapper (a pipe-fed `script`
+# would otherwise hand the child a 0x0 window) and the wrapper `exec`s the
+# command, so the aitm process is `script`'s direct child; it is found
+# through `pgrep -P` (never a global pkill). `script`'s own stderr goes to
+# <cast>.script.err for `recording_diag`. Sets SCRIPT_PID and REC_PID (empty
+# when the child was not found in 10 s).
 start_recording() {
-  local cast="$1" input="$2"; shift 2
+  local cast="$1"; shift
   local wrap="$ROOT/rec.$RANDOM$RANDOM.sh"
   { printf 'stty rows 40 cols 120 2>/dev/null\nexec'; printf ' %q' "$@"; printf '\n'; } > "$wrap"
   : > "$cast"
+  if [ -z "$FEEDER_FD" ]; then
+    note "recording: no feeder pipe open (start_feeder first)"; SCRIPT_PID=""; REC_PID=""; return 1
+  fi
   if [ "$OS" = Darwin ]; then
-    HOME="$HOME_DIR" script -q -t 0 "$cast" /bin/sh "$wrap" <"$input" >/dev/null 2>&1 &
+    HOME="$HOME_DIR" script -q -t 0 "$cast" /bin/sh "$wrap" <&"$FEEDER_FD" 7<&- >/dev/null 2>"$cast.script.err" &
   else
-    HOME="$HOME_DIR" script -q -f -c "/bin/sh '$wrap'" "$cast" <"$input" >/dev/null 2>&1 &
+    HOME="$HOME_DIR" script -q -f -c "/bin/sh '$wrap'" "$cast" <&"$FEEDER_FD" 7<&- >/dev/null 2>"$cast.script.err" &
   fi
   SCRIPT_PID=$!
   REC_PID=""
@@ -376,26 +417,43 @@ end_recording() {
   reap_feeder
 }
 
-# start_feeder <cmd...>: run <cmd> in the background with its stdout on a
-# fresh named pipe under $ROOT, as a recording's stdin. Sets FEEDER_FIFO and
-# FEEDER_PID; end_recording (and cleanup) reap the writer. A `<(…)` process
-# substitution would do the same job, but its `sleep` is invisible to
-# `jobs -p`, so one lingered per recording for up to 90 s after the run.
+# start_feeder <cmd...>: run <cmd> in the background with its stdout on an
+# anonymous pipe whose read end this shell holds on fd 7, as a recording's
+# stdin. Sets FEEDER_FD and FEEDER_PID; end_recording (and cleanup) reap the
+# writer. Not a FIFO: macOS implements FIFOs over sockets and BSD `script`
+# does `tcgetattr`/`ioctl(TIOCGWINSZ)` on its stdin, which a pipe answers
+# with ENOTTY (tolerated) and a FIFO with EOPNOTSUPP — so a FIFO-fed `script`
+# exits at once with `tcgetattr/ioctl: Operation not supported on socket`
+# and records nothing (live dry-run D5). The process substitution's PID is
+# `$!` right after the `exec` (bash 3.2 and 5.x), so the writer is tracked
+# without a FIFO and no `sleep` outlives the run. One recording at a time,
+# hence the fixed fd.
 start_feeder() {
-  FEEDER_PID=""; FEEDER_FIFO="$ROOT/feed.$RANDOM$RANDOM.fifo"
-  mkfifo "$FEEDER_FIFO" || { FEEDER_FIFO=""; return 1; }
-  "$@" >"$FEEDER_FIFO" &
+  FEEDER_PID=""; FEEDER_FD=""
+  exec 7< <("$@")
   FEEDER_PID=$!
+  [ -n "$FEEDER_PID" ] || { exec 7<&-; return 1; }
+  FEEDER_FD=7
 }
 
-# reap_feeder: end the recording's stdin writer and remove its pipe.
+# reap_feeder: end the recording's stdin writer and close the pipe.
 reap_feeder() {
   if [ -n "$FEEDER_PID" ]; then
     kill "$FEEDER_PID" 2>/dev/null
     wait "$FEEDER_PID" 2>/dev/null
   fi
-  [ -n "$FEEDER_FIFO" ] && rm -f "$FEEDER_FIFO"
-  FEEDER_PID=""; FEEDER_FIFO=""
+  [ -n "$FEEDER_FD" ] && exec 7<&-
+  FEEDER_PID=""; FEEDER_FD=""
+}
+
+# recording_diag <cast>: why a recording has no aitm child or no text —
+# `script`'s own stderr and the cast's size, so an environment failure
+# (dry-run D5: `script: tcgetattr/ioctl: Operation not supported on socket`)
+# is visible in the run's output instead of silent.
+recording_diag() {
+  local cast="$1" serr="$1.script.err" text=""
+  [ -s "$serr" ] && text="$(tr '\n' ' ' <"$serr" | head -c 300)"
+  note "recording: $(basename "$cast") is $(fsize "$cast" 2>/dev/null || echo 0) bytes; script stderr: [${text:-<empty>}]"
 }
 
 # record_server <cast> <cmd...>: a serving aitm in a pty, run until its ready
@@ -404,16 +462,16 @@ reap_feeder() {
 record_server() {
   local cast="$1"; shift
   if ! start_feeder sleep 90; then
-    note "recording: cannot create a named pipe under $ROOT"; return 1
+    note "recording: cannot open a feeder pipe"; return 1
   fi
-  start_recording "$cast" "$FEEDER_FIFO" "$@"
+  start_recording "$cast" "$@"
   local ok=0
   if [ -z "$REC_PID" ]; then
-    note "recording: aitm child of script($SCRIPT_PID) not found"
+    note "recording: aitm child of script(${SCRIPT_PID:-none}) not found"; recording_diag "$cast"
   elif wait_cast "$cast" '^(  Log +~?/|Log: )' 30; then
     ok=1
   else
-    note "recording: the ready card never appeared in $(basename "$cast")"
+    note "recording: the ready card never appeared in $(basename "$cast")"; recording_diag "$cast"
   fi
   end_recording INT
   [ "$ok" -eq 1 ]
@@ -490,9 +548,9 @@ section_preboot() {
 
 # ===========================================================================
 section_piped() {
-  begin_section "2. piped startup is plain lines (AC-W1-5, AC-W1-7, AC-W1-8, AC-W1-9, AC-W1-23)"
+  begin_section "2. piped startup is plain lines (AC-W1-5, AC-W1-7, AC-W1-8, AC-W1-9, AC-W1-23, AC-W1-33)"
   new_env piped || return
-  local out="$ROOT/plain.out" err="$ROOT/plain.err"
+  local out="$ROOT/plain.out" err="$ROOT/plain.err" log; log="$(log_path_for "$HOME_DIR")"
   start_server "$out" "$err" "$AITM_BIN" --config "$CFG"
   # The card's last row; `proxy listening` precedes the obscura and CA-trust
   # phases, so the rows below are only there once `Log:` is.
@@ -517,6 +575,20 @@ section_piped() {
   check "card row: Log:" grep -q -E '^Log: ' "$err"
   check "no INFO line on stderr" [ "$(count_fx INFO "$err")" = 0 ]
   check "exit 0 after SIGTERM" [ "$SERVER_RC" = 0 ]
+  # AC-W1-33 (dry-run D1): closing the embedded browser's CDP socket logs
+  # `WS Connection error: Ws(Protocol(ResetWithoutClosingHandshake))` at
+  # ERROR during teardown. The reporter is quiesced after the serving loop,
+  # so the line never reaches the view (the card row stays last) while the
+  # log file still records it. The stderr checks hold with or without an
+  # engine; the log check needs one (no browser, nothing to quiesce).
+  check "AC-W1-33: no 'WS Connection error' line on stderr after SIGTERM" [ "$(count_fx 'WS Connection error' "$err")" = 0 ]
+  check "AC-W1-33: the last stderr line is the 'Log:' card row" starts_with "$(tail -1 "$err")" 'Log: '
+  if have_obscura; then
+    check "AC-W1-33: the log file records the browser's teardown 'WS Connection error' ($(count_fx 'WS Connection error' "$log") records)" \
+      [ "$(count_fx 'WS Connection error' "$log")" -ge 1 ]
+  else
+    skip "AC-W1-33: the log records the browser's teardown error (no obscura beside AITM_BIN: no browser to close)"
+  fi
   end_section "$err" "$out"
 }
 
@@ -637,23 +709,54 @@ section_log() {
 
 # ===========================================================================
 section_warnings() {
-  begin_section "6. warnings and the browser line (AC-W1-19)"
+  begin_section "6. warnings and the browser line (AC-W1-19, AC-W1-33)"
   new_env warn || return
   local log; log="$(log_path_for "$HOME_DIR")"
-  start_server "$ROOT/warn.out" "$ROOT/warn.err" env AITM_OBSCURA_BIN=/nonexistent "$AITM_BIN" --config "$CFG"
-  wait_for "$ROOT/warn.err" '^Log: ' 30 || note "ready card not seen (the server exited, or 30 s passed)"
-  stop_server
-  check "exactly one 'warning: embedded browser unavailable; browser.* commands will error' line on stderr" \
-    [ "$(count_re '^warning: embedded browser unavailable; browser\.\* commands will error' "$ROOT/warn.err")" = 1 ]
-  check "the warning is in the log exactly once" [ "$(count_fx 'embedded browser unavailable; browser.* commands will error' "$log")" = 1 ]
-  check "stdout empty" [ ! -s "$ROOT/warn.out" ]
-  check "phase line 'browser unavailable'" grep -q -x -F 'browser unavailable' "$ROOT/warn.err"
+  # The "unavailable" run needs an aitm that finds no engine. Discovery
+  # (crates/aitm-browser/src/obscura.rs `discover_binary`) tries, in order,
+  # `browser.obscura.binary`, `AITM_OBSCURA_BIN`, `<exe_dir>/obscura`,
+  # `<exe_dir>/../libexec/obscura` and a PATH lookup, and a candidate that
+  # does not exist falls through to the next — so `AITM_OBSCURA_BIN=/nonexistent`
+  # still found the engine beside AITM_BIN (dry-run D3). Instead run a hard
+  # COPY of AITM_BIN from a scratch dir with no `obscura` in it or in a
+  # sibling libexec (a symlink would canonicalize back to the real dir), with
+  # `PATH=/usr/bin:/bin` so the PATH lookup finds none either (the trust read
+  # and the system-proxy probe use absolute paths; the row values are not
+  # asserted here). The copy (~130 MB on a debug build) lives under $ROOT, so
+  # the exit trap removes it even if the early `rm` below never runs; it
+  # loads no bundled detection catalogue (found beside the real binary),
+  # which this section does not assert on.
+  local copy="$ROOT/nobrowser/aitm"
+  mkdir -p "$ROOT/nobrowser"
+  if cp "$AITM_BIN" "$copy" && [ -x "$copy" ]; then
+    start_server "$ROOT/warn.out" "$ROOT/warn.err" env PATH=/usr/bin:/bin "$copy" --config "$CFG"
+    wait_for "$ROOT/warn.err" '^Log: ' 30 || note "ready card not seen (the server exited, or 30 s passed)"
+    stop_server
+    check "exactly one 'warning: embedded browser unavailable; browser.* commands will error' line on stderr" \
+      [ "$(count_re '^warning: embedded browser unavailable; browser\.\* commands will error' "$ROOT/warn.err")" = 1 ]
+    check "the warning is in the log exactly once" [ "$(count_fx 'embedded browser unavailable; browser.* commands will error' "$log")" = 1 ]
+    check "stdout empty" [ ! -s "$ROOT/warn.out" ]
+    check "phase line 'browser unavailable'" grep -q -x -F 'browser unavailable' "$ROOT/warn.err"
+  else
+    fail "setup: could not copy $AITM_BIN to $copy (disk space?); the browser-unavailable run did not happen"
+  fi
+  rm -f "$copy"
   if have_obscura; then
     new_env warn2 || return
     start_server "$ROOT/warn2.out" "$ROOT/warn2.err" "$AITM_BIN" --config "$CFG"
     wait_for "$ROOT/warn2.err" '^Log: ' 30 || note "ready card not seen (the server exited, or 30 s passed)"
     stop_server
-    check "normal run: phase line 'obscura probed <version>'" grep -q -E '^obscura probed [^ ]+$' "$ROOT/warn2.err"
+    # The engine word is stripped from the probe's raw `obscura aitm-v1`, so
+    # the line is `obscura probed aitm-v1` — one word after `probed`, never
+    # `obscura probed obscura …` (dry-run D4). The line found is printed on
+    # failure so a wording drift is diagnosable from the run's output.
+    local probed; probed="$(grep -a -E '^obscura probed' "$ROOT/warn2.err" | head -1)"
+    if printf '%s\n' "$probed" | grep -q -E '^obscura probed [^ ]+$'; then
+      pass "normal run: phase line 'obscura probed <version>' ('$probed')"
+    else
+      fail "normal run: phase line 'obscura probed <version>' (one word after 'probed', e.g. 'obscura probed aitm-v1'): found [${probed:-<no 'obscura probed' line>}]"
+    fi
+    check "AC-W1-33: normal run: no 'WS Connection error' line on stderr after SIGTERM" [ "$(count_fx 'WS Connection error' "$ROOT/warn2.err")" = 0 ]
   else
     skip "'obscura probed <version>' line (no obscura beside AITM_BIN; scripts/fetch-obscura-dev.sh)"
   fi
@@ -715,7 +818,7 @@ section_raw() {
 
 # ===========================================================================
 section_stdout() {
-  begin_section "9. stdout silence on the stdio transport (AC-W1-21, AC-W1-32; spec Open question 3 default)"
+  begin_section "9. stdout silence on the stdio transport (AC-W1-21, AC-W1-32, AC-W1-33; spec Open question 3 default)"
   new_env stdio || return
   HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG_STDIO" >"$ROOT/stdio.out" 2>"$ROOT/stdio.err" </dev/null &
   local pid=$! i=0 exited=0
@@ -735,6 +838,9 @@ section_stdout() {
   local eof_notes; eof_notes="$(count_re '^stdin closed · stdio MCP transport ended$' "$ROOT/stdio.err")"
   check "spec Open question 3 default: stderr has exactly one 'stdin closed · stdio MCP transport ended' line ($eof_notes)" [ "$eof_notes" = 1 ]
   check "AC-W1-32: the note is the last stderr line" [ "$(tail -1 "$ROOT/stdio.err")" = 'stdin closed · stdio MCP transport ended' ]
+  # AC-W1-33 (dry-run D1): the browser's CDP-socket teardown ERROR after the
+  # stdin-EOF exit is dropped by the quiesced reporter (it stays in the log).
+  check "AC-W1-33: no 'WS Connection error' line on stderr after the stdin-EOF exit" [ "$(count_fx 'WS Connection error' "$ROOT/stdio.err")" = 0 ]
   # AC-W1-32 names `aitm web` too: the same stdio config, bounded like the
   # bare run, nothing on stdout, the note exactly once and last.
   run_bounded "$ROOT/stdio-web.out" "$ROOT/stdio-web.err" 20 "$AITM_BIN" --config "$CFG_STDIO" web --no-open --listen "127.0.0.1:$WEB_PORT"
@@ -747,6 +853,7 @@ section_stdout() {
   eof_notes="$(count_re '^stdin closed · stdio MCP transport ended$' "$ROOT/stdio-web.err")"
   check "aitm web: stderr has exactly one 'stdin closed · stdio MCP transport ended' line ($eof_notes)" [ "$eof_notes" = 1 ]
   check "aitm web: the note is the last stderr line" [ "$(tail -1 "$ROOT/stdio-web.err")" = 'stdin closed · stdio MCP transport ended' ]
+  check "AC-W1-33: aitm web: no 'WS Connection error' line on stderr after the stdin-EOF exit" [ "$(count_fx 'WS Connection error' "$ROOT/stdio-web.err")" = 0 ]
   end_section "$ROOT/stdio.err" "$ROOT/stdio-web.err"
 }
 
@@ -838,9 +945,17 @@ section_liveenv() {
 # ===========================================================================
 section_perf() {
   begin_section "13. performance against the previous release (AC-W1-30)"
+  # The thread-COUNT comparison against 0.5.10 ("new == old") was retired
+  # (live dry-run D6): the W1 binary carries three named threads 0.5.10 does
+  # not — `aitm-audit-reads`, `aitm-audit-control`, `aitm-audit-agent`, main's
+  # durable audit log (#259), not this branch — so equality is wrong by
+  # construction. What AC-W1-30 guards is that no `aitm-term` thread outlives
+  # the ready card: that is the pass/fail below (SKIP when thread names cannot
+  # be read); both counts and the names present in the new binary but not in
+  # the old are printed as notes so a reviewer sees the audit threads explained.
   if [ -z "$AITM_OLD_BIN" ] || [ ! -x "$AITM_OLD_BIN" ]; then
     skip "one-shot timing vs the old binary (AITM_OLD_BIN unset or not executable)"
-    skip "thread count vs the old binary (same)"
+    skip "no aitm-term thread after the ready card (same)"
     return
   fi
   new_env perf || return
@@ -849,7 +964,7 @@ section_perf() {
   HOME="$HOME_DIR" "$AITM_OLD_BIN" --config "$CFG" scope list >/dev/null 2>&1 </dev/null; local ro=$?
   if [ "$rn" != 0 ] || [ "$ro" != 0 ]; then
     skip "one-shot timing (warm-up failed: new exit $rn, old exit $ro — the old binary may not read this config)"
-    skip "thread count (same)"
+    skip "no aitm-term thread after the ready card (same)"
     return
   fi
   local med_new med_old
@@ -860,19 +975,32 @@ section_perf() {
   start_server "$ROOT/thr-new.out" "$ROOT/thr-new.err" "$AITM_BIN" --config "$CFG"
   wait_for "$ROOT/thr-new.err" '^Log: ' 30 || note "new binary: ready card not seen (the server exited, or 30 s passed)"
   sleep 1
-  local tn; tn="$(thread_count "$SERVER_PID")"
-  if [ "$OS" != Darwin ]; then
-    check "no task named aitm-term after the ready card" [ "$(cat /proc/"$SERVER_PID"/task/*/comm 2>/dev/null | grep -c '^aitm-term$')" = 0 ]
-  fi
+  local tn tnames="$ROOT/thr-new.names" onames="$ROOT/thr-old.names" have_new=0 have_old=0
+  tn="$(thread_count "$SERVER_PID")"
+  thread_names "$SERVER_PID" "$tnames" && have_new=1
   stop_server
+  if [ "$have_new" = 1 ]; then
+    check "no thread named aitm-term after the ready card ($(wc -l <"$tnames" | tr -d ' ') thread names read, $(count_fx aitm-term "$tnames") aitm-term)" \
+      [ "$(count_fx aitm-term "$tnames")" = 0 ]
+  else
+    skip "no aitm-term thread after the ready card (thread names unavailable: \`sample\` missing, failed or over 60 s; or no /proc)"
+  fi
   start_server "$ROOT/thr-old.out" "$ROOT/thr-old.err" "$AITM_OLD_BIN" --config "$CFG"
   # 0.5.10 logs INFO on stdout.
   wait_for "$ROOT/thr-old.out" 'proxy listening' 30 || wait_for "$ROOT/thr-old.err" 'proxy listening' 5 || note "old binary: 'proxy listening' did not appear"
   sleep 1
   local to; to="$(thread_count "$SERVER_PID")"
+  thread_names "$SERVER_PID" "$onames" && have_old=1
   stop_server
-  note "threads after readiness: new=$tn old=$to"
-  check "thread counts differ by 0 (new=$tn old=$to)" [ "$tn" = "$to" ]
+  # Informational since D6 (see the heading comment): the counts and the names.
+  note "threads after readiness: new=$tn old=$to (informational; the count comparison was retired, dry-run D6)"
+  if [ "$have_new" = 1 ] && [ "$have_old" = 1 ]; then
+    local extra; extra="$(comm -23 <(sort -u "$tnames") <(sort -u "$onames") | tr '\n' ' ')"
+    note "thread names in new not in old: ${extra:-(none)}"
+    note "new binary's threads: $(sort "$tnames" | uniq -c | awk '{ c=$1; $1=""; sub(/^ /, ""); printf "%s%s× %s", (n++ ? ", " : ""), c, $0 }')"
+  else
+    note "thread names: new $([ "$have_new" = 1 ] && echo read || echo unavailable), old $([ "$have_old" = 1 ] && echo read || echo unavailable)"
+  fi
   end_section "$ROOT/thr-new.err"
 }
 
@@ -965,13 +1093,14 @@ section_tty() {
   # (i) aitm tui: phases, the clear, the alternate screen; `q` leaves only the header.
   cast="$ROOT/tui.cast"
   if start_feeder tui_feeder "$cast"; then
-    start_recording "$cast" "$FEEDER_FIFO" env TERM="$REC_TERM" "$AITM_BIN" --config "$CFG" tui
+    start_recording "$cast" env TERM="$REC_TERM" "$AITM_BIN" --config "$CFG" tui
+    [ -n "$REC_PID" ] || { note "aitm tui recording: aitm child of script(${SCRIPT_PID:-none}) not found"; recording_diag "$cast"; }
     local i=0
     while kill -0 "$SCRIPT_PID" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.25; i=$((i+1)); done
     kill -0 "$SCRIPT_PID" 2>/dev/null && note "aitm tui did not exit on 'q' within 50 s; sending Ctrl-C"
     end_recording INT
   else
-    note "aitm tui recording: cannot create a named pipe under $ROOT"
+    note "aitm tui recording: cannot open a feeder pipe"
   fi
   local verdict
   verdict="$(python3 - "$cast" "›•‹ aitmproxy $EXPECT_VERSION" <<'PY'
