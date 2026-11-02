@@ -1,0 +1,21 @@
+app pid=70391
+setup sheet: Not Now (try 1)
+window 34375 origin 461 -1264 size 1848 1126
+18:04:32.348 shot 10-status-before
+18:04:34.309 shot 11-scope-before
+18:04:38.596 shot 12-scope-after-0.7s
+core 70489 scope.list "structuredContent":["ok.test"],"isError":false}
+scope.json after ok.test: {"hosts":["ok.test"]}
+18:04:40.709 shot 13-status-after
+core pid 70489: SIGSTOP
+18:04:45.672 return pressed (core stopped)
+18:04:47.688 shot 20-busy-sending-2s
+18:05:19.789 shot 21-busy-queued-33s
+18:05:21.111 SIGCONT
+18:05:24.130 shot 22-busy-landed-3s-after-cont
+core 70489 scope.list "structuredContent":["ok.test","busy.test"],"isError":false}
+scope.json after SIGCONT: {"hosts":["ok.test"]}
+18:05:28.718 shot 23-busy-6s-after-cont
+core 70489 scope.list "structuredContent":["ok.test","busy.test"],"isError":false}
+leftovers: none
+busy exit 0

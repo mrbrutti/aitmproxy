@@ -1,0 +1,5 @@
+17:15:27.661 shot 6-queued-t0
+17:15:28.732 shot 7-queued-t0.5
+17:15:35.402 shot 8-landed-t6
+scope.list: "structuredContent":["a..host","queued.test","up.test"],"isError":false}
+proof2 exit 0
