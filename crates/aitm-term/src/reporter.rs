@@ -19,6 +19,9 @@
 //! thread and leaves the reporter in a synchronous plain-line mode so a late
 //! warning still prints (C10); only [`Reporter::note`] keeps its `✓` there,
 //! for the `stdin closed` line `main` prints after the serving loop ends.
+//! [`Reporter::quiesce`] marks that end: from then on tracing events are
+//! dropped at the door (the log file keeps them) while `note`, `warn` and
+//! `error` still print (spec D4/D7, AC-W1-33).
 //!
 //! The `Renderer` is pure over its inputs: time comes from a [`Clock`], the
 //! terminal width from an injected probe, and every byte goes to one
@@ -40,7 +43,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
@@ -679,6 +682,9 @@ struct Inner {
     /// Warnings and events dropped on a full queue, until the renderer
     /// reports them (S3).
     suppressed: Arc<AtomicUsize>,
+    /// Set by `quiesce` once the serving loop has ended: tracing events
+    /// are dropped at the door from then on (spec D4/D7, AC-W1-33).
+    quiesced: AtomicBool,
     state: Mutex<State>,
 }
 
@@ -737,6 +743,7 @@ impl Reporter {
                 home: OnceLock::new(),
                 next_id: AtomicU64::new(1),
                 suppressed,
+                quiesced: AtomicBool::new(false),
                 state: Mutex::new(State::Idle(renderer)),
             }),
         }
@@ -851,8 +858,26 @@ impl Reporter {
         self.send(Msg::Note(clean(line)));
     }
 
-    /// A WARN+ tracing event folded into the view (spec D7).
+    /// Marks the end of the serving loop on an orderly exit (spec D4/D7,
+    /// AC-W1-33): from now on a tracing event handed to [`Reporter::event`]
+    /// or to the [`Reporter::events`] sender is dropped before it touches
+    /// the queue or the post-`finish` synchronous path, so a dependency's
+    /// teardown noise (the browser's CDP socket closing logs an ERROR) is
+    /// never the operator's last line; the log file's own layer still
+    /// records it. `note`, `warn`, `error`, `card` and `finish` are
+    /// unaffected. Idempotent; never undone. A flag rather than a `Msg`
+    /// because `main` calls it after `finish()`, when no render thread
+    /// exists.
+    pub fn quiesce(&self) {
+        self.inner.quiesced.store(true, Ordering::Release);
+    }
+
+    /// A WARN+ tracing event folded into the view (spec D7); dropped once
+    /// the reporter is quiesced.
     pub fn event(&self, ev: UiEvent) {
+        if self.inner.quiesced.load(Ordering::Acquire) {
+            return;
+        }
         self.send(Msg::Event(sanitize_event(ev)));
     }
 
@@ -3522,5 +3547,167 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(sink.inner.text(), expected);
+    }
+
+    /// The chromiumoxide ERROR that reaches the `UiLayer` when `aitm` closes
+    /// the embedded browser during an orderly teardown (live dry-run D1).
+    fn ws_close_event() -> UiEvent {
+        UiEvent {
+            level: tracing::Level::ERROR,
+            target: "chromiumoxide::conn".to_string(),
+            message: "WS Connection error: Ws(Protocol(ResetWithoutClosingHandshake))".to_string(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Fix task (spec D4/D7, AC-W1-33, live dry-run D1): once the serving
+    /// loop has ended `main` quiesces the reporter, so a dependency's
+    /// teardown ERROR is no longer folded into the view while the reporter's
+    /// own `note`, `warn` and `error` still print. The hook runs after
+    /// `finish()`, when no render thread exists; a UTF-8 pipe is plain mode
+    /// with the `·` separator (the §9 stdin-EOF case).
+    #[test]
+    fn quiesce_drops_tracing_events_but_keeps_notes_and_warnings() {
+        const LINE: &str = "stdin closed · stdio MCP transport ended";
+
+        let sink = SharedSink::new();
+        let reporter =
+            Reporter::new(utf8_pipe(), Box::new(sink.clone()), Verbosity::Normal).checklist(true);
+        reporter.header("aitmproxy", "0.5.11");
+        reporter.phase("reading config").done("config defaults");
+        reporter.finish();
+        let before = sink.text();
+        assert_eq!(before, "aitmproxy 0.5.11\nconfig defaults\n");
+
+        reporter.quiesce();
+        reporter.event(ws_close_event());
+        assert_eq!(
+            sink.text(),
+            before,
+            "a quiesced reporter drops tracing events"
+        );
+        reporter.events().send(ws_close_event());
+        assert_eq!(sink.text(), before, "the UiLayer's sender honours it too");
+
+        reporter.note(LINE);
+        let mut expected = format!("{before}{LINE}\n");
+        assert_eq!(sink.text(), expected);
+
+        reporter.warn("late");
+        expected.push_str("warning: late\n");
+        assert_eq!(sink.text(), expected);
+
+        let report = port_report();
+        reporter.error(&report);
+        expected.push_str(&report.render_plain(reporter.glyphs()));
+        assert_eq!(sink.text(), expected);
+        assert!(
+            sink.text()
+                .contains("cannot start: the proxy port 127.0.0.1:8080 is already in use"),
+            "{:?}",
+            sink.text()
+        );
+
+        // Idempotent and never undone; a quiesce drop is not an S3
+        // suppression, so no `n warnings suppressed` line follows.
+        reporter.quiesce();
+        reporter.event(ws_close_event());
+        assert_eq!(sink.text(), expected);
+        assert!(!sink.text().contains("WS Connection error"));
+        assert!(!sink.text().contains("suppressed"));
+        assert_eq!(reporter.inner.suppressed.load(Ordering::Relaxed), 0);
+        no_escape_bytes(&sink);
+
+        // `Caps::plain()` proper (no UTF-8): the same rule, ASCII twins.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        reporter.finish();
+        reporter.quiesce();
+        reporter.event(ws_close_event());
+        reporter.note(LINE);
+        assert_eq!(sink.text(), "stdin closed - stdio MCP transport ended\n");
+        assert!(sink.bytes().iter().all(|b| *b < 0x80));
+    }
+
+    /// The flag is read where a `UiEvent` enters, so an event sent before
+    /// `quiesce()` is already in the queue and still prints when the
+    /// renderer drains, while one sent after it never reaches the channel,
+    /// through `event()` or through the `EventSender` alike.
+    #[test]
+    fn quiesce_is_not_retroactive_and_the_events_sender_honours_it() {
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(utf8_pipe(), Box::new(sink.clone()), Verbosity::Normal);
+        let sender = reporter.events();
+        reporter.event(ws_close_event());
+        sender.send(browser_event());
+        reporter.quiesce();
+        sender.send(ws_close_event());
+        reporter.event(browser_event());
+        reporter.warn("late");
+        reporter.finish();
+        assert_eq!(
+            sink.text(),
+            "error: WS Connection error: Ws(Protocol(ResetWithoutClosingHandshake))\n\
+             warning: embedded browser unavailable; browser.* commands will error engine=obscura error=nope\n\
+             warning: late\n"
+        );
+        assert_eq!(
+            reporter.inner.suppressed.load(Ordering::Relaxed),
+            0,
+            "a quiesce drop is not an S3 suppression"
+        );
+    }
+
+    /// On a TTY (the Ctrl-C case): after `finish()` the event is dropped
+    /// before the synchronous renderer sees it and the note keeps its `✓`;
+    /// before `finish()`, with the render thread live, the event never
+    /// reaches the queue, so the final frame holds only what was drawn.
+    #[test]
+    fn quiesce_on_a_tty_drops_the_event_and_keeps_the_note_glyph() {
+        const LINE: &str = "stdin closed · stdio MCP transport ended";
+        let frame = format!("›•‹ aitmproxy 0.5.11\n\n{BEGIN}{CLR}  ✓ config defaults\n{END}");
+
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let reporter = Reporter::with_clock(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+            clock.clone(),
+        )
+        .checklist(true);
+        reporter.header("aitmproxy", "0.5.11");
+        reporter.phase("reading config").done("config defaults");
+        reporter.finish();
+        assert_eq!(sink.text(), frame);
+        reporter.quiesce();
+        reporter.event(ws_close_event());
+        reporter.events().send(ws_close_event());
+        assert_eq!(sink.text(), frame, "nothing after the frame");
+        reporter.note(LINE);
+        let text = sink.text();
+        assert_eq!(
+            &text[frame.len()..],
+            "  ✓ stdin closed · stdio MCP transport ended\n"
+        );
+        assert!(!text.contains("WS Connection error"), "{text:?}");
+        assert!(!text.contains('✕'), "no failed glyph: {text:?}");
+
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let reporter = Reporter::with_clock(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+            clock.clone(),
+        )
+        .checklist(true);
+        reporter.header("aitmproxy", "0.5.11");
+        reporter.phase("reading config").done("config defaults");
+        reporter.quiesce();
+        reporter.event(ws_close_event());
+        reporter.events().send(ws_close_event());
+        reporter.finish();
+        assert_eq!(sink.text(), frame);
     }
 }

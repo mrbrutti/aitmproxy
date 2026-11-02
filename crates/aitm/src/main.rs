@@ -1102,6 +1102,9 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
                 Ok(())
             }
         };
+        // Spec D4 (AC-W1-33): the loop has ended; dependency teardown noise (the browser's
+        // CDP socket closing) now stays in the log instead of becoming the operator's last line.
+        reporter.quiesce();
         if let Some(line) = stdio_eof {
             reporter.note(line);
         }
