@@ -10,7 +10,8 @@
 
 mod rhai_harness;
 
-use aitm_scan_model::vocab::{Confidence, InsertionKind, Outcome};
+use aitm_scan_model::check::VerdictLocation;
+use aitm_scan_model::vocab::{Confidence, InsertionKind, Outcome, PointTrait};
 
 use rhai_harness::{active_path, point, run, Loaded, Replies};
 
@@ -62,7 +63,10 @@ async fn the_two_new_scripts_declare_one_check_each_with_valid_meta() {
     let meta = check.meta();
     assert_eq!(meta.id, "nosqli-json");
     assert_eq!(meta.class, "nosqli");
-    assert_eq!(meta.kinds, vec![InsertionKind::JsonValue]);
+    assert_eq!(
+        meta.kinds,
+        vec![InsertionKind::JsonValue, InsertionKind::EntireBody]
+    );
     assert_eq!(meta.cwe, Some(943));
     assert_eq!(
         nosqli.command_names(),
@@ -264,6 +268,265 @@ async fn the_new_scripts_find_their_vulnerable_shape_and_clear_the_patched_one()
         verdict.detail.contains("x-forwarded-host"),
         "the detail must name the response header, got: {}",
         verdict.detail
+    );
+}
+
+// --- nosqli-json, the `entire_body` shape: a whole JSON body, one operator
+// document per string field, each signal controlled by a string at the same
+// field (plan Task 11, spec amendment 65).
+
+/// The body the document branch is shown: a point's example as the HTTP lane
+/// hands it over, already scrubbed, so `password` reads `[redacted]`.
+const LOGIN_BODY: &str = r#"{"username":"alice","password":"[redacted]"}"#;
+
+/// A document with its spaces removed. Rhai's `to_json` is compact on the
+/// engine the scanner ships, but the spacing is not a contract across builds,
+/// while the key order is (a Rhai map is a `BTreeMap`, so `to_json` emits its
+/// keys sorted). No value in these documents holds a space.
+fn compact(text: &str) -> String {
+    text.replace(' ', "")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_places_an_operator_document_at_each_string_field_of_the_body() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let body_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/login",
+        Some(LOGIN_BODY),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    // The login route compares the document it was handed: `{"$ne": null}` at
+    // `password` logs in, the same operator at `username` does not, and the
+    // string control — the marker as a plain string — is refused like any
+    // wrong password. `[redacted]` answers every document that still carries
+    // the password *string*, which is every document whose operator sits at
+    // `username`.
+    let widened = Replies::plain(401, r#"{"ok":false}"#)
+        .when("[redacted]", 401, r#"{"ok":false}"#)
+        .when("aitm", 401, r#"{"ok":false}"#)
+        .when("$ne", 200, r#"{"ok":true,"marker":"m"}"#)
+        .build();
+    let verdict = run(&check, &body_point, &widened).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable);
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(
+        verdict.location,
+        Some(VerdictLocation {
+            path: None,
+            name: Some("password".to_string()),
+        }),
+        "the issue is located at the field the operator sat in"
+    );
+    assert_eq!(
+        verdict.evidence.matched.as_deref(),
+        Some(
+            "status 401 -> 200 with an operator at \"password\"; \
+             the string control answered 401"
+        )
+    );
+    // The evidence payload is the operator document the probe sent, through
+    // the bridge's mandatory `Verdict::scrubbed()`: `scrub_text_wide` masks
+    // the value of a `password` pair, and the value run of `"password":{…}`
+    // is the `{`, so the stored document reads `"password":[redacted]"$ne"…`.
+    // See the plan gap reported with this task: the plan asked for an
+    // `evidence.payload` that parses as JSON, which no document carrying a
+    // secret-named field can do once it is scrubbed. The document **on the
+    // wire** is asserted below, where nothing has scrubbed it.
+    assert_eq!(
+        verdict.evidence.payload.as_deref().map(compact),
+        Some(compact(
+            r#"{"password":[redacted]"$ne":null},"username":"alice"}"#
+        ))
+    );
+
+    assert_eq!(
+        widened
+            .payloads()
+            .iter()
+            .map(|sent| compact(sent))
+            .collect::<Vec<String>>(),
+        vec![
+            compact(r#"{"password":{"$ne":null},"username":"alice"}"#),
+            compact(&format!(
+                r#"{{"password":"aitm{MARKER}","username":"alice"}}"#
+            )),
+        ],
+        "the first string field answered the operator, so the control went to \
+         the same field and no second operator and no second field were spent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_is_clean_when_the_operator_is_refused() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let body_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/login",
+        Some(LOGIN_BODY),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    // A route that validates its body against a schema: an object where a
+    // string was declared is a 400, and the string control is the ordinary
+    // 401.
+    let refused = Replies::plain(401, r#"{"ok":false}"#)
+        .when("aitm", 401, r#"{"ok":false}"#)
+        .when("$ne", 400, r#"{"error":"password must be a string"}"#)
+        .when("$gt", 400, r#"{"error":"password must be a string"}"#)
+        .build();
+    let verdict = run(&check, &body_point, &refused).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean);
+    assert_eq!(
+        verdict.detail,
+        "A query-operator document at any string field of this JSON body did not change the answer."
+    );
+    assert_eq!(
+        refused
+            .payloads()
+            .iter()
+            .map(|sent| compact(sent))
+            .collect::<Vec<String>>(),
+        vec![
+            compact(r#"{"password":{"$ne":null},"username":"alice"}"#),
+            compact(r#"{"password":{"$gt":""},"username":"alice"}"#),
+            compact(r#"{"password":"[redacted]","username":{"$ne":null}}"#),
+            compact(r#"{"password":"[redacted]","username":{"$gt":""}}"#),
+        ],
+        "both operators are tried at both string fields, and no control is \
+         spent where no operator moved the answer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_is_inconclusive_when_the_example_is_not_the_document() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    // The example is cut: the lane shows a point's value up to a cap, and a
+    // document-level operator needs the document, not a prefix of it.
+    let cut_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/login",
+        Some(r#"{"username":"alice","password":"[redac"#),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    let host = Replies::plain(401, r#"{"ok":false}"#).build();
+    let verdict = run(&check, &cut_point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert_eq!(verdict.confidence, Confidence::Tentative);
+    assert_eq!(
+        verdict.detail,
+        "the JSON document is longer than the point's example; document-level operators need the whole body"
+    );
+    assert_eq!(verdict.evidence.payload, None);
+    assert_eq!(verdict.evidence.matched, None);
+    assert_eq!(
+        host.payloads(),
+        Vec::<String>::new(),
+        "no probe is spent on a document the check cannot rebuild"
+    );
+
+    // A cut that lands on the closing brace of a nested object still ends
+    // with `}`, so the whole document — not just its last character — has to
+    // be read before it is parsed.
+    let cut_at_a_brace = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/login",
+        Some(r#"{"username":"alice","profile":{"city":"lisbon"}"#),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+    let host = Replies::plain(401, r#"{"ok":false}"#).build();
+    let verdict = run(&check, &cut_at_a_brace, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert_eq!(
+        verdict.detail,
+        "the JSON document is longer than the point's example; document-level operators need the whole body"
+    );
+    assert_eq!(host.payloads(), Vec::<String>::new());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_visits_at_most_eight_string_fields_of_a_wide_body() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    // Ten string fields, in the key order a Rhai map keeps them in (sorted).
+    let wide = format!(
+        "{{{}}}",
+        (1..=10)
+            .map(|n| format!(r#""f{n:02}":"v""#))
+            .collect::<Vec<String>>()
+            .join(",")
+    );
+    let wide_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/search",
+        Some(&wide),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    // Nothing moves, so every operator document is spent and none is
+    // controlled.
+    let host = Replies::plain(401, r#"{"ok":false}"#).build();
+    let verdict = run(&check, &wide_point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean);
+    assert_eq!(
+        host.payloads().len(),
+        16,
+        "two operators at each of the first eight string fields, and no ninth \
+         field: an unbounded pass would have spent the job's whole probe budget"
+    );
+    assert!(
+        host.payloads()
+            .iter()
+            .all(|sent| !sent.contains(r#""f09":{"#) && !sent.contains(r#""f10":{"#)),
+        "no operator document sits at the ninth or tenth field, got {:?}",
+        host.payloads()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_meta_declares_both_kinds_and_wants_json() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let meta = check.meta();
+
+    assert_eq!(
+        meta.kinds,
+        vec![InsertionKind::JsonValue, InsertionKind::EntireBody],
+        "the value shape and the document shape (spec amendment 65)"
+    );
+    assert_eq!(
+        meta.wants_traits,
+        Some(vec![PointTrait::Json]),
+        "no probe is spent on a body that is not JSON"
+    );
+    assert!(
+        meta.needs_baseline,
+        "both shapes read the point's own baseline"
     );
 }
 
