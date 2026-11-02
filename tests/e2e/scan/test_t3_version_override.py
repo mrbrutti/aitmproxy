@@ -37,6 +37,7 @@ from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     boot_target,
+    require_checks,
     require_lane,
     require_verbs,
     start_job,
@@ -64,6 +65,9 @@ def main() -> None:
             op = BusClient.operator(core)
             require_verbs(op, "scan.start", "scan.status")
             require_lane(op, "http")
+            # The override is observable only through T3's HttpSender, which lands
+            # with its native checks (sqli-boolean is one of them): skip until then.
+            require_checks(op, "sqli-boolean", needs="needs T3 PR 2 (HttpSender wiring)")
 
             section("http.version: h1 forces h1 on a listener that offers h2")
             seq0 = v.logs.reset()

@@ -18,10 +18,15 @@ public struct OverviewBreakdowns: Hashable, Sendable {
         }
     }
 
+    /// One Apps group on the Clients bars: `key` is the group key (`ClientInfo.groupKey`,
+    /// the signing identifier when the rows have one, else the name) the bar narrows to and
+    /// shows as its tooltip; `name` is the display name of the first row seen with that key.
     public struct ClientCount: Hashable, Sendable {
+        public var key: String
         public var name: String
         public var count: Int
-        public init(_ name: String, _ count: Int) {
+        public init(key: String, name: String, count: Int) {
+            self.key = key
             self.name = name
             self.count = count
         }
@@ -29,7 +34,8 @@ public struct OverviewBreakdowns: Hashable, Sendable {
 
     /// Flows per HTTP method (HTTP and WebSocket rows only), most first, ties by label.
     public var methods: [MethodCount]
-    /// Flows per attributed client, most first, ties by name; rows without a client are skipped.
+    /// Flows per attributed client, grouped by `ClientInfo.groupKey`; most first, ties by
+    /// name, then by key (the same order as `ClientTree.clients`); rows without a client are skipped.
     public var clients: [ClientCount]
     /// Every raw-L4 row (`FlowRow.l4 != nil`), in capture order.
     public var l4Sessions: [FlowRow]
@@ -58,11 +64,9 @@ public struct OverviewBreakdowns: Hashable, Sendable {
             .sorted { $0.value == $1.value ? $0.key.label < $1.key.label : $0.value > $1.value }
             .map { MethodCount($0.key, $0.value) }
 
-        var byClient: [String: Int] = [:]
-        for row in http { if let name = row.client?.name { byClient[name, default: 0] += 1 } }
-        clients = byClient
-            .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-            .map { ClientCount($0.key, $0.value) }
+        // One grouping rule for the Apps tree and these bars (stage-6 Q-I1): group by `groupKey`,
+        // first row's name, count desc → name asc → key asc, all owned by `ClientTree.clients`.
+        clients = ClientTree.clients(in: http).map { ClientCount(key: $0.groupKey, name: $0.name, count: $1) }
 
         l4Sessions = rows.filter { $0.l4 != nil }
 

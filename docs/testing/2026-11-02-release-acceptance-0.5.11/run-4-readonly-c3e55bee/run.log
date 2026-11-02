@@ -1,0 +1,124 @@
+== release acceptance 0.5.11  2026-11-02T03:35:23Z
+   yes-list: (none: every machine-state step is SKIP)
+   manual:   0   window: 0   journeys: cli,mac,tui,web,negatives   cell timeout: 1200s
+   out:      /tmp/claude/acceptance/0.5.11/run-20261102T033523Z  (latest -> /tmp/claude/acceptance/0.5.11/latest)
+state-before.json recorded (scutil + per-service)
+state-before written
+   known secret values at start: 2
+
+---- cli-livecore  03:35:25
+mode: livecore   aitm: /opt/homebrew/bin/aitm -> ../Cellar/aitm/0.5.11/bin/aitm   HOME: /Users/matt
+8080 holder: aitm pid 98224   default ports: port 8080 held by aitm pid 98224
+
+CLI-0   SKIP    release run only; brew upgrade is Matt's
+CLI-4   FAIL    a core runs on 8080 (aitm pid 98224) but the one-shot printed "listening": false, "version": "0.5.11" (its own in-process state)
+CLI-5   FAIL    exit 0, printed 'acceptance-cli5.invalid' but the running core's scope.list does not contain it (false success; nothing to remove)
+N4-CLI  PASS    Error: cannot start: the proxy port 127.0.0.1:8080 is already in use.; 98 loader lines on stdout first
+CLI-9   SKIP    status read (exit 0: "managed_by_us": false "state": "off" ); set/unset need Matt's yes (ACCEPT_YES=CLI-9)
+CLI-10  BLOCKED MAC-8: the running core has no flows to compare against
+CLI-7   PASS    user installed=present trusted=yes (keychain has 1 aitmproxy cert); 98 loader lines before the JSON
+
+PASS=2 FAIL=2 SKIP/BLOCKED=3  outputs in /tmp/claude/acceptance/0.5.11/run-20261102T033523Z/cli
+
+---- mac  03:35:27
+MAC-0    SKIP    release run only; brew upgrade is Matt's
+N3-MAC   SKIP    CA stays trusted (un-trusting is Matt's yes; words read from source)
+N4-MAC   SKIP    needs a plain 8080 listener before launch — yes (it blocks his app's core)
+N5-MAC   SKIP    hand: Settings ▸ Bus field
+MAC-1    PASS    app running (bundle 0.5.11); embedded core pid 98224 listening 127.0.0.1:8080 version 0.5.11
+MAC-2    SKIP    needs the display-lock window (ACCEPT_WINDOW=1) to open the page and read it; expected words for the current state: system proxy off — Set as System Proxy so Sa
+MAC-3    SKIP    needs the display-lock window (ACCEPT_WINDOW=1) to open the page and read it; expected words for the current state: system proxy off — Set as System Proxy so Sa
+MAC-4    SKIP    needs the display-lock window (ACCEPT_WINDOW=1) to open the page and read it; expected words for the current state: system proxy off — Set as System Proxy so Sa
+N2-MAC   SKIP    needs the window (judged from the MAC-3 read)
+MAC-5    SKIP    needs the window (ACCEPT_WINDOW=1): types into the Edit Scope sheet; hosts ('example.com:80', 'httpbin.org:443')
+MAC-6    SKIP    needs Matt's yes (ACCEPT_YES=MAC-6) and the window
+MAC-7    SKIP    All Apps already on at start; needs the window to read 'All Apps is on' on the Status page
+MAC-8    BLOCKED needs MAC-5 and a route (MAC-6 or MAC-7)
+MAC-9a   BLOCKED no extension-captured rows (All Apps on but Scope empty → the extension claims nothing)
+MAC-9b   BLOCKED no proxied rows to judge
+MAC-10   BLOCKED needs MAC-8 rows, the window and a hand (reload in Safari)
+MAC-11   BLOCKED needs MAC-8 rows, the window and a hand (reload in Safari)
+MAC-12   BLOCKED needs MAC-8 rows, the window and a hand (reload in Safari)
+MAC-13   SKIP    needs the window (ACCEPT_WINDOW=1): Proxy ▸ Restart Core; Scope must survive
+N1-MAC   SKIP    needs the window and --manual (Restart Core, then an add within ~1 s after a focus re-probe)
+MAC-14   SKIP    All Apps was already on at start (operator's state) — not turned off by the run
+MAC-15   SKIP    nothing to restore (MAC-6 did not set it)
+MAC-16   SKIP    the app was already running at start; not quit by the run (Matt's app)
+
+---- n5  03:35:35
+N5-CLI   N/A     the one-shot refusal is CLI-6's row (no separate step on this surface)
+N5-TUI   PASS    exact refusal sentence shown; TUI stays open with the message
+N4-TUI   PASS    panel before any screen, exit 1
+N4-WEB   PASS    panel, exit 1, no card first
+
+---- tui  03:35:39
+TUI-1    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-2    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-3    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-4    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-5a   SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-5b   SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-6    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-7    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-8    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+N2-TUI   SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+TUI-9    N/A     no All Apps control on this surface
+TUI-10   N/A     no Apps view on this surface on 0.5.10
+N1-TUI   N/A     aitm tui owns its core on 0.5.10; the app's restart is seen only from aitm-tui --bus
+N3-TUI   SKIP    CA stays trusted (un-trusting is Matt's yes; words read from source)
+
+---- web  03:35:40
+WEB-1    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-2    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-3    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-4    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-5    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-6a   SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-6b   SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-6c   SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-6d   SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-7    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+N2-WEB   SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+N5-WEB   SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-8    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+WEB-9    N/A     no All Apps control on this surface
+WEB-10   N/A     no Apps view on this surface on 0.5.10
+N1-WEB   N/A     aitm web owns its core: a core restart under an open tab is not performable here (words pinned in D7)
+N3-WEB   SKIP    CA stays trusted (un-trusting is Matt's yes; words read from source)
+
+---- cli-nocore  03:35:41
+mode: nocore   aitm: /opt/homebrew/bin/aitm -> ../Cellar/aitm/0.5.11/bin/aitm   HOME: /Users/matt
+8080 holder: aitm pid 98224   default ports: port 8080 held by aitm pid 98224
+
+CLI-1   SKIP    port 8080 held by aitm pid 98224; the no-core half needs 8080, 8081 and 8082 free
+CLI-2   SKIP    port 8080 held by aitm pid 98224; the no-core half needs 8080, 8081 and 8082 free
+CLI-3   SKIP    port 8080 held by aitm pid 98224; the no-core half needs 8080, 8081 and 8082 free
+CLI-6   SKIP    port 8080 held by aitm pid 98224; the no-core half needs 8080, 8081 and 8082 free
+CLI-8   SKIP    port 8080 held by aitm pid 98224; the no-core half needs 8080, 8081 and 8082 free
+
+PASS=0 FAIL=0 SKIP/BLOCKED=5  outputs in /tmp/claude/acceptance/0.5.11/run-20261102T033523Z/cli
+
+---- restore diff (state-before vs state-after; timestamps and pids differ by design)
+DIFFERS:
+111,113d110
+< {"at":<ms>,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_d4ab833f2733e0a0-3","command":"scope.remove","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+< {"at":<ms>,"marker":"start","pid":31540,"schema":1,"stream":"control","version":"0.5.10"}
+< {"at":<ms>,"marker":"start","pid":57303,"schema":1,"stream":"control","version":"0.5.10"}
+115a113,115
+> {"at":<ms>,"marker":"start","pid":98877,"schema":1,"stream":"control","version":"0.5.11"}
+> {"at":<ms>,"marker":"start","pid":99071,"schema":1,"stream":"control","version":"0.5.11"}
+> {"at":<ms>,"marker":"start","pid":99077,"schema":1,"stream":"control","version":"0.5.11"}
+
+---- secret leak check (operator token value, agent token value, web #t= values, AITM_WEB_TOKEN)
+   known secret values: 2
+none
+report skeleton: /tmp/claude/acceptance/0.5.11/run-20261102T033523Z/README.md
+
+---- summary
+cli-livecore  FAIL  exit 1
+mac           SKIP  MAC-0    SKIP    release run only; brew upgrade is Matt's
+n5            PASS
+tui           SKIP  TUI-1    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+web           SKIP  WEB-1    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+cli-nocore    SKIP  CLI-1   SKIP    port 8080 held by aitm pid 98224; the no-core half needs 8080, 8081 and 8082 free
+VERDICT: FAIL (blocks the tap bump)

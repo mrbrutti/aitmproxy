@@ -1,0 +1,14 @@
+aitm under test: /opt/homebrew/bin/aitm (../Cellar/aitm/0.5.10/bin/aitm)
+HOME: /Users/matt (operator's real state; read-only verbs only)
+
+CLI-1  FAIL  exit 1; stdout 98 lines, stderr 189 lines; first stdout: [2m2026-11-02T02:08:26.230130Z[0m [32m INFO[0m [2maitm_plugin_rhai::loader[0m[2m:[0m loaded script [3mscript[0
+CLI-2  FAIL  exit 1; stdout 98 lines (49 Rhai loader lines); stderr first: expected a command before flags, got `--help`
+CLI-7  PASS  user.trusted=yes installed=present ; stdout has 49 loader lines before the JSON
+CLI-4  FAIL  a core runs on 8080 (aitm pid 78375) but the one-shot reports: "listening": false, version "version": "0.5.10" (its own in-process state)
+CLI-5  INFO  exit 0, printed: acceptance-cli5.invalid — verify with bus_truth.py: scope.list of the running core must contain acceptance-cli5.invalid, else FAIL (false success)
+CLI-6  SKIP  a core is running (aitm pid 78375); the no-core case needs the app quit
+N4-CLI PASS  Error: cannot start: the proxy port 127.0.0.1:8080 is already in use.
+CLI-3  SKIP  port 8080 held by aitm pid 78375 (the app's embedded core); needs the app quit
+CLI-8  SKIP  same
+
+PASS=2 FAIL=3 SKIP=3  outputs in /tmp/claude/acceptance/cli

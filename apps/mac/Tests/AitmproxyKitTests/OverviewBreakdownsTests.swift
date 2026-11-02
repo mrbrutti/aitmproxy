@@ -56,6 +56,23 @@ private enum OverviewBreakdownInputs {
     static let l4Rows: [FlowRow] = l4Flows.enumerated().map { $0.element.row(seq: 11 + $0.offset, inScope: true) }
 }
 
+/// The AI-AC7 rows (spec 2026-10-31-mac-app-icons-and-names, D4): two identifiers that share
+/// the name "Google Chrome (Service)", one owner, and a proxied flow with no client at all.
+/// Built here with literal values; `ClientTreeTests` and `OverviewTests` carry their own copy.
+private enum AppRows {
+    static func row(_ id: String, _ seq: Int, _ host: String, _ client: ClientInfo?) -> FlowRow {
+        FlowRow(id: FlowID(id), seq: seq, method: .get, scheme: "https", authority: host, path: "/", client: client)
+    }
+
+    static let chrome = ClientInfo(name: "Google Chrome", bundleID: "com.google.Chrome")
+    static let a = row("A", 1, "a.example", chrome)
+    static let b = row("B", 2, "a.example", ClientInfo(name: "Google Chrome (Service)", bundleID: "com.google.Chrome.helper"))
+    static let c = row("C", 3, "a.example", chrome)
+    static let d = row("D", 4, "b.example",
+                       ClientInfo(name: "Google Chrome (Service)", bundleID: "com.google.Chrome.helper.renderer"))
+    static let e = row("E", 5, "c.example", nil)
+}
+
 /// The Overview's lower half over HTTP/WS rows plus L4 rows.
 @Suite struct OverviewBreakdownsTests {
     static let rows = OverviewBreakdownInputs.rows + OverviewBreakdownInputs.l4Rows
@@ -140,5 +157,17 @@ private enum OverviewBreakdownInputs {
         #expect(b.largest.isEmpty)
         #expect(b.methodMax == 0)
         #expect(b.clientMax == 0)
+    }
+
+    /// AI-AC11: the Clients bars group by group key, keep the first row's name as the label,
+    /// and order count desc, then name asc, then key asc — so the two "(Service)" rows of one
+    /// owner stay two bars in a fixed order and the row with no client adds nothing.
+    @Test func clientBarsAreKeyedByIdentifier() {
+        let b = OverviewBreakdowns(rows: [AppRows.a, AppRows.b, AppRows.c, AppRows.d, AppRows.e])
+        #expect(b.clients.map(\.key) == ["com.google.Chrome", "com.google.Chrome.helper", "com.google.Chrome.helper.renderer"])
+        #expect(b.clients.map(\.name) == ["Google Chrome", "Google Chrome (Service)", "Google Chrome (Service)"])
+        #expect(b.clients.map(\.count) == [2, 1, 1])
+        #expect(b.clientMax == 2)
+        #expect(b.clients[0] == OverviewBreakdowns.ClientCount(key: "com.google.Chrome", name: "Google Chrome", count: 2))
     }
 }
