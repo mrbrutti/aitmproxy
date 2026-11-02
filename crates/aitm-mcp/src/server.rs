@@ -980,6 +980,23 @@ struct Services {
 
 type OnBound = Box<dyn FnOnce(SocketAddr) + Send>;
 
+/// The serving half shared by [`McpServer::serve`]'s loopback arm and
+/// [`McpServer::serve_on`]: report the bound address, publish the core pointer
+/// (spec D4: written when the listener starts serving, only under a published
+/// process context), then accept connections until the listener fails. The
+/// listener, and with it the pointer, drops when this returns.
+async fn serve_listener(
+    server: Arc<McpServer>,
+    on_bound: Option<OnBound>,
+    mut listener: LoopbackTcp,
+) -> anyhow::Result<()> {
+    if let Some(f) = on_bound {
+        f(listener.local_addr());
+    }
+    listener.publish_pointer();
+    listener.serve(server).await
+}
+
 /// The wire string for a connection's role in the `initialize` echo (Decision C):
 /// `"operator"` for the operator role, `"agent"` for every other frontend. The
 /// two strings are a fixed part of the additive protocol.
@@ -1446,6 +1463,58 @@ impl McpServer {
     /// `tools/list` enumerates every registered command; `tools/call` →
     /// `Command::invoke`.
     pub async fn serve(self) -> anyhow::Result<()> {
+        let (server, on_bound, selected) = self.into_shared();
+        match selected {
+            McpTransport::Stdio => transport::serve_stdio(server).await,
+            McpTransport::LoopbackTcp {
+                port,
+                token,
+                endpoint_file,
+            } => {
+                let operator_token = server.operator_token.clone().map(|t| t.to_string());
+                let listener = LoopbackTcp::bind(port, token, endpoint_file)
+                    .await?
+                    .with_operator_token(operator_token);
+                serve_listener(server, on_bound, listener).await
+            }
+            McpTransport::StreamableHttp {
+                bind,
+                token,
+                allowed_origins,
+                path,
+            } => {
+                let listener = StreamableHttp::bind(StreamableHttpCfg {
+                    bind,
+                    token,
+                    allowed_origins,
+                    path,
+                })
+                .await?;
+                if let Some(f) = on_bound {
+                    f(listener.local_addr());
+                }
+                listener.serve(server).await
+            }
+        }
+    }
+
+    /// Serve an already-bound loopback listener until it fails (spec D2): the
+    /// dedicated operator bus binds with [`LoopbackTcp::bind_operator_only`]
+    /// before the ready card, then hands the listener here. `on_bound` fires
+    /// with the bound address, the core pointer is published
+    /// ([`LoopbackTcp::publish_pointer`], a no-op without a process context),
+    /// and the token-gated accept loop runs. The `transport` this server was
+    /// built with is a label only on this path.
+    pub async fn serve_on(self, listener: LoopbackTcp) -> anyhow::Result<()> {
+        let (server, on_bound, _label) = self.into_shared();
+        serve_listener(server, on_bound, listener).await
+    }
+
+    /// The field move behind [`McpServer::serve`] and [`McpServer::serve_on`]:
+    /// the shared server every connection task clones (its `on_bound` slot
+    /// emptied, the push dispatcher spawned), the `on_bound` hook taken out of
+    /// it, and the transport it was built with.
+    fn into_shared(self) -> (Arc<McpServer>, Option<OnBound>, McpTransport) {
         let McpServer {
             registry,
             transport: selected,
@@ -1484,7 +1553,7 @@ impl McpServer {
             config,
             finding_recorder,
             egress,
-            operator_token: operator_token.clone(),
+            operator_token,
             stdio_role,
             agent_state,
             subscriptions,
@@ -1502,40 +1571,7 @@ impl McpServer {
             approval_timeout,
         });
         server.spawn_push_dispatcher();
-        match selected {
-            McpTransport::Stdio => transport::serve_stdio(server).await,
-            McpTransport::LoopbackTcp {
-                port,
-                token,
-                endpoint_file,
-            } => {
-                let listener = LoopbackTcp::bind(port, token, endpoint_file)
-                    .await?
-                    .with_operator_token(operator_token.map(|t| t.to_string()));
-                if let Some(f) = on_bound {
-                    f(listener.local_addr());
-                }
-                listener.serve(server).await
-            }
-            McpTransport::StreamableHttp {
-                bind,
-                token,
-                allowed_origins,
-                path,
-            } => {
-                let listener = StreamableHttp::bind(StreamableHttpCfg {
-                    bind,
-                    token,
-                    allowed_origins,
-                    path,
-                })
-                .await?;
-                if let Some(f) = on_bound {
-                    f(listener.local_addr());
-                }
-                listener.serve(server).await
-            }
-        }
+        (server, on_bound, selected)
     }
 
     /// Handle one JSON-RPC message with a default agent connection
