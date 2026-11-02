@@ -285,20 +285,77 @@ import Testing
               src: 127.0.0.1
               dst: 127.0.0.1
           - udp:
-              sport: 40000
-              dport: 9
-          - raw:
-              data: "hello"
+              src_port: 40000
+              dst_port: 9
+          - raw: "hello"
         """
         let value = try #require(PacketSpecDraft.parse(yaml))
         let layers = try #require(value["layers"]?.arrayValue)
         #expect(layers.count == 3)
-        #expect(layers[0].objectValue?.keys.contains("ipv4") == true)
-        #expect(layers[1]["udp"]?["dport"]?.intValue == 9)
-        #expect(layers[2]["raw"]?["data"]?.stringValue == "hello")
+        #expect(layers[0]["ipv4"]?["src"]?.stringValue == "127.0.0.1")
+        #expect(layers[0]["ipv4"]?["dst"]?.stringValue == "127.0.0.1")
+        // The map layers keep the core's field names (`PacketSpec`: src_port / dst_port).
+        #expect(layers[1]["udp"]?["src_port"]?.intValue == 40000)
+        #expect(layers[1]["udp"]?["dst_port"]?.intValue == 9)
+        // A scalar `raw` is the payload's UTF-8 bytes, not a `{data: …}` map.
+        #expect(layers[2]["raw"] == .array([104, 101, 108, 108, 111]))
         // Empty / malformed drafts fail cleanly rather than crafting nothing.
         #expect(PacketSpecDraft.parse("") == nil)
         #expect(PacketSpecDraft.parse("not: a packet") == nil)
+    }
+
+    /// L4PAR-AC27 (Kit half; plan M3a): the craft editor's starting text is a spec
+    /// `l4.craft` accepts — `udp.src_port` / `udp.dst_port` (the core's `PacketSpec`
+    /// names, not `sport` / `dport`) and `raw` as a byte list (the core's
+    /// `Layer::Raw(Vec<u8>)`), never a `{data: "…"}` map. The core answers this
+    /// sample with `length 36` (M9's live check over the bus).
+    @Test func testSampleSpecIsWhatTheCoreAccepts() throws {
+        let value = try #require(PacketSpecDraft.parse(PacketSpecDraft.sample))
+        let expected: JSONValue = .object([
+            "layers": .array([
+                .object(["ipv4": .object(["src": .string("127.0.0.1"), "dst": .string("127.0.0.1")])]),
+                .object(["udp": .object(["src_port": 40000, "dst_port": 9])]),
+                .object(["raw": .array([104, 101, 108, 108, 111, 45, 108, 52])]),
+            ]),
+        ])
+        #expect(value == expected)
+
+        // What actually goes over the bus: the compact serialization. The byte list
+        // is JSON integers (the core rejects floats), and none of the rejected keys
+        // appear anywhere — not in the sample text either.
+        let wire = value.serialized()
+        #expect(wire.contains(#""raw":[104,101,108,108,111,45,108,52]"#))
+        // `JSONValue.number` is a Double; a whole number must print as `104`, never
+        // `104.0`. (`127.0.0.1` legitimately contains `.0`, so look only where a
+        // number ends: before `,`, `]` or `}`.)
+        for end in [",", "]", "}"] {
+            #expect(!wire.contains(".0" + end), "a float reached the wire before \(end)")
+        }
+        for rejected in ["sport", "dport", "data"] {
+            #expect(!wire.contains(rejected), "rejected key \(rejected) on the wire")
+            #expect(!PacketSpecDraft.sample.contains(rejected), "rejected key \(rejected) in the sample")
+        }
+        #expect(wire == #"{"layers":[{"ipv4":{"dst":"127.0.0.1","src":"127.0.0.1"}},{"udp":{"dst_port":9,"src_port":40000}},{"raw":[104,101,108,108,111,45,108,52]}]}"#)
+
+        // The block style is the human-friendly form (the scripting rule): the
+        // sample is what the editor shows, not a one-line flow mapping.
+        #expect(PacketSpecDraft.sample.hasPrefix("layers:\n  - ipv4:\n"))
+        #expect(PacketSpecDraft.sample.contains("  - raw: \"hello-l4\"\n") || PacketSpecDraft.sample.hasSuffix("  - raw: \"hello-l4\""))
+
+        // A `raw` layer may also be written as an explicit byte list.
+        let list = try #require(PacketSpecDraft.parse("layers:\n  - raw: [1, 2, 255]"))
+        #expect(list == .object(["layers": .array([.object(["raw": .array([1, 2, 255])])])]))
+        #expect(list.serialized() == #"{"layers":[{"raw":[1,2,255]}]}"#)
+
+        // A `#` inside the quoted payload is payload, not a comment.
+        let hash = try #require(PacketSpecDraft.parse("layers:\n  - raw: \"a#b\" # trailing comment"))
+        #expect(hash["layers"]?[0]?["raw"] == .array([97, 35, 98]))
+
+        // Out-of-range or non-integer list members are not bytes: the draft fails
+        // cleanly instead of crafting something the core would reject later.
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: [1, 256]") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: [1.5]") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: hello") == nil)
     }
 
     /// The `l4.craft` result (bytes base64 + a layer summary) renders a hex preview

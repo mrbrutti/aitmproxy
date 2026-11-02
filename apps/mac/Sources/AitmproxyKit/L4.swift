@@ -737,10 +737,28 @@ public struct L4AgentGates: Hashable, Sendable {
 /// A bounded parser for the human-friendly YAML `PacketSpec` the craft editor
 /// authors (the project's human-friendly-scripting rule: readable, not agent-only).
 /// It handles exactly the `PacketSpec` shape — a `layers:` list whose items are
-/// single-key maps (`ipv4:` / `udp:` / `tcp:` / `icmp:` / `ether:` / `ipv6:` /
-/// `raw:`) of scalar `key: value` fields — and produces the `{layers: […]}` object
-/// `l4.craft` expects. The core validates the spec; this only shapes it.
+/// single-key maps (`ipv4:` / `udp:` / `tcp:` / `icmp:` / `ether:` / `ipv6:`) of
+/// scalar `key: value` fields, plus a `raw:` layer whose value is a scalar — a
+/// quoted UTF-8 string or a `[n, n, …]` byte list — and produces the
+/// `{layers: […]}` object `l4.craft` expects, with `raw` as a JSON integer list
+/// (the core's `Layer::Raw(Vec<u8>)`). The core validates the spec; this only
+/// shapes it.
 public enum PacketSpecDraft {
+    /// The craft editor's starting text (L4PAR-AC27): the spec `l4.craft` accepts,
+    /// with the core's `PacketSpec` field names (`src_port` / `dst_port`, never
+    /// `sport` / `dport`) and the payload as a `raw` scalar. The core builds it to
+    /// 36 bytes (20 IPv4 + 8 UDP + 8 payload).
+    public static let sample = """
+    layers:
+      - ipv4:
+          src: 127.0.0.1
+          dst: 127.0.0.1
+      - udp:
+          src_port: 40000
+          dst_port: 9
+      - raw: "hello-l4"
+    """
+
     public static func parse(_ yaml: String) -> JSONValue? {
         var lines: [(indent: Int, text: String)] = []
         for raw in yaml.split(separator: "\n", omittingEmptySubsequences: false) {
@@ -752,20 +770,28 @@ public enum PacketSpecDraft {
         guard let first = lines.first, first.text == "layers:" || first.text.hasPrefix("layers:") else { return nil }
 
         var layers: [JSONValue] = []
-        var current: (key: String, fields: [String: JSONValue])?
+        // A layer under construction: a map of scalar fields, or — for a scalar
+        // `raw:` — the byte list itself.
+        var current: (key: String, fields: [String: JSONValue], scalar: JSONValue?)?
         func flush() {
-            if let current { layers.append(.object([current.key: .object(current.fields)])) }
+            guard let current else { return }
+            layers.append(.object([current.key: current.scalar ?? .object(current.fields)]))
         }
         for line in lines.dropFirst() {
             if line.text.hasPrefix("- ") {
-                // A new layer item: `- udp:` (optionally with a field on the same line).
+                // A new layer item: `- udp:` (fields follow, indented) or
+                // `- raw: "payload"` / `- raw: [1, 2]` (the value on the same line).
                 flush()
                 current = nil
                 let item = String(line.text.dropFirst(2))
-                if let key = layerKey(item) {
-                    current = (key, [:])
-                } else { return nil }
-            } else if var current0 = current, let (k, v) = scalar(line.text) {
+                guard let (key, inline) = layerKey(item) else { return nil }
+                if key == "raw", !inline.isEmpty {
+                    guard let bytes = rawBytes(inline) else { return nil }
+                    current = (key, [:], bytes)
+                } else {
+                    current = (key, [:], nil)
+                }
+            } else if var current0 = current, current0.scalar == nil, let (k, v) = scalar(line.text) {
                 current0.fields[k] = v
                 current = current0
             }
@@ -776,15 +802,38 @@ public enum PacketSpecDraft {
         return .object(["layers": .array(layers)])
     }
 
-    /// `udp:` or `udp: {…}` → the layer key when it names a known layer.
-    private static func layerKey(_ item: String) -> String? {
+    /// `udp:` or `raw: "hi"` → the layer key when it names a known layer, and
+    /// whatever follows the colon on the same line (trimmed; empty for `udp:`).
+    private static func layerKey(_ item: String) -> (key: String, inline: String)? {
         guard let colon = item.firstIndex(of: ":") else { return nil }
         let key = String(item[..<colon]).trimmingCharacters(in: .whitespaces).lowercased()
         let known = ["ether", "ipv4", "ipv6", "tcp", "udp", "icmp", "raw"]
-        return known.contains(key) ? key : nil
+        guard known.contains(key) else { return nil }
+        let inline = String(item[item.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        return (key, inline)
     }
 
-    /// `src: 127.0.0.1` / `dport: 9` / `data: "hi"` → a key and a typed scalar.
+    /// A `raw` payload scalar → its bytes as JSON integers: `"hello"` is the
+    /// string's UTF-8; `[104, 105]` is taken as written, each member an integer in
+    /// `0...255`. Anything else (an unquoted word, a float, an out-of-range
+    /// member) is not a payload, and the draft fails rather than reaching the core.
+    private static func rawBytes(_ text: String) -> JSONValue? {
+        if text.hasPrefix("\"") && text.hasSuffix("\"") && text.count >= 2 {
+            let payload = String(text.dropFirst().dropLast())
+            return .array(payload.utf8.map { .number(Double($0)) })
+        }
+        if text.hasPrefix("[") && text.hasSuffix("]") && text.count >= 2 {
+            var bytes: [JSONValue] = []
+            for part in text.dropFirst().dropLast().split(separator: ",", omittingEmptySubsequences: true) {
+                guard let n = Int(part.trimmingCharacters(in: .whitespaces)), (0...255).contains(n) else { return nil }
+                bytes.append(.number(Double(n)))
+            }
+            return .array(bytes)
+        }
+        return nil
+    }
+
+    /// `src: 127.0.0.1` / `dst_port: 9` / `flags: "syn"` → a key and a typed scalar.
     private static func scalar(_ text: String) -> (String, JSONValue)? {
         guard let colon = text.firstIndex(of: ":") else { return nil }
         let key = String(text[..<colon]).trimmingCharacters(in: .whitespaces)
