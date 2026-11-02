@@ -791,6 +791,7 @@ Kept by the main session during stage 6. One row per finding.
 | 17 | quality | PASS | seven Minor: `PROMPT_FRAME_ROWS` overstates the trailer without a footnote; two dead `wire_confirm_from` writes; `help_scope_add_l4` wrapper vs the reducer's spelling; stale test name; two doc comments; two `unavailable — <reason>` pane strings pinned out of crate; two reply idioms on one `WireConfirm` | J2-J6; pane strings a follow-up for the L4 parity owner (H19 rule); two idioms accepted |
 | 17 | spec | PASS | four Minor: D7/Task 3 footnote letter; D3 lacks `ConfirmReply`/`classify` and the `Mode::Scope` return; the two test-precondition hunks (`scan_v2_confirm.rs` `L4Availability`, `scan_v2_launch.rs` `l4.pending`) outside the "conflicting hunks" letter; `quality_toast_text_renders_inert` title | spec D3/D7 and Task 3 amended (this commit); precondition hunks ratified as semantic-merge necessities (B10 honest availability, name-bound pending); J5 |
 | J | fix round | dispatched | `docs/superpowers/plans/2026-11-01-aitmproxy-scanner-v2-t7-fix-round-j.md` J1-J6 | crate gate, workspace gate, live run, push |
+| J | fix round | done | J1 `eb3bf1c4` (`forget_inflight` clears `l4.pending`; test `a_disconnect_clears_the_pending_l4_call_so_the_control_is_live_again`), J2-J6 `62b291c6` (footnote-derived frame, `PROMPT_FRAME_ROWS` gone; one `wire_confirm_from` writer; `help()` calls `supports_operator_scope_add` directly; two test renames; two docs); crate gate 638 passed | merge main `dd03860a` (v0.5.12 bump, clean), workspace gate, live run, push |
 
 ## Shipped
 
