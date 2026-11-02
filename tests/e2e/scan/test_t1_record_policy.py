@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aitm_e2e import check, fail, free_port, ok, section, skip  # noqa: E402
+from aitm_e2e import check, fail, free_port, ok, section  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
@@ -33,7 +33,6 @@ from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     TERMINAL_STATES,
     boot_target,
-    lane_source,
     require_verbs,
     scan_call,
     start_job,
@@ -132,15 +131,9 @@ def main() -> int:
               f"at least one issue-evidence probe flow was kept by issues_only ({len(probe_rows)} non-crawl scan row(s))")
         no_issue = [(r.get("id"), r.get("path")) for r in probe_rows
                     if not any(m.startswith("issue:") for m in marks_of(r))]
-        seed_paths = {"/robots.txt", "/sitemap.xml"}
-        if no_issue and all(path in seed_paths for _, path in no_issue) and lane_source(op, "http") == "crate":
-            # The lane crate (aitm-scan-http, #295 "seeds are not pages") fetches
-            # /robots.txt and /sitemap.xml as seeds through the recording client
-            # without the `crawl` mark, so they land in the store as probe rows
-            # with no issue — a record-policy gap in the lane, not the engine
-            # (the interim lane marks every crawl fetch). Loud, never green.
-            skip(f"http lane crate stores its seed fetches without the crawl mark (record policy, "
-                 f"amendment candidate for T2): {no_issue}")
+        # Amendment 79 (T2 follow-up): the lane crate's /robots.txt and /sitemap.xml
+        # seed fetches bypass the recorder, so no seed row can appear here; the
+        # assertion below is hard on both lane sources.
         check(not no_issue, f"no probe flow without an issue: every non-crawl scan row carries issue:<id> "
               f"(offenders: {no_issue[:5]})")
         n_target = len(target.logs.scanner_requests(seq0))

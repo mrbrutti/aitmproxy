@@ -335,17 +335,22 @@ impl fmt::Display for StopReason {
 /// `transport`, `other` — a closed set, so the engine's `crawl.errors` log and
 /// any frontend reading it never see a foreign error string.
 ///
-/// Type wins over text. The chain is walked twice, outermost context inwards:
+/// H2 negotiation wins over type, and type wins over text. The chain is walked
+/// three times, outermost context inwards:
 ///
-/// 1. **Typed.** A link whose concrete type the crate can see decides on its
+/// 1. **H2 negotiation.** Any link whose text carries `h2_not_negotiated:`
+///    (the literal `aitm-proto-http/src/sender.rs` writes, which this crate
+///    cannot see as a type because it depends on `aitm-core` only) decides the
+///    whole chain as `h2_not_negotiated`, wherever it sits and whatever
+///    refused-shaped link was wrapped above or below it: a forced-h2 failure
+///    arrives with a transport refusal in the same chain, and reading that
+///    first mis-tokenised it `connect_refused` (amendment 78).
+/// 2. **Typed.** A link whose concrete type the crate can see decides on its
 ///    own, whatever prose was wrapped around it: a `std::io::Error` of kind
 ///    `ConnectionRefused` is `connect_refused`, `TimedOut` is `timeout`, and
 ///    `ConnectionReset`, `BrokenPipe`, `UnexpectedEof` or `ConnectionAborted`
-///    is `transport`; a `tokio::time::error::Elapsed` is `timeout`; a link
-///    whose text starts with `h2_not_negotiated:` (the literal
-///    `aitm-proto-http/src/sender.rs` writes, which this crate cannot see as a
-///    type because it depends on `aitm-core` only) is `h2_not_negotiated`.
-/// 2. **Text.** Only when no link is typed: the first link whose words read as
+///    is `transport`; a `tokio::time::error::Elapsed` is `timeout`.
+/// 3. **Text.** Only when no link is typed: the first link whose words read as
 ///    a token wins, in the order `connect_refused`, `timeout`, `tls`,
 ///    `transport`. These rules exist for a browser driver's error, which has
 ///    already been flattened to a scrubbed string by the time it arrives. A
@@ -354,6 +359,15 @@ impl fmt::Display for StopReason {
 ///    typed link says otherwise.
 pub(crate) fn crawl_error_token(err: &anyhow::Error) -> &'static str {
     use std::io::ErrorKind;
+
+    // `contains`, not `starts_with`: an `anyhow` context or a flattened
+    // `{:#}` leaves the token after a prefix in the same link.
+    if err
+        .chain()
+        .any(|link| link.to_string().contains("h2_not_negotiated:"))
+    {
+        return "h2_not_negotiated";
+    }
 
     for link in err.chain() {
         if let Some(io) = link.downcast_ref::<std::io::Error>() {
@@ -369,9 +383,6 @@ pub(crate) fn crawl_error_token(err: &anyhow::Error) -> &'static str {
         }
         if link.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
             return "timeout";
-        }
-        if link.to_string().starts_with("h2_not_negotiated:") {
-            return "h2_not_negotiated";
         }
     }
 
@@ -737,6 +748,55 @@ mod tests {
             )),
             "other"
         );
+    }
+
+    /// Amendment 78: an h2-negotiation failure classifies before any
+    /// transport refusal, whichever way the chain nests. T1b measured a
+    /// forced-h2 failure as `connect_refused`: a refused-shaped link sat above
+    /// the sender's `h2_not_negotiated:` link and the typed pass read it first.
+    #[test]
+    fn crawl_error_token_reads_h2_not_negotiated_before_a_refusal() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        /// A refused-shaped link whose `source` is the sender's h2 verdict.
+        #[derive(Debug)]
+        struct Refused(anyhow::Error);
+        impl std::fmt::Display for Refused {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("connection to t:8443 refused")
+            }
+        }
+        impl std::error::Error for Refused {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                let source: &(dyn std::error::Error + 'static) = &*self.0;
+                Some(source)
+            }
+        }
+
+        // A typed `ConnectionRefused` outermost, the h2 link beneath it.
+        let h2 = anyhow::anyhow!("h2_not_negotiated: t:8443: ALPN offered http/1.1");
+        let typed_outer =
+            anyhow::Error::new(IoError::new(ErrorKind::ConnectionRefused, Refused(h2)))
+                .context("crawl: fetch failed");
+        assert_eq!(crawl_error_token(&typed_outer), "h2_not_negotiated");
+
+        // The same chain flattened into one refused-typed link, the token
+        // after a context prefix rather than at the start.
+        let flattened = anyhow::Error::new(IoError::new(
+            ErrorKind::ConnectionRefused,
+            "connection refused: h2_not_negotiated: t:8443: ALPN offered http/1.1",
+        ));
+        assert_eq!(crawl_error_token(&flattened), "h2_not_negotiated");
+
+        // Prose "connection refused" outermost, the h2 link beneath it.
+        let text_outer = anyhow::anyhow!("h2_not_negotiated: t:8443: ALPN offered http/1.1")
+            .context("connection refused");
+        assert_eq!(crawl_error_token(&text_outer), "h2_not_negotiated");
+
+        // The reverse nesting: the h2 link outermost over a typed refusal.
+        let reversed = anyhow::Error::new(IoError::new(ErrorKind::ConnectionRefused, "nope"))
+            .context("h2_not_negotiated: t:8443: ALPN offered http/1.1");
+        assert_eq!(crawl_error_token(&reversed), "h2_not_negotiated");
     }
 
     /// S-M3: a frontier holds queued and visited URLs, and a stored seed

@@ -570,7 +570,10 @@ of the **first** claim, and the clash is logged and reported by
 **The point map.** The closure receives `#{ kind, name, path, url, method,
 example, traits }`. `path`, `url`, `method` and `example` are `()` when the lane
 has none; `traits` is an array of trait tokens (`url`, `filename`, `number`,
-`email`, `base64`, `json`, `id`, `session`).
+`email`, `base64`, `json`, `id`, `session`, `structured`). `structured` marks a
+whole-document point — the `entire_body` of a JSON or XML body — rather than
+one field of it; it is information, not a filter: a check still says which
+`kinds` it wants.
 
 **The verdict.** Return one of three things:
 
