@@ -11,10 +11,12 @@
 //! paths*, not as permission: this is an authorised scan of the operator's own
 //! target, where the whole point is to reach what a crawler would not.
 //!
-//! Every GET here goes through the job's client with the marks the lane hands
-//! it (the job mark `scan:<job>` alone, spec D5: a seed fetch is not a crawled
-//! page, so the lane gives it no `crawl` mark and the engine's page count is
-//! untouched), carries the session, is bounded by
+//! Every GET here goes through the job's client with the options the lane
+//! hands it (the job mark `scan:<job>` alone, spec D5: a seed fetch is not a
+//! crawled page, so the lane gives it no `crawl` mark and the engine's page
+//! count is untouched; and `RecordPolicy::Never`, amendment 79: a seed is
+//! parsed in memory and never stored, so it leaves no scan-marked store row
+//! without an `issue:<id>`), carries the session, is bounded by
 //! `min(deadline - now, MAX_AWAIT)` and parses at most `MAX_BODY_PARSE_BYTES`.
 //! A failure is logged at debug through [`redact::safe_url`] and skipped: a
 //! target without a `robots.txt` is the normal case, not an error.
@@ -375,12 +377,12 @@ mod tests {
         })
     }
 
-    /// The options the lane passes: `record: Always` and the job mark only
-    /// (plan call A2; the lane test `seed_sends_carry_the_job_mark_only` owns
-    /// that choice).
+    /// The options the lane passes: `record: Never` (amendment 79) and the
+    /// job mark only (plan call A2; the lane test
+    /// `seed_sends_carry_the_job_mark_only` owns both choices).
     fn send_options() -> SendOptions {
         SendOptions {
-            record: RecordPolicy::Always,
+            record: RecordPolicy::Never,
             marks: vec![format!("scan:{JOB_ID}")],
             version: VersionPolicy::H1,
         }
@@ -433,7 +435,9 @@ mod tests {
             assert_eq!(req.headers.get("user-agent"), Some(USER_AGENT));
             assert_eq!(req.headers.get("accept"), Some(ACCEPT_SEEDS));
             assert_eq!(req.headers.get("host"), Some("t:8080"));
-            assert_eq!(opts.record, RecordPolicy::Always);
+            // Amendment 79: the caller's `Never` goes out unchanged on every
+            // seed send; `fetch_seeds` never promotes a seed to a recorded flow.
+            assert_eq!(opts.record, RecordPolicy::Never);
             // Sp2: the caller's version policy goes out on every seed send.
             assert_eq!(opts.version, VersionPolicy::H1);
         }

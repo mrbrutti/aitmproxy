@@ -363,13 +363,18 @@ async fn crawl_origin(
         return Ok(Vec::new());
     };
 
-    // Recorded and on the profile's HTTP version like the client engine's
-    // page fetches (Sp2), but marked with the job mark only: a `robots.txt`
-    // or `sitemap.xml` probe is not a crawled page, and the engine counts
-    // every `crawl`-marked flow as one (`scan.discover` reported four pages
-    // for `max_pages: 2`; T1b contract cell, 2026-11-02).
+    // On the profile's HTTP version like the client engine's page fetches
+    // (Sp2), but marked with the job mark only: a `robots.txt` or
+    // `sitemap.xml` probe is not a crawled page, and the engine counts every
+    // `crawl`-marked flow as one (`scan.discover` reported four pages for
+    // `max_pages: 2`; T1b contract cell, 2026-11-02). And never recorded
+    // (amendment 79): a recorded seed is a scan-marked, non-crawl store row
+    // with no `issue:<id>`, which the record-policy cell
+    // (`test_t1_record_policy`) rejects. The seed bodies are parsed in memory
+    // and nothing of theirs is added to the store, so D5's "every flow a job
+    // adds carries `scan:<job>`" holds vacuously for them.
     let send = SendOptions {
-        record: RecordPolicy::Always,
+        record: RecordPolicy::Never,
         marks: vec![job_mark.to_string()],
         version: job.profile().http.version.into(),
     };
@@ -485,7 +490,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use aitm_core::{Flow, FlowStore, MemFlowStore};
+    use aitm_core::{Flow, FlowStore, MemFlowStore, RecordPolicy};
     use aitm_scan_model::{
         Discovery, FlowRef, IgnoreRule, InsertionKind, InsertionPoint, JobCtx, Lane, LaneKind,
         ParamRef, ProfileTarget, ScanProfile, SessionMaterial, SiteNode, UseBrowser,
@@ -1133,7 +1138,11 @@ mod tests {
     /// the job mark alone, while a crawl GET carries `crawl` too, so the
     /// engine's page count (every `crawl`-marked flow) stays within
     /// `max_pages` (T1b contract cell: `scan.discover { max_pages: 2 }` had
-    /// reported four).
+    /// reported four). Nor is a seed recorded (amendment 79): a recorded seed
+    /// is a scan-marked, non-crawl store row with no `issue:<id>`, which the
+    /// record-policy cell (`test_t1_record_policy`) rejects; the seed bodies are
+    /// parsed in memory, so `RecordPolicy::Never` loses nothing, while the
+    /// crawl GET stays `Always`.
     #[tokio::test]
     async fn seed_sends_carry_the_job_mark_only() {
         let client = Arc::new(site(&fixture_pages()));
@@ -1161,6 +1170,20 @@ mod tests {
             marks_of("/a"),
             vec![job_mark(JOB_ID), MARK_CRAWL.to_string()],
             "a crawled page carries the crawl mark"
+        );
+
+        let record_of = |path: &str| -> RecordPolicy {
+            sent.iter()
+                .find(|(req, _)| req.path == path)
+                .map(|(_, opts)| opts.record)
+                .unwrap_or_else(|| panic!("{path} was fetched"))
+        };
+        assert_eq!(record_of("/robots.txt"), RecordPolicy::Never);
+        assert_eq!(record_of("/sitemap.xml"), RecordPolicy::Never);
+        assert_eq!(
+            record_of("/a"),
+            RecordPolicy::Always,
+            "a crawled page is recorded"
         );
     }
 
