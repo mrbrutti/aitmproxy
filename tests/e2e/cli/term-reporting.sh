@@ -36,7 +36,10 @@
 # A section whose precondition is missing SKIPs with a reason and never FAILs:
 #   - section 14 (TTY recordings) needs stdout to be a terminal (`[ -t 1 ]`)
 #     and a pty `script` can allocate;
-#   - section 13 needs AITM_OLD_BIN (executable);
+#   - section 13's comparison against the previous release (timing medians,
+#     thread counts side by side) needs AITM_OLD_BIN (executable); its
+#     `aitm-term` thread-name check runs on any machine and SKIPs only when
+#     thread names are unreadable (`sample` missing or failed; no `/proc`);
 #   - section 12 needs apps/web/node_modules and `node`;
 #   - the `obscura probed` check and the AC-W1-33 "the log records the
 #     browser's teardown error" check need `obscura` beside AITM_BIN;
@@ -894,7 +897,7 @@ section_tokens() {
 
 # ===========================================================================
 section_clistartup() {
-  begin_section "11. tests/e2e/cli/cli-startup.sh passes unchanged (AC-W1-23)"
+  begin_section "11. tests/e2e/cli/cli-startup.sh passes with its amended wait_ready (AC-W1-23)"
   local log="$ROOT/cli-startup.log"
   if [ -x "$here/cli-startup.sh" ]; then
     note "running cli-startup.sh (a few minutes)…"
@@ -950,28 +953,16 @@ section_perf() {
   # not — `aitm-audit-reads`, `aitm-audit-control`, `aitm-audit-agent`, main's
   # durable audit log (#259), not this branch — so equality is wrong by
   # construction. What AC-W1-30 guards is that no `aitm-term` thread outlives
-  # the ready card: that is the pass/fail below (SKIP when thread names cannot
-  # be read); both counts and the names present in the new binary but not in
-  # the old are printed as notes so a reviewer sees the audit threads explained.
-  if [ -z "$AITM_OLD_BIN" ] || [ ! -x "$AITM_OLD_BIN" ]; then
-    skip "one-shot timing vs the old binary (AITM_OLD_BIN unset or not executable)"
-    skip "no aitm-term thread after the ready card (same)"
-    return
-  fi
+  # the ready card: that is the pass/fail below, read from the NEW binary
+  # alone, so it runs on any machine and SKIPs only when thread names cannot
+  # be read (spec pass-3 Sp22). The comparison against the previous release
+  # — the one-shot timing medians, both thread counts, and the names present
+  # in the new binary but not in the old, printed as notes so a reviewer sees
+  # the audit threads explained — needs AITM_OLD_BIN and SKIPs without it.
   new_env perf || return
-  # Warm-up: both binaries mint/load the CA in the shared isolated HOME.
+  # Warm-up: the new binary mints the CA in the isolated HOME (the old binary
+  # loads it below, when there is one).
   HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" scope list >/dev/null 2>&1 </dev/null; local rn=$?
-  HOME="$HOME_DIR" "$AITM_OLD_BIN" --config "$CFG" scope list >/dev/null 2>&1 </dev/null; local ro=$?
-  if [ "$rn" != 0 ] || [ "$ro" != 0 ]; then
-    skip "one-shot timing (warm-up failed: new exit $rn, old exit $ro — the old binary may not read this config)"
-    skip "no aitm-term thread after the ready card (same)"
-    return
-  fi
-  local med_new med_old
-  med_new="$(median_of 11 "$AITM_BIN" --config "$CFG" scope list)"
-  med_old="$(median_of 11 "$AITM_OLD_BIN" --config "$CFG" scope list)"
-  note "aitm scope list median real of 11 runs: new=${med_new}s old=${med_old}s"
-  check "one-shot median: new ($med_new) <= old ($med_old) + 0.005" awk -v n="$med_new" -v o="$med_old" 'BEGIN { exit !(n <= o + 0.005) }'
   start_server "$ROOT/thr-new.out" "$ROOT/thr-new.err" "$AITM_BIN" --config "$CFG"
   wait_for "$ROOT/thr-new.err" '^Log: ' 30 || note "new binary: ready card not seen (the server exited, or 30 s passed)"
   sleep 1
@@ -983,8 +974,25 @@ section_perf() {
     check "no thread named aitm-term after the ready card ($(wc -l <"$tnames" | tr -d ' ') thread names read, $(count_fx aitm-term "$tnames") aitm-term)" \
       [ "$(count_fx aitm-term "$tnames")" = 0 ]
   else
-    skip "no aitm-term thread after the ready card (thread names unavailable: \`sample\` missing, failed or over 60 s; or no /proc)"
+    skip "no aitm-term thread after the ready card (thread names unreadable: \`sample\` missing or failed, or over 60 s; no /proc)"
   fi
+  # Everything below compares against the previous release.
+  if [ -z "$AITM_OLD_BIN" ] || [ ! -x "$AITM_OLD_BIN" ]; then
+    skip "one-shot timing vs the old binary (AITM_OLD_BIN unset or not executable)"
+    end_section "$ROOT/thr-new.err"
+    return
+  fi
+  HOME="$HOME_DIR" "$AITM_OLD_BIN" --config "$CFG" scope list >/dev/null 2>&1 </dev/null; local ro=$?
+  if [ "$rn" != 0 ] || [ "$ro" != 0 ]; then
+    skip "one-shot timing (warm-up failed: new exit $rn, old exit $ro — the old binary may not read this config)"
+    end_section "$ROOT/thr-new.err"
+    return
+  fi
+  local med_new med_old
+  med_new="$(median_of 11 "$AITM_BIN" --config "$CFG" scope list)"
+  med_old="$(median_of 11 "$AITM_OLD_BIN" --config "$CFG" scope list)"
+  note "aitm scope list median real of 11 runs: new=${med_new}s old=${med_old}s"
+  check "one-shot median: new ($med_new) <= old ($med_old) + 0.005" awk -v n="$med_new" -v o="$med_old" 'BEGIN { exit !(n <= o + 0.005) }'
   start_server "$ROOT/thr-old.out" "$ROOT/thr-old.err" "$AITM_OLD_BIN" --config "$CFG"
   # 0.5.10 logs INFO on stdout.
   wait_for "$ROOT/thr-old.out" 'proxy listening' 30 || wait_for "$ROOT/thr-old.err" 'proxy listening' 5 || note "old binary: 'proxy listening' did not appear"
