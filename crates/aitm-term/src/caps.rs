@@ -3,8 +3,8 @@
 //! [`Caps`] says what the stream we write to can show: whether it is a
 //! terminal, whether colour, rich glyphs and in-place drawing are allowed, how
 //! wide it is and whether we are under CI. [`Caps::from_parts`] is pure so
-//! unit tests drive it with a fake environment; [`Caps::detect_stderr`] feeds
-//! it the real one.
+//! unit tests drive it with a fake environment; [`Caps::detect_stderr`] and
+//! [`Caps::detect_stdout`] feed it the real one.
 
 use std::io::IsTerminal;
 
@@ -80,6 +80,19 @@ impl Caps {
     /// applies that rule.
     pub fn detect_stderr(color: ColorChoice) -> Caps {
         let tty = std::io::stderr().is_terminal();
+        let width = if tty { measure_width() } else { None };
+        Self::from_parts(tty, width, color, &|key| std::env::var(key).ok())
+    }
+
+    /// Detect stdout's capabilities from the process environment: the mirror
+    /// of [`Caps::detect_stderr`] for the help pages, which go to stdout
+    /// through `startup::write_stdout` (plan C49).
+    ///
+    /// The same spec T5 rule applies: the width is measured only after
+    /// `stdout` is known to be a terminal, so a pipe is never measured
+    /// through `/dev/tty` and gets 80.
+    pub fn detect_stdout(color: ColorChoice) -> Caps {
+        let tty = std::io::stdout().is_terminal();
         let width = if tty { measure_width() } else { None };
         Self::from_parts(tty, width, color, &|key| std::env::var(key).ok())
     }
@@ -485,5 +498,30 @@ mod tests {
         // A real measurement is still taken as is.
         let measured = Caps::from_parts(true, Some(120), ColorChoice::Auto, &env_of(TTY_ENV));
         assert_eq!(measured.width, 120);
+    }
+
+    // ---- wave 2, task 1: stdout detection (plan C49) ----
+
+    #[test]
+    fn detect_stdout_honours_the_color_flag_and_describes_one_stream() {
+        // The test binary's stdout may or may not be a terminal; `--color`
+        // beats every variable (spec T2), so these hold either way, and both
+        // calls describe the same stream.
+        let never = Caps::detect_stdout(ColorChoice::Never);
+        let always = Caps::detect_stdout(ColorChoice::Always);
+        assert!(!never.color, "--color=never must disable colour");
+        assert!(always.color, "--color=always must force colour");
+        assert_eq!(
+            always,
+            Caps {
+                color: true,
+                ..never
+            }
+        );
+        if !never.tty {
+            // A pipe is never measured: spec T5's 80 applies.
+            assert_eq!(never.width, 80);
+            assert!(!never.animate);
+        }
     }
 }

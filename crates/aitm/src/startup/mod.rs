@@ -2,9 +2,9 @@
 //! ready card (spec D1, D8, D9, D14; plan Task 7).
 //!
 //! `args` parses the global terminal flags (`-v`, `-vv`, `-q`, `--color`) into
-//! [`TermOpts`], answers `--version`/`--help` before anything boots
-//! ([`pre_boot`]) and owns the static [`SYNOPSIS`]; `errors` types the startup
-//! failures and renders them as panels (Task 8); `log` opens the log file and
+//! [`TermOpts`] and answers `--version` before anything boots ([`pre_boot`];
+//! help is [`crate::help`]'s since wave 2, plan C32); `errors` types the
+//! startup failures and renders them as panels (Task 8); `log` opens the log file and
 //! composes the three tracing layers (Task 9); `card` turns the live values
 //! into the ready card (Task 10). The leaf modules are addressed by path
 //! (`startup::errors::…`, `startup::log::…`, `startup::card::…`); only `args`
@@ -13,9 +13,9 @@
 //! file).
 //!
 //! [`write_stdout`] is the one sanctioned direct stdout writer outside the
-//! renderer and `render.rs` (spec D14): the pre-boot `--version`/`--help`
-//! text, `aitm web --help`'s usage text and the `operator-token` confirmation
-//! go through it.
+//! renderer and `render.rs` (spec D14): the pre-boot `--version` text, the
+//! help pages, `aitm web --help`'s usage text and the `operator-token`
+//! confirmation go through it.
 
 use std::io::Write;
 
@@ -24,7 +24,7 @@ pub mod card;
 pub mod errors;
 pub mod log;
 
-pub use args::{pre_boot, split_term_args, version_line, PreBoot, TermOpts, GROUPS, SYNOPSIS};
+pub use args::{pre_boot, split_term_args, version_line, PreBoot, TermOpts};
 
 /// Write `text` to stdout and flush it, through one lock and `write_all`
 /// (never `print!`, which panics on a closed pipe and bypasses the no-bypass

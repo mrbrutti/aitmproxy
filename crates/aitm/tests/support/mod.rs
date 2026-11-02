@@ -7,20 +7,27 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use aitm::describe;
 use aitm::scripts::LateHandles;
 use aitm::tui::{self, Services, TuiLog};
-use aitm::wire::{assemble, assemble_with_scripts, Assembled, Features, Governance, ScriptWiring};
+use aitm::wire::{
+    assemble, assemble_with_scripts, Assembled, Features, Governance, L4Shared, ScriptWiring,
+};
 use aitm_core::{Config, Plugin, Proxy};
 use aitm_findings::FindingsPlugin;
+use aitm_plugin::language::ProtocolLanguage;
 use aitm_plugin_rhai::wire::build_with_languages;
 use aitm_plugin_rhai::{MemoryFindingSink, RhaiConfig, ScriptServices};
 use aitm_poc::step_registry::PocStepRegistry;
+use aitm_proto_l4::backend::pcap::PcapBackend;
+use aitm_proto_l4::flow::InMemoryL4FlowStore;
+use aitm_proto_l4::guard::L4Guard;
+use aitm_proto_l4::L4Language;
 
 /// A fresh, unique directory under the system temp dir for one test's CA.
 pub fn temp_ca_dir(tag: &str) -> PathBuf {
@@ -52,56 +59,84 @@ pub fn assemble_services(cfg: &Config) -> (Proxy, Services, Governance) {
     (proxy, services, governance)
 }
 
-/// `main.rs`'s script services: late-bound handles the proxy fills in once
-/// built. Needs a tokio runtime context for the tier's `Handle`.
-fn startup_services() -> ScriptServices {
-    let handles = LateHandles::new();
+/// `main.rs`'s script services over `handles`: late-bound handles the proxy
+/// fills in once built. Needs a tokio runtime context for the tier's `Handle`.
+fn startup_services(handles: Arc<LateHandles>) -> ScriptServices {
     ScriptServices {
         store: handles.clone(),
         client: handles.clone(),
         browser: Some(handles.clone()),
-        guard: handles.clone(),
+        guard: handles,
         findings: Arc::new(MemoryFindingSink::new()),
         rt: tokio::runtime::Handle::current(),
     }
 }
 
-/// The command groups (first name segments) and every command name the
-/// binary registers for `features` with a default config: an EMPTY Rhai tier
-/// (`RhaiConfig::default()` declares no script and the bundled catalogue is
-/// never applied, so no `check.*`/`l4.*` script commands) plus the
-/// `FindingsPlugin`, through `assemble_with_scripts` exactly as `main` wires
-/// it (bare `assemble` would miss `script.*` and `findings.*`). The CA is
-/// minted in a throwaway [`temp_ca_dir`] that is removed before returning.
-/// Builds its own current-thread runtime for the tier's `Handle`, so call it
-/// from a plain `#[test]`, not from inside another runtime. Shared by
-/// `tests/synopsis_groups.rs` and `tests/synopsis_groups_l4.rs` (quality Q19).
-pub fn built_in_groups(features: &Features) -> (BTreeSet<String>, Vec<String>) {
+/// Every command the binary registers for `features` with a default config and
+/// the given Rhai config, through `assemble_with_scripts` exactly as `main`'s
+/// `run()` wires it: the `ws` language over the tier's own late-bound guard
+/// and, when `features.l4.enabled`, a shared L4 guard and store with the live
+/// `L4Language` over them (threaded into `Features::l4_shared` as `run()`
+/// does), both installed on the engine before compile; the tier's host
+/// plugin, its executor, the `l4:`/`ws:` PoC-step handlers from those same
+/// language instances, its commands, then the `FindingsPlugin` — as `(name,
+/// describe::fingerprint)` pairs in registration order. The live
+/// side of the `describe_registry` pins (plan C28), generic over the Rhai
+/// config so the bundled catalogue can be appended by the caller. The CA is
+/// minted in a throwaway [`temp_ca_dir`] that is removed before returning;
+/// the function builds its own current-thread runtime for the tier's
+/// `Handle`, so call it from a plain `#[test]`, never from inside another
+/// runtime.
+pub fn live_commands(features: &Features, rhai: RhaiConfig) -> Vec<(String, String)> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("a current-thread runtime for the script tier");
-    let dir = temp_ca_dir("built-in-groups");
+    let dir = temp_ca_dir("live-commands");
     let mut cfg = Config::default();
     cfg.ca.dir = dir.clone();
 
     let result = rt.block_on(async {
-        let tier = build_with_languages(RhaiConfig::default(), startup_services(), &[])
-            .expect("the empty rhai tier builds");
-        assert!(
-            tier.errors.is_empty(),
-            "empty tier errors: {:?}",
-            tier.errors
-        );
+        let handles = LateHandles::new();
+        let services = startup_services(handles.clone());
+        let mut features = features.clone();
+        let l4_shared = features.l4.enabled.then(|| L4Shared {
+            guard: Arc::new(L4Guard::new(&features.l4)),
+            store: Arc::new(InMemoryL4FlowStore::new()),
+        });
+        let l4_language = l4_shared.as_ref().map(|shared| {
+            L4Language::new(
+                shared.guard.clone(),
+                Arc::new(PcapBackend::new()),
+                shared.store.clone(),
+            )
+        });
+        let ws_language = aitm_scan_ws::language(handles.clone());
+        let mut languages: Vec<&dyn ProtocolLanguage> = Vec::new();
+        if let Some(lang) = &l4_language {
+            languages.push(lang);
+        }
+        if let Some(lang) = &ws_language {
+            languages.push(lang.as_ref());
+        }
+        let tier = build_with_languages(rhai, services, &languages).expect("the rhai tier builds");
+        let mut poc_step_handlers = PocStepRegistry::new();
+        if let Some(handler) = l4_language.as_ref().and_then(ProtocolLanguage::poc_step) {
+            poc_step_handlers.register(Arc::from(handler));
+        }
+        if let Some(handler) = ws_language.as_deref().and_then(ProtocolLanguage::poc_step) {
+            poc_step_handlers.register(Arc::from(handler));
+        }
+        features.l4_shared = l4_shared;
         let assembled = assemble_with_scripts(
             &cfg,
-            features,
+            &features,
             ScriptWiring {
                 plugins: vec![
                     Box::new(tier.host.with_max_body(cfg.limits.max_body_bytes)) as Box<dyn Plugin>
                 ],
                 executor: Some(tier.executor.clone()),
-                poc_step_handlers: PocStepRegistry::new(),
+                poc_step_handlers,
                 commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
                 // #232 (scanner v2): the script tier's check registry, as `main.rs` passes it.
                 script_checks: Some(tier.checks.clone()),
@@ -110,13 +145,12 @@ pub fn built_in_groups(features: &Features) -> (BTreeSet<String>, Vec<String>) {
         .expect("the proxy assembles in a temp CA dir");
 
         let registry = assembled.proxy.registry_arc();
-        let names: Vec<String> = registry.commands().map(|c| c.name().to_string()).collect();
-        let groups: BTreeSet<String> = names
-            .iter()
-            .filter_map(|name| name.split('.').next().map(str::to_string))
+        let pairs: Vec<(String, String)> = registry
+            .commands()
+            .map(|cmd| (cmd.name().to_string(), describe::fingerprint(&cmd.schema())))
             .collect();
         drop(assembled);
-        (groups, names)
+        pairs
     });
     let _ = std::fs::remove_dir_all(&dir);
     result

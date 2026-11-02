@@ -20,6 +20,8 @@ pub mod clock;
 pub mod error;
 pub mod event;
 pub mod glyphs;
+pub mod help;
+pub mod prompt;
 pub mod reporter;
 pub mod style;
 pub mod testing;

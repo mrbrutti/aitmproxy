@@ -19,20 +19,16 @@ mod common;
 use common::{list, production_lines, rust_files, workspace_root, Hit};
 
 /// The files allowed to write to stdout/stderr directly, with the reason spec
-/// D14 gives for each. W2 removes `confirm.rs` when the prompt goes through
-/// the layer.
-const ALLOWED: [(&str, &str); 3] = [
+/// D14 gives for each. `crates/aitm-cli/src/confirm.rs` was removed in W2:
+/// the prompt renders through `aitm_term::prompt`.
+const ALLOWED: [(&str, &str); 2] = [
     (
         "crates/aitm/src/render.rs",
         "`render_cli_value` builds the stdout bytes a one-shot result is written with",
     ),
     (
         "crates/aitm/src/startup/mod.rs",
-        "`write_stdout`: the pre-boot version/help text, `aitm web --help` and the operator-token confirmation",
-    ),
-    (
-        "crates/aitm-cli/src/confirm.rs",
-        "the `[y/N]` prompt, until W3 routes it through the layer",
+        "`write_stdout`: the pre-boot version line, the help page (`Mode::Help`: config read, nothing booted) and the operator-token confirmation",
     ),
 ];
 
@@ -161,14 +157,21 @@ fn no_print_macro_outside_the_allow_list() {
             hits.extend(scan_prints(&rel, &text));
         }
     }
-    // The allow-listed files sit one directory below each root, so reaching
-    // them proves the walk covers both roots and recurses.
+    // The allow-listed files sit one directory below the `aitm` root, so
+    // reaching them proves the walk recurses; `aitm-cli` has no allow-listed
+    // file since W2, so its dispatcher proves that root is still walked.
     for (allowed, _) in ALLOWED {
         assert!(
             walked.iter().any(|rel| rel == Path::new(allowed)),
             "the walk over {ROOTS:?} never reached {allowed}; rust_files is not recursing"
         );
     }
+    assert!(
+        walked
+            .iter()
+            .any(|rel| rel == Path::new("crates/aitm-cli/src/dispatch.rs")),
+        "the walk never reached aitm-cli"
+    );
 
     let allowed = ALLOWED
         .iter()
