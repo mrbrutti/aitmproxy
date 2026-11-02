@@ -82,7 +82,9 @@ Its crawl has three modes, and the lane picks one per origin:
   extracts, plus one navigation per `<form>` when `crawl.submit_forms` is set
   (a GET form becomes a query, a POST form a body). Every fetch goes through
   the job's own client, so it is paced, scoped and charged to the one job
-  budget like a probe. This is a fallback, not "nothing is fetched".
+  budget like a probe. This is a fallback, not "nothing is fetched". Every
+  request that fails is counted in `crawl.errors`, and a crawl that made
+  requests and fetched no page at all names why on `crawl.last_error`.
 - **No crawl at all** when `crawl.max_pages: 0`. That one setting turns every
   crawl off; the lane maps and audits only what the proxy has already
   captured for the origin.
@@ -209,7 +211,8 @@ budget:
   max_issues: 1024
   check_timeout_s: 60
   per_host_errors:
-    consecutive: 10           # consecutive errors from one host trip the breaker
+    consecutive: 10           # consecutive transport errors or timeouts from
+                              # one host trip the breaker; a 5xx is an answer
     ratio: 0.5                # or this error-to-probe ratio
 http:
   version: auto               # auto | h1 | h2 | h2c
@@ -223,6 +226,7 @@ l4:
   liveness_every: 25
   consecutive_timeouts: 20
   max_bytes_per_s: 65536
+  icmp_pace_ms: 1100          # ICMP-paced points; raised to ceilings.l4_icmp_pace_ms_min
   seeds: []                   # - { hex: "0001" } | { base64: "AAE=" } | { flow: <flow id> }
   fields: []                  # empty = the lane's own default table
   dry_run: false              # build and report every case, send nothing
@@ -231,6 +235,14 @@ l4:
 A `checks.include`/`exclude` entry is a check id, a check class, or
 `lane:<lane>`. An entry that names nothing the catalogue holds is refused with
 `unknown_check`, quoting the entry.
+
+`budget.per_host_errors` counts only probes that got **no answer**: connect and
+transport errors, a guard refusal other than a rate limit, and a per-probe
+timeout. A 5xx is an answer — it is handed to the check and it resets the host's
+consecutive run — so a target that errors on every payload never trips the
+breaker (amendment 40). A host that does trip is dropped for the rest of the
+job, and a job that stops because the next item's host is tripped reports
+`stopped_reason: errors`, as before.
 
 ### Where profiles come from
 
@@ -253,8 +265,9 @@ profile figure above its ceiling is **clamped, not refused**: the job runs,
 bounded, and every cut is reported in `scan.start`'s `clamped` list as
 `{ field, requested, applied }` and kept on `JobStatus.clamped`. The clamped
 fields are `budget.probes`, `budget.time_s`, `budget.max_issues`,
-`budget.check_timeout_s`, `l4.cases`, `l4.max_bytes_per_s` and
-`ws.max_frame_bytes`. `budget.check_timeout_s` is clamped by the lower of
+`budget.check_timeout_s`, `l4.cases`, `l4.max_bytes_per_s`, `l4.icmp_pace_ms`
+(the one field raised **up**, to the `l4_icmp_pace_ms_min` floor; amendment 46)
+and `ws.max_frame_bytes`. `budget.check_timeout_s` is clamped by the lower of
 `scanner.check_timeout_s` and `scanner.ceilings.time_s`: one check may never
 outlast the whole job.
 
@@ -277,10 +290,14 @@ naming the key.
 | `ceilings.time_s` | `7200` | Wall-clock ceiling for one job, in seconds. |
 | `ceilings.l4_cases` | `5000` | Maximum L4 fuzz cases one job may send. |
 | `ceilings.l4_bytes_per_s` | `1048576` | Maximum L4 send rate, in bytes per second. |
+| `ceilings.l4_icmp_pace_ms_min` | `1000` | Floor for a profile's `l4.icmp_pace_ms`: a lower value is raised to it and reported in `clamped` (amendment 46). |
 | `ceilings.ws_frame_bytes` | `4194304` | Maximum WebSocket frame payload one job may send, in bytes. |
 | `ceilings.max_issues` | `4096` | Maximum issues one job may record. |
 
-Every ceiling key is independent: raising one leaves the other five alone.
+Every ceiling key is independent: raising one leaves the other six alone.
+`l4_icmp_pace_ms_min` is the one floor among them: a profile `l4.icmp_pace_ms`
+below it is clamped **up** to the floor, and the raise appears in `scan.start`'s
+`clamped` list like any other clamp.
 
 **Legacy `scan.discover` budgets.** `ScannerConfig` carries five more fields,
 left over from the Stage 1 crawl that the legacy `scan.discover` /
@@ -390,11 +407,26 @@ captures, and `issue:<id>` on the flows re-recorded as an issue's evidence.
 
 Three reading notes from the 2026-11-01 live runs: `elapsed_ms` is live while
 the job runs (wall time since `started_at`, fixed at the terminal transition);
-`crawl.errors` counts crawls of an origin that failed outright (a browser crawl
-that timed out or was refused, after which the client crawl stands in), so a job
-that ran on fewer points than it could have says so; `poc_ref` on an issue is
+`crawl.errors` counts both a crawl of an origin that failed outright (a browser
+crawl that timed out or was refused, after which the client crawl stands in) and
+every single client-crawl request that failed, so a job that ran on fewer points
+than it could have says so, and when a crawl made requests and fetched no page
+at all `crawl.last_error` carries one of `h2_not_negotiated`, `connect_refused`,
+`tls`, `timeout`, `transport` or `other` (amendment 39; a partial failure leaves
+it unset). That is a reading, not a verdict: the job still runs its passive
+checks over what it captured and ends `done`, with `stopped_reason` and `error`
+untouched. `poc_ref` on an issue is
 present only when `findings.dir` is set, because the reproduction's
 `FindingRecord` is what it points at (no findings dir, no record, no `poc_ref`).
+A fourth note (amendment 58): a check that returns `error` is counted in
+`checks.errors`, and the first eight distinct `(check, detail)` pairs of a job
+are kept on `checks.error_samples` as `{ check, point, detail }` (the detail
+scrubbed and bounded like an evidence excerpt) with one warning per distinct
+detail kept (the first eight), then one notice that the sample store is full;
+later distinct errors are counted only. So a lane that is inert leaves a trace
+instead of `done` with nothing to show. `crawl.forms_submitted` is written by any lane through
+`JobCtx::report_forms_submitted`; the interim lane counts the POST forms it
+submitted (amendment 53).
 
 ## Issues
 
@@ -517,9 +549,17 @@ fn load(reg) {
 `needs_baseline` (false), `wants_traits` (null — when set, the check is
 scheduled only on points carrying one of those traits, and the restriction is
 ignored at `speed: thorough`), `targets_session` (false), `scope` (`point`, or
-`node` to run once per site-map node, or `origin` to run once per origin). A
-script may **not** declare `origin`: aitm records where the script came from
-(`native`, `bundled` or `custom`). A missing or mistyped meta key is a **load
+`node` to run once per site-map node, or `origin` to run once per origin). An
+origin-scoped HTTP check runs once per origin whether or not any insertion point
+was discovered there (amendment 38): the origins are the profile's targets plus
+every origin a surviving point belongs to, each scheduled as a synthesized
+`GET <origin>/` item that the interim HTTP lane serves with a probe host over
+that request. An origin is not a point, so no point gate applies to it —
+`audit.kinds`, `wants_traits`, the frequent-point rule and the session rule are
+not consulted and only the check's `intensity` can leave it out. A
+script may **not** declare the catalogue's `origin` field (not to be confused
+with `scope: origin`): aitm records where the script came from (`native`,
+`bundled` or `custom`). A missing or mistyped meta key is a **load
 error naming the key**, not a default — the catalogue cannot schedule what it
 cannot classify. An id a script already registered is a load error naming the
 source that holds it; an id that clashes across sources (lane checks, then the

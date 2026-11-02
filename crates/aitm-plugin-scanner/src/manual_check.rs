@@ -21,7 +21,7 @@
 //! interim HTTP lane discover and host the point out of that store. The
 //! operator's capture list is untouched.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -31,8 +31,8 @@ use aitm_core::{
     ProxyClient, Registry, Sensitivity, TypeDesc, Value,
 };
 use aitm_scan_model::{
-    scan_error, Check, InsertionKind, JobCtx, LaneKind, ProfileTarget, ScanErrorCode, ScanProfile,
-    SessionMaterial,
+    scan_error, Check, Evidence, InsertionKind, JobCtx, LaneKind, ProfileTarget, ScanErrorCode,
+    ScanProfile, SessionMaterial, Verdict,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -200,7 +200,8 @@ impl Command for ManualCheck {
             store: Arc::clone(&scratch),
             guard: Arc::clone(&services.guard),
             budget,
-            markers: AtomicU64::new(0),
+            markers: AtomicU32::new(0),
+            marker_seed: util::marker_seed(),
         });
 
         // The interim HTTP lane owns the only shape a manual run has: a query
@@ -227,8 +228,13 @@ impl Command for ManualCheck {
                         format!("`{param}` is not a query parameter of that url"),
                     )
                 })?;
-            let host = lane.probe_host_for(&point, Arc::clone(&job))?;
-            bounded_await(job.deadline(), &cancel, check.run(&point, host.as_ref()))
+            // Behind an `Arc`, as the worker hands it (amendment 62): a
+            // script check borrows the host through `shared()` for the
+            // length of its run and errors out before sending a byte when
+            // there is none to borrow.
+            let host =
+                crate::worker::ArcHost(Arc::from(lane.probe_host_for(&point, Arc::clone(&job))?));
+            bounded_await(job.deadline(), &cancel, check.run(&point, &host))
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
@@ -238,8 +244,42 @@ impl Command for ManualCheck {
                 })
         })?;
 
-        result_of(&verdict)
+        // The verdict goes straight back to the bus caller, so it gets the
+        // scrub the job path's worker applies when it files an issue (spec
+        // D8.1, amendment 56); a native check that echoes a credential from a
+        // response leaks nothing through `check.<id>`.
+        result_of(&scrubbed(verdict))
     }
+}
+
+/// `verdict` with its `detail` and evidence — and every `more` sibling's —
+/// scrubbed through [`util::scrub`] and `matched` bounded, in that order
+/// (amendment 16): a cut before the scrub could leave a credential fragment
+/// the scrubber no longer recognises. Idempotent, so a Rhai verdict the bridge
+/// already scrubbed comes through unchanged.
+fn scrubbed(mut verdict: Verdict) -> Verdict {
+    scrub_verdict(&mut verdict);
+    verdict.more.iter_mut().for_each(scrub_verdict);
+    verdict
+}
+
+/// Scrub one [`Verdict`]'s own free text in place: its `detail` and its
+/// [`Evidence`]. `detail` can echo a response snippet just like `matched` (the
+/// bridge's plain-string verdict form puts the whole string there); the job
+/// path never emits it, the manual path does, so it is scrubbed here too. One
+/// rule for the root and every sibling, so neither place can be missed.
+fn scrub_verdict(verdict: &mut Verdict) {
+    verdict.detail = util::scrub(&verdict.detail);
+    scrub_evidence(&mut verdict.evidence);
+}
+
+/// Scrub one [`Evidence`]'s two free-text fields in place.
+fn scrub_evidence(evidence: &mut Evidence) {
+    evidence.matched = evidence
+        .matched
+        .as_deref()
+        .map(|text| Evidence::excerpt(&util::scrub(text)));
+    evidence.payload = evidence.payload.as_deref().map(util::scrub);
 }
 
 /// The request a manual run probes: `url` with `param` set to `value`.
@@ -359,7 +399,11 @@ struct ManualJob {
     store: Arc<dyn FlowStore>,
     guard: Arc<dyn aitm_core::ScopeRateGuard>,
     budget: Arc<JobBudget>,
-    markers: AtomicU64,
+    /// The per-call marker counter, as wide as [`util::marker`]'s.
+    markers: AtomicU32,
+    /// Minted per invocation (amendment 55): a manual run's markers are as
+    /// unguessable up front as a job's.
+    marker_seed: u32,
 }
 
 impl JobCtx for ManualJob {
@@ -407,8 +451,10 @@ impl JobCtx for ManualJob {
         self.budget.cancel.is_cancelled()
     }
 
+    /// Fresh per call (amendment 57), seeded per invocation (amendment 55).
     fn marker(&self) -> String {
-        util::marker(self.markers.fetch_add(1, Ordering::SeqCst))
+        let counter = self.markers.fetch_add(1, Ordering::SeqCst);
+        util::marker(self.marker_seed, counter)
     }
 }
 
@@ -423,12 +469,171 @@ mod tests {
         HttpRequest, HttpResponse, HttpVersion, JobBus, MemFlowStore, Params, ProxyClient,
         Registry, ScopeEntry, ScopeRateGuard, SendOptions, Sensitivity, StdGuard, Value,
     };
+    use aitm_scan_model::check::{CheckMeta, Evidence, Verdict};
+    use aitm_scan_model::point::InsertionPoint;
+    use aitm_scan_model::testing::null_meta;
+    use aitm_scan_model::traits::{Check, ProbeHost};
+    use aitm_scan_model::vocab::{Confidence, Outcome};
     use aitm_scan_model::{ScanErrorCode, ScanRefusal};
     use futures::future::BoxFuture;
 
     use crate::config::ScannerConfig;
     use crate::jobs::ScanServices;
     use crate::plugin::ScannerPlugin;
+
+    /// A native check whose evidence echoes what a target's response carried —
+    /// a session cookie and a bearer token — the way a real check's `matched`
+    /// excerpt and `payload` would. It sends nothing; the leak is in the verdict.
+    struct LeakyCheck {
+        meta: CheckMeta,
+    }
+
+    impl LeakyCheck {
+        fn new() -> Self {
+            Self {
+                meta: null_meta("leaky-echo"),
+            }
+        }
+    }
+
+    impl Check for LeakyCheck {
+        fn meta(&self) -> &CheckMeta {
+            &self.meta
+        }
+
+        fn run<'a>(
+            &'a self,
+            _point: &'a InsertionPoint,
+            _host: &'a dyn ProbeHost,
+        ) -> BoxFuture<'a, Verdict> {
+            Box::pin(async {
+                Verdict {
+                    outcome: Outcome::Vulnerable,
+                    confidence: Confidence::Firm,
+                    evidence: Evidence {
+                        payload: Some("q=1&access_token=tok-123".to_string()),
+                        matched: Some(
+                            "Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi"
+                                .to_string(),
+                        ),
+                        ..Evidence::default()
+                    },
+                    detail: "echo: Authorization: Bearer abc.def.ghi".to_string(),
+                    poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
+                }
+            })
+        }
+    }
+
+    /// A native check whose `matched` is long enough that the excerpt bound
+    /// bites, with the secrets at the end, and which also returns a sibling
+    /// verdict carrying its own leak. Both are what a real check produces when
+    /// it quotes a whole response header block.
+    struct LoudLeakyCheck {
+        meta: CheckMeta,
+    }
+
+    impl LoudLeakyCheck {
+        /// The same shape the Rhai bridge's order test uses: 230 bytes of
+        /// padding, then a cookie and an `Authorization` line.
+        fn matched() -> String {
+            format!(
+                "{} Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi",
+                "a".repeat(230)
+            )
+        }
+
+        fn new() -> Self {
+            Self {
+                meta: null_meta("loud-echo"),
+            }
+        }
+    }
+
+    impl Check for LoudLeakyCheck {
+        fn meta(&self) -> &CheckMeta {
+            &self.meta
+        }
+
+        fn run<'a>(
+            &'a self,
+            _point: &'a InsertionPoint,
+            _host: &'a dyn ProbeHost,
+        ) -> BoxFuture<'a, Verdict> {
+            Box::pin(async {
+                Verdict {
+                    outcome: Outcome::Vulnerable,
+                    confidence: Confidence::Firm,
+                    evidence: Evidence {
+                        matched: Some(Self::matched()),
+                        ..Evidence::default()
+                    },
+                    detail: "loud".to_string(),
+                    poc_hint: None,
+                    location: None,
+                    more: vec![Verdict {
+                        outcome: Outcome::Vulnerable,
+                        confidence: Confidence::Firm,
+                        evidence: Evidence {
+                            payload: Some("sid=s3cr3t-cookie".to_string()),
+                            matched: Some("Cookie: sid=s3cr3t-cookie".to_string()),
+                            ..Evidence::default()
+                        },
+                        detail: "sibling: Authorization: Bearer abc.def.ghi".to_string(),
+                        poc_hint: None,
+                        location: None,
+                        more: Vec::new(),
+                    }],
+                }
+            })
+        }
+    }
+
+    /// A native check that needs the host behind an `Arc` the way every Rhai
+    /// script check does (the bridge errors with "ProbeHost::shared returned
+    /// none" otherwise): `Vulnerable` when `shared()` gives one, `Error`
+    /// naming the gap when it does not.
+    struct SharingCheck {
+        meta: CheckMeta,
+    }
+
+    impl SharingCheck {
+        fn new() -> Self {
+            Self {
+                meta: null_meta("needs-shared"),
+            }
+        }
+    }
+
+    impl Check for SharingCheck {
+        fn meta(&self) -> &CheckMeta {
+            &self.meta
+        }
+
+        fn run<'a>(
+            &'a self,
+            _point: &'a InsertionPoint,
+            host: &'a dyn ProbeHost,
+        ) -> BoxFuture<'a, Verdict> {
+            Box::pin(async move {
+                let (outcome, detail) = match host.shared() {
+                    Some(_) => (Outcome::Vulnerable, "shared host received"),
+                    None => (Outcome::Error, "ProbeHost::shared returned none"),
+                };
+                Verdict {
+                    outcome,
+                    confidence: Confidence::Firm,
+                    evidence: Evidence::default(),
+                    detail: detail.to_string(),
+                    poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
+                }
+            })
+        }
+    }
 
     /// A client that answers every request with an HTML page echoing the
     /// decoded query values, so the interim `xss-reflected` check sees its
@@ -507,12 +712,19 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_checks(Vec::new())
+        }
+
+        /// A harness whose catalogue also holds `extra`, for a test that needs a
+        /// check with a particular verdict beside the legacy natives.
+        fn with_checks(extra: Vec<Arc<dyn Check>>) -> Self {
             let cfg = ScannerConfig::default();
             // The native slot holds the lane's two legacy active checks, standing
             // in for the T3 natives the binary puts there (PR 2a), so
             // `check.xss-reflected` exists to drive these tests with.
-            let plugin = ScannerPlugin::new(cfg.clone())
-                .with_native_checks(crate::interim_lane::legacy_active_checks());
+            let mut natives = crate::interim_lane::legacy_active_checks();
+            natives.extend(extra);
+            let plugin = ScannerPlugin::new(cfg.clone()).with_native_checks(natives);
             let late = plugin.late();
             let mut reg = Registry::new();
             reg.add_plugin(Box::new(plugin));
@@ -604,6 +816,105 @@ mod tests {
             h.store.count(),
             before,
             "the synthetic flow never entered the store"
+        );
+    }
+
+    /// Amendment 62: the manual path hands the check a host whose `shared()`
+    /// is `Some`, exactly as the worker does with `ArcHost`; otherwise every
+    /// `check.<rhai-id>` verb errors before it sends a byte (T3's 2b live run).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manual_check_hands_a_shared_host_to_the_check() {
+        let h = Harness::with_checks(vec![Arc::new(SharingCheck::new())]);
+
+        let result = h
+            .call(
+                "check.needs-shared",
+                &[("url", s("http://ex.test/search")), ("param", s("q"))],
+            )
+            .expect("the manual check runs");
+
+        assert_eq!(
+            obj(&result, "detail"),
+            &s("shared host received"),
+            "the host handed to a manual check has `shared()`: {result:?}"
+        );
+        assert_eq!(obj(&result, "outcome"), &s("vulnerable"));
+    }
+
+    /// Amendment 56 (D8.1): the manual path returns a verdict straight to the bus
+    /// caller, so it scrubs `evidence.matched` and `evidence.payload` the way the
+    /// job path's worker does — a native check that echoes a session cookie or a
+    /// bearer token from a response hands neither to the caller. The literals
+    /// are `scrub_text_wide`'s own form: a secret pair's value and the whole of
+    /// an `Authorization` line become `[redacted]`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manual_verdict_evidence_is_scrubbed() {
+        let h = Harness::with_checks(vec![Arc::new(LeakyCheck::new()) as Arc<dyn Check>]);
+
+        let result = h
+            .call(
+                "check.leaky-echo",
+                &[("url", s("http://ex.test/search")), ("param", s("q"))],
+            )
+            .expect("the manual check runs");
+
+        assert_eq!(obj(&result, "outcome"), &s("vulnerable"));
+        let evidence = obj(&result, "evidence");
+        assert_eq!(
+            obj(evidence, "matched"),
+            &s("Cookie: [redacted]; Authorization: [redacted]")
+        );
+        assert_eq!(obj(evidence, "payload"), &s("q=1&access_token=[redacted]"));
+        assert_eq!(
+            obj(&result, "detail"),
+            &Value::Str("echo: Authorization: [redacted]".into()),
+            "detail is scrubbed on the manual path too"
+        );
+    }
+
+    /// Amendment 56 with amendment 16's order: the manual path scrubs **then**
+    /// bounds, exactly as the Rhai bridge does, and it reaches the sibling
+    /// verdicts too. Bounded first, the cut would land inside the cookie value
+    /// and the scrub would then leave 249 bytes; the exact 256-byte literal
+    /// pins the order rather than merely "something was redacted".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manual_evidence_is_scrubbed_before_it_is_bounded() {
+        let h = Harness::with_checks(vec![Arc::new(LoudLeakyCheck::new()) as Arc<dyn Check>]);
+
+        let result = h
+            .call(
+                "check.loud-echo",
+                &[("url", s("http://ex.test/search")), ("param", s("q"))],
+            )
+            .expect("the manual check runs");
+
+        let matched = match obj(obj(&result, "evidence"), "matched") {
+            Value::Str(text) => text.clone(),
+            other => panic!("matched is not a string: {other:?}"),
+        };
+        assert_eq!(
+            matched.len(),
+            aitm_scan_model::check::MAX_EXCERPT_BYTES,
+            "scrubbed first, then cut: {matched:?}"
+        );
+        assert_eq!(
+            matched,
+            format!("{} Cookie: [redacted]; Autho", "a".repeat(230))
+        );
+        assert!(!matched.contains("s3cr3t"), "{matched:?}");
+
+        let more = match obj(&result, "more") {
+            Value::Array(items) => items.clone(),
+            other => panic!("more is not an array: {other:?}"),
+        };
+        assert_eq!(more.len(), 1);
+        let sibling = obj(&more[0], "evidence");
+        assert_eq!(obj(sibling, "matched"), &s("Cookie: [redacted]"));
+        assert_eq!(obj(sibling, "payload"), &s("sid=[redacted]"));
+        assert_eq!(
+            obj(&more[0], "detail"),
+            &Value::Str("sibling: Authorization: [redacted]".into()),
+            "a sibling's detail is scrubbed like the root's"
         );
     }
 
