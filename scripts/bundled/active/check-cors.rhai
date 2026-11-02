@@ -1,39 +1,67 @@
-// check-cors.rhai — operator command `check.cors { url }`: send a cross-origin
-// preflight-style request with a canary Origin and report whether the server
-// reflects it (optionally with credentials). OWASP A05 Misconfiguration.
+// check-cors.rhai — catalogue check `cors`, class `cors`.
 //
-// ACTIVE: one scope-/rate-gated request via the proxy client, operator-invoked
-// only. The Origin is a harmless canary. For authorised testing only.
+// A server that echoes whatever `Origin` it is given has no cross-origin
+// policy at all; with credentials allowed, any site a victim visits can read
+// authenticated responses. The probe asks the point's own URL once with a
+// canary Origin nobody owns and reads two response headers back.
+//
+// This is an origin-level audit (`scope: "origin"`): the answer belongs to the
+// authority, not to the value the point carries, so the host runs it once per
+// origin however many points that origin has. It composes its own request
+// through `probe.raw` because no insertion point carries an `Origin`.
+//
+// OWASP A05 Misconfiguration. CWE-942.
 const NAME = "check-cors";
 const API  = "1";
 
-fn hget(h, name) {
-    let want = name.to_lower();
-    for k in h.keys() { if k.to_lower() == want { return h[k]; } }
-    ""
+const META = #{
+    id: "cors",
+    name: "CORS reflects an arbitrary Origin",
+    class: "cors",
+    lanes: ["http"],
+    kinds: ["query"],
+    scope: "origin",
+    intensity: "light",
+    cost: "light",
+    technique: "reflected",
+    severity: "medium",
+    confidence_max: "certain",
+    needs_baseline: false,
+    cwe: 942,
+    description: "Requests the origin once with a canary Origin header and reports when it comes back in Access-Control-Allow-Origin, noting whether credentials are allowed too.",
+    remediation: "Echo only origins on an allow-list, and never pair a reflected origin with Access-Control-Allow-Credentials: true.",
+};
+
+fn header_value(headers, name) {
+    let value = headers[name];
+    if type_of(value) == "string" { value } else { "" }
 }
 
 fn load(reg) {
-    reg.add_command("check.cors", "Probe { url } CORS with a canary Origin", |args| {
-        if type_of(args.url) != "string" { return "usage: check.cors { url: \"https://host/api\" }"; }
-        let canary = "https://aitm-cors-canary.example";
-        let resp = http.send(#{ method: "GET", url: args.url, headers: #{ "Origin": canary } });
-        if resp.status == () { return `no response from ${args.url}`; }
-        let acao = hget(resp.headers, "Access-Control-Allow-Origin");
-        let creds = contains_ci(hget(resp.headers, "Access-Control-Allow-Credentials"), "true");
-        if acao == canary {
-            let sev = if creds { "high" } else { "medium" };
-            finding(#{
-                name: "CORS reflects arbitrary Origin (active)",
-                severity: sev,
-                flow_id: resp.flow_id,
-                detail: `${args.url} reflected the canary Origin in Access-Control-Allow-Origin (credentials=${creds}).`,
-                tags: ["cors", "active", "owasp-a05"],
-            });
-            return `VULNERABLE: origin reflected (credentials=${creds})`;
-        } else if acao == "*" {
-            return "ACAO is * (no credentials possible)";
+    reg.add_check(META, |point| {
+        // A canary nobody owns, so a reflection cannot be a real allow-list hit.
+        let canary = "https://" + probe.marker() + ".aitm-canary.example";
+        let reply = probe.raw(#{ method: "GET", url: point.url, headers: #{ "origin": canary } });
+        let allowed = header_value(reply.headers, "access-control-allow-origin");
+        let credentialed = contains_ci(header_value(reply.headers, "access-control-allow-credentials"), "true");
+
+        if allowed == canary {
+            let with_credentials = if credentialed { " with credentials allowed, so authenticated responses are readable cross-origin" } else { "" };
+            return #{
+                outcome: "vulnerable",
+                confidence: "certain",
+                evidence: #{ payload: canary, matched: "access-control-allow-origin: " + allowed },
+                detail: `${point.url} reflected an Origin nobody owns${with_credentials}.`,
+            };
         }
-        `not reflected (ACAO: ${acao})`
+
+        // `*` is a real policy decision: it cannot carry credentials, so it is
+        // reported as clean here and left to the passive headers audit.
+        #{
+            outcome: "clean",
+            confidence: "certain",
+            evidence: #{ payload: canary, matched: () },
+            detail: `${point.url} did not reflect the canary Origin (Access-Control-Allow-Origin: ${allowed}).`,
+        }
     });
 }
