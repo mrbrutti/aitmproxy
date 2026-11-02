@@ -1,7 +1,8 @@
 // The L4 capture + scope controls, shown above the flow list in the L4 focus view (sidebar → L4).
 // L4 sessions now live in the one unified list, so the retired L4Panel's capture controls move here
 // — reachable when the operator narrows to L4, out of the way otherwise. Honest degradation: when
-// `l4.*` is not advertised it says so in place instead of faking an L4 surface.
+// `l4.*` is not advertised it says so in place instead of faking an L4 surface; when it is, the
+// controls follow the store's live `l4.capture.status` availability (parity spec §1).
 import { Show, type Component } from 'solid-js';
 import type { L4Store } from './store';
 import { CaptureControls } from './CaptureControls';
@@ -20,11 +21,12 @@ export const L4CaptureBar: Component<{ store: L4Store }> = (props) => {
       }
     >
       <CaptureControls
-        canCapture={store.caps().capture}
+        capture={store.captureAvailability()}
+        running={store.captureIds()}
         canScope={store.caps().scope}
-        activeCaptures={store.captureIds().length}
         scope={store.scope()}
-        onStart={(iface) => void store.startCapture(iface, 'inbound')}
+        onStart={(iface, direction) => void store.startCapture(iface, direction)}
+        onStop={(id) => void store.stopCapture(id)}
       />
     </Show>
   );

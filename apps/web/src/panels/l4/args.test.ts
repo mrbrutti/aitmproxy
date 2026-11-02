@@ -257,6 +257,106 @@ describe('store_reads_through_builders (C3 tripwire)', () => {
   });
 });
 
+// ---- capture-controls tripwire (task C4, AC18 "no filter", AC19) ----------------------------------
+//
+// The web never sends a `filter` key to `l4.capture.start` (spec §7(c): the core derives the BPF
+// filter from L4 scope; a free-form operator string would be a second, unguarded definition of what
+// gets captured). Every non-test `.ts`/`.tsx` under `apps/web/src` is walked with node `fs`; at each
+// `'l4.capture.start'` call-site literal, that line and the two after it must not mention `filter`,
+// and `CaptureControls.tsx` must not contain the word at all (no prop, signal or label).
+
+interface WalkedFile {
+  rel: string;
+  text: string;
+}
+
+async function readWebSources(): Promise<WalkedFile[]> {
+  const fsModule = 'node:fs';
+  const pathModule = 'node:path';
+  const urlModule = 'node:url';
+  const fs = (await import(/* @vite-ignore */ fsModule)) as {
+    readFileSync(path: string, encoding: 'utf8'): string;
+    readdirSync(path: string, opts: { withFileTypes: true }): { name: string; isDirectory(): boolean; isFile(): boolean }[];
+  };
+  const path = (await import(/* @vite-ignore */ pathModule)) as {
+    dirname(p: string): string;
+    join(...parts: string[]): string;
+    relative(from: string, to: string): string;
+  };
+  const url = (await import(/* @vite-ignore */ urlModule)) as { fileURLToPath(u: string): string };
+  const here = url.fileURLToPath(import.meta.url);
+  // panels/l4/args.test.ts → apps/web/src
+  const srcRoot = path.join(path.dirname(here), '..', '..');
+  const out: WalkedFile[] = [];
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (!/\.tsx?$/.test(entry.name) || /\.test\.tsx?$/.test(entry.name) || /\.d\.ts$/.test(entry.name)) continue;
+      out.push({ rel: path.relative(srcRoot, full), text: fs.readFileSync(full, 'utf8') });
+    }
+  };
+  walk(srcRoot);
+  return out;
+}
+
+/** A call-site literal: an opening quote right before the verb (a backticked doc mention is not one). */
+const CAPTURE_START_LITERAL = /['"]l4\.capture\.start\b/;
+
+describe('no_filter_on_capture_start (C4 tripwire, AC18)', () => {
+  it('no non-test source passes filter to l4.capture.start, and CaptureControls.tsx has no filter at all', async () => {
+    const files = await readWebSources();
+    expect(files.length).toBeGreaterThan(10);
+    const problems: string[] = [];
+    let sawCaptureControls = false;
+    let sawCallSite = false;
+    for (const { rel, text } of files) {
+      const lines = text.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (!CAPTURE_START_LITERAL.test(lines[i]!)) continue;
+        sawCallSite = true;
+        const window = lines.slice(i, i + 3).join('\n');
+        if (/filter/i.test(window)) problems.push(`${rel}:${i + 1}: l4.capture.start call mentions filter`);
+      }
+      if (rel.endsWith('panels/l4/CaptureControls.tsx')) {
+        sawCaptureControls = true;
+        lines.forEach((line, i) => {
+          if (/filter/i.test(line)) problems.push(`${rel}:${i + 1}: contains "filter": ${line.trim().slice(0, 72)}`);
+        });
+      }
+    }
+    expect(sawCaptureControls, 'walk must reach panels/l4/CaptureControls.tsx').toBe(true);
+    expect(sawCallSite, 'walk must see at least one l4.capture.start call site').toBe(true);
+    expect(problems).toEqual([]);
+  });
+
+  it('CaptureControls renders a direction select, a Start with the reason, and a Stop per running id (AC19)', async () => {
+    const src = await readL4Source('CaptureControls.tsx');
+    // What the live browser script (cua-l4.mjs) locates: the landmark and the Start button text.
+    expect(src).toContain('aria-label="Capture"');
+    expect(src).toContain('Start capture');
+    expect(src).toContain('data-testid="l4-capture-start"');
+    // The direction select replaces the filter input.
+    expect(src).toContain('aria-label="Capture direction"');
+    expect(src).toContain('<option value="inbound">');
+    expect(src).toContain('<option value="outbound">');
+    // Start is disabled with the core's reason as visible text and as the title.
+    expect(src).toContain('disabled={!props.capture.available}');
+    expect(src).toContain('data-testid="l4-capture-reason"');
+    expect(src).toMatch(/title=\{[^}]*props\.capture\.reason/);
+    // One Stop per running id, calling onStop(id).
+    expect(src).toContain('aria-label={`Stop capture ${id}`}');
+    expect(src).toContain('props.onStop(id)');
+    // The old props are gone.
+    expect(src).not.toContain('canCapture');
+    expect(src).not.toContain('activeCaptures');
+  });
+});
+
 // ---- live schema block (AC18 live; run in C10 against the rig, skipped in the gate) ---------------
 //
 // Reads the real core's `tools/list` over the loopback-TCP bus (the wire of
