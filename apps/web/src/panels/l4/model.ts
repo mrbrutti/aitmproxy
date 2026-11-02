@@ -518,14 +518,14 @@ export function revertArgs(parkedId: string): { id: string } {
   return { id: parkedId };
 }
 
-/** The scope add form's draft, one field per `l4.scope.add` argument. */
-export interface L4ScopeDraft {
+/** The scope add form's draft, one field per `l4.scope.add` argument (a type alias so it is assignable to the bus's `Record<string, unknown>`). */
+export type L4ScopeDraft = {
   cidr: string;
   ports: string;
   interface: string;
   direction: L4Direction;
   capability: 'capture' | 'inject' | 'intercept';
-}
+};
 
 /** `l4.scope.add` arguments, in the form's field order. */
 export function scopeAddArgs(d: L4ScopeDraft): L4ScopeDraft {

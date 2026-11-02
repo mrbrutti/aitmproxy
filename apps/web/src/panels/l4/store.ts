@@ -46,8 +46,6 @@ import {
 export interface L4Caps {
   craft: boolean;
   inject: boolean;
-  capture: boolean;
-  intercept: boolean;
   scope: boolean;
   interfaces: boolean;
   agentStatus: boolean;
@@ -64,15 +62,13 @@ export function createL4Store(app: AppStore) {
   const caps = createMemo<L4Caps>(() => ({
     craft: has('l4.craft'),
     inject: has('l4.inject'),
-    capture: has('l4.capture.start'),
-    intercept: has('l4.intercept.status') || has('l4.intercept.start'),
     scope: has('l4.scope.list'),
     interfaces: has('l4.interfaces'),
     agentStatus: has('l4.agent.status'),
     agentSet: has('l4.agent.set'),
   }));
   /** Whether `l4.flow.get` takes the §2 window on this core (older cores get `{id}` only). */
-  const window = () => supportsFlowWindow(tools());
+  const windowed = () => supportsFlowWindow(tools());
 
   const [flowsById, setFlowsById] = createStore<Record<string, L4FlowWire>>({});
   const [ids, setIds] = createSignal<string[]>([]);
@@ -87,29 +83,44 @@ export function createL4Store(app: AppStore) {
   const [inspected, setInspected] = createSignal<L4FlowWire | null>(null);
   /** The last read failure of the current pass; null once a pass completes clean. */
   const [error, setError] = createSignal<string | null>(null);
-  const interceptParked = createMemo(() => parked().length);
 
   // ---- reads: once-per-message failure log, poll plan ------------------------------------------
 
   // Every read failure goes through this one log: a failing verb repeats on every poll, the activity
-  // log carries each distinct message once (spec §7(c)); cleared after a clean pass so a recurrence
-  // after recovery is logged again.
+  // log carries each distinct message once (spec §7(c)). Recovery is per label: when a verb's read
+  // succeeds again its last message is forgotten, so a recurrence after recovery is logged again —
+  // and a pass that ran only the slow group cannot un-suppress a fast-group verb still failing.
   const readFailures = createOnceLog((msg) => app.notice(msg, 'error'));
+  /** The last logged message per read label, forgotten when that label's read succeeds. */
+  const lastFailure = new Map<string, string>();
   const clock: L4PollClock = { lastTickAt: null, lastSlowAt: null };
   let failedThisPass = false;
   let inFlight = false;
+  /** A `refresh(true)` arrived while a pass was in flight: run one more pass when it ends. */
+  let forcePending = false;
 
   function failed(label: string, e: unknown): void {
     const message = `${label}: ${(e as Error).message}`;
     failedThisPass = true;
     setError(message);
+    lastFailure.set(label, message);
     readFailures.log(message);
+  }
+
+  /** The read under `label` succeeded: its last failure, if any, may be logged again if it recurs. */
+  function recovered(label: string): void {
+    const message = lastFailure.get(label);
+    if (message === undefined) return;
+    lastFailure.delete(label);
+    readFailures.forget(message);
   }
 
   /** One bus read; a failure is logged once and yields `undefined`. */
   async function read<T>(label: string, pending: Promise<T>): Promise<T | undefined> {
     try {
-      return await pending;
+      const value = await pending;
+      recovered(label);
+      return value;
     } catch (e) {
       failed(label, e);
       return undefined;
@@ -124,10 +135,14 @@ export function createL4Store(app: AppStore) {
   async function readAvailability(label: string, pending: Promise<unknown>): Promise<{ avail: L4Availability; reply: unknown } | null> {
     try {
       const reply = await pending;
+      recovered(label);
       return { avail: availabilityFromReply(reply), reply };
     } catch (e) {
       const avail = availabilityFromError((e as Error).message);
-      if (avail) return { avail, reply: null };
+      if (avail) {
+        recovered(label);
+        return { avail, reply: null };
+      }
       failed(label, e);
       return null;
     }
@@ -145,7 +160,7 @@ export function createL4Store(app: AppStore) {
       // Register with the app so the unified list and selection route L4 ids to the L4 inspector.
       app.setL4Ids?.(next);
       const got = await Promise.all(
-        next.map((id) => read<L4FlowWire>('l4.flow.get', app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'list', window())))),
+        next.map((id) => read<L4FlowWire>('l4.flow.get', app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'list', windowed())))),
       );
       batch(() => {
         for (const f of got) if (f && typeof f.id === 'string') setFlowsById(f.id, f);
@@ -191,7 +206,9 @@ export function createL4Store(app: AppStore) {
   /**
    * One timer call (`state/context.tsx`, every 1.5 s). The poll plan decides what is due: while the
    * lane is idle (capture unavailable, no flows) the fast group runs every 10 s and the slow group
-   * every 60 s (AC23); otherwise both run on every call. `force` (after an action) runs both now.
+   * every 60 s (AC23); otherwise both run on every call. `force` (after an action) runs both now —
+   * or, when a pass is already in flight, once more as soon as it ends (an ordinary timer call that
+   * lands mid-pass is simply dropped; the next one comes in 1.5 s).
    */
   async function refresh(force = false): Promise<void> {
     if (!present()) {
@@ -199,7 +216,10 @@ export function createL4Store(app: AppStore) {
       app.setL4Ids?.([]);
       return;
     }
-    if (inFlight) return;
+    if (inFlight) {
+      if (force) forcePending = true;
+      return;
+    }
     const now = Date.now();
     const idle = !force && !captureAvailability().available && ids().length === 0;
     const plan = l4PollPlan(now, clock, idle);
@@ -215,18 +235,19 @@ export function createL4Store(app: AppStore) {
         clock.lastSlowAt = now;
         await slow();
       }
-      if (!failedThisPass) {
-        readFailures.clear();
-        setError(null);
-      }
+      if (!failedThisPass) setError(null);
     } finally {
       inFlight = false;
+    }
+    if (forcePending) {
+      forcePending = false;
+      await refresh(true);
     }
   }
 
   /** Fetch the selected flow's first packet window (spec §2) for the inspector. */
   async function inspect(id: string): Promise<void> {
-    const flow = await read<L4FlowWire>('l4.flow.get', app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', window())));
+    const flow = await read<L4FlowWire>('l4.flow.get', app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', windowed())));
     if (!flow || flow.id !== id) return;
     // A flow's packet log is append-only, so a window already extended by `loadMore()` is a longer
     // prefix of the same log: keep it (and its continuation point) rather than shrink back to the
@@ -244,19 +265,27 @@ export function createL4Store(app: AppStore) {
    * `next_offset` and append its packets to the inspected flow; `truncated` / `next_offset` then
    * come from the new reply. A no-op when nothing is inspected or the window is complete.
    */
+  /** The `next_offset` a `loadMore()` read is in flight for; a second click for the same window is ignored. */
+  let loadingFrom: number | null = null;
   async function loadMore(): Promise<void> {
     const shown = inspected();
     if (!shown || shown.truncated !== true || typeof shown.next_offset !== 'number') return;
+    if (loadingFrom === shown.next_offset) return;
+    loadingFrom = shown.next_offset;
     const id = shown.id;
-    const more = await read<L4FlowWire>(
-      'l4.flow.get',
-      app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', window(), shown.next_offset)),
-    );
-    if (!more || more.id !== id) return;
-    const current = inspected();
-    // The selection moved while the read was in flight: the reply belongs to a flow no longer shown.
-    if (!current || current.id !== id) return;
-    setInspected({ ...more, offset: current.offset ?? 0, packets: [...current.packets, ...more.packets] });
+    try {
+      const more = await read<L4FlowWire>(
+        'l4.flow.get',
+        app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', windowed(), shown.next_offset)),
+      );
+      if (!more || more.id !== id) return;
+      const current = inspected();
+      // The selection moved while the read was in flight: the reply belongs to a flow no longer shown.
+      if (!current || current.id !== id) return;
+      setInspected({ ...more, offset: current.offset ?? 0, packets: [...current.packets, ...more.packets] });
+    } finally {
+      loadingFrom = null;
+    }
   }
 
   // Selection is the app's single `selectedId`; an L4 id gets its window, anything else clears it.
@@ -327,13 +356,13 @@ export function createL4Store(app: AppStore) {
   // validates the entry and writes the prompt; nothing here fabricates either. After a `done` the
   // slow group re-reads `l4.scope.list`, so the new entry shows with its `runtime` provenance.
   async function addScope(draft: L4ScopeDraft): Promise<GuardedOutcome> {
-    const outcome = await beginGuarded(app.call, 'l4.scope.add', { ...scopeAddArgs(draft) });
+    const outcome = await beginGuarded(app.call, 'l4.scope.add', scopeAddArgs(draft));
     if (outcome.kind === 'done') await slow();
     return outcome;
   }
 
   async function confirmAddScope(draft: L4ScopeDraft, token: string): Promise<GuardedOutcome> {
-    const outcome = await confirmGuarded(app.call, 'l4.scope.add', { ...scopeAddArgs(draft) }, token);
+    const outcome = await confirmGuarded(app.call, 'l4.scope.add', scopeAddArgs(draft), token);
     if (outcome.kind === 'done') await slow();
     return outcome;
   }
@@ -359,7 +388,6 @@ export function createL4Store(app: AppStore) {
     captureAvailability,
     interceptAvailability,
     parked,
-    interceptParked,
     inspected,
     selectedFlow,
     selectedRow,

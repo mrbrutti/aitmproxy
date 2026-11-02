@@ -15,7 +15,7 @@ import { L4Inspector, type L4InspectorProps } from './L4Inspector';
 import type { L4Caps } from './store';
 import { l4Row, OPERATOR_ONLY_REASON, type InterceptBarModel, type L4FlowWire, type L4PacketWire, type L4ScopeEntryWire } from './model';
 
-const CAPS: L4Caps = { craft: true, inject: true, capture: true, intercept: true, scope: true, interfaces: true, agentStatus: true, agentSet: true };
+const CAPS: L4Caps = { craft: true, inject: true, scope: true, interfaces: true, agentStatus: true, agentSet: true };
 
 /** One scope entry covering `lo0`, so the flow is in scope and only the role gates Inject. */
 const LO0_SCOPE: L4ScopeEntryWire[] = [

@@ -234,6 +234,32 @@ describe('L4 store: once-per-message failure log (spec §7(c))', () => {
     ]);
   });
 
+  it('idle cadence: l4.flow.list failing on every tick is noticed exactly once across a slow-only pass at 60 s (fix 3: per-label recovery)', async () => {
+    h = harness({ replies: { 'l4.flow.list': new BusError('boom') } });
+    // Ticks at 0, 10.5, …, 52.5 all fail; at 60 s only the slow group is due and it succeeds — that
+    // clean slow-only pass must not forget the still-failing fast-group message (re-logged at 63 s).
+    await driveTimer(h, 65_000);
+    expect(h.count('l4.flow.list')).toBe(7);
+    expect(h.count('l4.scope.list')).toBe(2);
+    expect(h.notices).toEqual([['l4.flow.list: boom', 'error']]);
+  });
+
+  it('recovery is per label: scope.list recovering does not re-arm the flow.list message', async () => {
+    h = harness({ replies: { 'l4.flow.list': new BusError('boom'), 'l4.scope.list': new BusError('scope closed') } });
+    await h.store.refresh(true);
+    h.replies['l4.scope.list'] = [];
+    await h.store.refresh(true);
+    await h.store.refresh(true);
+    expect(h.notices).toEqual([
+      ['l4.flow.list: boom', 'error'],
+      ['l4.scope.list: scope closed', 'error'],
+    ]);
+    // scope.list fails again → logged once more (it recovered in between); flow.list still once.
+    h.replies['l4.scope.list'] = new BusError('scope closed');
+    await h.store.refresh(true);
+    expect(h.notices.map(([t]) => t)).toEqual(['l4.flow.list: boom', 'l4.scope.list: scope closed', 'l4.scope.list: scope closed']);
+  });
+
   it('two distinct failure messages are each noticed once', async () => {
     h = harness({ replies: { 'l4.flow.list': new BusError('boom'), 'l4.scope.list': new BusError('scope closed') } });
     for (let i = 0; i < 3; i++) await h.store.refresh(true);
@@ -298,6 +324,63 @@ describe('L4 store: windowed reads (spec §2)', () => {
     await h.store.loadMore();
     expect(h.count('l4.flow.get')).toBe(before);
   });
+
+  it('a second loadMore while the first is in flight for the same next_offset is ignored: one read, packets appended once (fix 3)', async () => {
+    const pkt = (n: number) => ({ dir: 'inbound' as const, length: n, injected: false, layers: ['IPv4', 'UDP'] });
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    h = harness({
+      replies: {
+        'l4.flow.list': ['F1'],
+        'l4.flow.get': (a: Record<string, unknown>) =>
+          a.limit === 0
+            ? flowWire('F1', { packet_count: 3 })
+            : a.offset === 0
+              ? flowWire('F1', { packet_count: 3, packets: [pkt(1), pkt(2)], offset: 0, truncated: true, next_offset: 2 })
+              : gate.then(() => flowWire('F1', { packet_count: 3, packets: [pkt(3)], offset: 2, truncated: false, next_offset: null })),
+      },
+    });
+    await h.store.refresh();
+    await h.store.inspect('F1');
+    const first = h.store.loadMore();
+    const second = h.store.loadMore();
+    release();
+    await Promise.all([first, second]);
+    expect(h.argsOf('l4.flow.get').filter((a) => a.offset === 2)).toHaveLength(1);
+    expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2, 3]);
+    expect(h.store.inspected()?.truncated).toBe(false);
+  });
+});
+
+describe('L4 store: refresh(force) while a pass is in flight (fix 3)', () => {
+  it('a forced refresh arriving mid-pass runs one more pass after the current one instead of being dropped', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    let listCalls = 0;
+    h = harness({ replies: { 'l4.flow.list': () => (++listCalls === 1 ? gate.then(() => []) : []) } });
+    const timerPass = h.store.refresh();
+    expect(h.count('l4.flow.list')).toBe(1);
+    const forced = h.store.refresh(true);
+    // Still one read: the forced pass waits for the in-flight one.
+    expect(h.count('l4.flow.list')).toBe(1);
+    release();
+    await Promise.all([timerPass, forced]);
+    expect(h.count('l4.flow.list')).toBe(2);
+    expect(h.count('l4.capture.status')).toBe(2);
+    expect(h.count('l4.scope.list')).toBe(2);
+  });
+
+  it('a plain timer call arriving mid-pass is still dropped (no queueing of ordinary ticks)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    let listCalls = 0;
+    h = harness({ replies: { 'l4.flow.list': () => (++listCalls === 1 ? gate.then(() => []) : []) } });
+    const a = h.store.refresh();
+    const b = h.store.refresh();
+    release();
+    await Promise.all([a, b]);
+    expect(h.count('l4.flow.list')).toBe(1);
+  });
 });
 
 describe('L4 store: parked packets and verdicts (spec §4; AC20)', () => {
@@ -316,7 +399,7 @@ describe('L4 store: parked packets and verdicts (spec §4; AC20)', () => {
     await h.store.refresh();
     expect(h.count('l4.intercept.list')).toBe(1);
     expect(h.store.parked().map((p) => p.id)).toEqual(['P1', 'P2']);
-    expect(h.store.interceptParked()).toBe(2);
+    expect(h.store.parked()).toHaveLength(2);
     // The class goes away (D0-style flip): the list is not polled and the parked set is cleared.
     h.replies['l4.intercept.status'] = UNAVAILABLE_INTERCEPT;
     await h.store.refresh(true);
