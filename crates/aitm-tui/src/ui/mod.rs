@@ -115,6 +115,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         Mode::Ca => overlays::ca(app, theme, body, buf),
         Mode::Config => overlays::config(app, theme, body, buf),
         Mode::Scan => scan::render(app, theme, body, buf),
+        Mode::L4 => l4::panel(app, theme, body, buf),
         Mode::Inspector | Mode::Edit if app.narrow() => inspector::render(app, theme, body, buf),
         _ => main_region(app, theme, &view, body, buf),
     }
