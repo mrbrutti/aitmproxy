@@ -1090,10 +1090,13 @@ section_tty() {
   record_server "$cast" env TERM="$REC_TERM" CI=1 "$AITM_BIN" --config "$CFG" || note "see the assertions below"
   check "CI=1: zero cursor-up sequences" [ "$(bytecount "$cast" '\x1b\[[0-9]*A')" = 0 ]
 
-  # (e)–(h) colour forcing is TTY-only and ordered: flag > NO_COLOR > CLICOLOR_FORCE > TERM.
+  # (e)–(h) colour forcing is TTY-only and ordered: flag > NO_COLOR > CLICOLOR_FORCE.
+  # A dumb TTY is never animated and the plain path never emits an escape byte
+  # (spec D4), so forcing colour on TERM=dumb has no effect; only --color=always
+  # on a capable TTY paints over NO_COLOR.
   cast="$ROOT/tty-force.cast"
   record_server "$cast" env TERM=dumb CLICOLOR_FORCE=1 "$AITM_BIN" --config "$CFG" || note "see the assertions below"
-  check "TERM=dumb CLICOLOR_FORCE=1: SGR colour present (ESC[3Xm)" [ "$(bytecount "$cast" '\x1b\[3[0-9]m')" -ge 1 ]
+  check "TERM=dumb CLICOLOR_FORCE=1: no SGR colour (forcing cannot override a dumb terminal)" [ "$(bytecount "$cast" '\x1b\[3[0-9]m')" = 0 ]
   check "TERM=dumb CLICOLOR_FORCE=1: zero cursor-up sequences (no animation on a dumb TTY)" [ "$(bytecount "$cast" '\x1b\[[0-9]*A')" = 0 ]
   cast="$ROOT/tty-dumb.cast"
   record_server "$cast" env TERM=dumb "$AITM_BIN" --config "$CFG" || note "see the assertions below"
