@@ -410,6 +410,7 @@ Kept by the main session during stage 6. One row per finding.
 - (S10, 2026-11-02) After the ports are bound, re-read `mcp.operator_token` from the config and prefer the file's value, so two first runs started together agree with the file.
 - (Q21, 2026-11-02) `oneshot::run::Inputs` takes `registry: &Registry` instead of the whole `Services`; `main.rs` then moves the handles into the builder as before.
 - (Q26, 2026-11-02) `docs/research/README.md`: renumber or re-sort the `24-*`/`25-*` notes (two `25-*` after the merges).
+- (v0.5.14 acceptance, 2026-11-02) The two-cores panel (R11) names which of the cores is the running Aitmproxy.app's — the pointer's `pid`'s parent (the app bundle) or the bundle path — beside each config path, so an operator facing `/T/aitm-embedded-core/<uuid>/config.yaml` twice (an orphaned pre-0.5.14 core beside the live one) knows which to stop. Found when the orchestrator's acceptance met an orphaned 0.5.13 core (the pre-fix SIGTERM hang) next to the new app's.
 
 ## Shipped
 
