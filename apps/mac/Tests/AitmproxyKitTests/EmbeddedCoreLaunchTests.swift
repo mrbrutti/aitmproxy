@@ -757,6 +757,10 @@ import Testing
         #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\rx")) {
             try config(systemProxyBypass: ["evil.test\rx"]).yaml()
         }
+        // U+0085 (NEL) is a line break to libyaml too; the shared helper refuses it on a host as on a path (S-2).
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\u{85}x")) {
+            try config(systemProxyBypass: ["evil.test\u{85}x"]).yaml()
+        }
         // The error names the offending host, not the first one, and a later good host does not rescue it.
         #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("\n")) {
             try config(systemProxyAuto: true, systemProxyBypass: ["ok.test", "\n", "also-ok.test"]).yaml()
@@ -895,6 +899,10 @@ import Testing
         let lineSeparator = config(auditLogFile: URL(fileURLWithPath: "/tmp/x\u{2028}listen: evil"))
         #expect(throws: EmbeddedCoreLaunch.ConfigError.pathContainsNewline("/tmp/x\u{2028}listen: evil")) {
             try lineSeparator.yaml()
+        }
+        let paragraphSeparator = config(auditLogFile: URL(fileURLWithPath: "/tmp/x\u{2029}listen: evil"))
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.pathContainsNewline("/tmp/x\u{2029}listen: evil")) {
+            try paragraphSeparator.yaml()
         }
     }
 

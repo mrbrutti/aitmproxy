@@ -365,10 +365,12 @@ public enum EmbeddedCoreLaunch {
 
     /// Something is wrong with a value spliced into the generated config.
     public enum ConfigError: Error, Equatable {
-        /// A path carried a newline, which would break out of its YAML scalar.
+        /// A path carried a line break (`\n`, `\r`, U+0085, U+2028, U+2029; see
+        /// `yamlDoubleQuoted`), which would break out of its YAML scalar.
         case pathContainsNewline(String)
-        /// A scope or system-proxy bypass host carried a newline, which would break out
-        /// of its YAML scalar and let a crafted host inject YAML into the token-bearing config.
+        /// A scope or system-proxy bypass host carried a line break (`\n`, `\r`, U+0085,
+        /// U+2028, U+2029; see `yamlDoubleQuoted`), which would break out of its YAML scalar
+        /// and let a crafted host inject YAML into the token-bearing config.
         case hostContainsNewline(String)
     }
 
