@@ -222,6 +222,13 @@ actor EmbeddedCore {
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "RUST_LOG")
         environment["AITM_OBSCURA_BIN"] = binaries.obscura.path
+        // A dev bundle, harness or live self-test (an overridden store) publishes its core pointer
+        // under its own store, never in the operator's run dir: otherwise the CLI's one-shots see
+        // "two running cores" beside the installed app (seen on the 0.5.14 acceptance run). The
+        // installed app keeps the core's default dir, which is where the CLI looks.
+        if let runDir = EmbeddedCoreLaunch.isolatedRunDir(environment: environment) {
+            environment[EmbeddedCoreLaunch.runDirEnvironmentKey] = runDir.path
+        }
         process.environment = environment
 
         let out = Pipe()

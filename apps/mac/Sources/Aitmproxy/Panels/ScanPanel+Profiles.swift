@@ -433,9 +433,9 @@ private struct ScanProfileEditor: View {
                 .scanFieldChrome()
                 .frame(width: 240)
                 .help("Filter the checks by id, name or class")
-            let tree = ScanCheckTree(
-                checks: state.surface.checks, selection: edited.checks,
-                intensity: edited.intensity, query: state.surface.checkQuery)
+            // Built once per distinct (catalogue, selection, intensity, query), not per body pass
+            // (MS-R1): the state caches it, so an unrelated tick never rebuilds ~160 rows.
+            let tree = state.checkTree(selection: edited.checks, intensity: edited.intensity)
             // A flat indented list, not a disclosure tree: every row keeps its
             // height, so the list never jumps under the pointer (plan Task 5).
             VStack(spacing: 0) {
