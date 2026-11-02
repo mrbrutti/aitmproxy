@@ -80,7 +80,7 @@ fn startup_services(handles: Arc<LateHandles>) -> ScriptServices {
 /// does), both installed on the engine before compile; the tier's host
 /// plugin, its executor, the `l4:`/`ws:` PoC-step handlers from those same
 /// language instances, its commands, then the `FindingsPlugin` — as `(name,
-/// describe::fingerprint)` pairs in registration order (fix Q10). The live
+/// describe::fingerprint)` pairs in registration order. The live
 /// side of the `describe_registry` pins (plan C28), generic over the Rhai
 /// config so the bundled catalogue can be appended by the caller. The CA is
 /// minted in a throwaway [`temp_ca_dir`] that is removed before returning;

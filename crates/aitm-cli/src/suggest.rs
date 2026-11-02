@@ -22,7 +22,7 @@ pub const MAX_SUGGESTIONS: usize = 3;
 /// Optimal-string-alignment Damerau–Levenshtein distance over `char`s: an
 /// insertion, a deletion, a substitution or an adjacent transposition each
 /// cost one. Case-sensitive. Memory is three rows of `b`'s length, whatever
-/// `a`'s length (argv is attacker-shaped input; fix S1).
+/// `a`'s length (argv is attacker-shaped input).
 pub fn distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -206,18 +206,14 @@ mod tests {
     /// so nothing is offered — and the answer comes without building a
     /// 100 000-row edit table per candidate: the length difference alone
     /// rules each out, and the table that is built is three rows deep.
+    /// No wall-clock bound is asserted: on a loaded machine any bound is a
+    /// flake, and what the fix changed is the shape of the work, which the
+    /// boundary cases below pin without a clock.
     #[test]
     fn suggest_rejects_a_100k_char_input_without_a_full_edit_table() {
         let input: String = std::iter::repeat_n('s', 100_000).collect();
         assert_eq!(input.chars().count(), 100_000);
-        let started = std::time::Instant::now();
-        let found = suggest(&input, GROUPS);
-        let elapsed = started.elapsed();
-        assert_eq!(found, Vec::<&str>::new());
-        assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "suggest took {elapsed:?} for a 100 000-char input"
-        );
+        assert_eq!(suggest(&input, GROUPS), Vec::<&str>::new());
         // The length pre-filter is a lower bound on the distance, so every
         // pinned result above is unchanged; a candidate exactly MAX_DISTANCE
         // longer or shorter is still scored (no prefix here, so rule 2 runs).

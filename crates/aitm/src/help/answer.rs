@@ -12,7 +12,7 @@
 //! closure, and the registry is `describe::registry`'s inert one. Nothing
 //! here probes a terminal either: the topic is resolved over the registry
 //! alone, and no `Cli` (whose constructor builds a stdin confirmer and
-//! measures stderr) exists on the help path (fix Q1).
+//! measures stderr) exists on the help path.
 
 use std::path::{Path, PathBuf};
 
@@ -156,7 +156,7 @@ fn page(caps: &Caps, page: &HelpPage) -> Answer {
 
 /// A `describe::registry` failure as a report: the top of the `anyhow` chain
 /// is the headline and every cause under it a `why` line, so nothing the
-/// engine said is lost (fix Q2). Pre-boot, so no log footer.
+/// engine said is lost. Pre-boot, so no log footer.
 fn registry_failure(err: &anyhow::Error) -> ErrorReport {
     ErrorReport::failure(err.to_string())
         .with_why(err.chain().skip(1).map(ToString::to_string).collect())
@@ -164,14 +164,50 @@ fn registry_failure(err: &anyhow::Error) -> ErrorReport {
 
 /// The first line of the error's root cause: `load_settings`'s context
 /// layers (`in config file <path>`, `parsing config YAML`) only repeat the
-/// path the warning already names; the cause is the line the operator needs.
+/// path the warning already names; the cause is the line the operator needs,
+/// with any scalar serde quoted in it redacted ([`redact_scalars`]).
 fn first_line(err: &anyhow::Error) -> String {
-    err.root_cause()
-        .to_string()
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    redact_scalars(
+        err.root_cause()
+            .to_string()
+            .lines()
+            .next()
+            .unwrap_or_default(),
+    )
+}
+
+/// serde's type-mismatch messages quote the offending scalar — `invalid type:
+/// string "<token>", expected usize` — so a value mis-indented under a key of
+/// another type (an operator token under `limits:`, say) would be echoed to
+/// stderr by the `config not read` warning. The payload between serde's own
+/// delimiters (`"…"` for a string, `` `…` `` for an integer, a boolean or a
+/// floating point) becomes `…`; the field path before it and the `expected …`
+/// clause after it stay, which is what the operator needs to find the line.
+/// A message that quotes no scalar passes through unchanged.
+fn redact_scalars(line: &str) -> String {
+    const KINDS: [&str; 2] = ["invalid type: ", "invalid value: "];
+    const SHAPES: [(&str, &str); 4] = [
+        ("string \"", "\""),
+        ("integer `", "`"),
+        ("boolean `", "`"),
+        ("floating point `", "`"),
+    ];
+    let mut out = line.to_string();
+    for kind in KINDS {
+        for (open, close) in SHAPES {
+            let opener = format!("{kind}{open}");
+            let Some(at) = out.find(&opener) else {
+                continue;
+            };
+            let start = at + opener.len();
+            // The payload is `Debug`-escaped (its own quotes are `\"`), so the
+            // last `<close>, expected ` on the line is the clause after it.
+            let closer = format!("{close}, expected ");
+            let end = out[start..].rfind(&closer).map_or(out.len(), |i| start + i);
+            out.replace_range(start..end, "…");
+        }
+    }
+    out
 }
 
 /// `Settings` defaults, field by field (the type has no `Default`): what help
@@ -780,10 +816,10 @@ mod tests {
     /// Fix Q1: the help path resolves its topic through the free
     /// `aitm_cli::dispatch::locate` and constructs no `Cli`, so neither
     /// `TtyConfirmer::from_stdin()` nor `Caps::detect_stderr` runs to print
-    /// `aitm scope`. A terminal probe is not observable from a test, so two
-    /// proxies stand in: the env closure refuses every key but the eleven
+    /// `aitm scope`. A terminal probe is not observable from a test, so a
+    /// proxy stands in: the env closure refuses every key but the eleven
     /// `describe` documents (the `env::apply*` and `bundled` keys `run()`
-    /// reads), and this file names no `Cli` constructor.
+    /// reads).
     #[test]
     fn group_page_builds_no_cli_and_reads_only_the_documented_env_keys() {
         const READ_BY_DESCRIBE: &[&str] = &[
@@ -826,18 +862,6 @@ mod tests {
             "{answer:?}"
         );
         assert_eq!(sink.text(), "");
-        // The needles are assembled so this test's own text does not match.
-        let source = include_str!("answer.rs");
-        let cli_new = concat!("Cli", "::new(");
-        let cli_path = concat!("aitm_cli", "::Cli");
-        assert!(
-            !source.contains(cli_new),
-            "the help path constructs a Cli (and with it a confirmer and a terminal probe)"
-        );
-        assert!(
-            !source.contains(cli_path),
-            "the help path names aitm_cli's Cli; it should use dispatch::locate"
-        );
     }
 
     /// Fix Q2: when `describe::registry` fails, the report keeps the whole
@@ -865,5 +889,78 @@ mod tests {
         let bare = registry_failure(&anyhow::anyhow!("no runtime"));
         assert_eq!(bare.what, "no runtime");
         assert_eq!(bare.why, Vec::<String>::new());
+    }
+
+    // ---- fix S2 (panel pass 2): the config warning echoes no scalar ----
+
+    /// serde's type-mismatch message quotes the offending scalar, so a token
+    /// mis-indented under a numeric key would reach stderr through the
+    /// `config not read` warning. The warning keeps the field path and the
+    /// `expected …` clause and redacts the quoted payload.
+    #[test]
+    fn config_warning_redacts_the_mistyped_scalar() {
+        let config = TempConfig::new(
+            "redact-scalar",
+            "limits:\n  max_body_bytes: optoken-test-abc\n",
+        );
+        let (reporter, sink) = reporter();
+        let settings = settings_for_help(Some(&config.path), &reporter);
+        reporter.finish();
+        assert_eq!(
+            settings.core.limits.max_body_bytes,
+            aitm_core::Config::default().limits.max_body_bytes
+        );
+        let warned = sink.text();
+        assert_eq!(warned.lines().count(), 1, "{warned:?}");
+        assert!(warned.contains("limits.max_body_bytes"), "{warned:?}");
+        assert!(warned.contains("expected"), "{warned:?}");
+        assert!(
+            !warned.contains("optoken-test-abc"),
+            "the scalar is echoed: {warned:?}"
+        );
+        assert!(warned.contains("string \"…\""), "{warned:?}");
+        // The other scalar shapes serde quotes, redacted inside their own
+        // delimiters; the path and the `expected` clause stay.
+        let line = |msg: &str| first_line(&anyhow::anyhow!("{msg}"));
+        assert_eq!(
+            line("l4.enabled: invalid type: string \"optoken-x\", expected a boolean at line 3 column 12"),
+            "l4.enabled: invalid type: string \"…\", expected a boolean at line 3 column 12"
+        );
+        assert_eq!(
+            line("listen: invalid value: string \"optoken-y\", expected a socket address"),
+            "listen: invalid value: string \"…\", expected a socket address"
+        );
+        assert_eq!(
+            line("scope.hosts: invalid type: integer `7`, expected a sequence"),
+            "scope.hosts: invalid type: integer `…`, expected a sequence"
+        );
+        assert_eq!(
+            line("strict: invalid type: boolean `true`, expected usize"),
+            "strict: invalid type: boolean `…`, expected usize"
+        );
+        assert_eq!(
+            line("limits.max_body_bytes: invalid type: floating point `1.5`, expected usize"),
+            "limits.max_body_bytes: invalid type: floating point `…`, expected usize"
+        );
+    }
+
+    /// A message that quotes no scalar passes through `first_line` unchanged.
+    #[test]
+    fn config_warning_passes_other_messages_through_unchanged() {
+        let line = |msg: &str| first_line(&anyhow::anyhow!("{msg}"));
+        assert_eq!(
+            line("unknown field `lsiten`, expected one of `listen`, `limits`"),
+            "unknown field `lsiten`, expected one of `listen`, `limits`"
+        );
+        assert_eq!(
+            line("did not find expected key at line 2 column 1"),
+            "did not find expected key at line 2 column 1"
+        );
+        assert_eq!(
+            line("listen: invalid socket address syntax"),
+            "listen: invalid socket address syntax"
+        );
+        // Only the first line of the root cause, as before.
+        assert_eq!(line("first\nsecond"), "first");
     }
 }

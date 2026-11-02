@@ -229,7 +229,7 @@ pub fn wrap_usage(line: &str, width: usize) -> Vec<String> {
 /// T1). Done before layout, so a substituted `...` is measured at its real
 /// width. Returns an owned `String`: every caller keeps the prepared text
 /// past the borrow (a title it edits, a line it pushes), so a borrowed form
-/// was a `Cow` that was always `into_owned()` (fix Q6).
+/// was a `Cow` that was always `into_owned()`.
 fn prepare(caps: &Caps, glyphs: &Glyphs, s: &str) -> String {
     let s = text::sanitize(s);
     if caps.unicode || !s.contains(['·', '…']) {

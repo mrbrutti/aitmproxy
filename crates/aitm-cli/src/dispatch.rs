@@ -20,7 +20,7 @@
 //! The dispatcher only resolves argv; the help pages themselves are built by
 //! the `aitm` binary over the free [`locate`], which returns the located
 //! command or the group it names over the registry alone — no `Cli`, so no
-//! confirmer and no terminal probe on the help path (fix Q1). [`Cli::locate`]
+//! confirmer and no terminal probe on the help path. [`Cli::locate`]
 //! is the same resolver over the `Cli`'s registry.
 
 use std::collections::BTreeMap;
@@ -57,7 +57,7 @@ pub fn spaced(dotted: &str) -> String {
 
 /// The group of a dotted command name: its first segment (`scope` for
 /// `scope.add` and for `scope`). The one definition the dispatcher, the
-/// schema-only registry and the help pages share (fix Q3).
+/// schema-only registry and the help pages share.
 pub fn group_of(name: &str) -> &str {
     name.split('.').next().unwrap_or(name)
 }
@@ -259,8 +259,7 @@ impl Cli {
             }
             Located::Command { cmd, rest } => (cmd, rest),
         };
-        let yes = rest.iter().any(|t| t == YES_FLAG);
-        let flags: Vec<String> = rest.iter().filter(|t| *t != YES_FLAG).cloned().collect();
+        let (yes, flags) = split_yes(rest);
         let args = parse_flags(&flags, cmd.as_ref()).map_err(anyhow::Error::new)?;
         let services = self.services.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no core services attached; call Cli::with_services first")
@@ -349,7 +348,7 @@ impl Cli {
 ///
 /// Free of `Cli` on purpose: the help path resolves its topic here over the
 /// schema-only registry, and constructs no confirmer and probes no terminal
-/// to do it (fix Q1).
+/// to do it.
 #[expect(
     clippy::result_large_err,
     reason = "the plan pins the ErrorReport return (C35)"
@@ -432,6 +431,30 @@ fn groups(registry: &Registry) -> Vec<&str> {
         }
     }
     groups
+}
+
+/// Check the tokens after a located command against `cmd`'s flag grammar
+/// exactly as [`Cli::dispatch`] does — the reserved `--yes` removed, the rest
+/// parsed into typed `Params` by the one flag parser — and discard the values.
+/// `Ok(())` means `dispatch` would reach the command; `Err` is the usage
+/// error it would return. For callers that validate a command line without
+/// running it, such as the help catalogue's example check.
+#[expect(
+    clippy::result_large_err,
+    reason = "the plan pins the ErrorReport return (C35)"
+)]
+pub fn check_flags(rest: &[String], cmd: &dyn Command) -> Result<(), ErrorReport> {
+    let (_, flags) = split_yes(rest);
+    parse_flags(&flags, cmd).map(|_params| ())
+}
+
+/// `rest` without the reserved [`YES_FLAG`], and whether it was there. The one
+/// place `--yes` leaves the token stream, so `dispatch` and `check_flags`
+/// cannot drift.
+fn split_yes(rest: &[String]) -> (bool, Vec<String>) {
+    let yes = rest.iter().any(|t| t == YES_FLAG);
+    let flags = rest.iter().filter(|t| *t != YES_FLAG).cloned().collect();
+    (yes, flags)
 }
 
 /// A token that is a flag to the dispatcher: `--` and at least one more
@@ -1457,5 +1480,54 @@ mod tests {
         assert_eq!(r.what, "unknown command ``");
         assert_eq!(r.why, vec!["did you mean: ca".to_string()]);
         assert_eq!(r.command, fix(TOP_HELP));
+    }
+
+    // ---- fix Q13/Sp7 (panel pass 2) ----
+
+    /// `check_flags` is `dispatch`'s flag grammar without the invocation: a
+    /// bare boolean followed by a stray word is that word's error, a
+    /// non-numeric integer value is the parser's own error, and a valid line
+    /// is `Ok` with or without the reserved `--yes`, which is removed before
+    /// parsing exactly as `dispatch` removes it (so it is never a value).
+    #[test]
+    fn check_flags_is_the_dispatchers_grammar_without_the_invocation() {
+        let confine = fake(
+            "browser.confine",
+            vec![param("on", TypeDesc::Bool, true)],
+            None,
+        );
+        let r = check_flags(&argv(&["--on", "maybe"]), confine.as_ref())
+            .expect_err("a bare boolean followed by a stray word");
+        assert_eq!(r.what, "unexpected argument `maybe` for `browser confine`");
+        assert_eq!(
+            r.why,
+            vec!["Usage: aitm browser confine --on <true|false>".to_string()]
+        );
+        assert_eq!(r.command, fix("aitm browser confine --help"));
+        check_flags(&argv(&["--on"]), confine.as_ref()).expect("a bare boolean is a value");
+
+        let activity = fake(
+            "agent.activity",
+            vec![param("limit", TypeDesc::Int, false)],
+            None,
+        );
+        let r = check_flags(&argv(&["--limit", "abc"]), activity.as_ref())
+            .expect_err("a non-numeric integer value");
+        assert_eq!(r.what, "flag --limit: expected an integer, got `abc`");
+        assert_eq!(
+            r.why,
+            vec!["Usage: aitm agent activity [--limit <limit>]".to_string()]
+        );
+        check_flags(&argv(&["--limit", "50"]), activity.as_ref()).expect("an integer value");
+
+        let add = fake("scope.add", vec![param("host", TypeDesc::Str, true)], None);
+        check_flags(&argv(&["--host", "a.test"]), add.as_ref()).expect("a valid line");
+        check_flags(&argv(&["--host", "a.test", "--yes"]), add.as_ref())
+            .expect("--yes is stripped, not parsed");
+        let r = check_flags(&argv(&["--host", "--yes"]), add.as_ref())
+            .expect_err("--yes is removed before parsing, so --host has no value");
+        assert_eq!(r.what, "flag --host needs a value");
+        let r = check_flags(&argv(&[]), add.as_ref()).expect_err("a required flag");
+        assert_eq!(r.what, "missing required flag --host for `scope add`");
     }
 }

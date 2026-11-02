@@ -99,7 +99,7 @@ pub fn render_confirm(caps: &Caps, prompt: &ConfirmPrompt) -> String {
     let tail = format!(" {YES_NO} ");
     // With no ask the tail joins the question's last line now; with one it
     // closes the prompt after the details and notes. Either way `tail` is
-    // moved once (fix Q11).
+    // moved once.
     let ask = if prompt.ask.is_empty() {
         match lines.last_mut() {
             Some(last) => last.push_str(&tail),

@@ -133,7 +133,7 @@ pub fn group_info(name: &str) -> Option<&'static GroupInfo> {
 
 /// The examples, keyed by dotted command name (`scope.add`) and by group name
 /// (`scope`), sorted by key (plan C45). One entry per block, kept that way by
-/// hand: rustfmt is told to leave the table alone (fix Q7).
+/// hand: rustfmt is told to leave the table alone.
 #[rustfmt::skip]
 pub const EXAMPLES: &[(&str, &[&str])] = &[
     ("agent.activity", &[
@@ -588,7 +588,7 @@ pub const NO_PURPOSE: &str = "(no description)";
 mod tests {
     use std::collections::BTreeMap;
 
-    use aitm_cli::dispatch::{group_of, locate, Located};
+    use aitm_cli::dispatch::{check_flags, group_of, locate, Located};
     use aitm_core::{Config, TypeDesc};
     use aitm_plugin_rhai::RhaiConfig;
     use aitm_proto_l4::config::L4Config;
@@ -834,13 +834,12 @@ mod tests {
         assert_eq!(shell_words("aitm x --flag=''"), ["aitm", "x", "--flag="]);
     }
 
-    /// Why `line` is not a runnable example for `key`, or `None` when it is
-    /// (fix Sp3): split quote-aware, it must resolve through
-    /// `aitm_cli::dispatch::locate` to the command its key names (a group
-    /// key: one of the group's verbs); every `--name` after the command must
-    /// be a parameter of that command's schema (or the reserved `--yes`),
-    /// given once, with a value unless it is a bare boolean; every required
-    /// parameter must be given; nothing else may follow the command.
+    /// Why `line` is not a runnable example for `key`, or `None` when it is:
+    /// split quote-aware, it must resolve through `aitm_cli::dispatch::locate`
+    /// to the command its key names (a group key: one of the group's verbs),
+    /// and everything after the command must pass
+    /// `aitm_cli::dispatch::check_flags` — the dispatcher's own flag grammar,
+    /// `--yes` and all — whose headline is the reason returned.
     fn example_problem(registry: &aitm_core::Registry, key: &str, line: &str) -> Option<String> {
         let argv = shell_words(line);
         if argv.first().map(String::as_str) != Some("aitm") {
@@ -860,43 +859,9 @@ mod tests {
         } else if group_of(cmd.name()) != key {
             return Some(format!("runs `{}`, outside the group", cmd.name()));
         }
-        let schema = cmd.schema();
-        let mut given: Vec<&str> = Vec::new();
-        let mut tokens = rest.iter().peekable();
-        while let Some(token) = tokens.next() {
-            let Some(flag) = token.strip_prefix("--") else {
-                return Some(format!("stray argument {token:?}"));
-            };
-            let (name, inline) = match flag.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (flag, None),
-            };
-            if name == "yes" {
-                continue;
-            }
-            let Some(def) = schema.params.iter().find(|def| def.name == name) else {
-                return Some(format!("--{name} is not a flag of `{}`", cmd.name()));
-            };
-            if given.contains(&name) {
-                return Some(format!("--{name} given twice"));
-            }
-            given.push(name);
-            if inline.is_none() {
-                match tokens.peek() {
-                    Some(next) if !next.starts_with("--") => {
-                        tokens.next();
-                    }
-                    _ if matches!(def.ty, TypeDesc::Bool) => {}
-                    _ => return Some(format!("--{name} has no value")),
-                }
-            }
-        }
-        schema
-            .params
-            .iter()
-            .filter(|def| def.required && !given.contains(&def.name.as_str()))
-            .map(|def| format!("required --{} missing", def.name))
-            .next()
+        check_flags(rest, cmd.as_ref())
+            .err()
+            .map(|report| report.what)
     }
 
     /// The checker bites on each defect class it exists for, with the words
@@ -916,23 +881,33 @@ mod tests {
         );
         assert_eq!(
             problem("scope.add", "aitm scope add --hsot a.test"),
-            Some("--hsot is not a flag of `scope.add`".to_string())
+            Some("unknown flag --hsot for `scope add`".to_string())
         );
         assert_eq!(
             problem("scope.add", "aitm scope add"),
-            Some("required --host missing".to_string())
+            Some("missing required flag --host for `scope add`".to_string())
         );
         assert_eq!(
             problem("scope.add", "aitm scope add --host"),
-            Some("--host has no value".to_string())
+            Some("flag --host needs a value".to_string())
         );
         assert_eq!(
             problem("scope.add", "aitm scope add --host a --host b"),
-            Some("--host given twice".to_string())
+            Some("flag --host given more than once".to_string())
         );
         assert_eq!(
             problem("scope.add", "aitm scope add --host a extra"),
-            Some("stray argument \"extra\"".to_string())
+            Some("unexpected argument `extra` for `scope add`".to_string())
+        );
+        // The dispatcher's grammar, not a looser copy: a bare boolean swallows
+        // no following word, and an integer value is type-checked.
+        assert_eq!(
+            problem("browser.confine", "aitm browser confine --on maybe"),
+            Some("unexpected argument `maybe` for `browser confine`".to_string())
+        );
+        assert_eq!(
+            problem("agent.activity", "aitm agent activity --limit abc"),
+            Some("flag --limit: expected an integer, got `abc`".to_string())
         );
         assert_eq!(
             problem("scope.add", "aitm scope list"),
