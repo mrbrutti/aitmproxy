@@ -50,7 +50,7 @@ use crate::crawl::client::ClientCrawler;
 use crate::crawl::frontier::{held_copy, limits_for, Crawler, StopReason};
 use crate::crawl::seeds::fetch_seeds;
 use crate::host::{HttpProbeHost, SessionMonitors};
-use crate::limits::{is_crawl_mark, job_mark, MARK_CRAWL, MAX_SEED_URLS, MAX_STORED_FLOWS};
+use crate::limits::{is_crawl_mark, job_mark, MAX_SEED_URLS, MAX_STORED_FLOWS};
 use crate::points::{enumerate_v2, CompiledIgnore, EnumerateOptions};
 use crate::redact;
 use crate::sitemap::{is_authenticated, SiteMapBuilder};
@@ -363,11 +363,14 @@ async fn crawl_origin(
         return Ok(Vec::new());
     };
 
-    // The same options the client engine sends its pages with: recorded,
-    // marked, and on the profile's HTTP version (Sp2).
+    // Recorded and on the profile's HTTP version like the client engine's
+    // page fetches (Sp2), but marked with the job mark only: a `robots.txt`
+    // or `sitemap.xml` probe is not a crawled page, and the engine counts
+    // every `crawl`-marked flow as one (`scan.discover` reported four pages
+    // for `max_pages: 2`; T1b contract cell, 2026-11-02).
     let send = SendOptions {
         record: RecordPolicy::Always,
-        marks: vec![job_mark.to_string(), MARK_CRAWL.to_string()],
+        marks: vec![job_mark.to_string()],
         version: job.profile().http.version.into(),
     };
     let client = job.client();
@@ -701,7 +704,7 @@ mod tests {
         .with_store(Arc::clone(&store))
         .with_browser(Arc::clone(&browser));
 
-        let _ = discover(&job, &[ORIGIN]).await;
+        discover(&job, &[ORIGIN]).await;
 
         assert!(
             browser
@@ -788,7 +791,7 @@ mod tests {
         .with_store(Arc::clone(&store))
         .with_session(material());
 
-        let _ = discover(&job, &[ORIGIN]).await;
+        discover(&job, &[ORIGIN]).await;
 
         // Copied out of the guard: the browser half below awaits, and a
         // `MutexGuard` may not be held across an await.
@@ -827,7 +830,7 @@ mod tests {
         .with_browser(Arc::clone(&browser))
         .with_session(material());
 
-        let _ = discover(&browser_job, &[ORIGIN]).await;
+        discover(&browser_job, &[ORIGIN]).await;
 
         assert!(
             browser.log_lines().contains(&"cookie-set sid".to_string()),
@@ -1097,6 +1100,41 @@ mod tests {
 
     // --- Sp2: every crawl send honours the profile's HTTP version ------------
 
+    /// A seed probe is not a page: `robots.txt` and `sitemap.xml` go out with
+    /// the job mark alone, while a crawl GET carries `crawl` too, so the
+    /// engine's page count (every `crawl`-marked flow) stays within
+    /// `max_pages` (T1b contract cell: `scan.discover { max_pages: 2 }` had
+    /// reported four).
+    #[tokio::test]
+    async fn seed_sends_carry_the_job_mark_only() {
+        let client = Arc::new(site(&fixture_pages()));
+        let job = FakeJob::new(
+            profile(|p| {
+                p.crawl.use_browser = UseBrowser::Never;
+                p.crawl.robots = true;
+                p.crawl.sitemap = true;
+            }),
+            Arc::clone(&client),
+        );
+
+        discover(&job, &[ORIGIN]).await;
+
+        let sent = client.sent.lock().unwrap();
+        let marks_of = |path: &str| -> Vec<String> {
+            sent.iter()
+                .find(|(req, _)| req.path == path)
+                .map(|(_, opts)| opts.marks.clone())
+                .unwrap_or_else(|| panic!("{path} was fetched"))
+        };
+        assert_eq!(marks_of("/robots.txt"), vec![job_mark(JOB_ID)]);
+        assert_eq!(marks_of("/sitemap.xml"), vec![job_mark(JOB_ID)]);
+        assert_eq!(
+            marks_of("/a"),
+            vec![job_mark(JOB_ID), MARK_CRAWL.to_string()],
+            "a crawled page carries the crawl mark"
+        );
+    }
+
     /// `http.version: h1` reaches the seed fetches and the crawl GETs alike:
     /// the lane builds the seed `SendOptions` from the profile, not from
     /// `SendOptions::default()`.
@@ -1113,7 +1151,7 @@ mod tests {
             Arc::clone(&client),
         );
 
-        let _ = discover(&job, &[ORIGIN]).await;
+        discover(&job, &[ORIGIN]).await;
 
         let sent = client.sent.lock().unwrap();
         assert!(sent.iter().any(|(req, _)| req.path == "/robots.txt"));
