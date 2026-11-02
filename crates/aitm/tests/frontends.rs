@@ -111,10 +111,10 @@ const EXPECTED_TOOLS: [&str; 103] = [
     "scan.profile.delete",
     "scan.session.preview",
     // One manual verb per registered check (spec D3 `check.<id>`): the ten T3
-    // natives of `aitm-scan-checks-http` (PR 2a; `xss-reflected` and
-    // `open-redirect` took over the interim lane's two active ids) and the
-    // interim lane's three passive checks, whose ids go away with T2's
-    // integration.
+    // natives of `aitm-scan-checks-http` (PR 2a) and the three passive checks
+    // the scanner engine itself ships (`reflection`, `security-header`,
+    // `cookie-flag`), which stay on the surface whatever lane holds the http
+    // slot (spec amendment 24: "the passives stay").
     "check.xss-reflected",
     "check.open-redirect",
     "check.sqli-boolean",
