@@ -20,6 +20,7 @@ pub mod flow;
 pub mod guard;
 pub mod header;
 pub mod jobs;
+pub mod peer;
 pub mod plugin;
 pub mod protocol;
 pub mod proxy;
@@ -66,6 +67,7 @@ pub use guard::{
 };
 pub use header::{HeaderError, HeaderMap};
 pub use jobs::{JobBus, JobEvent, DEFAULT_JOB_BUS_CAPACITY};
+pub use peer::PeerResolver;
 pub use plugin::Plugin;
 pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 pub use proxy::{Proxy, ProxyBuilder};

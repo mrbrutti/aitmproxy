@@ -347,6 +347,7 @@ pub(crate) fn connected_app(cols: u16, rows: u16) -> App {
             name: (*name).to_string(),
             description: format!("{name} (test)"),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            confirmable: false,
         })
         .collect();
     let _ = app.on_bus(BusEvent::Connected {

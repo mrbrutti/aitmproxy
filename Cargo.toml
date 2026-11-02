@@ -25,6 +25,7 @@ members = [
     "crates/aitm-bus-client",
     "crates/aitm-tui",
     "crates/aitm-peer-token",
+    "crates/aitm-peer-process",
     "crates/aitm-scan-model",
     "crates/aitm-scan-http",
     "crates/aitm-scan-checks-http",
@@ -37,7 +38,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.11"
+version = "0.5.12"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.97"
@@ -99,6 +100,7 @@ aitm-bus-client = { path = "crates/aitm-bus-client" }
 aitm-tui = { path = "crates/aitm-tui" }
 aitm-plugin-scanner = { path = "crates/aitm-plugin-scanner" }
 aitm-peer-token = { path = "crates/aitm-peer-token" }
+aitm-peer-process = { path = "crates/aitm-peer-process" }
 aitm-scan-model = { path = "crates/aitm-scan-model" }
 aitm-scan-http = { path = "crates/aitm-scan-http" }
 aitm-scan-checks-http = { path = "crates/aitm-scan-checks-http" }
