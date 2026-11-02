@@ -1175,7 +1175,8 @@ Acceptance:
 - [unit] `ScopeAddQueue` (Kit): a send that fails with a bus absence (disconnected, transport, timeout) is `queued` and replayable; a core refusal (tool, rpc) is `failed` with the reason; a host `scope.list` names leaves the queue; ✕ drops it; Retry re-sends.
 - [live] Dev bundle + real core, Scope page: Proxy ▸ Restart Core, then type a host and press Return while the core is down — the row reads `queued — added when the core is back`; when the bus reconnects the host is sent again, `scope.list` names it, and the row becomes a real entry (the pill/sidebar count moves) with no further action.
 - [live] A host the core refuses reads `not added — <the core's reason>` with Retry and ✕; the status bar carries the same reason; nothing is persisted to `scope.json`.
-- [live] The same add while the core is up still lands within a poll (regression).
+- [live] The same add while the core is up still lands within a poll (regression), and every surface that reads Scope moves with it inside that poll: the status-bar pill, the sidebar Scope badge, the Flows banner's "Nothing is decrypted" line, the Status page's Scope step.
+- [live] A core that is merely busy (bus connected, the call times out: SIGSTOP on the dev bundle's core) leaves the row `queued — added when the core is back`; it lands on its own once the core answers again (the next poll re-sends it), with no reconnect and no operator action.
 - [live] After Proxy ▸ Restart Core, a verb from the page (row ✕, a plain add) reaches the new core on the first try: no "the bus connection closed" under a connected title (the superseded bus run's teardown must not clear the new client; FIXLOG 2026-11-01).
 UX:
 - Surface: inline on the Scope page row (and the Scope sheet, which embeds the page); no alert.

@@ -4,8 +4,9 @@ import Foundation
 /// The Scope page's adds in flight (S-081). A host the operator typed is `sending`
 /// until the core lists it. A send that failed because the bus was not there — the
 /// embedded core restarting, a dropped connection, a timeout — is `queued` and
-/// replayed the moment the bus is back, so an add typed during a restart lands
-/// instead of silently staying "pending". A send the core refused is `failed` with
+/// replayed on the next connect and on every poll while it stays queued (one attempt
+/// per host in flight at a time), so an add typed during a restart, or while the core
+/// was too busy to answer, lands instead of silently staying "pending". A send the core refused is `failed` with
 /// the core's reason and waits for the operator's Retry or ✕. Nothing here is a
 /// scope fact: `scope.list` (`Session.scopeHosts`) is, and `confirm` drops every
 /// host it lists.

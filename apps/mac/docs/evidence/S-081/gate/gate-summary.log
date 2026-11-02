@@ -8,3 +8,4 @@ live-fresh exit 0
 LIVE SELFTEST PASS 98 checks
 reconnect exit 0
 RECONNECT LIVE SELFTEST PASS (reconnect-bus, restart-core, crash-respawn: an operator action through the app succeeded after each)
+bus-client suite re-run alone after one load flake (refusedConnectionIsTransportError, a refused-connect socket test, untouched by this PR): ✔ Test run with 31 tests in 6 suites passed after 0.572 seconds.

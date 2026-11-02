@@ -19,7 +19,9 @@ dispatch that never reaches the running core — the CLI UX session owns that.)
 Fix: `ScopeAddQueue` (Kit) holds the adds in flight on the Session: `sending…`,
 `queued — added when the core is back` (bus absence; replayed when the bus
 reconnects, `BusService` calls `replayQueuedScopeAdds` after its connect-time
-`scope.list`), or `not added — <reason>` with Retry and ✕ (the core refused). The
+`scope.list` and on every poll while an add stays queued — a core that is merely busy
+and lets the call time out gets the add again without a reconnect), or `not added —
+<reason>` with Retry and ✕ (the core refused). The
 Scope page renders that state on the row instead of a silent pending entry.
 Rule: a surface must never show an operator's intent as if it were the system's
 state; an in-flight or failed action carries its state on the row it created, and a

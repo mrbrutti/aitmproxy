@@ -194,6 +194,10 @@ final class BusService: FlowActions {
             // The next refresh reads `self.client`, which a later start() may already own: a
             // superseded run's call would land a frame ahead of the new client's token line.
             guard owns() else { return }
+            // A Scope add that timed out on a busy core (bus up, no reconnect coming) is queued
+            // too: the next poll re-sends it (S-081). `begin` makes it `sending` until the core
+            // answers, so at most one attempt per host is ever in flight.
+            session.replayQueuedScopeAdds()
             // The proxy's recording state is the core's fact, not this client's memory: a pause
             // from any other client (agent, TUI, web) reaches the toolbar's Proxy switch within
             // one poll, and a relaunch against an already-paused core starts out saying so.
@@ -256,7 +260,15 @@ final class BusService: FlowActions {
     private func refreshScope() async -> Bool {
         guard let client else { return false }
         guard let entries = try? await client.call("scope.list").arrayValue?.compactMap(\.stringValue) else { return false }
+        // An operator add that the core applied after this client gave up on it (the call timed
+        // out on a busy core, the reply came later) shows up here first, not in `scopeVerb`: it
+        // is still the operator's own Scope action, so it reaches `scope.json` too (D4) — else
+        // the host would be on the core and on the page but gone at the next launch (S-081).
+        let landedLate = session.scopeAdds.hosts.contains(where: entries.contains)
         session.scopeHosts = entries
+        if landedLate, preferEmbedded {
+            do { try persistEmbeddedScope() } catch { session.lastError = "scope not saved: \(Self.describe(error))" }
+        }
         return true
     }
 

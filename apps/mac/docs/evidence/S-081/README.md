@@ -66,3 +66,25 @@ touched the installed app. Logs are the scripts' stdout with timestamps.
 - `scope-json.log` — the final run on the tip (items 5, 7, 8 above): `scope.json` read before and after
   every step; a refused host writes nothing to it.
 - `gate-summary.log` — the gate script's exit lines on the tip.
+
+## busy/ — a core that is merely busy, and every surface after a successful add
+
+Asked by the orchestrator after the diagnosis of the installed 0.5.10 (Scope empty on the core; the
+add had never left the app). Dev bundle, 0.5.10 release core; the embedded core is made "busy" with
+`kill -STOP` (bus socket open, nothing answers) and released with `kill -CONT` — no restart, no
+reconnect, no operator action in between.
+
+1. `1-status-before-add.png` → `3-status-after-add.png` (`2-scope-0.7s-after-add.png` between): one add
+   of `ok.test`, and 0.7 s later the Scope row is a plain entry, the pill reads `1 hosts in scope`,
+   the sidebar badge 1; the Status page's step turns from "Add a host to Scope (for now as
+   example.com:443)" to "Scope: 1 host decrypted" ✓; the Flows banner's "Nothing is decrypted
+   until a host is in Scope" line is gone (after/5 shows the banner with a host in Scope).
+2. `4-core-stopped-queued-33s.png` — `busy.test` typed while the core is stopped: 33 s later (past the
+   bus client's 30 s call timeout) the row reads `queued — added when the core is back`, the
+   status bar `add to scope: the bus did not reply in time`, the title still "connected".
+3. `5-landed-3s-after-cont.png` — 3 s after `kill -CONT`, with no reconnect: `busy.test` is a plain
+   row, pill `2 hosts in scope`, badge 2; `scope.list` = `["ok.test","busy.test"]` (`run1.log`).
+4. `run1.log` also shows the gap the first run exposed: `scope.json` still `{"hosts":["ok.test"]}`
+   after the late landing — the core had applied the timed-out call when it woke, so the app's own
+   verb path (the only `scope.json` writer) never ran. Fixed on the tip: a scope.list that confirms
+   an operator add in flight persists the snapshot too; `run2.log` reads the file after SIGCONT.
