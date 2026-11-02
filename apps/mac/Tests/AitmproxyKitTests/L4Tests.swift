@@ -129,31 +129,118 @@ import Testing
     }
 }
 
-@Suite struct L4DegradationTests {
-    /// `macos_embedded_core_degrades` (L4OPS-AC18): against the self-contained
-    /// app's embedded user-level core the L4 surface renders but every wire verb
-    /// is `L4Unavailable`, with a reason that names the Phase-2 Network/System
-    /// Extension as the path; pointed at a privileged core over the bus it drives
-    /// L4 fully.
-    @Test func macos_embedded_core_degrades() {
-        let embedded = L4Availability.resolve(embeddedCore: true, wireError: "L4 unavailable: no privilege")
-        guard case let .degraded(reason) = embedded else {
-            Issue.record("embedded core must degrade")
-            return
-        }
-        #expect(reason.lowercased().contains("extension"))
-        #expect(reason.lowercased().contains("privileged") || reason.lowercased().contains("privilege"))
+@Suite struct L4AvailabilityTests {
+    /// L4PAR-AC26 (Kit): availability comes from the core's `l4.capture.status` /
+    /// `l4.intercept.status` reply (spec §1), never from a guess about the core.
+    /// The AC3 object maps to `.degraded(reason)`; `{available: true}` and an
+    /// older core's bare array map to `.available`; a tool error carrying
+    /// `L4 unavailable: X` keeps only `X` (Decision 9); no reply at all is
+    /// `.pending` with the shared literal `Reading L4 availability…`.
+    @Test func testResolveReadsStatusObject() {
+        let unavailable = JSONValue.object([
+            "available": .bool(false),
+            "code": .string("needs_privilege"),
+            "reason": .string("X"),
+            "captures": .array([]),
+        ])
+        #expect(L4Availability.resolve(status: unavailable, error: nil) == .degraded(reason: "X"))
+        #expect(L4Availability.resolve(status: unavailable, error: nil).reason == "X")
+        #expect(!L4Availability.resolve(status: unavailable, error: nil).canDriveWire)
+        #expect(L4Availability.resolve(status: unavailable, error: nil).rendersSurface)
 
-        // The surface still renders (capture/scope/craft work locally) — degradation
-        // is per wire verb, not a blank screen.
-        #expect(embedded.rendersSurface)
-        #expect(!embedded.canDriveWire)
+        // `available: false` with no reason still degrades, with a non-empty reason.
+        #expect(L4Availability.resolve(status: .object(["available": .bool(false)]), error: nil)
+            == .degraded(reason: "L4 unavailable"))
 
-        // Pointed at a privileged / remote core over the bus: full drive, no banner.
-        let privileged = L4Availability.resolve(embeddedCore: false, wireError: nil)
-        #expect(privileged == .available)
-        #expect(privileged.canDriveWire)
-        #expect(privileged.rendersSurface)
+        // The status object may arrive wrapped in `structuredContent`.
+        let wrapped = JSONValue.object(["structuredContent": unavailable])
+        #expect(L4Availability.resolve(status: wrapped, error: nil) == .degraded(reason: "X"))
+
+        let available = L4Availability.resolve(status: .object(["available": .bool(true)]), error: nil)
+        #expect(available == .available)
+        #expect(available.canDriveWire)
+        #expect(available.reason == nil)
+
+        // An older core answers the status verbs with the bare payload array.
+        #expect(L4Availability.resolve(status: .array([]), error: nil) == .available)
+        #expect(L4Availability.resolve(status: .array([.string("f1")]), error: nil) == .available)
+
+        // An older core's gated error: keep only the text after the marker.
+        #expect(L4Availability.resolve(status: nil, error: "l4.capture.status: L4 unavailable: X")
+            == .degraded(reason: "X"))
+        // The status reply wins over a stale error.
+        #expect(L4Availability.resolve(status: .object(["available": .bool(true)]), error: "L4 unavailable: X")
+            == .available)
+        // An unrelated error is not an availability verdict.
+        #expect(L4Availability.resolve(status: nil, error: "connection refused") == .pending)
+
+        let pending = L4Availability.resolve(status: nil, error: nil)
+        #expect(pending == .pending)
+        #expect(pending.displayText == "Reading L4 availability…")
+        #expect(!pending.canDriveWire)
+        #expect(pending.rendersSurface)
+        #expect(pending.reason == nil)
+    }
+}
+
+@Suite struct L4ParkedPacketTests {
+    /// L4PAR-AC28 (Kit): Forward / Drop / Mutate / Revert act on a parked packet
+    /// by its parked id (spec §4), so the args builder carries exactly `{id}`.
+    @Test func testVerdictArgsCarryParkedID() {
+        #expect(L4Verdict.args(parkedID: "P1") == ["id": .string("P1")])
+        #expect(L4Verdict.args(parkedID: "P1").count == 1)
+    }
+
+    /// `l4.intercept.list` lists parked packets oldest first (Decision 3); the
+    /// bar acts on the first listed entry for the selected flow.
+    @Test func testParkedListAndFirst() throws {
+        let reply = JSONValue.object([
+            "structuredContent": .array([
+                .object([
+                    "id": .string("P1"), "flow": .string("F"), "state": .string("parked"),
+                    "length": .number(60), "layers": .array([.string("IPv4"), .string("TCP")]),
+                    "parked_at": .number(1_761_955_200_000),
+                ]),
+                .object([
+                    "id": .string("P2"), "flow": .string("G"), "state": .string("parked"),
+                    "length": .number(42), "layers": .array([.string("IPv4"), .string("UDP")]),
+                    "parked_at": .number(1_761_955_200_500),
+                ]),
+                .object([
+                    "id": .string("P3"), "flow": .string("G"), "state": .string("parked"),
+                    "length": .number(43), "layers": .array([.string("IPv4"), .string("UDP")]),
+                    "parked_at": .number(1_761_955_201_000),
+                ]),
+            ]),
+        ])
+        let parked = L4ParkedPacket.list(reply)
+        #expect(parked.map(\.id) == ["P1", "P2", "P3"])
+        #expect(parked[0].flow == FlowID("F"))
+        #expect(parked[0].state == "parked")
+        #expect(parked[0].length == 60)
+        #expect(parked[0].layers == ["IPv4", "TCP"])
+        #expect(parked[0].parkedAt == Date(timeIntervalSince1970: 1_761_955_200))
+        #expect(parked[1].parkedAt == Date(timeIntervalSince1970: 1_761_955_200.5))
+
+        // The first listed entry for G is P2 (oldest), not P3.
+        let g = try #require(L4ParkedPacket.first(for: FlowID("G"), in: parked))
+        #expect(g.id == "P2")
+        #expect(L4ParkedPacket.first(for: FlowID("F"), in: parked)?.id == "P1")
+        #expect(L4ParkedPacket.first(for: FlowID("H"), in: parked) == nil)
+
+        // A bare array (an older core) parses the same; an entry without an id or
+        // flow is skipped, and a non-list reply is empty.
+        let bare = JSONValue.array([
+            .object(["id": .string("P9"), "flow": .string("F")]),
+            .object(["flow": .string("F")]),
+            .object(["id": .string("P10")]),
+        ])
+        let bareParsed = L4ParkedPacket.list(bare)
+        #expect(bareParsed.map(\.id) == ["P9"])
+        #expect(bareParsed[0].length == 0)
+        #expect(bareParsed[0].layers == [])
+        #expect(bareParsed[0].parkedAt == nil)
+        #expect(L4ParkedPacket.list(.object(["available": .bool(false)])).isEmpty)
     }
 }
 

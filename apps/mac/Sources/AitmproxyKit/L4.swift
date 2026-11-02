@@ -296,26 +296,83 @@ public struct L4InjectOutcome: Sendable {
     public var refusalText: String? { isRefusal ? error : nil }
 }
 
-// MARK: - macOS honest degradation (AC18)
+// MARK: - Availability from the core (L4PAR-AC26; spec §1, Decision 9)
 
-/// Whether this macOS app can drive the L4 wire. Against the self-contained app's
-/// embedded user-level core the surface renders but every wire verb is
-/// `L4Unavailable`, with a reason naming the Phase-2 Network/System Extension as the
-/// path; pointed at a privileged (Linux / elevated / remote) core over the bus it
-/// drives L4 fully. This app never builds a macOS capture backend (deferred Phase 2).
+/// Whether the core this app talks to can drive the L4 wire, read from the core's
+/// own `l4.capture.status` / `l4.intercept.status` reply (spec §1) and never from a
+/// guess about what kind of core it is. The surface always renders; degradation is
+/// per wire verb, with the core's `reason` quoted. Until the first reply arrives the
+/// value is `.pending`, and the UI shows `Reading L4 availability…`.
 public enum L4Availability: Hashable, Sendable {
+    /// No status reply has been read yet (first poll outstanding).
+    case pending
     case available
     case degraded(reason: String)
 
-    /// The operator-facing reason the embedded core cannot reach the wire.
+    /// The marker the gated verbs put in front of their reason (`L4 unavailable: X`).
+    /// A status error carrying it degrades with just `X`.
+    public static let unavailableMarker = "L4 unavailable: "
+
+    /// The one pending literal shared by the TUI, the web UI and this app.
+    public static let pendingText = "Reading L4 availability…"
+
+    /// Resolve availability from one status verb's reply.
+    ///
+    /// - An object with a bool `available`: `true` ⇒ `.available`; `false` ⇒
+    ///   `.degraded(reason:)` with the object's `reason`, or `L4 unavailable` when
+    ///   the core sent none. The object may be wrapped in `structuredContent`.
+    /// - A bare array (an older core's payload-only reply) ⇒ `.available`.
+    /// - No usable status and an `error` containing `L4 unavailable: X` (an older
+    ///   core's gated verb) ⇒ `.degraded(reason: "X")`.
+    /// - Neither ⇒ `.pending`.
+    public static func resolve(status: JSONValue?, error: String?) -> L4Availability {
+        if let raw = status {
+            let json = raw["structuredContent"] ?? raw
+            if let available = json["available"]?.boolValue {
+                if available { return .available }
+                let reason = json["reason"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+                return .degraded(reason: reason.flatMap { $0.isEmpty ? nil : $0 } ?? "L4 unavailable")
+            }
+            if json.arrayValue != nil { return .available }
+        }
+        if let error, let range = error.range(of: unavailableMarker) {
+            let reason = error[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            return .degraded(reason: reason.isEmpty ? "L4 unavailable" : reason)
+        }
+        return .pending
+    }
+
+    /// The text a surface renders for this state: the pending literal while the
+    /// first reply is outstanding, the core's reason when degraded, nil when
+    /// available (nothing to say).
+    public var displayText: String? {
+        switch self {
+        case .pending: Self.pendingText
+        case .degraded(let reason): reason
+        case .available: nil
+        }
+    }
+
+    /// The surface always renders (capture/scope/craft work locally); degradation is
+    /// per wire verb, not a blank screen.
+    public var rendersSurface: Bool { true }
+    /// Only a confirmed `.available` drives the wire; `.pending` does not.
+    public var canDriveWire: Bool { self == .available }
+    /// The core's reason when degraded; nil when available or pending.
+    public var reason: String? {
+        if case let .degraded(reason) = self { return reason }
+        return nil
+    }
+
+    // Kept for Session.swift / L4Inspector.swift until M4a rewires them to
+    // `resolve(status:error:)`; M4a deletes both members.
     public static let embeddedReason =
         "Raw L4 capture and injection need a privileged core. This app's embedded core runs as "
         + "you and cannot open raw sockets, /dev/bpf or NFQUEUE. A macOS Network/System Extension "
         + "(Phase 2) will provide the local capture path; until then, point the app at a privileged "
         + "core (Linux, elevated, or remote) over the bus to drive L4."
 
-    /// Resolve availability. The embedded user-level core always degrades (it cannot
-    /// do raw L4); a privileged/remote core over the bus drives fully.
+    // Kept for Session.swift until M4a; M4a deletes it.
     public static func resolve(embeddedCore: Bool, wireError: String?) -> L4Availability {
         if embeddedCore { return .degraded(reason: embeddedReason) }
         if let wireError, wireError.lowercased().contains("l4 unavailable") {
@@ -323,14 +380,62 @@ public enum L4Availability: Hashable, Sendable {
         }
         return .available
     }
+}
 
-    /// The surface always renders (capture/scope/craft work locally); degradation is
-    /// per wire verb, not a blank screen.
-    public var rendersSurface: Bool { true }
-    public var canDriveWire: Bool { self == .available }
-    public var reason: String? {
-        if case let .degraded(reason) = self { return reason }
-        return nil
+// MARK: - Parked packets and verdicts (L4PAR-AC28; spec §4, Decision 3)
+
+/// One parked packet from `l4.intercept.list`: the parked id the verdict verbs
+/// take, the flow it belongs to, its state, byte length, decoded layer names and
+/// when the core parked it (`parked_at`, epoch milliseconds). The core lists
+/// parked packets in arrival order, oldest first.
+public struct L4ParkedPacket: Hashable, Sendable, Identifiable {
+    public let id: String
+    public let flow: FlowID
+    public let state: String
+    public let length: Int
+    public let layers: [String]
+    public let parkedAt: Date?
+
+    public init(id: String, flow: FlowID, state: String, length: Int, layers: [String], parkedAt: Date?) {
+        self.id = id
+        self.flow = flow
+        self.state = state
+        self.length = length
+        self.layers = layers
+        self.parkedAt = parkedAt
+    }
+
+    /// Decode one list entry; nil without an `id` and a `flow` (nothing to act on).
+    init?(json: JSONValue) {
+        guard let id = json["id"]?.stringValue, let flow = json["flow"]?.stringValue else { return nil }
+        self.id = id
+        self.flow = FlowID(flow)
+        self.state = json["state"]?.stringValue ?? ""
+        self.length = json["length"]?.intValue ?? 0
+        self.layers = json["layers"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+        self.parkedAt = json["parked_at"]?.doubleValue.map { Date(timeIntervalSince1970: $0 / 1000) }
+    }
+
+    /// Parse an `l4.intercept.list` reply (a bare array, or `{structuredContent: [...]}`)
+    /// in the core's order. A reply that is not a list yields no packets.
+    public static func list(_ raw: JSONValue) -> [L4ParkedPacket] {
+        let json = raw["structuredContent"] ?? raw
+        return (json.arrayValue ?? []).compactMap { L4ParkedPacket(json: $0) }
+    }
+
+    /// The first listed parked packet for `flow`, the oldest, which is the one the
+    /// intercept bar acts on by default (Decision 3).
+    public static func first(for flow: FlowID, in parked: [L4ParkedPacket]) -> L4ParkedPacket? {
+        parked.first { $0.flow == flow }
+    }
+}
+
+/// Arguments for the parked-packet verdict verbs (`l4.intercept.forward` / `.drop`
+/// / `.mutate` / `.revert`): they act on a parked id, never on a flow id.
+public enum L4Verdict {
+    /// `{id: <parked id>}`; Mutate adds `spec` beside it.
+    public static func args(parkedID: String) -> [String: JSONValue] {
+        ["id": .string(parkedID)]
     }
 }
 
