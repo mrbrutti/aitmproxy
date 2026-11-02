@@ -769,6 +769,50 @@ mod tests {
         );
     }
 
+    /// Amendment 72b, the refusal half: the host's `charge` is the job's, so a
+    /// charge the budget cannot cover is refused and debits nothing — what is
+    /// left stays affordable for a smaller stimulus.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ws_host_refuses_a_charge_the_job_budget_cannot_cover() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(1);
+        let host = host_for("msg", &job, transport);
+
+        assert!(!host.charge(2), "two units out of one are refused");
+        assert_eq!(job.charged(), 0, "a refused charge debits nothing");
+        assert_eq!(job.budget_left(), 1, "the one unit is still there");
+
+        assert!(host.charge(1), "what is left is still affordable");
+        assert_eq!(job.budget_left(), 0);
+    }
+
+    /// C9: the ws handshake is `held_flows`' business, never `captured`'s. Even
+    /// once the host holds conversations, `captured()` answers `None` — a
+    /// passive check on this lane reads the held flows, not one captured HTTP
+    /// flow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ws_host_holds_the_handshake_and_captures_nothing() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+        let host = host_for("msg", &job, transport);
+
+        host.baseline().await.expect("the baseline");
+        host.probe(&text("a", PayloadMode::Replace))
+            .await
+            .expect("the probe");
+
+        let held = host.held_flows();
+        assert!(
+            held.iter().any(|flow| matches!(flow, Flow::Http(_))),
+            "the handshake is held as an HTTP flow: {} held",
+            held.len()
+        );
+        assert!(
+            host.captured().is_none(),
+            "the handshake is not this point's captured flow"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn budget_exhausted_is_err_before_connect() {
         let (transport, log) = ws_server(None, echo_handler);

@@ -1865,6 +1865,26 @@ mod tests {
         );
     }
 
+    /// Amendment 72b, the refusal half: the host's `charge` is the job's, so a
+    /// charge the budget cannot cover is refused and debits nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_packet_host_refuses_a_charge_the_job_budget_cannot_cover() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 10);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let host = PacketHost::new(runner);
+        let job = Arc::clone(&job).with_budget(1);
+        let spent = job.charged();
+
+        assert!(!host.charge(2), "two units out of one are refused");
+        assert_eq!(job.charged(), spent, "a refused charge debits nothing");
+        assert_eq!(job.budget_left(), 1, "the one unit is still there");
+
+        assert!(host.charge(1), "what is left is still affordable");
+        assert_eq!(job.budget_left(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hundred_clean_cases_exact_counts() {
         let mock = MockBackend::new(MockReply::Echo);

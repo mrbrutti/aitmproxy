@@ -473,11 +473,12 @@ mod tests {
         assert!(discovery.nodes.is_empty());
     }
 
-    /// T1b (spec D2, D9.3): the three `ProbeHost` additions are default-bodied,
-    /// so a lane written against T1a still compiles and answers `None` — the
-    /// engine's own hosts override them.
+    /// Amendment 72b (spec D2, D9.3): `client` and `captured` are required, and
+    /// the null host — no job handle, no captured flow — spells out `None` for
+    /// both. `shared` keeps its default body, so a host that is not behind an
+    /// `Arc` still inherits "none to give".
     #[test]
-    fn probe_host_defaults_are_none() {
+    fn the_null_host_lends_nothing_and_shared_still_defaults_to_none() {
         let host = NullHost::new();
 
         assert!(host.client().is_none());
@@ -522,12 +523,14 @@ mod tests {
         assert_eq!(dynamic.budget_left(), 7);
     }
 
-    /// T3 security panel (2026-11-01): a stimulus that bypasses `probe` must
-    /// still be budgeted. The default body only *checks* — it has no job handle
-    /// to charge — so a host written before this method refuses exactly what it
-    /// cannot afford and its budget is unchanged either way.
+    /// T3 security panel (2026-11-01), under amendment 72b: a stimulus that
+    /// bypasses `probe` must still be budgeted. `charge` is required of every
+    /// host, and the null host has no job handle to debit, so its answer only
+    /// *checks*: it refuses exactly what it cannot afford and its budget is
+    /// unchanged either way. The lane hosts that do hold a `JobCtx` debit for
+    /// real, each pinned in its own crate's `host.rs` tests.
     #[test]
-    fn probe_host_charge_default_checks_the_budget_and_spends_nothing() {
+    fn the_null_host_charge_checks_the_budget_and_spends_nothing() {
         let host = NullHost::new();
         let dynamic: &dyn ProbeHost = &host;
         assert_eq!(dynamic.budget_left(), 3);
@@ -537,7 +540,7 @@ mod tests {
         assert_eq!(
             dynamic.budget_left(),
             3,
-            "the default body charges nothing: it has no job handle"
+            "the null host charges nothing: it has no job handle"
         );
     }
 

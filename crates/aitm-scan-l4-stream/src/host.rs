@@ -1604,6 +1604,22 @@ mod tests {
         assert_eq!(client.writes(), 1);
     }
 
+    /// Amendment 72b, the refusal half: the host's `charge` is the job's answer,
+    /// not a `budget_left` comparison. This job refuses every charge while
+    /// still reporting a thousand units left, so a host that only compared the
+    /// two would wrongly say yes.
+    #[tokio::test]
+    async fn the_stream_host_refuses_a_charge_the_job_refuses() {
+        let job = Arc::new(TestJob::new().broke());
+        let client = Arc::new(CountingClient::live());
+        let host = test_host(endpoint(6379), Some(loopback_guard()), &job, &client);
+
+        assert_eq!(job.budget_left(), 1000, "the job still reports units left");
+        assert!(!host.charge(2), "the job refused, so the host refuses");
+        assert_eq!(job.charges(), 0, "a refused charge debits nothing");
+        assert_eq!(client.count(), 0, "a refused charge sends nothing");
+    }
+
     #[tokio::test]
     async fn budget_exhausted() {
         let job = Arc::new(TestJob::new().broke());

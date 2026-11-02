@@ -774,8 +774,8 @@ mod tests {
     /// Wave-2/3 security review: a script check must only ever send through
     /// the host's budgeted client. The recorder therefore lends one — inert, so
     /// a closure's `http.send` is refused rather than reaching the network —
-    /// instead of the trait default `None`, which the bridge is to treat as a
-    /// wiring error.
+    /// rather than the `None` of a clientless host, which the bridge is to
+    /// treat as a wiring error (`client` is required since amendment 72b).
     #[test]
     fn recording_host_lends_an_inert_client() {
         let host = RecordingHost::new(200, "ok");
