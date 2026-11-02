@@ -849,16 +849,11 @@ fn the_retired_scripts_are_gone() {
 
 /// A JSON body whose fields are all numbers, booleans or nulls: the document
 /// branch has nowhere to put an operator, so it sends nothing at all — and
-/// still answers `clean` with `firm` confidence.
-///
-/// **Tester finding (PR 3b, document branch).** `Outcome::Clean` is "the check
-/// ran and found nothing" (`aitm-scan-model` vocab), and the detail says the
-/// operator "did not change the answer" when no operator was ever placed. The
-/// honest answer for a body with no string field is `inconclusive` (or a
-/// skip), as the cut example gets. This test pins what the shipped script does
-/// today so the fix is a deliberate edit here, not a silent change.
+/// says so. `Outcome::Clean` is reserved for "operators were tried and nothing
+/// moved" (`aitm-scan-model` vocab); a body no operator was ever placed in is
+/// `inconclusive`, the same answer the cut example gets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nosqli_json_calls_a_body_with_no_string_field_clean_without_a_probe() {
+async fn nosqli_json_is_inconclusive_when_the_body_has_no_string_field() {
     let check = Loaded::load("check-nosqli-json.rhai")
         .expect("loads")
         .single()
@@ -879,17 +874,14 @@ async fn nosqli_json_calls_a_body_with_no_string_field_clean_without_a_probe() {
         Vec::<String>::new(),
         "no string field, so no operator document was ever built"
     );
-    assert_eq!(
-        verdict.outcome,
-        Outcome::Clean,
-        "today's answer: {verdict:?}"
-    );
-    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{verdict:?}");
+    assert_eq!(verdict.confidence, Confidence::Tentative);
     assert_eq!(
         verdict.detail,
-        "A query-operator document at any string field of this JSON body did not change the answer."
+        "this JSON body has no string field to place an operator document at"
     );
     assert_eq!(verdict.evidence.payload, None);
+    assert_eq!(verdict.evidence.matched, None);
 }
 
 /// The lane's `entire_body` example is **scrubbed** before the check sees it
@@ -899,43 +891,74 @@ async fn nosqli_json_calls_a_body_with_no_string_field_clean_without_a_probe() {
 /// `{"user":"a","api_key":[redacted]}`, pinned by
 /// `redact::tests::an_entire_body_example_with_an_unquoted_secret_value_is_no_longer_json`.
 ///
-/// **Tester finding (PR 3b, document branch).** That text passes
-/// `is_whole_json_object` — its braces and brackets balance and no quote is
-/// left open — so the script hands it to `parse_json`, which fails, and the
-/// whole check ends as an `error` verdict on an ordinary JSON body. The guard
-/// the Task 11 review log accepted covers the *cut* example; this shape is not
-/// a cut and is not covered. The honest answer is the same `inconclusive` the
-/// cut gets. Pinned as it behaves today so the fix is a deliberate edit here.
+/// Its braces and brackets balance and no quote is left open, so completeness
+/// alone would hand it to `parse_json`, which fails uncatchably and ends the
+/// whole check as an `error`. A mask standing where a value should be says the
+/// example is not the document the store saw: the check answers `inconclusive`
+/// with a detail of its own, because the cause is the scrub and not a cut. A
+/// mask *inside* a quoted string is still a whole document and is still probed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nosqli_json_errors_on_an_example_the_scrub_left_unparsable() {
+async fn nosqli_json_is_inconclusive_when_the_scrub_masked_an_unquoted_value() {
     let check = Loaded::load("check-nosqli-json.rhai")
         .expect("loads")
         .single()
         .expect("exactly one check");
-    let body_point = point(
+
+    for example in [
+        r#"{"user":"a","api_key":[redacted]}"#,
+        r#"{"user":"a","token":[redacted],"page":2}"#,
+        r#"{"user":"a","session":{"token":[redacted]}}"#,
+    ] {
+        let body_point = point(
+            InsertionKind::EntireBody,
+            "body",
+            "http://127.0.0.1:8080/api/login",
+            Some(example),
+            &[PointTrait::Json, PointTrait::Structured],
+        );
+
+        let host = Replies::plain(401, r#"{"ok":false}"#).build();
+        let verdict = run(&check, &body_point, &host).await;
+
+        assert_eq!(
+            verdict.outcome,
+            Outcome::Inconclusive,
+            "{example}: {verdict:?}"
+        );
+        assert_eq!(verdict.confidence, Confidence::Tentative, "{example}");
+        assert_eq!(
+            verdict.detail,
+            "a secret in this JSON body was masked before the check saw it; \
+             document-level operators need the whole body",
+            "{example}: the scrub case says why, and says something other than \
+             the cut case"
+        );
+        assert_eq!(verdict.evidence.payload, None, "{example}");
+        assert_eq!(verdict.evidence.matched, None, "{example}");
+        assert_eq!(
+            host.payloads(),
+            Vec::<String>::new(),
+            "{example}: no probe is spent on a document the check cannot rebuild"
+        );
+    }
+
+    // The masked value the lane leaves *quoted* — the ordinary case — is a
+    // whole document still, and every string field of it is probed.
+    let quoted = point(
         InsertionKind::EntireBody,
         "body",
         "http://127.0.0.1:8080/api/login",
-        Some(r#"{"user":"a","api_key":[redacted]}"#),
+        Some(LOGIN_BODY),
         &[PointTrait::Json, PointTrait::Structured],
     );
-
     let host = Replies::plain(401, r#"{"ok":false}"#).build();
-    let verdict = run(&check, &body_point, &host).await;
+    let verdict = run(&check, &quoted, &host).await;
 
+    assert_eq!(verdict.outcome, Outcome::Clean, "{verdict:?}");
     assert_eq!(
-        verdict.outcome,
-        Outcome::Error,
-        "today's answer on a scrubbed-unquoted-secret body: {verdict:?}"
-    );
-    assert!(
-        verdict.detail.contains("Variable not found: redacted"),
-        "the Rhai failure reaches the operator verbatim: {}",
-        verdict.detail
-    );
-    assert_eq!(
-        host.payloads(),
-        Vec::<String>::new(),
-        "the check dies before it probes"
+        host.payloads().len(),
+        4,
+        "both operators at both string fields: {:?}",
+        host.payloads()
     );
 }

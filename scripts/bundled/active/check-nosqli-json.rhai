@@ -16,8 +16,9 @@
 // materially) for the operator while the baseline and the control do not is a
 // comparison the store ran on the document rather than on a string. The
 // example is the body the lane captured, scrubbed, so a secret field is probed
-// as `[redacted]`; a document the example does not hold whole is
-// `inconclusive`, never a guess.
+// as `[redacted]`; a document the example does not hold whole — cut, or with a
+// secret the scrub left unquoted — is `inconclusive`, never a guess, and so is
+// a document with no string field to put an operator in.
 //
 // Read-only: both operators only widen a comparison, neither writes. New in
 // the v2 catalogue (spec D8.2) — the shipped scripts had no JSON-body check.
@@ -105,6 +106,13 @@ fn document_verdict(point) {
     if !is_whole_json_object(point.example) {
         return not_a_document();
     }
+    // A whole body the lane's scrub already broke: a secret-named field whose
+    // value was not a quoted string loses the quotes with the value, so the
+    // mask stands bare where the value was. The braces still balance, but the
+    // text is no longer JSON and `parse_json` would die on it uncatchably.
+    if holds_a_bare_mask(point.example) {
+        return masked_before_the_check();
+    }
     let body = point.example;
     body.trim();
     let doc = parse_json(body);
@@ -130,6 +138,13 @@ fn document_verdict(point) {
         if type_of(doc[key]) == "string" {
             fields.push(key);
         }
+    }
+
+    // Every field a number, a boolean or null: there is no slot a schema
+    // declared a string, so there is nowhere an operator document would be an
+    // operator rather than the shape the route expects.
+    if fields.is_empty() {
+        return no_string_field();
     }
 
     let last_document = ();
@@ -213,9 +228,10 @@ fn document_verdict(point) {
 // has to be judged before it is handed over. The case this is here for is the
 // cut example: the lane shows a point's value up to a cap, and what is cut
 // ends inside a string or with a brace still open. So does a body whose
-// scrub took the `{` of a nested secret-named object. A text that passes here
-// and still does not parse (complete but invalid) ends the check as an
-// `error` verdict, which the engine records like any other failed check.
+// scrub took the `{` of a nested secret-named object. Completeness is only
+// half the question: a complete body can still be invalid, which
+// `holds_a_bare_mask` below answers for the one shape that reaches the check
+// that way.
 fn is_whole_json_object(text) {
     if type_of(text) != "string" {
         return false;
@@ -251,6 +267,65 @@ fn is_whole_json_object(text) {
         }
     }
     !in_string && depth == 0
+}
+
+// Whether `text` holds the scrub's mask token outside of any quoted string.
+//
+// The lane scrubs an example before the check sees it, and a secret-named
+// field whose value is *not* a quoted string — a number, an object, `true`,
+// `null` — has the whole value run replaced, mask and all:
+// `{"user":"a","api_key":12345}` arrives as `{"user":"a","api_key":[redacted]}`.
+// That balances, so completeness cannot catch it; the bare mask can. A mask
+// inside a quoted string (`"password":"[redacted]"`) is an ordinary string
+// value and is probed like any other.
+fn holds_a_bare_mask(text) {
+    if type_of(text) != "string" {
+        return false;
+    }
+    // Everything outside the quoted strings, in order. Reading it on its own
+    // keeps a masked *value* apart from a masked string.
+    let outside = "";
+    let in_string = false;
+    let escaped = false;
+    for ch in text {
+        if escaped {
+            escaped = false;
+        } else if in_string {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+        } else {
+            outside += ch;
+        }
+    }
+    outside.contains("[redacted]")
+}
+
+// The verdict for an example the scrub broke before the check saw it. Said
+// apart from the cut case: the body was whole, a secret in it was not.
+fn masked_before_the_check() {
+    #{
+        outcome: "inconclusive",
+        confidence: "tentative",
+        evidence: #{ payload: (), matched: () },
+        detail: "a secret in this JSON body was masked before the check saw it; document-level operators need the whole body",
+    }
+}
+
+// The verdict for a document with no string field. Nothing was tried, so
+// nothing is clean: `clean` is for operators that were sent and did not move
+// the answer.
+fn no_string_field() {
+    #{
+        outcome: "inconclusive",
+        confidence: "tentative",
+        evidence: #{ payload: (), matched: () },
+        detail: "this JSON body has no string field to place an operator document at",
+    }
 }
 
 // The verdict for a point whose example is not the document it came from.
