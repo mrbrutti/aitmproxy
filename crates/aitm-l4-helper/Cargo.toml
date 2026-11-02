@@ -1,0 +1,50 @@
+[package]
+name = "aitm-l4-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Packet-capture privilege helper: macOS /dev/bpf permission fix (bpf-permissions, bpf-revert) and the Linux CAP_NET_RAW serve mode behind the core's L4 guard."
+
+[[bin]]
+name = "aitm-l4-helper"
+path = "src/main.rs"
+
+[dependencies]
+# The helper wire protocol, the privilege receipt and the shared L4 guard
+# (spec §5.2, §5.3): the only product crate the helper links. No Rhai, no
+# `aitm-mcp`, no HTTP (plan unit p2 preamble; the P2.1 `cargo tree` tripwire).
+aitm-proto-l4.workspace = true
+# The real `Wire` for `serve` (plan P2.7): libpcap capture + L2 inject, the same
+# crate and version `aitm-proto-l4` uses (research note 08; libpcap ships with
+# macOS, Linux needs libpcap-dev).
+pcap = "2.5"
+# Local-destination inject on Linux (spec S1 from spike S7, plan A6): a raw IP
+# socket with IP_HDRINCL through socket2's safe API (`set_header_included_v4`),
+# because `pcap_inject` of an L2 frame on `lo` is dropped as a martian. Already
+# in `Cargo.lock` (tokio/hyper); no new transitive code. `set_header_included_*`
+# live behind socket2's `all` feature; declared here rather than inherited from
+# tokio's enabling of it elsewhere in the graph.
+socket2 = { version = "0.6", features = ["all"] }
+
+[lints]
+workspace = true
+
+# Unified-log line for the macOS permission modes (plan P2.4, spec §3.1 step 6):
+# subsystem `com.mrbrutti.aitmproxy.l4-helper`. Only the raw `OsLog` type is
+# used, so the `log`-facade/`logger` default features (and their `dashmap`
+# dependency) are off. The crate's own FFI `unsafe` stays internal; this crate
+# keeps the workspace `unsafe_code = "forbid"`.
+[target.'cfg(target_os = "macos")'.dependencies]
+oslog = { version = "0.2.0", default-features = false }
+
+# Linux `serve` mode (plan P2.6, spec §5.1, spike S7): the privilege drop to
+# the invoking user keeping only CAP_NET_RAW. `caps` for the bounding /
+# ambient / permitted+effective sets, `nix` for setgroups/setresgid/setresuid,
+# prctl (keepcaps, no_new_privs, PDEATHSIG), SO_PEERCRED and the raw IP socket
+# used for local-destination injects (IP_HDRINCL). Both expose safe APIs; this
+# crate keeps the workspace `unsafe_code = "forbid"`. `nix` 0.31 was already in
+# the lock; `caps` 0.5.6 is new (fetched once in the Terminal).
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5.6"
+nix = { version = "0.31", features = ["user", "process", "socket", "fs", "uio"] }

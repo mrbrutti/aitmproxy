@@ -1,0 +1,27 @@
+## CLI-7 exit 0
+## stdout (122 lines; Rhai loader lines dropped)
+{
+  "detail": [
+    "macOS: presence from `security find-certificate`; trust from `security verify-cert` (basic policy, local only; our install sets the ssl and basic policies together)",
+    "the embedded browser (obscura) does not use the OS trust store; it trusts this CA through --ca-cert at launch"
+  ],
+  "dir": "/Users/matt/Library/Application Support/aitmproxy/ca",
+  "exists": true,
+  "fingerprint_sha1": "B2:D8:E7:80:FF:3A:B7:1F:71:F8:54:4A:1D:7A:8B:64:DD:C5:A4:85",
+  "fingerprint_sha256": "31:04:DC:B8:1E:15:11:75:22:90:08:5B:D2:D8:56:7B:24:39:CF:0C:99:DA:D8:32:2C:8E:7C:31:2E:70:8B:E5",
+  "path": "/Users/matt/Library/Application Support/aitmproxy/ca/ca.crt",
+  "platform": "macos",
+  "stores": {
+    "system": {
+      "installed": "absent",
+      "location": "/Library/Keychains/System.keychain",
+      "trusted": "no"
+    },
+    "user": {
+      "installed": "present",
+      "location": "/Users/matt/Library/Keychains/login.keychain-db",
+      "trusted": "yes"
+    }
+  }
+}
+## stderr (0 lines)

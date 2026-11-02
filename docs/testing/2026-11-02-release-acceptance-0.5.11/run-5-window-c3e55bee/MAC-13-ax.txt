@@ -1,0 +1,81 @@
+AXStaticText	missing value	aitmproxy	text
+AXStaticText	missing value	TRAFFIC	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	TESTING	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	AUTOMATION	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXTextField	missing value		text field
+AXStaticText	missing value	⌘⇧F	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXTextField	missing value		Host to add to scope
+AXButton	missing value	missing value	button
+AXButton	missing value	no limit	button
+AXStaticText	missing value	No flows yet	text
+AXStaticText	missing value	system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core.	text
+AXButton	missing value	missing value	button
+AXStaticText	missing value	every proxy-aware app, regardless of Scope	text
+AXButton		missing value	sort button
+AXButton	#	missing value	sort button
+AXButton	URL	missing value	sort button
+AXButton	Client	missing value	sort button
+AXButton	Method	missing value	sort button
+AXButton	Status	missing value	sort button
+AXButton	Time	missing value	sort button
+AXButton	Duration	missing value	sort button
+AXButton	Request	missing value	sort button
+AXButton	Response	missing value	sort button
+AXButton	SSL	missing value	sort button
+AXButton	Edited	missing value	sort button
+AXButton	Origin	missing value	sort button
+AXButton		missing value	sort button
+AXStaticText	missing value	No Flow Selected	text
+AXStaticText	missing value	Select a flow in the list to inspect it, or press ↑ ↓.	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	1 / 0 rows	text
+AXStaticText	missing value	1 hosts in scope	text
+AXStaticText	missing value	↑ 0 B/s	text
+AXStaticText	missing value	↓ 0 B/s	text
+AXButton	missing value	missing value	button
+AXCheckBox	missing value	1	toggle button
+AXCheckBox	missing value	1	toggle button
+AXButton	missing value	missing value	Toggle Sidebar
+AXButton	missing value	missing value	Compose
+AXButton	missing value	missing value	Clear Session
+AXButton	missing value	missing value	Command Palette
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	close button
+AXButton	missing value	missing value	full screen button
+AXButton	missing value	missing value	minimize button
