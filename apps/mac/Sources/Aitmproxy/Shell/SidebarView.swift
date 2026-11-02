@@ -206,6 +206,9 @@ struct SidebarView: View {
         // The chevron reads open whenever domain rows are showing: toggled open, or while a query is
         // typed (Tester M3 — a visible app always has hosts, so "querying" is the whole condition).
         let expanded = session.expandedApps.contains(key) || querying
+        // One rule for both entry points (chevron and the VoiceOver action): while a query drives the
+        // sub-rows a toggle would change nothing visible yet flip `expandedApps` for later.
+        let canToggle = !querying
         return HStack(spacing: 0) {
             Button {
                 session.toggleExpanded(key)
@@ -217,9 +220,7 @@ struct SidebarView: View {
                     .frame(width: Tok.Size.icon, height: Tok.Size.icon)
                     .contentShape(Rectangle())
             }
-            // While a query drives the sub-rows a click would change nothing visible yet flip
-            // `expandedApps` for later (stage-6 spec on #272): the chevron is inert until the query clears.
-            .disabled(querying)
+            .disabled(!canToggle)
             .buttonStyle(.plain)
             .accessibilityLabel(expanded ? "Collapse \(client.name)" : "Expand \(client.name)")
             Button {
@@ -245,7 +246,7 @@ struct SidebarView: View {
                 Button(pinned ? "Unpin App" : "Pin App") { pinned ? session.unpin(group) : session.pin(group) }
             }
             .accessibilityLabel("\(client.name), \(count) flows\(pinned ? ", pinned" : ""), \(expanded ? "expanded" : "collapsed")")
-            .accessibilityAction(named: expanded ? "Collapse" : "Expand") { session.toggleExpanded(key) }
+            .accessibilityAction(named: expanded ? "Collapse" : "Expand") { if canToggle { session.toggleExpanded(key) } }
             .accessibilityAddTraits(selected ? .isSelected : [])
         }
         .padding(.leading, Inset.chevron)

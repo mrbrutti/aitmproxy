@@ -116,6 +116,8 @@ final class FlowCellView: NSTableCellView {
                 label.font = Tok.Face.nsUI(body)
                 label.stringValue = client.name
                 if let identity = AppIdentityResolver.shared.identity(for: identifier) {
+                    awaitingIdentifier = nil
+                    pendingTint = nil
                     applyClientMark(identity, name: client.name, tint: meta.nsColor)
                 } else {
                     // Pending: an empty mark keeps the label's x; the verdict lands through the callback
@@ -135,6 +137,8 @@ final class FlowCellView: NSTableCellView {
                     }
                 }
             } else {
+                awaitingIdentifier = nil
+                pendingTint = nil
                 label.stringValue = Format.dash
             }
             label.isHidden = false
