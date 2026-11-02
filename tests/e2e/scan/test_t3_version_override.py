@@ -18,7 +18,8 @@ Act + assert, two jobs:
      all-failed crawl degrades, it does not stop early), `crawl.errors > 0`,
      `crawl.pages == 0`, `crawl.last_error == "h2_not_negotiated"`,
      `probes.errors > 0`, and the target logged only
-     `tls_handshake` entries (all `alpn == "http/1.1"`) and zero HTTP requests.
+     `tls_handshake` entries (all `alpn == "none"`: the client offered h2 only,
+     the listener http/1.1 only) and zero HTTP requests.
 
 Observer, independent of the scanner: the target's control origin `GET /log/http`
 (`version`, `alpn`, and the absence of `request` entries). No fixture.
@@ -125,13 +126,19 @@ def main() -> None:
             check(len(hs2) > 0, f"the target saw TLS handshakes ({len(hs2)})")
             check(kinds2 == ["tls_handshake"],
                   f"the target logged only tls_handshake entries (kinds {kinds2})")
-            check(alpns2 == ["http/1.1"],
-                  f"every handshake negotiated http/1.1 (observed {alpns2})")
+            # Forced h2 offers ALPN ["h2"] only and the h1-only listener offers
+            # only http/1.1, so no protocol is selected: the target logs `none`
+            # for every handshake, which is exactly what `h2_not_negotiated`
+            # names. (This line was unreachable before amendment 39b made the
+            # cell run to its end; it had expected http/1.1.)
+            check(alpns2 == ["none"],
+                  f"no handshake negotiated a protocol under forced h2 against h1-only "
+                  f"(observed {alpns2})")
             check(len(reqs2) == 0,
                   f"the target served zero HTTP requests under forced h2 (observed {len(reqs2)})")
 
             ok("T3-2: h1 is forced on an h2 listener; forced h2 on an h1-only listener "
-               "errors every probe and ends the job done/errors")
+               "errors every probe and ends the job done with crawl.last_error h2_not_negotiated")
 
 
 if __name__ == "__main__":
