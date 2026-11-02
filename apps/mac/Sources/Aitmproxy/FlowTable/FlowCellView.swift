@@ -2,7 +2,8 @@ import AitmproxyKit
 import AppKit
 
 /// One cell. A label for text columns; a small drawn view for the dot, the
-/// method/status badges, the padlock, the origin tag and the mark swatch.
+/// method/status badges, the padlock, the origin tag and the mark swatch; the
+/// client's icon or process mark (icons spec D6) ahead of its name.
 final class FlowCellView: NSTableCellView {
     let column: FlowColumn
     private let label = NSTextField(labelWithString: "")
@@ -10,7 +11,12 @@ final class FlowCellView: NSTableCellView {
     private let dot = DotView()
     private let icon = NSImageView()
     private let swatch = NSView()
-    private let monogram = MonogramView()
+    /// The Client column's mark: the owner's icon, the process glyph, or empty while
+    /// the identity is pending (never the glyph while pending). Internal so a harness can read it.
+    let clientIcon = NSImageView()
+    /// The identifier this cell last showed: a pending verdict is applied only while it still matches
+    /// (cells are reused).
+    private var shownIdentifier: String?
 
     init(column: FlowColumn) {
         self.column = column
@@ -22,7 +28,7 @@ final class FlowCellView: NSTableCellView {
         label.font = Tok.Face.nsData(Tok.Typography.Size.md)
         label.alignment = column.numeric ? .right : .left
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        for view in [label, badge, dot, icon, swatch, monogram] as [NSView] {
+        for view in [label, badge, dot, icon, swatch, clientIcon] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
             view.isHidden = true
@@ -44,13 +50,13 @@ final class FlowCellView: NSTableCellView {
             swatch.centerXAnchor.constraint(equalTo: centerXAnchor),
             swatch.widthAnchor.constraint(equalToConstant: 6),
             swatch.heightAnchor.constraint(equalToConstant: 16),
-            monogram.centerYAnchor.constraint(equalTo: centerYAnchor),
-            monogram.leadingAnchor.constraint(equalTo: leadingAnchor, constant: pad),
-            monogram.widthAnchor.constraint(equalToConstant: 16),
-            monogram.heightAnchor.constraint(equalToConstant: 16),
+            clientIcon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            clientIcon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: pad),
+            clientIcon.widthAnchor.constraint(equalToConstant: Tok.Size.icon),
+            clientIcon.heightAnchor.constraint(equalToConstant: Tok.Size.icon),
         ])
         if column == .client {
-            label.leadingAnchor.constraint(equalTo: monogram.trailingAnchor, constant: 6).isActive = true
+            label.leadingAnchor.constraint(equalTo: clientIcon.trailingAnchor, constant: 6).isActive = true
         } else {
             label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: pad).isActive = true
         }
@@ -58,6 +64,7 @@ final class FlowCellView: NSTableCellView {
         swatch.layer?.cornerRadius = 2
         icon.symbolConfiguration = .init(pointSize: 12, weight: .regular)
         icon.contentTintColor = Tok.Ink.secondary.nsColor
+        clientIcon.imageScaling = .scaleProportionallyUpOrDown
         textField = label
     }
 
@@ -72,7 +79,8 @@ final class FlowCellView: NSTableCellView {
     }
 
     func configure(_ row: FlowRow, density: Density = .dense) {
-        for view in [label, badge, dot, icon, swatch, monogram] as [NSView] { view.isHidden = true }
+        for view in [label, badge, dot, icon, swatch, clientIcon] as [NSView] { view.isHidden = true }
+        shownIdentifier = nil
         let dim = !row.inScope
         let ink = dim ? Tok.Ink.tertiary : Tok.Ink.primary
         let meta = dim ? Tok.Ink.tertiary : Tok.Ink.secondary
@@ -96,10 +104,24 @@ final class FlowCellView: NSTableCellView {
             label.isHidden = false
         case .client:
             if let client = row.client {
-                monogram.text = client.monogram
-                monogram.isHidden = false
+                // Icon + name (icons spec D6): the same text as the sidebar's app row, "(Service)" included.
+                let identifier = client.bundleID ?? client.name
+                shownIdentifier = identifier
+                clientIcon.isHidden = false
                 label.font = Tok.Face.nsUI(body)
                 label.stringValue = client.name
+                if let identity = AppIdentityResolver.shared.identity(for: identifier) {
+                    applyClientMark(identity, name: client.name, tint: meta.nsColor)
+                } else {
+                    // Pending: an empty mark keeps the label's x; the verdict lands through the callback
+                    // only if this reused cell still shows the same identifier.
+                    clientIcon.image = nil
+                    AppIdentityResolver.shared.onResolve(identifier) { [weak self] identity in
+                        guard let self, self.shownIdentifier == identifier else { return }
+                        self.applyClientMark(identity, name: client.name, tint: meta.nsColor)
+                        self.clientIcon.setAccessibilityElement(self.clientIcon.image != nil)
+                    }
+                }
             } else {
                 label.stringValue = Format.dash
             }
@@ -213,11 +235,30 @@ final class FlowCellView: NSTableCellView {
                 swatch.isHidden = false
             }
         }
-        toolTip = column == .url ? row.url : column == .ssl ? row.tls.help : column == .comment ? row.comment : nil
+        toolTip = switch column {
+        case .url: row.url
+        case .ssl: row.tls.help
+        case .comment: row.comment
+        // The identifier, never the raw `bundleID` (icons spec D10, stage-6 S-M3): it is wire text.
+        case .client: row.client.map { AppIdentifier.tooltipText($0.bundleID ?? $0.name) }
+        default: nil
+        }
         describeDrawnViews(row)
     }
 
-    /// The drawn views (badge, dot, swatch, monogram) carry labels in the
+    /// The Client mark for a verdict (icons spec D6): the owner's icon untouched (no tint, no
+    /// template), else the process glyph in the cell's ink — secondary, tertiary out of scope.
+    private func applyClientMark(_ identity: AppIdentity, name: String, tint: NSColor) {
+        if let icon = identity.icon {
+            clientIcon.image = icon
+        } else {
+            clientIcon.image = NSImage(systemSymbolName: Tok.Glyph.process, accessibilityDescription: name)
+            clientIcon.symbolConfiguration = .init(pointSize: Tok.Size.iconInline, weight: .regular)
+            clientIcon.contentTintColor = tint
+        }
+    }
+
+    /// The drawn views (badge, dot, swatch, client mark) carry labels in the
     /// screen's words, so VoiceOver reads a cell the same as a sighted user (S-069).
     private func describeDrawnViews(_ row: FlowRow) {
         badge.setAccessibilityElement(!badge.isHidden)
@@ -229,9 +270,9 @@ final class FlowCellView: NSTableCellView {
         swatch.setAccessibilityElement(!swatch.isHidden)
         swatch.setAccessibilityRole(.image)
         swatch.setAccessibilityLabel(row.mark.map { "marked \($0.rawValue)" })
-        monogram.setAccessibilityElement(!monogram.isHidden)
-        monogram.setAccessibilityRole(.image)
-        monogram.setAccessibilityLabel(row.client?.name)
+        clientIcon.setAccessibilityElement(!clientIcon.isHidden && clientIcon.image != nil)
+        clientIcon.setAccessibilityRole(.image)
+        clientIcon.setAccessibilityLabel(row.client?.name)
         icon.setAccessibilityLabel(icon.image?.accessibilityDescription)
     }
 
@@ -309,23 +350,6 @@ final class BadgeView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         pair.bg.nsColor.setFill()
         NSBezierPath(roundedRect: bounds, xRadius: Tok.Radius.badge, yRadius: Tok.Radius.badge).fill()
-        let size = attributed.size()
-        attributed.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2))
-    }
-}
-
-/// The 16px monogram disc for the Client column.
-final class MonogramView: NSView {
-    var text = "" { didSet { needsDisplay = true } }
-    override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: Tok.Radius.badge, yRadius: Tok.Radius.badge)
-        Tok.Ground.raised.nsColor.setFill()
-        path.fill()
-        Tok.Line.control.nsColor.setStroke()
-        path.stroke()
-        let attributed = NSAttributedString(string: text, attributes: [
-            .font: Tok.Face.nsUI(Tok.Typography.Size.xs, .medium), .foregroundColor: Tok.Ink.secondary.nsColor,
-        ])
         let size = attributed.size()
         attributed.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2))
     }
