@@ -601,13 +601,13 @@ Kept by the main session during stage 6. One row per finding.
 | fix A | spec pass 2 | Minor | Sp6 T12's `mod.rs` sentence still said `SYNOPSIS` is dropped from the re-export (it stays until T15 item 10) | fixed in dfc1bb3b |
 | fix A | spec pass 2 | Minor | Sp7 the Sp3 example checker is more lenient than `parse_flags` (a Bool flag swallows any following token; values not type-checked) | fixed in 44083726: `aitm_cli::dispatch::check_flags(rest, cmd)` (shares `split_yes` + `parse_flags` with `Cli::dispatch`) replaces the hand-written flag loop; 12 negative cases; all 114 entries pass under the real parser — same item as Q13 |
 | fix A | spec pass 2 | Minor | Sp8 Review-log rows named "fix round A" instead of the SHA; Q5/Q12/Sp4 named no accepter | fixed in dfc1bb3b |
-| fix B | spec pass 3 | Minor | Sp9 `check_flags` (and `group_of`) were public API recorded only in Review-log rows | fixed in this round's log commit: Task 5's `pub` list, Task 10's test bullet and C31 amended |
-| fix B | spec pass 3 | Minor | Sp10 Review-log rows said "fixed in this commit" | fixed in this round's log commit: SHAs 4f18fc41 / dfc1bb3b / add28b42 |
+| fix B | spec pass 3 | Minor | Sp9 `check_flags` (and `group_of`) were public API recorded only in Review-log rows | fixed in 63ed1b50: Task 5's `pub` list, Task 10's test bullet and C31 amended |
+| fix B | spec pass 3 | Minor | Sp10 Review-log rows said "fixed in this commit" | fixed in 63ed1b50: SHAs 4f18fc41 / dfc1bb3b / add28b42 |
 | fix B | spec pass 3 | Minor | Sp11 = Q18 | fixed in add28b42 |
-| fix B | spec pass 3 | Minor | Sp12 = S4 (`unknown variant` echo) | fix round C |
+| fix B | spec pass 3 | Minor | Sp12 = S4 (`unknown variant` echo) | fixed in 628af81a |
 | fix B | quality pass 3 | Minor | Q18 the Q17 acceptance named two test-side tags when ten exist, two added by the round itself | fixed in add28b42: the acceptance names the class |
-| fix B | quality pass 3 | Minor | Q19 `redact_scalars`'s `rfind` comment gave the wrong reason and the no-closer fallback was undocumented | fix round C |
-| fix B | security pass 3 | Minor | S4 serde's `unknown variant \`<value>\`` quotes an enum field's value raw (five enum fields; `mcp.stdio_role` is a sibling of `operator_token`) and `redact_scalars` had no shape for it | fix round C: the shape, a literal case, an end-to-end case, the escaped-quote adversarial case |
+| fix B | quality pass 3 | Minor | Q19 `redact_scalars`'s `rfind` comment gave the wrong reason and the no-closer fallback was undocumented | fixed in 628af81a |
+| fix B | security pass 3 | Minor | S4 serde's `unknown variant \`<value>\`` quotes an enum field's value raw (five enum fields; `mcp.stdio_role` is a sibling of `operator_token`) and `redact_scalars` had no shape for it | fixed in 628af81a: `unknown variant` shape (both closers), end-to-end red→green through `settings_for_help`, forged-closer and no-closer literals, the escaped-quote string case |
 | fix A | security pass 2 | Minor | S2 (pre-existing, outside the range) serde_yaml quotes a mis-placed scalar in its type error, so a token mis-indented under a numeric key would be echoed into the help path's `config not read` warning | fixed in 44083726: `redact_scalars` in `first_line` blanks the `string "…"`/`` integer `…` ``/boolean/float payloads, keeps the field path and the `expected …` clause; red test proved the echo on this tree |
 | fix A | security pass 2 | Minor | S3 = Q14 (wall-clock assertion) | fixed in 44083726 |
 | fix A | quality pass 2 | Minor | Q13 `example_problem` re-implements the dispatcher's flag grammar (see Sp7) | fixed in 44083726 (with Sp7) |
