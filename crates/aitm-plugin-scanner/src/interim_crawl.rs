@@ -272,8 +272,13 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
                         break;
                     }
                 }
+                // Reported here, where the failure happened, so each request
+                // carries its own classified token; `failed`/`last_error` stay
+                // the crawl's aggregate view for the status.
+                let kind = classify(&err);
+                job.report_crawl_error(origin, kind.as_str());
                 failed += 1;
-                last_error = Some(classify(&err));
+                last_error = Some(kind);
                 continue;
             }
         };

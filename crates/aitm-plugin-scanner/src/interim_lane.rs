@@ -205,14 +205,9 @@ impl InterimHttpLane {
         if crawled.forms_submitted > 0 {
             job.report_forms_submitted(u64::from(crawled.forms_submitted));
         }
-        // Amendment 39: each failed request is one `crawl.errors` unit, named by
-        // its classified token. `last_error` is the aggregate kind the crawl
-        // retained; the reason is a token, so there is nothing to scrub.
-        if let Some(kind) = crawled.last_error {
-            for _ in 0..crawled.failed {
-                job.report_crawl_error(origin, kind.as_str());
-            }
-        }
+        // Amendment 39: each failed request was reported by the crawl where it
+        // failed, named by its own classified token (a token, so nothing to
+        // scrub); `failed`/`last_error` are its aggregate view.
         crawled.stopped
     }
 
@@ -385,7 +380,6 @@ impl Lane for InterimHttpLane {
                 point: point.clone(),
                 flow,
                 legacy: None,
-                synthetic: true,
                 job,
                 baseline: OnceCell::new(),
                 baseline_peer: Mutex::new(None),
@@ -416,7 +410,6 @@ impl Lane for InterimHttpLane {
             point: point.clone(),
             flow,
             legacy: Some(legacy),
-            synthetic: false,
             job,
             baseline: OnceCell::new(),
             baseline_peer: Mutex::new(None),
@@ -521,12 +514,11 @@ pub struct InterimProbeHost {
     point: InsertionPoint,
     flow: HttpFlow,
     /// The v1 point [`ProbeHost::probe`] injects into, or `None` for an origin
-    /// item (amendment 38), which has nothing to inject into.
+    /// item (amendment 38), which has nothing to inject into. `None` also means
+    /// [`InterimProbeHost::flow`] was synthesized for the origin rather than
+    /// captured from the wire, so [`ProbeHost::captured`] does not offer it as
+    /// traffic that happened.
     legacy: Option<InjectionPoint>,
-    /// Whether [`InterimProbeHost::flow`] was synthesized for an origin item
-    /// rather than captured from the wire, so [`ProbeHost::captured`] does not
-    /// offer it as traffic that happened.
-    synthetic: bool,
     job: Arc<dyn JobCtx>,
     baseline: OnceCell<ProbeResponse>,
     baseline_peer: Mutex<Option<SocketAddr>>,
@@ -694,12 +686,10 @@ impl ProbeHost for InterimProbeHost {
     }
 
     fn captured(&self) -> Option<HttpFlow> {
-        // A synthesized origin request is not traffic the scan observed, so a
-        // passive check must not read it as a capture (amendment 38).
-        if self.synthetic {
-            return None;
-        }
-        Some(self.flow.clone())
+        // A synthesized origin request (no point to inject into) is not traffic
+        // the scan observed, so a passive check must not read it as a capture
+        // (amendment 38).
+        self.legacy.as_ref().map(|_| self.flow.clone())
     }
 
     fn charge(&self, units: u32) -> bool {
@@ -3253,6 +3243,40 @@ mod tests {
                 "connect_refused".to_string()
             )],
             "exactly one entry, for the one refused link",
+        );
+    }
+
+    /// Each failed client-crawl request is reported where it fails, with its
+    /// own classified token: a crawl that loses one link to `connect_refused`
+    /// and the next to `tls` reports those two tokens, in that order, not the
+    /// last kind twice.
+    #[tokio::test]
+    async fn each_failed_crawl_request_is_reported_with_its_own_kind() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let seed = concat!(
+            "<html><body>",
+            "<a href=\"/a\">a</a>",
+            "<a href=\"/b\">b</a>",
+            "</body></html>",
+        );
+        let client = FailingSite::new(
+            vec![("/", seed)],
+            vec![("/a", "connection refused"), ("/b", "tls handshake failed")],
+        );
+        let job = TestJob::new(Arc::clone(&store), client as _);
+
+        let _ = discover_origins(&job, &["http://scan.test"]).await;
+
+        assert_eq!(
+            job.crawl_errors(),
+            vec![
+                (
+                    "http://scan.test".to_string(),
+                    "connect_refused".to_string()
+                ),
+                ("http://scan.test".to_string(), "tls".to_string()),
+            ],
+            "one entry per failed link, each with the kind of that failure",
         );
     }
 

@@ -376,13 +376,15 @@ fn scope_key(meta: &CheckMeta, point: &InsertionPoint, node: Option<&SiteNode>) 
 /// merged into another one's single run.
 fn origin_key(point: &InsertionPoint, node: Option<&SiteNode>) -> String {
     if let Some(node) = node {
-        return format!("{}://{}:{}", node.scheme, node.host, node.port);
+        return node_origin_key(node);
     }
-    if let Some(parsed) = point.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
-        if let Some(host) = parsed.host_str() {
-            let port = parsed.port_or_known_default().unwrap_or(0);
-            return format!("{}://{}:{}", parsed.scheme(), host, port);
-        }
+    if let Some(key) = point
+        .url
+        .as_deref()
+        .and_then(|u| url::Url::parse(u).ok())
+        .and_then(|parsed| url_origin_key(&parsed))
+    {
+        return key;
     }
     format!("point:{}", point.id)
 }
@@ -400,17 +402,24 @@ fn node_origin_key(node: &SiteNode) -> String {
     format!("{}://{}:{}", node.scheme, node.host, node.port)
 }
 
-/// An origin string in its `scheme://host:port` form, with the scheme's default
-/// port filled in. An origin that does not parse as a URL is used verbatim, so
-/// a profile's target is never silently dropped.
-fn normalize_origin(origin: &str) -> String {
-    if let Ok(parsed) = url::Url::parse(origin) {
-        if let Some(host) = parsed.host_str() {
-            let port = parsed.port_or_known_default().unwrap_or(0);
-            return format!("{}://{}:{}", parsed.scheme(), host, port);
-        }
-    }
-    origin.to_string()
+/// A URL's origin, `scheme://host:port`, with the scheme's default port filled
+/// in; `None` for a URL without a host. The one spelling of the key the origin
+/// set dedupes on, so a node, a point URL and a profile target agree.
+fn url_origin_key(url: &url::Url) -> Option<String> {
+    let host = url.host_str()?;
+    let port = url.port_or_known_default().unwrap_or(0);
+    Some(format!("{}://{}:{}", url.scheme(), host, port))
+}
+
+/// A profile target origin's key, `scheme://host:port` with the default port
+/// filled in. Unlike [`crate::util::normalize_origin`] (which keeps only an
+/// explicit port), this is the origin set's key form. A target that does not
+/// parse as a URL is used verbatim, so it is never silently dropped.
+fn target_origin_key(origin: &str) -> String {
+    url::Url::parse(origin)
+        .ok()
+        .and_then(|parsed| url_origin_key(&parsed))
+        .unwrap_or_else(|| origin.to_string())
 }
 
 /// The origins an origin-scoped HTTP check runs against, each with the site
@@ -427,7 +436,7 @@ fn origin_set<'a>(
     let mut seen: HashSet<String> = HashSet::new();
 
     for origin in &profile.target.origins {
-        let key = normalize_origin(origin);
+        let key = target_origin_key(origin);
         if seen.insert(key.clone()) {
             keys.push(key);
         }
