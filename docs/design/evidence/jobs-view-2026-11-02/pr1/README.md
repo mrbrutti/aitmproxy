@@ -14,3 +14,20 @@ Real app (dev bundle `Aitmproxy-jobsux` built from the branch), a core built fro
 | C1/C2 defects before the fix | `../09-cancelled.png`, `../10-cancelled-later.png`, `../13-first-row-detail.png` (the stale detail) | 0 |
 
 Unit criteria AC1–AC4, AC1b, AC9 and the unit halves of AC7/AC8/AC12 are Swift Testing cases named in the spec's requirement-to-evidence table; the Terminal gate logs are `/tmp/claude/jobsux-gate-w*-{build,test}.log` (w7 on 35a3148f: 877 Kit + 37 bus tests, 0 errors, the three pre-existing `Text +` warnings).
+
+## Merged head (passes 7 and 7b, 2026-11-02): PR 1 + origin/main (#308), bundle tree + #310
+
+After mac-review's CPU fix (#308) landed first, PR 1 merged `origin/main` (4529ea6b; docs ad822f45) and re-ran the proof. The dev bundle was built from `tmp/jobsux-bundle` b7f603f7 = the merged head + #310's branch (`claude/serene-villani-38530e`, still open at the time) so the embedded core writes its audit log under the isolated store. Evidence in `merged/`; `merged/proof.log` is the driver's log for both passes. The bundle was quit after each pass.
+
+| Check | Evidence | Pass |
+| --- | --- | --- |
+| #310: the generated config carries the audit log under the store; Matt's real `audit.jsonl` untouched | `70-config-audit-lines.txt` (`audit_log: "/tmp/Aitmproxy-dev-state-jobsux/audit.jsonl"`); `proof.log` "real audit log before/after: mtime=1793660731 size=92013" both times, "#310 PASS" twice | 7 |
+| AC8 bus-started job selected with no click | `61-ac8-autoselected.png` + `61-ax-dump.tsv` (`Running · Crawling · 0:04`, Cancel Scan enabled) | 7 |
+| AC5 `Cancelling…` → `Cancelled` within 5 s, identical at +60 s | `ac5-frames-7/f02–f08` (frame loop across the press), `62-ac5-running.png`, `63-ac5-cancelled-5s.png` + `63-ax-dump.tsv` (`Cancelled · Done · 0:14`), `63-ac5-status.json` (cancelled at 14,653 ms), `65-ac5-cancelled-65s.png` + `65-ax-dump.tsv` (same header and row) | 7 |
+| AC7 one AX press + two ⌥⌘. → one `scan.cancel` | `audit-grep.txt` (one line for the job, from the store's audit log); `proof.log` "before=0 after=1" | 7 |
+| AC10 dead target: sentence, crawl line, raw token once | `64-ac10-dead-target.png` + `64-ax-dump.tsv` lines 88–90 | 7 |
+| AC11 three rows, one `selected=true` | `66-ax-selected.txt` | 7 |
+| AC12 frozen core: inline error with the age advancing, Cancel disabled, recovery | pass 7: `68-ac12-36s.png` (`Unable to list jobs: the bus did not reply in time. Showing values from 0:37 ago; retrying every 2 s.`, Cancel disabled), `69-ac12-recovered.png`; pass 7b unfiltered dumps `71-ax-dump.tsv` (`0:39 ago`, `Cancel Scan false`), `72-ax-dump.tsv` (`0:50 ago`), `72b-ax-dump.tsv` (error gone, `Cancel Scan true`), frames `71-ac12-36s.png`, `72-ac12-recovered.png`. The inline error is an `AXUnknown` element, which pass 7's role-filtered dumps dropped; the frames and the unfiltered dumps carry it | 7, 7b |
+| AC6 finished while unselected, then selected: Done with the bus's counters, no Cancel Scan | pass 7b: `70-ac6-thorough-selected.png` (the thorough job selected while light-http runs), `73-ac6-before-select.png`, `73-ac6-status.json` (done, 940 of 940 checks, 5 issues, 351,252 ms), `74-ac6-light-http-done.png` + `74-ax-dump.tsv` (`Done · Done · 5:51`, no Cancel Scan). Pass 7's frame 67 is not an AC6 proof: its 400 s wait ended with the job still running (1523/1538) | 7b |
+
+Gate on the merged head: w9 (`swift build` 0 errors, 886 Kit + 37 bus tests, grid-lint and six tripwires PASS; `/tmp/claude/jobsux-gate-w9-*.log`).
