@@ -3386,7 +3386,12 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        assert!(h.egress_confined(), "a running job holds the posture");
+        // No pre-terminal read of the hold here: on the multi-thread runtime
+        // the lane's panic can end the job before this line runs, so "a
+        // running job holds the posture" raced the supervisor (CI flake,
+        // amendment 71). That property is pinned without a race by
+        // `commands::tests::discover_wait_answers_on_finish_not_on_a_terminal_status`
+        // (an entry whose `finish` has not run still holds its egress hold).
 
         // The terminal signal decides when the job is over; `TERMINAL_NET` is
         // the only net (the old 2 s bound tripped on a loaded gate machine).
