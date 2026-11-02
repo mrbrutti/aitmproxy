@@ -816,6 +816,32 @@ import Testing
         #expect(!(try config.yaml()).contains("audit_log"))
     }
 
+    @Test func default_config_is_byte_identical_to_the_pre_audit_log_document() throws {
+        // AC1 (tester): "no `audit_log` key" alone would still pass if the nil path left a stray
+        // byte in the `mcp:` block (a blank line, a shifted indent after `operator_token`), and
+        // the tail `hasSuffix` pins never look there. Pin the whole default document exactly as
+        // `yaml()` rendered it before `auditLogFile` existed (`EmbeddedCoreLaunch.swift` at
+        // 61a5ae05: no trailing newline, the tails each start with their own `\n`), so the
+        // installed app's config is proven byte-identical, not merely key-free.
+        let config = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
+        let expected = """
+        listen: "127.0.0.1:8080"
+        mcp:
+          transport:
+            loopback_tcp:
+              port: 0
+              token: "\(config.token)"
+              endpoint_file: "/tmp/bus.endpoint"
+          operator_token: "\(config.operatorToken)"
+        browser:
+          proxy_addr: "127.0.0.1:8083"
+          obscura:
+            binary: "/Apps/Aitmproxy.app/Contents/Resources/core/obscura"
+            stop_timeout: 2
+        """
+        #expect(try config.yaml() == expected)
+    }
+
     @Test func audit_log_line_sits_inside_the_mcp_block_and_is_what_the_core_parses() throws {
         // AC2/AC5: the key belongs to `mcp` (`deny_unknown_fields`), so it is the line directly
         // after `operator_token` at two-space indent and before the top-level `browser:`.
@@ -862,6 +888,9 @@ import Testing
         #expect(file([:]) == nil)
         #expect(file(["APP_STORE": ""]) == nil)
         #expect(file(["APP_LIVE": "0"]) == nil)
+        // Spec Design 2: `APP_LIVE` is matched as exactly "1" (what the live harness sets and
+        // `SelfTest.live` checks), so a truthy-looking spelling is still a normal launch.
+        #expect(file(["APP_LIVE": "true"]) == nil)
         #expect(file(["APP_STORE": "/tmp/Aitmproxy-dev-state-x"])?.path == "/tmp/Aitmproxy-dev-state-x/audit.jsonl")
         #expect(file(["APP_LIVE": "1"])?.path == "/tmp/wd/audit.jsonl")
         #expect(file(["APP_STORE": "/tmp/Aitmproxy-dev-state-x", "APP_LIVE": "1"])?.path == "/tmp/Aitmproxy-dev-state-x/audit.jsonl")
