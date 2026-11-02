@@ -298,17 +298,22 @@ class StepWriter:
         if s and s not in self.secrets:
             self.secrets.append(s)
 
-    def _clean(self, s: str) -> str:
+    def clean(self, s: str) -> str:
+        """Redact every known secret (and any `#t=` value), flatten tabs/newlines."""
         return redact(str(s), *self.secrets).replace("\t", " ").replace("\n", " ")
+
+    def redact(self, s: str) -> str:
+        """Redact only (keeps newlines): for files written beside the steps."""
+        return redact(str(s), *self.secrets)
 
     def step(self, sid: str, result: str, observed: str = "", truth: str = "", explains: str = "") -> None:
         if result not in RESULTS:
             raise ValueError(f"{sid}: unknown result {result!r} (one of {RESULTS})")
         self.results[sid] = result
-        obs = self._clean(observed)
+        obs = self.clean(observed)
         print(f"{sid:8s} {result:7s} {obs[:160]}", flush=True)
         with open(self.path, "a", encoding="utf-8") as f:
-            f.write("\t".join([sid, result, obs, self._clean(truth), self._clean(explains)]) + "\n")
+            f.write("\t".join([sid, result, obs, self.clean(truth), self.clean(explains)]) + "\n")
 
     def finish(self) -> None:
         if self._finished:

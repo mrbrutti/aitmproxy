@@ -161,7 +161,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
     truth0 = bus_truth(bus)
     ps = truth0.get("proxy.status", {})
     with open(os.path.join(OUT, "mac-bus-truth-start.json"), "w", encoding="utf-8") as f:
-        f.write(w._clean(json.dumps(truth0, indent=1, sort_keys=True)))
+        f.write(w.redact(json.dumps(truth0, indent=1, sort_keys=True)))
     t0 = int(time.time() * 1000)
 
     # Read-only AX dump of whatever the window shows, for the report (no press).
