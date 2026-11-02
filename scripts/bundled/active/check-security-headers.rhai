@@ -1,37 +1,77 @@
-// check-security-headers.rhai — operator command `check.headers { url }`:
-// actively fetch a URL and report missing security response headers.
-// OWASP A05:2021 Security Misconfiguration.
+// check-security-headers.rhai — catalogue check `headers`, class
+// `missing-security-headers`.
 //
-// ACTIVE: sends one GET through the proxy's own client, which is scope- and
-// rate-gated (deny-by-default). It runs only when the operator invokes the
-// command; it registers no automatic hook. For authorised testing only.
+// The cheapest audit there is: the point's baseline response has already been
+// fetched, so this check sends nothing at all and only reads which of the five
+// standard protective headers are absent. That is why it declares
+// `intensity: "passive"` and `technique: "passive"` — no probe leaves.
+//
+// It is an origin-level audit (`scope: "origin"`): the header set belongs to
+// the authority, so one verdict covers it however many points it has.
+//
+// OWASP A05 Security Misconfiguration.
 const NAME = "check-security-headers";
 const API  = "1";
 
-fn hget(h, name) {
-    let want = name.to_lower();
-    for k in h.keys() { if k.to_lower() == want { return h[k]; } }
-    ""
-}
+// The shipped script's list, lower-cased: probe headers are a lower-case map.
+const WANTED = ["strict-transport-security", "content-security-policy",
+                "x-content-type-options", "x-frame-options", "referrer-policy"];
+
+const META = #{
+    id: "headers",
+    name: "Missing security headers",
+    class: "missing-security-headers",
+    lanes: ["http"],
+    kinds: ["query"],
+    scope: "origin",
+    intensity: "passive",
+    cost: "light",
+    technique: "passive",
+    severity: "low",
+    confidence_max: "certain",
+    needs_baseline: true,
+    description: "Reads the point's baseline response and reports which of HSTS, CSP, X-Content-Type-Options, X-Frame-Options and Referrer-Policy are absent.",
+    remediation: "Set the missing headers at the edge for every response, starting with Content-Security-Policy and Strict-Transport-Security.",
+};
 
 fn load(reg) {
-    reg.add_command("check.headers", "Fetch { url } and report missing security headers", |args| {
-        if type_of(args.url) != "string" { return "usage: check.headers { url: \"https://host/path\" }"; }
-        let resp = http.send(#{ method: "GET", url: args.url });
-        if resp.status == () { return `request to ${args.url} produced no response`; }
-        let wanted = ["Strict-Transport-Security", "Content-Security-Policy",
-                      "X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy"];
-        let missing = [];
-        for h in wanted { if hget(resp.headers, h) == "" { missing.push(h); } }
-        if missing.len() > 0 {
-            finding(#{
-                name: "Missing security headers (active)",
-                severity: "low",
-                flow_id: resp.flow_id,
-                detail: `${args.url} (HTTP ${resp.status}) is missing: ${missing}.`,
-                tags: ["headers", "active", "owasp-a05"],
-            });
+    reg.add_check(META, |point| {
+        // `point.url` is `()` when the lane recorded no URL for this point, and
+        // an origin-scoped audit has no origin to attribute an answer to.
+        if type_of(point.url) != "string" {
+            return #{
+                outcome: "inconclusive",
+                confidence: "tentative",
+                detail: "This insertion point carries no URL, so there is no origin to audit.",
+            };
         }
-        `checked ${args.url}: ${missing.len()} header(s) missing`
+
+        let reply = probe.baseline();
+        let missing = "";
+        let count = 0;
+        for name in WANTED {
+            // An empty value protects nothing, so it counts as missing.
+            let value = reply.headers[name];
+            if type_of(value) != "string" || value == "" {
+                count += 1;
+                missing = if missing == "" { name } else { missing + ", " + name };
+            }
+        }
+
+        if count > 0 {
+            return #{
+                outcome: "vulnerable",
+                confidence: "certain",
+                evidence: #{ payload: "GET " + point.url, matched: missing },
+                detail: `${point.url} (HTTP ${reply.status}) is missing ${count} security header(s): ${missing}.`,
+            };
+        }
+
+        #{
+            outcome: "clean",
+            confidence: "certain",
+            evidence: #{ payload: "GET " + point.url, matched: () },
+            detail: "All five standard security headers are present on this origin's responses.",
+        }
     });
 }

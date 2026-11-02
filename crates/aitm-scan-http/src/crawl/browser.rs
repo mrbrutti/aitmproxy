@@ -60,7 +60,8 @@ use url::Url;
 
 use crate::crawl::extract::{extract, Extracted, FieldKind, FormSpec};
 use crate::crawl::frontier::{
-    fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits, StopReason,
+    crawl_error_token, fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits,
+    StopReason,
 };
 use crate::crawl::values::{chosen_fields, form_action, value_for};
 use crate::limits::{
@@ -497,8 +498,13 @@ async fn bounded<T>(
     job: &dyn JobCtx,
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
+    // Both time-bound failures keep a typed cause under their `scan:` context
+    // (`crawl_error_token` reads the type, never this crate's own prose).
     let Some(limit) = remaining(job) else {
-        anyhow::bail!("scan: the job deadline passed before the browser answered");
+        return Err(
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut))
+                .context("scan: the job deadline passed before the browser answered"),
+        );
     };
     match tokio::time::timeout(limit, future).await {
         Ok(Ok(value)) => Ok(value),
@@ -506,7 +512,8 @@ async fn bounded<T>(
         // or the statement it rejected), so it is scrubbed here, once, before
         // any call site logs it or `prime_session` propagates it (AC T2-6).
         Ok(Err(err)) => Err(anyhow::anyhow!("{}", scrub_error(&err))),
-        Err(_) => anyhow::bail!("scan: the browser did not answer within {limit:?}"),
+        Err(elapsed) => Err(anyhow::Error::new(elapsed)
+            .context(format!("scan: the browser timed out after {limit:?}"))),
     }
 }
 
@@ -621,6 +628,11 @@ impl<'a> Run<'a> {
             Err(err) => {
                 self.guard.record_error(&authority);
                 self.collect();
+                // Amendment 39b: the job counts this page into `crawl.errors`
+                // with a closed reason token; the driver's own text stays in
+                // the (scrubbed) log line below.
+                self.job
+                    .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -652,6 +664,8 @@ impl<'a> Run<'a> {
             Ok(dom) => dom,
             Err(err) => {
                 self.collect();
+                self.job
+                    .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -795,6 +809,10 @@ impl<'a> Run<'a> {
                     Ok(value) => Submitted::from_value(&value),
                     Err(err) => {
                         self.collect();
+                        // Amendment 39b: a submission the browser fails counts
+                        // into `crawl.errors` like a page it cannot load.
+                        self.job
+                            .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                         tracing::debug!(
                             target: "scan",
                             job = self.job.job_id(),
@@ -935,6 +953,10 @@ impl<'a> Run<'a> {
             .await;
             if let Err(err) = clicked {
                 self.collect();
+                // Amendment 39b: a click the browser fails counts into
+                // `crawl.errors` like a page it cannot load.
+                self.job
+                    .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -1022,6 +1044,8 @@ impl<'a> Run<'a> {
             Ok(_) => Ok(Step::Continue),
             Err(err) => {
                 self.guard.record_error(&guard_authority(page));
+                self.job
+                    .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -2399,6 +2423,9 @@ mod tests {
         fn marker(&self) -> String {
             self.inner.marker()
         }
+        fn report_crawl_error(&self, origin: &str, reason: &str) {
+            self.inner.report_crawl_error(origin, reason);
+        }
     }
 
     /// The crawler's "could not load this page" line carries the driver's error
@@ -2430,6 +2457,222 @@ mod tests {
         for line in lines.all() {
             assert!(!line.contains("abc") && !line.contains("S3"), "{line}");
         }
+    }
+
+    /// A driver whose every navigation fails with a TLS error.
+    struct TlsFailBrowser;
+
+    impl BrowserDriver for TlsFailBrowser {
+        fn navigate(&self, _url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            Box::pin(async { Err(anyhow::anyhow!("tls handshake failed")) })
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// Amendment 39b: a page the browser cannot load is reported to the job
+    /// with the crawl origin and one closed reason token, so an all-failing
+    /// browser crawl does not end with `crawl.errors 0`.
+    #[tokio::test]
+    async fn failed_navigation_is_reported_to_the_job() {
+        let job = JobWithDriver {
+            inner: FakeJob::new(
+                ScanProfile::default(),
+                Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+            ),
+            driver: Arc::new(TlsFailBrowser),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a page the browser cannot load is skipped, not fatal");
+        assert_eq!(report.pages, 0);
+
+        assert_eq!(
+            *job.inner.crawl_errors.lock().unwrap(),
+            vec![(ROOT.to_string(), "tls".to_string())]
+        );
+    }
+
+    /// A driver whose navigation never answers.
+    struct HangingNavBrowser;
+
+    impl BrowserDriver for HangingNavBrowser {
+        fn navigate(&self, _url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// A page the browser never answers within the job's deadline is reported
+    /// as `timeout`, read off the `tokio` timeout's own type (`bounded` keeps
+    /// the `Elapsed` under its context), not off the prose around it.
+    #[tokio::test]
+    async fn a_browser_call_that_never_answers_reports_timeout() {
+        let mut inner = FakeJob::new(
+            ScanProfile::default(),
+            Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+        );
+        inner.deadline = Instant::now() + Duration::from_millis(100);
+        let job = JobWithDriver {
+            inner,
+            driver: Arc::new(HangingNavBrowser),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a page the browser never answered is skipped, not fatal");
+        assert_eq!(report.pages, 0);
+
+        assert_eq!(
+            *job.inner.crawl_errors.lock().unwrap(),
+            vec![(ROOT.to_string(), "timeout".to_string())]
+        );
+    }
+
+    /// [`pages`] behind a driver whose tagged submit eval, or whose click,
+    /// fails with a fixed error; everything else is the double's own.
+    struct FailingInteractionBrowser {
+        inner: FakeBrowser,
+        submit_fails: Option<&'static str>,
+        click_fails: Option<&'static str>,
+    }
+
+    impl BrowserDriver for FailingInteractionBrowser {
+        fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            self.inner.navigate(url)
+        }
+
+        fn click(&self, target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            match self.click_fails {
+                Some(text) => Box::pin(async move { Err(anyhow::anyhow!(text)) }),
+                None => self.inner.click(target),
+            }
+        }
+
+        fn type_text(&self, selector: &str, text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.inner.type_text(selector, text)
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            self.inner.screenshot()
+        }
+
+        fn eval(&self, expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            if let Some(text) = self.submit_fails {
+                if expr.contains(SUBMIT_FORM_MARKER) {
+                    return Box::pin(async move { Err(anyhow::anyhow!(text)) });
+                }
+            }
+            self.inner.eval(expr)
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            self.inner.get_dom()
+        }
+    }
+
+    /// Amendment 39b: a form submission the browser fails is reported to the
+    /// job with the crawl origin and one closed reason token, like a page it
+    /// cannot load; the crawl goes on to the page's click.
+    #[tokio::test]
+    async fn failed_form_submission_is_reported_to_the_job() {
+        let job = JobWithDriver {
+            inner: FakeJob::new(
+                ScanProfile::default(),
+                Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+            ),
+            driver: Arc::new(FailingInteractionBrowser {
+                inner: pages(),
+                submit_fails: Some("connection reset by peer"),
+                click_fails: None,
+            }),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a submission the browser fails is skipped, not fatal");
+        assert_eq!(report.forms_submitted, 0);
+        assert_eq!(report.clicks, 1);
+
+        assert_eq!(
+            *job.inner.crawl_errors.lock().unwrap(),
+            vec![(ROOT.to_string(), "transport".to_string())]
+        );
+    }
+
+    /// Amendment 39b: a click the browser fails is reported to the job with
+    /// the crawl origin and one closed reason token; the form before it was
+    /// submitted and the crawl goes on.
+    #[tokio::test]
+    async fn failed_click_is_reported_to_the_job() {
+        let job = JobWithDriver {
+            inner: FakeJob::new(
+                ScanProfile::default(),
+                Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+            ),
+            driver: Arc::new(FailingInteractionBrowser {
+                inner: pages(),
+                submit_fails: None,
+                click_fails: Some("tls handshake failed"),
+            }),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a click the browser fails is skipped, not fatal");
+        assert_eq!(report.forms_submitted, 1);
+        assert_eq!(report.clicks, 0);
+
+        assert_eq!(
+            *job.inner.crawl_errors.lock().unwrap(),
+            vec![(ROOT.to_string(), "tls".to_string())]
+        );
     }
 
     /// `prime_session` propagates a failed navigation as an error whose text is

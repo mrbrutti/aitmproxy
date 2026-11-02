@@ -1,55 +1,82 @@
-// check-command-injection.rhai — operator/agent command
-// `check.cmdi { url, param, value? }`: confirm OS command injection using a
-// marker whose *executed* form differs from its literal form, so a reflection
-// cannot be mistaken for execution. OWASP A03 Injection.
+// check-command-injection.rhai — catalogue check `cmdi`, class `cmdi`.
 //
-// ACTIVE: scope-/rate-gated GETs, invoked only. The injected command is a benign
-// `echo` of a random marker (no data access, no destructive action); detection
-// is confirmed only when the shell-concatenated marker appears. Authorised only.
+// The marker is split in two halves that only a shell rejoins. A server that
+// echoes the request shows the literal command text; a server that runs it
+// shows the halves joined and the command word gone. That asymmetry is the
+// whole detection: a reflection cannot be mistaken for execution. The
+// injected command is a benign echo of the job's own marker.
+//
+// The shipped script's timing half is gone — native `cmdi-time` owns that
+// technique, and a check never sleeps (spec D4). OWASP A03. CWE-78.
 const NAME = "check-command-injection";
 const API  = "1";
 
-fn q(url, param, value) {
-    let sep = if url.contains("?") { "&" } else { "?" };
-    `${url}${sep}${url_encode(param)}=${url_encode(value)}`
-}
+const META = #{
+    id: "cmdi",
+    name: "OS command injection",
+    class: "cmdi",
+    lanes: ["http"],
+    kinds: ["query", "body_param", "json_value"],
+    intensity: "medium",
+    cost: "medium",
+    technique: "reflected",
+    severity: "critical",
+    confidence_max: "certain",
+    needs_baseline: false,
+    cwe: 78,
+    description: "Appends a benign split echo marker through the common shell separators and reports when the reply carries the marker reassembled.",
+    remediation: "Call the program directly with an argument vector instead of a shell string, and allow-list the values that may reach it.",
+};
 
 fn load(reg) {
-    reg.add_command("check.cmdi", "Confirm OS command injection in { url, param }", |args| {
-        if type_of(args.url) != "string" || type_of(args.param) != "string" {
-            return "usage: check.cmdi { url, param }";
-        }
-        let base = if type_of(args.value) == "string" { args.value } else { "1" };
-        // Marker split so only shell execution reassembles it: literal reflection
-        // shows "A$(echo B)C"; execution shows "ABC".
-        let r1 = rand_text_alpha(3).to_upper();
-        let r2 = rand_text_alpha(3).to_upper();
-        let executed = `${r1}${r2}`;
-        // Separators for *nix (;, |, &&, $()  ``) and a Windows &.
+    reg.add_check(META, |point| {
+        let base = if type_of(point.example) == "string" { point.example } else { "1" };
+        // The job's marker, cut in half. The halves are what the payload
+        // carries; the whole is what only a shell puts back together. The
+        // marker rather than random letters: the oracle has to recognise this
+        // job's token in the reply, and the engine, the evidence and a later
+        // PoC all speak that same token.
+        let marker = probe.marker().to_upper();
+        let half = marker.len() / 2;
+        let first = marker.sub_string(0, half);
+        let second = marker.sub_string(half);
+        let executed = first + second;
+        let literal = "echo " + first;
+        // Separators for a POSIX shell (; | && $() backticks) and a Windows one.
         let payloads = [
-            `${base};echo ${r1}${r2}`,
-            `${base}|echo ${r1}${r2}`,
-            `${base}&&echo ${r1}${r2}`,
-            `${base}$(echo ${r1})${r2}`,
-            `${base}` + "`echo " + `${r1}` + "`" + `${r2}`,
-            `${base}&echo ${r1}${r2}`,
+            base + ";echo " + executed,
+            base + "|echo " + executed,
+            base + "&&echo " + executed,
+            base + "$(echo " + first + ")" + second,
+            base + "`echo " + first + "`" + second,
+            base + "&echo " + executed,
         ];
-        for pl in payloads {
-            let r = http.send(#{ method: "GET", url: q(args.url, args.param, pl) });
-            if r.status == () { continue; }
-            // Confirm the executed concatenation is present AND the raw payload is not
-            // (so a plain reflection of the payload does not false-positive).
-            if r.body.contains(executed) && !r.body.contains(`echo ${r1}`) {
-                finding(#{
-                    name: "OS command injection",
-                    severity: "critical",
-                    flow_id: r.flow_id,
-                    detail: `\"${args.param}\" on ${args.url} executed an injected shell command (echo marker reassembled as ${executed}). This is remote command execution.`,
-                    tags: ["command-injection", "rce", "injection", "active", "owasp-a03"],
-                });
-                return "VULNERABLE: command injection confirmed";
+
+        for payload in payloads {
+            let reply = probe.send(payload);
+            // Reassembled marker present AND the literal command absent.
+            if reply.body.contains(executed) && !reply.body.contains(literal) {
+                return #{
+                    outcome: "vulnerable",
+                    confidence: "certain",
+                    evidence: #{ payload: payload, matched: executed },
+                    detail: `"${point.name}" ran an injected shell command: the split echo marker came back joined as ${executed} with the command text gone. This is remote command execution.`,
+                    poc_hint: #{
+                        matchers: [ #{ type: "word", word: executed, part: "body" },
+                                    #{ not: #{ type: "word", word: literal, part: "body" } } ],
+                        control: #{
+                            payload: base,
+                            matchers: [ #{ not: #{ type: "word", word: executed, part: "body" } } ],
+                        },
+                    },
+                };
             }
         }
-        "no command injection confirmed"
+        #{
+            outcome: "clean",
+            confidence: "firm",
+            evidence: #{ payload: payloads[0], matched: () },
+            detail: "No separator reassembled the echo marker, so nothing reached a shell.",
+        }
     });
 }
