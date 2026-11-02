@@ -1102,9 +1102,6 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
                 Ok(())
             }
         };
-        // Spec D4 (AC-W1-33): the loop has ended; dependency teardown noise (the browser's
-        // CDP socket closing) now stays in the log instead of becoming the operator's last line.
-        reporter.quiesce();
         if let Some(line) = stdio_eof {
             reporter.note(line);
         }
@@ -1120,6 +1117,12 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         let recovery = sysproxy.on_orderly_exit();
         log_recovery("exit", &recovery);
     }
+
+    // Spec D4 (AC-W1-33): the loop has ended; quiesce the reporter after the
+    // system-proxy restore (its warning must stay visible), before the browser
+    // reap (its CDP-socket teardown noise must not). That noise stays in the
+    // log instead of becoming the operator's last line.
+    reporter.quiesce();
 
     // Whichever arm ended the run, reap the browser child before returning;
     // a signal would otherwise leave it orphaned (no destructor runs).
