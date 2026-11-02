@@ -536,7 +536,14 @@ mod tests {
             .await
             .expect("the loopback target plans");
         assert_eq!(discovery.points.len(), 14);
-        assert!(discovery.nodes.is_empty());
+        // One node for the one declared target, named by all 14 points, so the
+        // engine can place an issue on it (`l4_location`).
+        assert_eq!(discovery.nodes.len(), 1);
+        assert_eq!(discovery.nodes[0].id, "l4:127.0.0.1:9/udp");
+        assert_eq!(discovery.nodes[0].points, 14);
+        for point in &discovery.points {
+            assert_eq!(point.site_node.as_deref(), Some("l4:127.0.0.1:9/udp"));
+        }
 
         let mut foreign = discovery.points[0].clone();
         foreign.lane = LaneKind::Http;

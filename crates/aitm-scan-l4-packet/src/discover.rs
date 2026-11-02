@@ -35,7 +35,7 @@ use aitm_proto_l4::types::{
     IpCidr, L4Action, L4Capability, L4Direction, L4Proto, L4ScopeEntry, L4Target,
 };
 use aitm_scan_model::ids::FlowRef;
-use aitm_scan_model::point::InsertionPoint;
+use aitm_scan_model::point::{InsertionPoint, SiteNode};
 use aitm_scan_model::profile::{L4Options, L4Seed, L4TargetSpec, ProfileTarget, ScanProfile};
 use aitm_scan_model::traits::Discovery;
 use aitm_scan_model::vocab::{InsertionKind, L4Transport, LaneKind};
@@ -625,6 +625,79 @@ fn raw_example(seed: &SeedSpec, origin: SeedOrigin) -> String {
     }
 }
 
+/// The site-map node id of an L4 target: `"l4:<ip>:<port>/<proto>"`.
+///
+/// This is exactly the prefix every one of that target's point ids already
+/// carries ([`crate::plan::point_id`] appends `/<field>`), so a point and its
+/// node agree by construction and no third spelling of the target exists.
+#[must_use]
+pub fn node_id(target: &ResolvedTarget) -> String {
+    format!("l4:{}", target_key(target.ip, target.port, target.proto))
+}
+
+/// The one site-map node a target gets.
+///
+/// The engine places an L4 issue from the point's **site node**, never from the
+/// point itself: `aitm_plugin_scanner`'s `l4_location` reads `location.l4.ip`
+/// and `.port` from `host`/`port`, `.proto` from [`SiteNode::l4_transport`]
+/// over `scheme`, and `.grammar` from [`SiteNode::l4_grammar`] over
+/// `path_template`; `IssueTarget` comes from the same three. With no node a
+/// confirmed `l4-crash` reached the operator with `location.l4` null (live
+/// proof run 10, task 4b).
+///
+/// `method` is empty: an L4 target has no request method, and nothing reads one
+/// (an issue's `location.method` comes from the point, which carries `None`).
+/// `params` is empty as well — a packet-lane point is a frame field, not a
+/// parameter — but `points` is the real minted count, because the scheduler
+/// reads it for exposure.
+fn site_node_for(
+    target: &ResolvedTarget,
+    spec: &L4TargetSpec,
+    flows: Vec<FlowRef>,
+    points: usize,
+) -> SiteNode {
+    // `/` + the grammar, which `l4_grammar()` reads back; a bare `/` for a
+    // target that names none, which reads back `None` rather than "".
+    let path_template = match spec.grammar.as_deref().map(str::trim) {
+        Some(grammar) if !grammar.is_empty() => format!("/{grammar}"),
+        _ => "/".to_string(),
+    };
+    SiteNode {
+        id: node_id(target),
+        method: String::new(),
+        scheme: transport_name(target.proto).to_string(),
+        host: target.ip.to_string(),
+        port: target.port,
+        path_template,
+        flows,
+        params: Vec::new(),
+        auth: false,
+        points: u32::try_from(points).unwrap_or(u32::MAX),
+        audited: false,
+    }
+}
+
+/// The captured flows a profile's seeds name, in profile order, de-duplicated.
+///
+/// [`seed_payloads`] refuses a declared seed flow that carries no outbound
+/// packet to the target, so every flow named here really did seed every target
+/// that planned, and the target's node can link back to it. A seed the lane
+/// scavenged from the store on its own is **not** listed: [`SeedPayload`]
+/// carries no flow ref to list.
+fn seed_flows(options: &L4Options) -> Vec<FlowRef> {
+    let named = options.seeds.iter().filter_map(|seed| match seed {
+        L4Seed::Flow { flow } => Some(*flow),
+        L4Seed::Hex { .. } | L4Seed::Base64 { .. } => None,
+    });
+    let mut out: Vec<FlowRef> = Vec::new();
+    for flow in named {
+        if !out.contains(&flow) {
+            out.push(flow);
+        }
+    }
+    out
+}
+
 /// One insertion point per field of this target, in field order.
 ///
 /// `example` is the value the seed actually puts on the wire — decimal for a
@@ -632,8 +705,10 @@ fn raw_example(seed: &SeedSpec, origin: SeedOrigin) -> String {
 /// a case starts from. A captured seed's payload is operator plaintext, so the
 /// raw point shows only its byte count, never the bytes (spec D2 "`example`
 /// redacted"; review finding SEC3); a profile or default seed shows its hex, cut
-/// at [`crate::codec::DETAIL_HEX_CHARS`]. Every point is lane-local: no site node, no flow
-/// (call C6).
+/// at [`crate::codec::DETAIL_HEX_CHARS`]. Every point is lane-local: no flow
+/// (call C6). Each point names its target's site node ([`node_id`]), which is
+/// the only place the engine can read an L4 issue's target and `location.l4`
+/// from (see [`site_node_for`]).
 #[must_use]
 pub fn points_for(
     target: &ResolvedTarget,
@@ -647,6 +722,7 @@ pub fn points_for(
         transport_name(target.proto),
         host_port(target.ip, target.port)
     );
+    let node = node_id(target);
     fields
         .iter()
         .map(|field| {
@@ -663,7 +739,7 @@ pub fn points_for(
                 name,
                 example,
                 flow: None,
-                site_node: None,
+                site_node: Some(node.clone()),
                 traits: Vec::new(),
                 frequency: 1,
                 method: None,
@@ -728,7 +804,9 @@ pub fn discover_all(
 ) -> Result<(Vec<TargetPlan>, Discovery), DiscoverError> {
     let mut plans: Vec<TargetPlan> = Vec::with_capacity(target.l4.len());
     let mut points: Vec<InsertionPoint> = Vec::new();
+    let mut nodes: Vec<SiteNode> = Vec::with_capacity(target.l4.len());
     let mut probed: Vec<String> = Vec::new();
+    let flows = seed_flows(&profile.l4);
 
     for (index, spec) in target.l4.iter().enumerate() {
         let resolved = resolve_target(guard, spec)?;
@@ -774,17 +852,20 @@ pub fn discover_all(
             .seeds
             .first()
             .map_or(SeedOrigin::Default, |payload| payload.origin);
-        points.extend(points_for(&plan.target, &plan.fields, &seed, origin));
+        let minted = points_for(&plan.target, &plan.fields, &seed, origin);
+        // One node per declared target, in profile order, so the engine can
+        // place every issue these points raise (task 4b).
+        nodes.push(site_node_for(
+            &plan.target,
+            spec,
+            flows.clone(),
+            minted.len(),
+        ));
+        points.extend(minted);
         plans.push(plan);
     }
 
-    Ok((
-        plans,
-        Discovery {
-            points,
-            nodes: Vec::new(),
-        },
-    ))
+    Ok((plans, Discovery { points, nodes }))
 }
 
 #[cfg(test)]
@@ -805,7 +886,7 @@ mod tests {
         RateCap,
     };
     use aitm_scan_model::ids::FlowRef;
-    use aitm_scan_model::profile::{L4Options, L4Seed};
+    use aitm_scan_model::profile::{L4Options, L4Seed, L4TargetSpec};
     use aitm_scan_model::vocab::{InsertionKind, L4Transport, LaneKind};
 
     use super::{
@@ -1233,7 +1314,7 @@ mod tests {
             assert_eq!(point.url.as_deref(), Some("udp://127.0.0.1:9"));
             assert_eq!(point.frequency, 1);
             assert!(point.flow.is_none());
-            assert!(point.site_node.is_none());
+            assert_eq!(point.site_node.as_deref(), Some("l4:127.0.0.1:9/udp"));
             assert!(point.traits.is_empty());
             assert!(point.method.is_none());
         }
@@ -1282,9 +1363,138 @@ mod tests {
 
         assert_eq!(plans.len(), 2);
         assert_eq!(discovery.points.len(), 14 + 19);
-        assert!(discovery.nodes.is_empty());
+        assert_eq!(discovery.nodes.len(), 2);
         assert_eq!(plans[1].src_port, 40_001);
         assert_eq!(guard.in_flight(), 0);
+    }
+
+    /// The engine places an L4 issue only from the point's site node
+    /// (`aitm-plugin-scanner`'s `l4_location`), so discovery emits exactly one
+    /// node per declared target and every point of that target names it. Run
+    /// 10 of the live proof shipped `location.l4 == null` because the lane
+    /// returned no node at all (task 4b).
+    #[test]
+    fn discovery_emits_one_site_node_per_target_and_points_reference_it() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9), tcp_target(80)], 100);
+
+        let (_plans, discovery) = discover_all(
+            &guard,
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &[],
+            "aitm7f3a",
+        )
+        .expect("both targets resolve");
+
+        assert_eq!(discovery.nodes.len(), 2);
+
+        let udp = &discovery.nodes[0];
+        assert_eq!(udp.id, "l4:127.0.0.1:9/udp");
+        assert_eq!(udp.scheme, "udp");
+        assert_eq!(udp.host, "127.0.0.1");
+        assert_eq!(udp.port, 9);
+        assert_eq!(udp.l4_transport(), Some(L4Transport::Udp));
+        assert_eq!(udp.path_template, "/");
+        assert_eq!(udp.l4_grammar(), None);
+        assert_eq!(udp.method, "");
+        assert_eq!(udp.points, 14);
+        assert!(udp.flows.is_empty());
+        assert!(udp.params.is_empty());
+        assert!(!udp.auth);
+        assert!(!udp.audited);
+
+        let tcp = &discovery.nodes[1];
+        assert_eq!(tcp.id, "l4:127.0.0.1:80/tcp");
+        assert_eq!(tcp.scheme, "tcp");
+        assert_eq!(tcp.host, "127.0.0.1");
+        assert_eq!(tcp.port, 80);
+        assert_eq!(tcp.l4_transport(), Some(L4Transport::Tcp));
+        assert_eq!(tcp.points, 19);
+
+        // Every point names its own target's node, and the point ids are
+        // unchanged: a point id is still its node id plus `/<field>`.
+        assert_eq!(discovery.points.len(), 14 + 19);
+        let mut per_node = vec![0_u32; discovery.nodes.len()];
+        for point in &discovery.points {
+            let named = point.site_node.as_deref().expect("every point has a node");
+            let index = discovery
+                .nodes
+                .iter()
+                .position(|node| node.id == named)
+                .unwrap_or_else(|| panic!("point {} names an unknown node {named}", point.id));
+            assert!(
+                point.id.starts_with(&format!("{named}/")),
+                "point {} does not belong to node {named}",
+                point.id
+            );
+            per_node[index] += 1;
+        }
+        // `points` is what the scheduler reads for exposure, so it is the real
+        // count, not a guess.
+        assert_eq!(per_node, vec![udp.points, tcp.points]);
+    }
+
+    /// A target that names a grammar carries it in `path_template` as
+    /// `/<grammar>`, which is what `SiteNode::l4_grammar` (and so the issue's
+    /// `location.l4.grammar`) reads back; a target without one carries `/` and
+    /// reads back `None` rather than an empty grammar name.
+    #[test]
+    fn site_node_carries_the_grammar_in_path_template() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let with_grammar = L4TargetSpec {
+            grammar: Some("raw".to_string()),
+            ..udp_target(9)
+        };
+        let profile = l4_profile(vec![with_grammar, tcp_target(80)], 100);
+
+        let (_plans, discovery) = discover_all(
+            &guard,
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &[],
+            "aitm7f3a",
+        )
+        .expect("both targets resolve");
+
+        assert_eq!(discovery.nodes[0].path_template, "/raw");
+        assert_eq!(discovery.nodes[0].l4_grammar(), Some("raw"));
+        assert_eq!(discovery.nodes[1].path_template, "/");
+        assert_eq!(discovery.nodes[1].l4_grammar(), None);
+    }
+
+    /// A node links back to the captured flow the operator seeded it from, so
+    /// the site map can say where the bytes came from. A flow named twice is
+    /// listed once.
+    #[test]
+    fn site_node_links_the_captured_seed_flow() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let (store, id) = store_with(vec![udp_packet(9, b"one", L4Direction::Outbound, false)]);
+        let mut profile = l4_profile(vec![udp_target(9)], 100);
+        profile.l4.seeds = vec![
+            L4Seed::Flow { flow: flow_ref(id) },
+            L4Seed::Flow { flow: flow_ref(id) },
+        ];
+
+        let (_plans, discovery) = discover_all(
+            &guard,
+            backend.as_ref(),
+            Some(&store as &dyn L4FlowStore),
+            &profile.target,
+            &profile,
+            &[],
+            "aitm7f3a",
+        )
+        .expect("the target resolves");
+
+        assert_eq!(discovery.nodes[0].flows, vec![flow_ref(id)]);
     }
 
     #[test]
