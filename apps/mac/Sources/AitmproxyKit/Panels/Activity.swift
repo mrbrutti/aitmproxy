@@ -92,11 +92,12 @@ public struct ActivityEntry: Identifiable, Hashable, Sendable {
         self.init(at: at, origin: origin, command: command, args: args, result: result)
     }
 
-    /// `id=0000… format=pem` — sorted keys, scalars as written, nested values compact; cut at `limit` with an ellipsis.
+    /// `id=0000… format=pem` — sorted keys, scalars as written, nested values compact; cut at `limit` with an
+    /// ellipsis. A confirm token (`_confirm`, `l4_confirm`, …) is a capability, so its value is elided.
     public static func summary(of args: JSONValue, limit: Int = 60) -> String {
         let text: String
         if let members = args.objectValue {
-            text = members.keys.sorted().map { "\($0)=\(scalar(members[$0] ?? .null))" }.joined(separator: " ")
+            text = members.keys.sorted().map { "\($0)=\($0.contains("_confirm") ? "…" : scalar(members[$0] ?? .null))" }.joined(separator: " ")
         } else if args.isNull {
             text = ""
         } else {

@@ -41,6 +41,7 @@ if [ -z "${AITM_BIN:-}" ]; then
   fi
 fi
 AITM_BIN="$(cd "$(dirname "$AITM_BIN")" && pwd)/$(basename "$AITM_BIN")"
+export AITM_AUDIT_LOG="${AITM_AUDIT_LOG:-off}"
 OBSCURA="${OBSCURA:-$(dirname "$AITM_BIN")/obscura}"
 
 echo "aitm under test: $AITM_BIN"

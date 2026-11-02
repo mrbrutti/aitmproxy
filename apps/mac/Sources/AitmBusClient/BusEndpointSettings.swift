@@ -3,8 +3,8 @@ import Foundation
 /// Settings ▸ Bus as values, read from one `UserDefaults` store so the endpoint
 /// resolution is a pure function of (settings, config file) and testable without
 /// the app. Which store the app reads is decided once, by `SettingsDomain` in the
-/// Kit: the operator's real defaults in a normal launch, an isolated suite in
-/// self-test / snapshot / fixture runs.
+/// Kit: the operator's real defaults in a normal launch, an isolated suite in a
+/// harness run (`APP_STORE` / `APP_LIVE`).
 public struct BusEndpointSettings: Equatable, Sendable {
     /// Read host/port/token from aitmproxy's `config.yaml` (the default).
     public var fromConfig = true

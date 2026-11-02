@@ -24,7 +24,9 @@ use aitm_core::{
 pub struct FlowState {
     pub id: FlowId,
     pub kind: FlowKind,
-    /// `Some` for HTTP flows.
+    /// `Some` for HTTP flows. For a WebSocket flow, `Some` once the host has
+    /// projected the upgrade handshake onto it ([`FlowState::with_handshake`]):
+    /// a read-only view whose `url` carries the `ws://` / `wss://` scheme.
     pub request: Option<RequestState>,
     /// `Some` for HTTP flows that already carry a response.
     pub response: Option<ResponseState>,
@@ -128,6 +130,33 @@ impl FlowState {
         }
     }
 
+    /// Project a WebSocket flow's upgrade handshake onto its script-visible
+    /// `request`, so `on_ws_start` / `on_ws_message` can read the URL the
+    /// client connected to and the handshake headers (`Origin`, `Cookie`,
+    /// `Sec-WebSocket-*`). The `WsFlow` itself carries only the handshake's
+    /// `FlowId`; the host resolves it through the flow store and passes the
+    /// stored `HttpFlow` here. The URL's scheme is `wss` when the handshake was
+    /// `https` or arrived over TLS, `ws` otherwise; path, query, method, headers
+    /// and body are the handshake's.
+    ///
+    /// A no-op for an HTTP flow (its request is its own) and for a `handshake`
+    /// that is not an HTTP flow. The view is read-only: `apply_to` never writes
+    /// a WebSocket flow's `request` back, and the handles refuse the edit.
+    #[must_use]
+    pub fn with_handshake(mut self, handshake: &Flow, max_body: usize) -> Self {
+        if self.kind != FlowKind::WebSocket {
+            return self;
+        }
+        if let Flow::Http(h) = handshake {
+            let mut request = RequestState::from_request(&h.request, max_body);
+            let tls = h.request.scheme.eq_ignore_ascii_case("https") || h.client_conn.tls;
+            let scheme = if tls { "wss" } else { "ws" };
+            request.url = format!("{scheme}://{}{}", h.request.authority, h.request.path);
+            self.request = Some(request);
+        }
+        self
+    }
+
     /// Apply field edits and effects back to the live flow; returns the chain
     /// verdict: `Halt` iff a [`FlowEffect::Halt`] was recorded.
     ///
@@ -163,6 +192,8 @@ impl FlowState {
                 f.request.version
             }
             Flow::WebSocket(w) => {
+                // `request`, when present, is the projected handshake: a
+                // read-only view, never written back (the upgrade is done).
                 // The frame a `WsMessage` event is about is the newest one: the
                 // WebSocket module appends it and dispatches in the same step,
                 // and the chain holds the flow for the whole dispatch.
@@ -402,4 +433,123 @@ fn split_url(url: &str) -> (Option<(String, String)>, String) {
         Some((scheme.to_string(), authority.to_string())),
         path.to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use aitm_core::{ConnInfo, Event, FlowMeta, HttpFlow, InterceptState, WsFlow};
+
+    use super::*;
+
+    fn conn(tls: bool) -> ConnInfo {
+        ConnInfo {
+            peer: "127.0.0.1:0".parse().expect("addr"),
+            sni: None,
+            alpn: None,
+            tls,
+            established: SystemTime::now(),
+        }
+    }
+
+    /// The 101 upgrade request a browser sends for `ws(s)://127.0.0.1:8080/ws`.
+    fn handshake(scheme: &str) -> Flow {
+        let mut headers = HeaderMap::new();
+        headers.set("Host", "127.0.0.1:8080");
+        headers.set("Upgrade", "websocket");
+        headers.set("Connection", "Upgrade");
+        headers.set("Origin", "http://127.0.0.1:8080");
+        headers.set("Cookie", "sid=abc123");
+        headers.set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+        Flow::Http(HttpFlow {
+            id: FlowId::new(),
+            request: HttpRequest {
+                method: "GET".into(),
+                scheme: scheme.into(),
+                authority: "127.0.0.1:8080".into(),
+                path: "/ws?room=1".into(),
+                version: HttpVersion::Http11,
+                headers,
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            },
+            response: None,
+            client_conn: conn(scheme == "https"),
+            server_conn: None,
+            metadata: FlowMeta::default(),
+            intercept: InterceptState::Observed,
+        })
+    }
+
+    fn ws_flow(handshake: FlowId, tls: bool) -> Flow {
+        Flow::WebSocket(WsFlow {
+            id: FlowId::new(),
+            handshake,
+            messages: Vec::new(),
+            client_conn: conn(tls),
+            server_conn: None,
+            metadata: FlowMeta::default(),
+            intercept: InterceptState::Observed,
+        })
+    }
+
+    #[test]
+    fn ws_snapshot_projects_the_handshake_as_the_request() {
+        let hs = handshake("http");
+        let flow = ws_flow(hs.id(), false);
+        let st = FlowState::snapshot(&flow, &Event::WsStart(flow.id()), 1 << 20)
+            .with_handshake(&hs, 1 << 20);
+
+        assert_eq!(st.kind, FlowKind::WebSocket);
+        let req = st.request.expect("a WS flow's request is its handshake");
+        assert_eq!(req.url, "ws://127.0.0.1:8080/ws?room=1");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/ws");
+        assert_eq!(req.query, vec![("room".to_string(), "1".to_string())]);
+        assert!(req
+            .headers
+            .contains(&("Upgrade".to_string(), "websocket".to_string())));
+        assert!(req
+            .headers
+            .contains(&("Origin".to_string(), "http://127.0.0.1:8080".to_string())));
+        assert!(req
+            .headers
+            .contains(&("Cookie".to_string(), "sid=abc123".to_string())));
+        assert!(
+            st.response.is_none(),
+            "the handshake's response is not projected"
+        );
+    }
+
+    #[test]
+    fn ws_snapshot_uses_wss_for_a_tls_handshake() {
+        let hs = handshake("https");
+        let flow = ws_flow(hs.id(), true);
+        let st = FlowState::snapshot(&flow, &Event::WsStart(flow.id()), 1 << 20)
+            .with_handshake(&hs, 1 << 20);
+        assert_eq!(
+            st.request.expect("request").url,
+            "wss://127.0.0.1:8080/ws?room=1"
+        );
+    }
+
+    #[test]
+    fn with_handshake_leaves_an_http_flow_alone() {
+        let hs = handshake("http");
+        let other = handshake("https");
+        let st = FlowState::snapshot(&hs, &Event::Request(hs.id()), 1 << 20);
+        let before = st.clone();
+        assert_eq!(st.with_handshake(&other, 1 << 20), before);
+    }
+
+    #[test]
+    fn with_handshake_ignores_a_non_http_handshake() {
+        let hs = handshake("http");
+        let flow = ws_flow(hs.id(), false);
+        let not_http = ws_flow(FlowId::new(), false);
+        let st = FlowState::snapshot(&flow, &Event::WsStart(flow.id()), 1 << 20)
+            .with_handshake(&not_http, 1 << 20);
+        assert!(st.request.is_none());
+    }
 }

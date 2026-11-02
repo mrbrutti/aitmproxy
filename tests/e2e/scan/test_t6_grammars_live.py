@@ -8,16 +8,22 @@ For each grammar of parent D8.5 (TLV, RESP, memcached text, DNS UDP,
 Modbus/TCP, MQTT, SMTP, FTP) and its child-spec-D5 speaker:
 
   * on VULNERABLE, one job (`l4-stream-safe`, `overrides.l4.max_bytes_per_s =
-    16384`, `cases = 200`) files EXACTLY ONE issue whose
-    `location.l4.grammar` is that grammar and whose class is `l4-crash` or
-    `l4-parser-fault`;
+    16384`, `cases = 200`) files AT LEAST ONE issue of class `l4-crash` or
+    `l4-parser-fault`, and every such issue names that grammar in
+    `location.l4.grammar` (umbrella D6 keys L4 issues by field path too, so a
+    grammar whose seeded bug is reachable from several field paths files one
+    issue per path: resp 5, dns 4 in T6's engine run; T6-4 wording amended);
   * the generated messages really are well formed: some inbound message in
     the speaker's own `/log/l4` is classified `ok`;
   * the speaker's own `downtime` ring is non-empty (its parse bug made it
     close and fail liveness for its bounded window);
   * the pacer holds on the speaker's own clock: over every sliding 1 000 ms
     window of the inbound `messages`, the summed `len` is at most
-    `16384 * 1.1` bytes (10 % slack for window alignment);
+    `16384 + max(10 %, 4 KiB)` bytes. The lane paces its own WRITE timestamps;
+    the observer buckets the speaker's READ timestamps, and with eight checks
+    on four connections reads cluster at the receiver, so a wall-clock bucket
+    can hold writes from a slightly longer send interval (T6 run 3: 18 453 on
+    resp, ~8 RESP messages over the 10 % slack); hence the 4 KiB floor;
   * on PATCHED the same job files zero issues and the `downtime` ring stays
     empty.
 
@@ -25,11 +31,17 @@ Modbus/TCP, MQTT, SMTP, FTP) and its child-spec-D5 speaker:
 covered by AC T5-2b in `test_t5_crash_oracle.py`; it is not run here. That is
 why this cell iterates eight grammars, not nine.
 
-Partial skips. A grammar the lane has not landed yet (no `scan.checks` check
-with the `l4_field` insertion kind naming it, or `scan.start` refused with
-`invalid_profile` naming it) prints `[SKIP-PART] <grammar>` and the cell moves
-on -- but if EVERY grammar skips that way the cell FAILS, so a half-landed
-lane is visible while a missing lane is a normal whole-cell SKIP 77.
+Partial skips. The lane ships three GENERIC checks for every grammar
+(`l4-crash`, `l4-parser-fault`, `l4-latency-outlier`, kind `l4_field`; T6 child
+spec S6.3): a check id never names a grammar, the grammar lives in
+`Issue.location.l4.grammar` and the site node's `path_template`. So "landed" is
+one question for the whole lane (at least one `l4_stream` check of kind `l4_field`
+in `scan.checks`),
+and the per-grammar question is answered by `scan.start`: an unknown grammar is
+refused with `invalid_profile: unknown grammar '<x>'; known: ...`, printed as
+`[SKIP-PART] <grammar>` and the cell moves on -- but if EVERY grammar skips that
+way the cell FAILS, so a half-landed lane is visible while a missing lane is a
+normal whole-cell SKIP 77.
 
 Observer: the seeded speakers' control-origin L4 logs (classification,
 downtime, and the message timestamps the pacer bound is computed from).
@@ -46,7 +58,6 @@ Exit 0 pass / 1 fail / 77 skip. Never prints a token.
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -82,10 +93,20 @@ GRAMMARS: tuple[tuple[str, str], ...] = (
     ("smtp", "l4-smtp"),
     ("ftp", "l4-ftp"),
 )
+# `tlv` is the one grammar with no generator of its own: a named `tlv` with an empty
+# corpus has nothing to infer from (parent spec D8.5 Corpus (c); T6 child spec S5.2 (c)),
+# so the row passes the
+# same three well-formed frames `test_t6_tlv_crash.py` uses (u16 BE length + payload,
+# three distinct lengths so the S4 length inference succeeds). Every other grammar
+# generates its own seeds.
+TLV_SEEDS = [{"hex": "000161"}, {"hex": "00026162"}, {"hex": "0003616263"}]
 FAULT_CLASSES = {"l4-crash", "l4-parser-fault"}
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.checks")
 MAX_BYTES_PER_S = 16384
-PACER_LIMIT = MAX_BYTES_PER_S * 1.1
+# 10 % slack for window alignment, with a 4 KiB floor: the speaker logs READ
+# timestamps while the lane paces WRITE timestamps, and clustered reads can pull a
+# few extra messages into a 1 s bucket (T6 run 3).
+PACER_LIMIT = MAX_BYTES_PER_S + max(MAX_BYTES_PER_S * 0.1, 4096)
 WINDOW_MS = 1000
 CASES = 200
 # One bounded L4 job per grammar against a local speaker; 300 s each.
@@ -96,23 +117,14 @@ EXPECT = Expectations("grammar assertion")
 expect = EXPECT.expect
 
 
-def advertises(checks: list[dict], grammar: str) -> bool | None:
-    """Does `scan.checks` advertise `grammar`? True / False, or None when the
-    build exposes no `l4_field` check at all (so the question cannot be
-    answered from the catalogue and only `scan.start` can refuse).
-
-    The match is on the `id` / `class` TOKENS (split on `-` and `_`), never on free
-    text: a description that merely mentions "dns" is not an advertised dns grammar."""
-    l4_field = [c for c in checks if "l4_field" in (c.get("kinds") or [])]
-    if not l4_field:
-        return None
-    for c in l4_field:
-        tokens = set()
-        for key in ("id", "class"):
-            tokens.update(re.split(r"[-_]", str(c.get(key) or "").lower()))
-        if grammar in tokens:
-            return True
-    return False
+def lane_landed(checks: list[dict]) -> bool:
+    """Has the stream lane landed at all: at least one `scan.checks` entry of the
+    `l4_stream` lane with the `l4_field` insertion kind, whatever its id (the
+    three generic checks carry no grammar name; T6 child spec S6.3). The packet
+    lane's checks carry `l4_field` too, hence the lane filter. Per-grammar
+    support is decided by `scan.start`, never by the catalogue."""
+    return any("l4_field" in (c.get("kinds") or []) and "l4_stream" in (c.get("lanes") or [])
+               for c in checks)
 
 
 def worst_window(messages: list[dict]) -> tuple[int, int]:
@@ -144,7 +156,8 @@ def start_stream_job(op: BusClient, target: ScanTarget, service: str, grammar: s
             profile_name="l4-stream-safe",
             overrides={
                 "target": {"l4": [l4_endpoint(target, service, grammar)]},
-                "l4": {"cases": CASES, "max_bytes_per_s": MAX_BYTES_PER_S},
+                "l4": {"cases": CASES, "max_bytes_per_s": MAX_BYTES_PER_S,
+                       **({"seeds": TLV_SEEDS} if grammar == "tlv" else {})},
             },
             confirm=True,
         )
@@ -161,8 +174,9 @@ def check_grammar(op: BusClient, vuln: ScanTarget, patched: ScanTarget,
     """Run both halves for one grammar. True when it ran, False when it was
     skipped as not landed."""
     section(f"grammar {grammar} -- speaker {service}")
-    if advertises(checks, grammar) is False:
-        print(f"  [SKIP-PART] {grammar}: no scan.checks `l4_field` check names it", flush=True)
+    if not lane_landed(checks):
+        print(f"  [SKIP-PART] {grammar}: scan.checks has no `l4_stream` check of kind `l4_field` "
+              "(lane not landed)", flush=True)
         return False
 
     vuln.logs.reset()
@@ -176,13 +190,13 @@ def check_grammar(op: BusClient, vuln: ScanTarget, patched: ScanTarget,
            f"stopped_reason={status.get('stopped_reason')!r}, error={status.get('error')!r})")
 
     found = issues(op, "operator", job=job)
-    mine = [i for i in found
-            if ((i.get("location") or {}).get("l4") or {}).get("grammar") == grammar
-            and i.get("class") in FAULT_CLASSES]
-    expect(len(mine) == 1,
-           f"{grammar}: exactly one {sorted(FAULT_CLASSES)} issue naming the grammar "
-           f"(got {len(mine)} of {len(found)}: "
-           f"{[(i.get('class'), ((i.get('location') or {}).get('l4') or {}).get('grammar')) for i in found]})")
+    faults = [i for i in found if i.get("class") in FAULT_CLASSES]
+    grammars = [((i.get("location") or {}).get("l4") or {}).get("grammar") for i in faults]
+    # One issue per (node, field path) is the D6 dedupe key: several field paths
+    # can each reach the seeded bug, so "at least one, all naming the grammar".
+    expect(len(faults) >= 1 and all(g == grammar for g in grammars),
+           f"{grammar}: at least one {sorted(FAULT_CLASSES)} issue and every one names the grammar "
+           f"(got {len(faults)} fault issue(s) of {len(found)}, grammars {grammars})")
 
     inbound = vuln.logs.messages(service, dir="in")
     expect(any(m.get("classified") == "ok" for m in inbound),

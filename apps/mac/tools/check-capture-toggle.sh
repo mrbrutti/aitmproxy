@@ -3,7 +3,7 @@
 # docs/superpowers/specs/2026-10-30-macos-ne-ship-and-toggle-design.md):
 # TG-AC3 spawn reads the choice fresh, TG-AC4 first run OFF asks nothing, TG-AC5 ON,
 # TG-AC6 OFF, TG-AC8 persisted OFF default and idempotent, TG-AC10 menu + shortcut,
-# TG-AC11 the four snapshot states; and the stage-6 fixes: disable() honest and stops capture first,
+# and the stage-6 fixes: disable() honest and stops capture first,
 # an OFF launch converges the tunnel to off, the toggle and the menu command stand down unless the
 # embedded core is active, spawn() never opens the gate in a build without the extension,
 # CaptureSwitch reads the choice as spawn() does, and Uninstall's ratified clear-and-restart.
@@ -38,9 +38,7 @@ health=Sources/Aitmproxy/Bus/CoreHealthState.swift
 settings=Sources/Aitmproxy/SettingsView.swift
 app=Sources/Aitmproxy/App.swift
 shell=Sources/Aitmproxy/Shell/ShellView.swift
-snap=Sources/Aitmproxy/Snapshot.swift
-scenes=Sources/Aitmproxy/SnapshotScenes.swift
-for f in "$ext" "$core" "$core_ctl" "$health" "$settings" "$app" "$shell" "$snap" "$scenes"; do
+for f in "$ext" "$core" "$core_ctl" "$health" "$settings" "$app" "$shell"; do
     [ -f "$f" ] || { echo "FAIL: $f not found; update this script"; exit 1; }
 done
 
@@ -327,9 +325,7 @@ launch=$(body_of "$health" '^[[:space:]]*(private )?static func launchSupportsCa
 found "visibility CoreHealthState.launchSupportsCapture()" "$launch"
 has "visibility captureSupported comes from the launch guards, not a constant" \
     "$(code_lines "$health")" 'var captureSupported: Bool = CoreHealthState.launchSupportsCapture()'
-has "visibility fixtures are never capture-capable" "$launch" 'Store.usesFixtures'
 has "visibility self-test runs are never capture-capable" "$launch" 'SelfTest.requested'
-has "visibility snapshot runs are never capture-capable" "$launch" 'APP_SNAPSHOT'
 has "visibility only a build that embeds the extension is capture-capable" "$launch" 'CaptureExtension.isEmbedded(inApp: Bundle.main.bundleURL)'
 cs_body=$(body_of "$settings" '^struct CaptureSettings')
 found "visibility CaptureSettings view" "$cs_body"
@@ -423,28 +419,9 @@ else
     fail "TG-AC10 the capture command has no .keyboardShortcut within its Button"
 fi
 
-# ============================ TG-AC11: the four snapshot states ========================
-has "TG-AC11 the snapshot states are off, awaiting, active, failed and noscope" "$(code_lines "$scenes")" 'case off, awaiting, active, failed, noscope'
-has "NS-AC5 the noscope state seeds an empty scope" "$(code_lines "$scenes")" 'session.scopeHosts = []'
-has "NS-AC5 reset restores the fixture scope" "$(code_lines "$scenes")" 'session.scopeHosts = Fixtures.scope'
-# Two enums in this file declare `func apply(to session: Session)`; cut the capture-state enum
-# first so the pins below cannot drift onto SnapshotScene.apply.
-cs_body=$(body_of "$scenes" 'enum CaptureSnapshotState')
-found "NS-AC5 CaptureSnapshotState body" "$cs_body"
-ordered "NS-AC5 every capture state starts from the fixture scope before the switch (no light-to-dark leak)" \
-    "$(line_of "$cs_body" 'session.scopeHosts = Fixtures.scope')" "$(line_of "$cs_body" 'switch self')"
-ordered "NS-AC5 only noscope empties the scope, after the per-state restore" \
-    "$(line_of "$cs_body" 'session.scopeHosts = Fixtures.scope')" "$(line_of "$cs_body" 'session.scopeHosts = \[\]')"
-has "NS-AC5 the apps scene keeps the first saved rows if applied twice" "$(code_lines "$scenes")" 'Self.savedRows ?? session.rows'
+# TG-AC11 / NS-AC5 snapshot-scene pins removed 2026-10-31 with the fixture modes (spec 2026-10-31-remove-fake-data-ui-modes).
 has "NS-AC4 the Settings status row stops reading Capturing when the scope is empty" "$settings_code" 'Text("On, nothing in scope")'
 has "security-3 the poll loop refreshes the scope so the advice never argues with the core" "$(code_lines Sources/Aitmproxy/Bus/BusService.swift)" 'await refreshScope()'
-for seeded in '.inactive' '.pendingApproval' '.capturing' '.degraded('; do
-    has "TG-AC11 a snapshot state seeds $seeded" "$(code_lines "$scenes")" "captureCapability = $seeded"
-done
-has "TG-AC11 every state is captured" "$(code_lines "$snap")" 'for state in CaptureSnapshotState.allCases'
-has "TG-AC11 each capture is written as settings-capture-<state>-<mode>.png" "$(code_lines "$snap")" \
-    'settings-capture-\(state.rawValue)-\(mode).png'
-has "TG-AC11 the capture loop runs in light and dark" "$(code_lines "$snap")" 'for mode in ["light", "dark"]'
 
 # ============ NS-AC2/3/4/8: honest "on but scope is empty" state (hotfix spec 2026-10-31) ====
 # Spec docs/superpowers/specs/2026-10-31-ne-no-scope-honest-state-design.md. The extension is
@@ -471,14 +448,13 @@ for view in banner empty; do
 done
 has "NS-AC3 the banner never promises app attribution" "$(code_lines Sources/AitmproxyKit/CaptureAdvice.swift)" 'carry no source app'
 hasnt "NS-AC3 no advice copy promises app attribution" "$(code_lines Sources/AitmproxyKit/CaptureAdvice.swift)" 'attribute flows to apps|flows are attributed|needs the (macOS )?capture extension'
-has "NS-AC8 with flows present the Apps page keeps the table and shows the banner" "$shell_code" 'session.clients.isEmpty, !session.rows.isEmpty'
+has "NS-AC8 with flows present the list pages keep the table and the route banner is guarded by trafficRoutes.banner (spec 2026-10-31-mac-traffic-route-advice D8)" "$shell_code" 'if routes.banner != nil {'
+has "NS-AC8 the guard's routes are session.trafficRoutes, read once" "$shell_code" 'let routes = session.trafficRoutes'
 has "NS-AC8 the full empty state shows only when there are no flows at all" "$shell_code" 'session.clients.isEmpty, session.rows.isEmpty'
 hasnt "NS-AC4 ShellView reads no capture.enabled key" "$shell_code" 'capture\.enabled'
 hasnt "NS-AC4 ShellView never calls the toggle glue" "$shell_code" 'CaptureSwitch'
 hasnt "NS-AC4 ShellView never touches the controller handle" "$shell_code" 'extensionController'
-has "NS-AC5 an apps-noattribution scene exists" "$(code_lines "$scenes")" 'case appsNoAttribution = "apps-noattribution"'
-has "NS-AC5 the apps scene strips the fixture clients" "$(code_lines "$scenes")" 'row.client = nil'
-has "NS-AC5 the apps scene seeds the empty-scope trap" "$(code_lines "$scenes")" 'CaptureSnapshotState.noscope.apply(to: session)'
+# TG-AC11 / NS-AC5 snapshot-scene pins removed 2026-10-31 with the fixture modes (spec 2026-10-31-remove-fake-data-ui-modes).
 
 # ---- NS-AC2/3/5/8 scoped pins (Tester, stage 5) ---------------------------------------------
 # The file-level pins above cannot tell the Apps banner from the Apps empty state, Settings from
@@ -547,41 +523,32 @@ has "NS-AC3 the Apps empty state shows the advice detail" "$empty_body" 'Text(ad
 
 # NS-AC8: MainView renders the banner above the table when flows exist, the empty state only when
 # there are none, and the flow table is the fallback. A view that exists but is never rendered fails here.
+# Since spec 2026-10-31-mac-traffic-route-advice-design D8 the one banner line on every list page is
+# RouteBanner(routes:) (the closed routes' state words, one remedy button), handed the one
+# `let routes = session.trafficRoutes` MainView reads per body and guarded by `routes.banner != nil`;
+# AppsAttributionBanner's call site is gone (its struct stays, so the NS-AC3 body pins above still hold)
+# and a second RouteBanner(routes:) call, a second trafficRoutes read or a returning AppsAttributionBanner()
+# call in MainView fails here.
 main_body=$(body_of "$shell" '^struct MainView: View')
 found "NS-AC8 MainView" "$main_body"
-equals "NS-AC8 the banner is rendered exactly once" "$(grep -c -F 'AppsAttributionBanner()' <<<"$main_body")" "1"
+equals "NS-AC8 the banner is rendered exactly once" "$(grep -c -F 'RouteBanner(routes: routes)' <<<"$main_body")" "1"
+equals "NS-AC8 MainView reads session.trafficRoutes exactly once" "$(grep -c -F 'session.trafficRoutes' <<<"$main_body")" "1"
+equals "NS-AC8 the old Apps banner is no longer rendered" "$(grep -c -F 'AppsAttributionBanner()' <<<"$main_body")" "0"
 equals "NS-AC8 the empty state is rendered exactly once" "$(grep -c -F 'AppsEmptyState()' <<<"$main_body")" "1"
-main_bcond=$(line_of "$main_body" 'session[.]page == [.]apps, session[.]clients[.]isEmpty, !session[.]rows[.]isEmpty [{]')
-main_bcall=$(line_of "$main_body" 'AppsAttributionBanner[(][)]')
+main_routes=$(line_of "$main_body" 'let routes = session[.]trafficRoutes$')
+main_bcond=$(line_of "$main_body" 'if routes[.]banner != nil [{]')
+main_bcall=$(line_of "$main_body" 'RouteBanner[(]routes: routes[)]')
 main_split=$(line_of "$main_body" 'if session[.]splitView [{]')
 main_econd=$(line_of "$main_body" 'else if session[.]page == [.]apps, session[.]clients[.]isEmpty, session[.]rows[.]isEmpty [{]')
 main_ecall=$(line_of "$main_body" 'AppsEmptyState[(][)]')
-main_table=$(line_of "$main_body" '^[0-9]+:[[:space:]]*flowTable[[:space:]]*$')
-ordered "NS-AC8 the banner condition (flows present) guards the banner" "$main_bcond" "$main_bcall"
+main_table=$(line_of "$main_body" '^[0-9]+:[[:space:]]*flowTable[(]routes: routes[)][[:space:]]*$')
+ordered "NS-AC8 the routes are read before the banner's guard" "$main_routes" "$main_bcond"
+ordered "NS-AC8 the banner condition (a route is closed) guards the banner" "$main_bcond" "$main_bcall"
 ordered "NS-AC8 the banner sits above the flow table" "$main_bcall" "$main_split"
 ordered "NS-AC8 the empty-state condition (no flows) guards the empty state" "$main_econd" "$main_ecall"
 ordered "NS-AC8 the flow table is the fallback after the empty state" "$main_ecall" "$main_table"
 
-# NS-AC5: the two scenes are seeded as the spec says, restored afterwards (the apps scene edits the
-# shared fixture rows), and both are in the light + dark capture loops.
-noscope_body=$(case_body "$scenes" 'case [.]noscope:')
-found "NS-AC5 the noscope snapshot state" "$noscope_body"
-has "NS-AC5 noscope seeds capture ON (.capturing)" "$noscope_body" 'captureCapability = .capturing'
-has "NS-AC5 noscope seeds the persisted choice on" "$noscope_body" 'captureChoice = true'
-has "NS-AC5 noscope seeds an EMPTY scope" "$noscope_body" 'session.scopeHosts = []'
-apps_scene_body=$(case_body "$scenes" 'case [.]appsNoAttribution:')
-found "NS-AC5 the apps-noattribution scene" "$apps_scene_body"
-has "NS-AC5 the apps scene keeps the fixture rows to restore" "$apps_scene_body" 'Self.savedRows = '
-has "NS-AC5 the apps scene strips the client from every row" "$apps_scene_body" 'row.client = nil'
-has "NS-AC5 the apps scene lands on the Apps page" "$apps_scene_body" 'session.page = .apps'
-has "NS-AC5 the apps scene applies the noscope state" "$apps_scene_body" 'CaptureSnapshotState.noscope.apply(to: session)'
-scene_reset=$(body_of "$scenes" 'static func reset[(]_ session: Session[)]')
-found "NS-AC5 SnapshotScene.reset" "$scene_reset"
-has "NS-AC5 reset restores the fixture rows" "$scene_reset" 'session.rows = rows'
-has "NS-AC5 reset forgets the saved rows" "$scene_reset" 'savedRows = nil'
-has "NS-AC5 reset restores the capture snapshot state" "$scene_reset" 'CaptureSnapshotState.reset(session)'
-has "NS-AC5 every scene (apps-noattribution included) is captured in the light and dark loop" "$(code_lines "$snap")" 'for scene in SnapshotScene.allCases'
-has "NS-AC5 every capture state (noscope included) is captured in the light and dark loop" "$(code_lines "$snap")" 'for state in CaptureSnapshotState.allCases'
+# TG-AC11 / NS-AC5 snapshot-scene pins removed 2026-10-31 with the fixture modes (spec 2026-10-31-remove-fake-data-ui-modes).
 
 # Scoped companions for the stage-6 fixes (Tester): the file-level pins above cannot tell a call in
 # pollLoop from the other refreshScope() callers, or the Status row branch from the generic one.

@@ -8,7 +8,7 @@ import type { AgentPolicy } from '~/state/app';
 import { POLICY_OPTIONS } from './activity';
 import css from './AgentPanel.module.css';
 
-const ICONS: Record<AgentPolicy, IconName> = { all: 'shield', readonly: 'eye', paused: 'pause' };
+const ICONS: Record<AgentPolicy, IconName> = { all: 'shield', auto: 'bot', ask: 'hand', readonly: 'eye', paused: 'pause' };
 
 export const PolicyControl: Component<{
   value: AgentPolicy;

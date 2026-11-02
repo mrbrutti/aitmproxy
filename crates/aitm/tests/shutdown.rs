@@ -215,6 +215,7 @@ impl Aitm {
             .arg("--config")
             .arg(config)
             .env("RUST_LOG", "info")
+            .env("AITM_AUDIT_LOG", "off")
             .env_remove("AITM_CONFIG")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

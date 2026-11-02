@@ -7,10 +7,10 @@
 //! with the guard from its `LateHandles` — the `ws.*` host fns are `Guarded`
 //! through the scope guard, never ungated (D8.3, call A17).
 //!
-//! Track T1a handed over the skeleton; T4 fills it module by module. Both slot
-//! bodies delegate to [`lane::build`] and [`language::build`], so flipping a
-//! slot is an edit inside the module that owns it and this file is written once
-//! (T4 plan call 11).
+//! Track T1a handed over the skeleton and T4 filled it module by module. Both
+//! slot bodies delegate to [`lane::build`] and [`language::build`], so a change
+//! to either is an edit inside the module that owns it and this file is written
+//! once (T4 plan call 11).
 
 #![forbid(unsafe_code)]
 
@@ -33,7 +33,7 @@ pub mod testing;
 pub mod transport;
 pub mod types;
 
-/// The WebSocket lane, or `None` while the lane is unimplemented.
+/// The WebSocket lane, or `None` when this build ships without it.
 ///
 /// `crates/aitm/src/wire.rs` calls this once at startup and registers the lane
 /// it gets back; a `None` lane makes `scan.start` refuse a `ws` lane with
@@ -44,7 +44,7 @@ pub fn lane() -> Option<Arc<dyn Lane>> {
     lane::build()
 }
 
-/// The `ws.*` protocol language, or `None` while the track is unimplemented.
+/// The `ws.*` protocol language, or `None` when this build ships without it.
 ///
 /// `crates/aitm/src/main.rs` calls this with the scope/rate guard from its
 /// `LateHandles` and registers what it gets back. Every `ws.*` host fn is

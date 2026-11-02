@@ -1,0 +1,2174 @@
+//! Public-API tests for the strict audit redaction in `aitm_core::redact_strict`
+//! (spec Design 14.2 and 14.3, AC44).
+//!
+//! Every test collects its failing rows into one assertion message, so a single
+//! run shows every wrong row instead of the first.
+
+use std::sync::mpsc;
+use std::time::Duration;
+
+use aitm_core::redact_strict::{
+    is_benign_header, is_secret_key_strict, scrub_strict, scrub_strict_bounded,
+};
+
+/// Seconds a hostile 4 MiB input is given: generous, because the suites of a loaded
+/// CI host run in parallel and in a debug build.
+const HOSTILE_SECS: u64 = 60;
+
+/// Run `f` on its own thread and give it `secs` seconds. A timeout or a panic is an
+/// `Err`, so a hang fails the test instead of hanging the run (a detached thread
+/// dies with the test process).
+fn within<T: Send + 'static>(
+    secs: u64,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // A send error means the receiver timed out and left; nothing to report.
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("no result within {secs} s")),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("the worker panicked".to_string()),
+    }
+}
+
+/// One table of `(input, expected)` rows and the failures they produced.
+#[derive(Default)]
+struct Table {
+    failures: Vec<String>,
+}
+
+impl Table {
+    /// `scrub_strict(input)` must equal `expected`, and a second pass must change
+    /// nothing (the idempotence contract of every pass).
+    fn row(&mut self, input: &str, expected: &str) {
+        let got = scrub_strict(input);
+        if got != expected {
+            self.failures.push(format!(
+                "scrub_strict({input:?}): want {expected:?}, got {got:?}"
+            ));
+        }
+        let again = scrub_strict(&got);
+        if again != got {
+            self.failures.push(format!(
+                "scrub_strict is not idempotent on {input:?}: first {got:?}, second {again:?}"
+            ));
+        }
+    }
+
+    /// A row that must come through byte for byte.
+    fn unchanged(&mut self, input: &str) {
+        self.row(input, input);
+    }
+
+    /// Hostile shapes, 4 MiB each, on a thread that is given `HOSTILE_SECS`. `Basic ` repeated
+    /// has no token of 8 characters, so it is untouched; `Cookie: ` repeated is one
+    /// header line, masked once to its end.
+    fn hostile_inputs(&mut self) {
+        let basic = "Basic ".repeat((4 << 20) / 6 + 1);
+        let cookie = "Cookie: ".repeat((4 << 20) / 8 + 1);
+
+        let basic_in = basic.clone();
+        let got_basic = within(HOSTILE_SECS, move || scrub_strict(&basic_in));
+        let got_cookie = within(HOSTILE_SECS, move || scrub_strict(&cookie));
+
+        match got_basic {
+            Ok(out) if out == basic => {}
+            Ok(out) => self
+                .failures
+                .push(format!("`Basic ` x N changed: {} bytes out", out.len())),
+            Err(e) => self.failures.push(format!("`Basic ` x N: {e}")),
+        }
+        match got_cookie {
+            Ok(out) if out == "Cookie: [redacted]" => {}
+            Ok(out) => self.failures.push(format!(
+                "`Cookie: ` x N did not collapse to one masked line: {} bytes out",
+                out.len()
+            )),
+            Err(e) => self.failures.push(format!("`Cookie: ` x N: {e}")),
+        }
+    }
+
+    /// One hostile shape on a thread that is given `HOSTILE_SECS`: the pass must return, and
+    /// return exactly `expected`.
+    fn hostile(&mut self, label: &str, input: String, expected: String) {
+        match within(HOSTILE_SECS, move || scrub_strict(&input)) {
+            Ok(out) if out == expected => {}
+            Ok(out) => self.failures.push(format!(
+                "{label}: wrong output, {} bytes out (want {} bytes)",
+                out.len(),
+                expected.len()
+            )),
+            Err(e) => self.failures.push(format!("{label}: {e}")),
+        }
+    }
+
+    /// One hostile shape that only has to come back, in time and without a panic.
+    /// It is 2 MiB: a scan of it that is quadratic is tens of billions of steps, far
+    /// past the guard.
+    fn hostile_completes(&mut self, label: &str, input: String) {
+        if let Err(e) = within(HOSTILE_SECS, move || scrub_strict(&input).len()) {
+            self.failures.push(format!("{label}: {e}"));
+        }
+    }
+
+    /// A hostile shape that must come back as `expected` and be a fixed point: a second
+    /// call over the result changes nothing.
+    fn hostile_settles(&mut self, label: &str, input: String, expected: String) {
+        let ran = within(HOSTILE_SECS, move || {
+            let first = scrub_strict(&input);
+            let second = scrub_strict(&first);
+            (first, second)
+        });
+        match ran {
+            Ok((first, second)) if first == expected && second == first => {}
+            Ok((first, second)) => self.failures.push(format!(
+                "{label}: first {} bytes (want {} bytes), second call {}",
+                first.len(),
+                expected.len(),
+                if second == first {
+                    "settled"
+                } else {
+                    "changed it"
+                }
+            )),
+            Err(e) => self.failures.push(format!("{label}: {e}")),
+        }
+    }
+
+    /// Hostile shapes of P4 and P5, 4 MiB each. A bare `eyJ` run has no dot, an
+    /// unterminated PEM block is masked once to the end of the text, and a scheme
+    /// with a colon but no `@` is no credential.
+    fn hostile_shapes(&mut self) {
+        let jwt = "eyJ".repeat((4 << 20) / 3 + 1);
+        let pem = "-----BEGIN PRIVATE KEY-----".repeat((4 << 20) / 27 + 1);
+        let url = "https://a:".repeat((4 << 20) / 10 + 1);
+        self.hostile("`eyJ` x N", jwt.clone(), jwt);
+        self.hostile("unterminated PEM x N", pem, "[redacted]".to_string());
+        self.hostile("`https://a:` x N", url.clone(), url);
+
+        // Shapes that would cost a pass over the rest of the text at every
+        // candidate if a failed scan were not remembered: a first JWT segment that
+        // runs on through `-`, and an unclosed quote after every key word.
+        let jwt_dash = "eyJ-".repeat((4 << 20) / 4 + 1);
+        self.hostile("`eyJ-` x N", jwt_dash.clone(), jwt_dash);
+        let pairs = (4 << 20) / 9 + 1;
+        self.hostile(
+            "`pass=\"x ` x N",
+            "pass=\"x ".repeat(pairs),
+            "pass=\"[redacted] ".repeat(pairs),
+        );
+    }
+
+    fn finish(self) {
+        assert!(
+            self.failures.is_empty(),
+            "{} wrong row(s):\n{}",
+            self.failures.len(),
+            self.failures.join("\n")
+        );
+    }
+}
+
+#[test]
+fn scrub_strict_masks_every_pass_and_keeps_the_benign() {
+    let mut t = Table::default();
+
+    // P2: header lines.
+    t.row(
+        "GET / HTTP/1.1\r\nCookie: a=b; c=SECRET44\r\nHost: x",
+        "GET / HTTP/1.1\r\nCookie: [redacted]\r\nHost: x",
+    );
+    t.row(
+        "Set-Cookie: JSESSIONID=\"S\"; Path=/",
+        "Set-Cookie: [redacted]",
+    );
+    t.row(
+        "x Authorization: Digest username=\"u\", response=\"R\"\nnext",
+        "x Authorization: [redacted]\nnext",
+    );
+    t.row("X-Api-Key: a b c\nok", "X-Api-Key: [redacted]\nok");
+    t.row(
+        "Proxy-Authorization: Basic Zm9v",
+        "Proxy-Authorization: [redacted]",
+    );
+
+    // P2, beyond the spec's rows: a named header mid-line masks to the end of its
+    // line (every cookie, not only the first); at the start of a line a name of the
+    // strict vocabulary that `scrub_text` does not know (`pass`) does the same; an
+    // empty value is left alone.
+    t.row("see Cookie: a=b; c=d\nnext", "see Cookie: [redacted]\nnext");
+    t.row("pass: a b\nok", "pass: [redacted]\nok");
+    t.unchanged("Cookie:");
+    // Regression: `scrub_text` already masked the next line and
+    // kept the CRLF inside its match, so the header's value is whitespace alone
+    // (U+2028 is whitespace to it). P2 must not rewrite that whitespace, or a second
+    // `scrub_text` eats the CR (its `.+` matches a CR) and the second pass differs.
+    t.unchanged("Authorization:\u{2028}\r\n[redacted]\n");
+    t.row(
+        "Authorization:\u{2028}\r\nfoo\n",
+        "Authorization:\u{2028}\r\n[redacted]\n",
+    );
+
+    // P3: Basic, Negotiate and NTLM credentials.
+    t.row("use Basic dXNlcjpwYXNz now", "use Basic [redacted] now");
+    t.row("negotiate AAAAAAAAAAAAAAAAAAAA", "negotiate [redacted]");
+
+    // P3 at its length gate: a Basic token of exactly 8 characters that decodes to
+    // `user:pass` is masked, one of 7 is not, and the same at the port gate: five
+    // digits are a port, six are not.
+    t.row("use Basic dTpwYXNz now", "use Basic [redacted] now");
+    t.unchanged("use Basic dTpwYXN now");
+    t.unchanged("pass.example.com:65535");
+    t.row("pass.example.com:655350", "pass.example.com: [redacted]");
+
+    // P3 gates: a Basic token of 8 or more characters that decodes to no `:`
+    // ("foobar"), and a Negotiate or NTLM token one character short of 16, stay.
+    t.unchanged("Basic Zm9vYmFy");
+    t.unchanged("ntlm AAAAAAAAAAAAAAA");
+    t.row("NTLM\tAAAAAAAAAAAAAAAA.", "NTLM\t[redacted].");
+
+    // P4: URL userinfo.
+    t.row(
+        "https://user:hunter2@host.test/p",
+        "https://user:[redacted]@host.test/p",
+    );
+    t.row(
+        "https://ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@github.com/",
+        "https://[redacted]@github.com/",
+    );
+
+    // P5: credential shapes. Each is the whole text and becomes `[redacted]`.
+    for shape in [
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl",
+        "AKIAAAAAAAAAAAAAAAAA",
+        "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "github_pat_aaaaaaaaaaaaaaaaaaaaaa",
+        "glpat-aaaaaaaaaaaaaaaaaaaa",
+        "xoxb-111111111111",
+        "sk_live_aaaaaaaaaaaaaaaa",
+        "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "AIzaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+    ] {
+        t.row(shape, "[redacted]");
+    }
+    t.row("x\n-----BEGIN PRIVATE KEY-----\nMII", "x\n[redacted]");
+
+    // P6: the audit-only key words, as pairs, quoted pairs and JSON members.
+    t.row("passphrase=hunter2&x=1", "passphrase=[redacted]&x=1");
+    t.row("x=1&private_key=K&y=2", "x=1&private_key=[redacted]&y=2");
+    t.row(
+        "{\"pass\":\"p\",\"user\":\"u\"}",
+        "{\"pass\":\"[redacted]\",\"user\":\"u\"}",
+    );
+    // AC44 gives the `key: value` form as `"otp: 123456 done"` -> `"otp: [redacted]
+    // done"`. That cannot hold beside P2: `otp` is a strict key at the start of the
+    // text, so P2 masks the whole line first (`"otp: [redacted]"`, as `pass: a b`
+    // above). P6 sees the same pair once it is not at a line start.
+    t.row("x otp: 123456 done", "x otp: [redacted] done");
+    t.row("a totp: 654321, b=1", "a totp: [redacted], b=1");
+
+    // P4 gates: an empty password is no secret; a user name alone stays unless it
+    // is 20 bytes or more or holds a shape; the scan stops at `/`, `?` and `#`.
+    t.unchanged("https://user:@host.test/");
+    t.row("https://:pw@host.test/", "https://:[redacted]@host.test/");
+    t.row(
+        "https://abcdefghijklmnopqrst@host.test/",
+        "https://[redacted]@host.test/",
+    );
+    t.unchanged("https://abcdefghijklmnopqrs@host.test/");
+    t.row(
+        "https://xoxb-1234567890@host.test/",
+        "https://[redacted]@host.test/",
+    );
+    t.unchanged("https://host.test/a@b");
+    t.unchanged("https://host.test?x=a:b@c");
+    t.row(
+        "a https://u:p1@h1/x b http://v:p2@h2/y",
+        "a https://u:[redacted]@h1/x b http://v:[redacted]@h2/y",
+    );
+
+    // P5 in context, and its gates.
+    t.row(
+        "jwt is eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl.",
+        "jwt is [redacted].",
+    );
+    t.unchanged("eyJabc.eyJabc.sig");
+    t.unchanged("eyJabcd.eyJzdWIiOiJ4In0.sig");
+    t.unchanged("eyJhbGciOiJIUzI1NiJ9.abcdefg.sig");
+    t.row("eyJhbGciOiJIUzI1NiJ9.abcdefgh.sig", "[redacted]");
+    t.unchanged("eyJhbGciOiJIUzI1NiJ9.abcdefgh");
+    t.row(
+        "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and AKIABBBBBBBBBBBBBBBB",
+        "[redacted] and [redacted]",
+    );
+    t.row(
+        "KEY_ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "KEY_[redacted]",
+    );
+    t.row("AKIABBBBBBBBBBBBBBBB_x", "[redacted]_x");
+    t.unchanged("myghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    t.unchanged("ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    t.unchanged("AKIAAAAAAAAAAAAAAAA");
+    // An exact-length shape needs a boundary after it, unless what follows is the
+    // start of another credential, which is masked in the same scan.
+    t.unchanged("AKIAAAAAAAAAAAAAAAAAA");
+    t.unchanged("AKIAAAAAAAAAAAAAAAAAauth:p");
+    t.row(
+        "AKIABBBBBBBBBBBBBBBBghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "[redacted][redacted]",
+    );
+    t.unchanged("sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    t.unchanged("task-0f8fad5b-d9cb-469f-a165-9b4f5e5a1d3c");
+    t.row(
+        "k:\n-----BEGIN EC PRIVATE KEY-----\nAAA\n-----END EC PRIVATE KEY-----\nafter",
+        "k:\n[redacted]\nafter",
+    );
+    t.row(
+        "-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----\nmid\n\
+         -----BEGIN PRIVATE KEY-----\nB\n-----END PRIVATE KEY-----",
+        "[redacted]\nmid\n[redacted]",
+    );
+    t.unchanged("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----");
+
+    // Regressions, each a case where one mask changed how a neighbour read, so
+    // that a second call masked what the first left. A name glued
+    // to the closing dashes stays: the block is masked before any other pass runs, so
+    // the name is read as a name by the first call, and its value is masked with it.
+    t.row(
+        "-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----cookie: x",
+        "[redacted]cookie: [redacted]",
+    );
+    // A no-break space ends a P4 userinfo as it ends a `scrub_text` value; masking
+    // across it joined the value to the text after it.
+    t.unchanged("x://auth.com:[redacted]\u{a0}@h y");
+    t.row(
+        "x://auth.com://k\u{a0}@h y",
+        "x://auth.com:[redacted]\u{a0}@h y",
+    );
+    // An exact-length shape glued to the start of another credential, and a
+    // credential glued to the end of a masked one.
+    t.row(
+        "AIzaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_xoxb-0123456789",
+        "[redacted][redacted]",
+    );
+
+    // P6 gates: a quoted value, an empty value, a host:port, a pair nested in a
+    // value, a key that ends in the word.
+    t.row("pass='a b' z=1", "pass='[redacted]' z=1");
+    t.row(r#"pass="a\"b" z=1"#, r#"pass="[redacted]" z=1"#);
+    t.unchanged("pw=&x=1");
+    t.unchanged("pass.example.com:8443");
+    t.row("x_pass=1;y=2", "x_pass=[redacted];y=2");
+    t.row("user.pw=abc&q=1", "user.pw=[redacted]&q=1");
+    t.row("PW=abc", "PW=[redacted]");
+    t.row("next=/cb?pass=abc&x=1", "next=/cb?pass=[redacted]&x=1");
+
+    // Every pass at once.
+    t.row(
+        "fetch https://user:hunter2@host.test/p with ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and passphrase=zz",
+        "fetch https://user:[redacted]@host.test/p with [redacted] and passphrase=[redacted]",
+    );
+
+    // Unchanged byte for byte (no pass may touch any of them).
+    t.unchanged("0f8fad5b-d9cb-469f-a165-9b4f5e5a1d3c");
+    t.unchanged("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    t.unchanged("auth.example.com:8443");
+    t.unchanged("https://example.test/a/b?x=1&y=two#frag");
+    t.unchanged("ssh://git@github.com/o/r");
+    t.unchanged("git@github.com:o/r.git");
+    t.unchanged("basic information");
+    t.unchanged("the Cookie header is described in RFC 6265");
+    t.unchanged("sk-prod-eu-1.example.test");
+    t.unchanged("Accept: text/html");
+    t.unchanged("X-Forwarded-For: 203.0.113.9");
+    t.unchanged("author=bob&authority=example.com&inside=1&bypass=1&passed=true");
+    t.unchanged("{\"a\":1,\"b\":[true,null],\"c\":\"d\"}");
+    t.unchanged("{{target}}/login?user={{user}}");
+    t.unchanged("AKIA");
+    t.unchanged("AKIAFOO");
+    t.unchanged("ghp_short");
+    t.unchanged("eyJ");
+
+    t.hostile_inputs();
+    t.hostile_shapes();
+    t.finish();
+}
+
+#[test]
+fn the_strict_vocabulary_is_audit_only() {
+    // AC63: the extra key words reach the audit path only. The shared scrubber and
+    // the shared predicate (the scanner's, the findings store's, the PoC builder's)
+    // are exactly what they were.
+    let mut failures = Vec::new();
+    if aitm_core::redact::is_secret_key("passphrase") {
+        failures.push("redact::is_secret_key(\"passphrase\") must stay false".to_string());
+    }
+    if !is_secret_key_strict("passphrase") {
+        failures.push("is_secret_key_strict(\"passphrase\") must be true".to_string());
+    }
+    let shared = aitm_core::redact::scrub_text("pass=x");
+    if shared != "pass=x" {
+        failures.push(format!(
+            "scrub_text(\"pass=x\"): want \"pass=x\", got {shared:?}"
+        ));
+    }
+    let strict = scrub_strict("pass=x");
+    if strict != "pass=[redacted]" {
+        failures.push(format!(
+            "scrub_strict(\"pass=x\"): want \"pass=[redacted]\", got {strict:?}"
+        ));
+    }
+    for key in [
+        "author",
+        "authority",
+        "inside",
+        "bypass",
+        "passed",
+        "sessions",
+    ] {
+        if is_secret_key_strict(key) {
+            failures.push(format!("`{key}` must not be a strict secret key"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn is_secret_key_strict_vocabulary() {
+    let mut failures = Vec::new();
+    for key in [
+        "passphrase",
+        "private_key",
+        "Private-Key",
+        "access_key",
+        "signing-key",
+        "pass",
+        "PW",
+        "otp",
+        "totp",
+        "x_pass",
+        "user.pw",
+        // camelCase: the words are found where a capital follows a lower-case letter
+        // or a digit.
+        "userPass",
+        "dbPass",
+        "adminPw",
+        "totpCode",
+        "otpCode",
+        "authKey",
+        "sessionKey",
+        "userPASS",
+        "user2Pass",
+        "privatekey",
+        "signing_key",
+        "accesskey",
+        "oauth2Token",
+        // Everything the shared `is_secret_key` says stays true.
+        "token",
+        "sid",
+        "Cookie",
+        "Authorization",
+    ] {
+        if !is_secret_key_strict(key) {
+            failures.push(format!("`{key}` should be a strict secret key"));
+        }
+    }
+    for key in [
+        "author",
+        "authority",
+        "inside",
+        "bypass",
+        "passed",
+        "sessions",
+        "compass",
+        "power",
+        "path",
+        "host",
+        // Capitals that are not a word boundary, and look-alikes of the new words.
+        "Passed",
+        "bypassCache",
+        "compassPoint",
+        "passedBy",
+        "userAgent",
+        "Compass",
+        "authority",
+        "Authority",
+    ] {
+        if is_secret_key_strict(key) {
+            failures.push(format!("`{key}` should not be a strict secret key"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Shapes from a fuzz run (a sample, not all there are) where one round did not
+/// leave a fixed point. Each changes under `scrub_strict`, and the result of a second
+/// call must equal the first.
+const FUZZ_FOUND_SHAPES: &[&str] = &[
+    // The value rule masks a trailing backslash, so a quote stops being escaped.
+    "secret=\"\rpw\n:\\\"",
+    "privatekey=' privatekey:\\'",
+    "pass=' pass:\\'",
+    "\tprivatekey:\"=\u{b}\"s",
+    "Pass=\",privatekey:\\\"",
+    " pw:\"\rpass=\\\"",
+    " pass:' privatekey:\\'",
+    "\u{a0}ApiKey:'}apikey::'d",
+    "\"CookieA:\" aCookie:\\\"",
+    "ApiKey=\"\u{c}ApiKey:\\\"",
+    "/apikey:\" auth=\\\"",
+    " token:\" apikey:\\\"",
+    "[pass:\" otp=\\\"",
+    "Authorization.=' pw=\\'",
+    "?ApiKey:\" signing-key:\\\"",
+    "Cookie=\"=\n\"n",
+    // A mask that takes away a terminator or a delimiter another pass stopped at.
+    "w://-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----[]abcdefgh@",
+    "a://okenZm9va_-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----@",
+    "Y://xxxxxxxxxx-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----@",
+    "4://sk_live_pw-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----@",
+    "-://eaaaaaaaa------BEGIN PRIVATE KEY----------END PRIVATE KEY-----@",
+    "h://ApiKey:}@",
+    "A://CookieA:}@",
+    "-://Cookie_:}@",
+    "6://passphrase:/}@",
+    "p://privatekey=.&@",
+    // A mask that takes away the `.` that made `scrub_text` read a host and a port.
+    ".xoxp-et-Cookiex_ApiKey:8",
+    ".xoxb-fghprivate_Cookie:4",
+    ".sk_live_3AuthorizatioSet-Cookie:4",
+    ".rk_test_eyJhbGciOiJProxy-Auth:1",
+    ".rk_test_bmF0dXJlAKIAxoxp-passwd:8",
+    ".xoxp-AAAAAAAAAA_Cookie:3",
+    ".rk_test_NztokenhttpProxy-Auth:1",
+    "AIzaeyJzdWIiOiJ4eyJhbGciOiJauthsk_live_xoxb-234Cookie2",
+];
+
+#[test]
+fn shapes_found_by_fuzzing_are_fixed_points() {
+    // scrub_strict runs its rounds again until the text stops changing, so a second
+    // call over the result changes nothing for these shapes, which no single round
+    // settles. Each must also change: a shape the passes leave alone settles nothing.
+    let mut failures = Vec::new();
+    for shape in FUZZ_FOUND_SHAPES {
+        let first = scrub_strict(shape);
+        if first == *shape {
+            failures.push(format!("{shape:?} is not changed by scrub_strict"));
+        }
+        let second = scrub_strict(&first);
+        if first != second {
+            failures.push(format!("{shape:?}: first {first:?}, second {second:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} shapes are not fixed points:\n{}",
+        failures.len(),
+        FUZZ_FOUND_SHAPES.len(),
+        failures.join("\n")
+    );
+}
+
+/// A text that needs as many rounds as an adversary likes: after the quotes are
+/// re-paired, each round masks one more `"D "c ` segment, and two rounds are spent on
+/// each, so `n` segments (`n` of 1 or more) need `5 + 2 * n` calls of one round until a
+/// call leaves the text as it was.
+fn layered(n: usize) -> String {
+    format!("-u\t\"otp:(\": \"h\u{3000}\"#&{}", "\"D \"c ".repeat(n))
+}
+
+#[test]
+fn a_shape_that_needed_seven_rounds_is_masked_not_replaced() {
+    // Found by fuzzing: the fixed point is reached after the sixth round and shown by
+    // the seventh. It is masked as the rounds leave it, not replaced whole.
+    assert_eq!(layered(1), "-u\t\"otp:(\": \"h\u{3000}\"#&\"D \"c ");
+    let mut t = Table::default();
+    t.row(&layered(1), "-u\t\"otp:[redacted]");
+    t.finish();
+}
+
+#[test]
+fn a_text_that_does_not_settle_is_replaced_whole() {
+    // When the rounds run out without a round leaving its input as it was, the last
+    // output has not been shown to be a fixed point and may still hold a credential a
+    // later round would mask. The whole text is replaced, and the replacement is a
+    // fixed point. If a later change makes these shapes settle, replace them with
+    // shapes that still do not.
+    let mut t = Table::default();
+    t.row(&layered(40), "[redacted]");
+    t.row(&format!("before {} after", layered(40)), "[redacted]");
+    t.row(&format!("{}password=hunter2", layered(40)), "[redacted]");
+    t.row("[redacted]", "[redacted]");
+    // 2 MiB: the work is a fixed number of linear rounds.
+    t.hostile_settles(
+        "`\"D \"c ` x N",
+        layered((2 << 20) / "\"D \"c ".len()),
+        "[redacted]".to_string(),
+    );
+    t.finish();
+    // The bounded form follows: the text is cut first, then replaced whole.
+    assert_eq!(
+        scrub_strict_bounded(&layered(40), 1 << 20),
+        "[redacted]",
+        "bounded, inside the cut"
+    );
+    assert_eq!(
+        scrub_strict_bounded(&layered(40), 100),
+        "[redacted]",
+        "bounded, cut inside the layers"
+    );
+}
+
+#[test]
+fn a_header_after_an_escaped_line_break_is_masked_to_the_end_of_its_line() {
+    // Text from a free string that holds a raw request escaped once or twice has the
+    // two characters `\` and `n` where a request has a line break. The `n` is a
+    // letter to the name rules, so `nCookie` was one name and P2 did not read it: only
+    // `scrub_text` masked the first pair of the cookie and the rest stayed.
+    // Every literal below is the text itself: a backslash, then the letter.
+    let mut t = Table::default();
+
+    // The reviewer's reproducers, one frame each.
+    t.row(
+        r"\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"\nCookie: [redacted]",
+    );
+    t.row(
+        r"\r\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"\r\nCookie: [redacted]",
+    );
+    t.row(
+        r"\\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"\\nCookie: [redacted]",
+    );
+    t.row(
+        r"GET / HTTP/1.1\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"GET / HTTP/1.1\nCookie: [redacted]",
+    );
+    t.row(
+        r"Host: h\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"Host: h\nCookie: [redacted]",
+    );
+    t.row(
+        r"\nSet-Cookie: a=b; Path=/; z=CNRYx9k3f7q2z8w1",
+        r"\nSet-Cookie: [redacted]",
+    );
+
+    // The other escapes, every depth of backslashes, the other credential headers,
+    // case and blanks.
+    t.row(r"\tCookie: a=b; z=C", r"\tCookie: [redacted]");
+    t.row(r"\rCookie: a=b; z=C", r"\rCookie: [redacted]");
+    t.row(r"x\\\nCookie: a=b; z=C", r"x\\\nCookie: [redacted]");
+    t.row(r"x\\\\nCookie: a=b; z=C", r"x\\\\nCookie: [redacted]");
+    t.row(r"\n\nCookie: a=b; z=C", r"\n\nCookie: [redacted]");
+    t.row(r"\nCookie2: a=b; z=C", r"\nCookie2: [redacted]");
+    t.row(r"\ncookie: a=b; z=C", r"\ncookie: [redacted]");
+    t.row(r"\nCOOKIE :  a=b; z=C", r"\nCOOKIE : [redacted]");
+    t.row(
+        r"\nAuthorization: Bearer abc.def; z=C",
+        r"\nAuthorization: [redacted]",
+    );
+    t.row(
+        r"\nProxy-Authorization: Basic abc; z=C",
+        r"\nProxy-Authorization: [redacted]",
+    );
+
+    // The strict-name rule reads the start of a line: after an escaped break, `pass`
+    // is a header name too. An empty value is still left alone.
+    t.row(r"x\npass: hunter2 there", r"x\npass: [redacted]");
+    t.row(r"x\r\npw: a b", r"x\r\npw: [redacted]");
+    t.unchanged(r"x\nCookie:");
+
+    // Where the mask ends. The value runs to the next REAL CR or LF or to the end of
+    // the text, escaped breaks inside it included: a cookie value may hold a
+    // backslash and a letter, so ending at one could leave a tail of the value.
+    // Everything after an escaped break is therefore masked with it, a following
+    // header (`Host: x`) too.
+    t.row(r"\nCookie: a=b; z=C\r\nHost: x", r"\nCookie: [redacted]");
+    t.row(
+        r"\nCookie: a=b; z=C\nHost: x\nCookie: q=r",
+        r"\nCookie: [redacted]",
+    );
+    t.row(r"\nCookie: a=b; sid=ab\ncd", r"\nCookie: [redacted]");
+    // A real line break ends it, as for any header, and what follows is read again.
+    t.row(
+        "\\nCookie: a=b; z=C\r\nHost: x",
+        "\\nCookie: [redacted]\r\nHost: x",
+    );
+    t.row(
+        "\\nCookie: a=b; z=C\nHost: x\\nCookie: q=r; s=t",
+        "\\nCookie: [redacted]\nHost: x\\nCookie: [redacted]",
+    );
+    // A folded line after it, real, is part of the value.
+    t.row(
+        "\\nCookie: a=b;\r\n z=C\r\nHost: x",
+        "\\nCookie: [redacted]\r\nHost: x",
+    );
+
+    // Real line breaks, a space and `; ` before the name were read before and still
+    // are, and so is the name at the start of the text.
+    t.row("\nCookie: a=b; z=C", "\nCookie: [redacted]");
+    t.row("\r\nCookie: a=b; z=C", "\r\nCookie: [redacted]");
+    t.row("x Cookie: a=b; z=C", "x Cookie: [redacted]");
+    t.row("x; Cookie: a=b; z=C", "x; Cookie: [redacted]");
+    t.row("Cookie: a=b; z=C", "Cookie: [redacted]");
+
+    // Only the pair of characters is a break. A word that ends in `n`, `r` or `t`
+    // glued to the name is not (`onCookie`: `scrub_text` alone reads that key), a
+    // backslash before a name that does not start with those letters is not, an
+    // upper-case `\N` is not, and prose that is no header is untouched.
+    t.row("onCookie: a=b; z=C", "onCookie: [redacted]");
+    t.row("tCookie: a=b; z=C", "tCookie: [redacted]");
+    t.row(r"\Cookie: a=b; z=C", r"\Cookie: [redacted]");
+    // `\N` and `\x` are no line break, so P2 does not read these names and the
+    // output is what `scrub_text` alone gives, the tail of the cookie included. A
+    // break that P2 read would mask the whole value (see above).
+    t.row(r"\NCookie: a=b; z=C", r"\NCookie: [redacted]; z=C");
+    t.row(r"\xCookie: a=b; z=C", r"\xCookie: [redacted]; z=C");
+    t.row("https://x/cookie: y", "https://x/cookie: [redacted]");
+    t.unchanged(r"\nbypass: x");
+    t.unchanged(r"\nauthor: Bob");
+    t.unchanged(r"\ncompass: north");
+    // A name that merely starts with `n`, `r` or `t` is no escape without the
+    // backslash: `tpass` and `npw` are not `pass` and `pw` at the start of a line.
+    t.unchanged("tpass: hunter2 there");
+    t.unchanged("npw: a b");
+    t.unchanged("x\nrotp: 123456");
+    t.unchanged(r"C:\temp\notes: draft");
+    t.unchanged("a\\nb: c");
+
+    // Hostile, 2 MiB each. Every name run is read once, an escaped break glued to it
+    // included, and a masked line is skipped whole.
+    let times = |unit: &str| unit.repeat((2 << 20) / unit.len());
+    // One header with no real line break after it: its value is the whole rest.
+    let unit = r"\nCookie: ";
+    t.hostile_settles(
+        r"`\nCookie: ` x N",
+        times(unit),
+        r"\nCookie: [redacted]".to_string(),
+    );
+    // Names that are no header, or have no value: nothing to mask.
+    for (label, unit) in [(r"`\nn` x N", r"\nn"), (r"`\nCookie` x N", r"\nCookie")] {
+        t.hostile_settles(label, times(unit), times(unit));
+    }
+    // A name with a colon and an empty line: as after a real line break, `scrub_text`
+    // reads the next line's first word as the value (it skips line breaks after the
+    // separator), so the units pair off, the second of each pair being the value.
+    let unit = "\\npass:\n";
+    let units = (2 << 20) / unit.len();
+    assert_eq!(units % 2, 0);
+    t.hostile_settles(
+        r"`\npass:` and a real LF x N",
+        unit.repeat(units),
+        "\\npass:\n[redacted]\n".repeat(units / 2),
+    );
+    // A real line break after each value: every line is a header of its own.
+    for (label, unit, line) in [
+        (
+            r"`\nCookie: a=b` and a real LF x N",
+            "\\nCookie: a=b\n",
+            "\\nCookie: [redacted]\n",
+        ),
+        (
+            r"`\nSet-Cookie: a=b` and a real CRLF x N",
+            "\\nSet-Cookie: a=b\r\n",
+            "\\nSet-Cookie: [redacted]\r\n",
+        ),
+    ] {
+        t.hostile_settles(label, times(unit), line.repeat((2 << 20) / unit.len()));
+    }
+    t.finish();
+}
+
+#[test]
+fn a_pair_after_an_escaped_line_break_is_masked_whatever_its_key() {
+    // The same text as above, a request kept in a string, with the break written as
+    // a backslash and `n`, `r` or `t` glued to the key that follows it: `\npw` is one
+    // run of name bytes, so `pw`, `otp`, `pass`, `sid`, `auth` and `session` (which the
+    // vocabularies match only as a whole segment of the key) were not read, and the
+    // credential was written whole. The key starts one byte after the letter, as it
+    // does after a real line break. Every literal is the text itself.
+    let mut t = Table::default();
+
+    // The extra words, the shared words that match a whole segment, and the fields
+    // the reviewer named.
+    t.row(r"\npw=abc&x=1", r"\npw=[redacted]&x=1");
+    t.row(r"x\notp=123456&y=1", r"x\notp=[redacted]&y=1");
+    t.row(r"\npass=abc&y=1", r"\npass=[redacted]&y=1");
+    t.row(r"\ntotp=654321&y=1", r"\ntotp=[redacted]&y=1");
+    t.row(r"x\nauth=abc", r"x\nauth=[redacted]");
+    t.row(r"x\nsid=abc;y", r"x\nsid=[redacted];y");
+    t.row(r"\nsession=abc", r"\nsession=[redacted]");
+    t.row(r"\njwt=abc&q=1", r"\njwt=[redacted]&q=1");
+    t.row(r"\ncsrf=abc&q=1", r"\ncsrf=[redacted]&q=1");
+    t.row(r"\nx-auth=abc&q=1", r"\nx-auth=[redacted]&q=1");
+    t.row(r"\nconnect.sid=abc&q=1", r"\nconnect.sid=[redacted]&q=1");
+
+    // What was already masked stays masked: the needles are substrings of the run.
+    t.row(r"\ntoken=abc&x=1", r"\ntoken=[redacted]&x=1");
+    t.row(r"\npassword=O'Brien&x=1", r"\npassword=[redacted]&x=1");
+    t.row(r"\nuserPass=abc", r"\nuserPass=[redacted]");
+    t.row(r"\nauthorization=abc def", r"\nauthorization=[redacted]");
+
+    // Every escape, and every depth of backslashes.
+    t.row(r"\tpw=abc&x=1", r"\tpw=[redacted]&x=1");
+    t.row(r"\rpw=abc&x=1", r"\rpw=[redacted]&x=1");
+    t.row(r"a\r\npw=abc&x=1", r"a\r\npw=[redacted]&x=1");
+    t.row(r"\\npw=abc&x=1", r"\\npw=[redacted]&x=1");
+    t.row(r"\\\npw=abc&x=1", r"\\\npw=[redacted]&x=1");
+    t.row(r"\n\npw=abc&x=1", r"\n\npw=[redacted]&x=1");
+    t.row(r"x\npw=a\npass=b", r"x\npw=[redacted]");
+
+    // The key forms: quoted values, `:` pairs, bracket-notation names, flags.
+    t.row(r#"\npw="a b" z"#, r#"\npw="[redacted]" z"#);
+    t.row(r"\npw='a b' z", r"\npw='[redacted]' z");
+    t.row(r#"\npass=a"b&x"#, r#"\npass=[redacted]&x"#);
+    t.row(r"\npass=O'Brien&x=1", r"\npass=[redacted]&x=1");
+    t.row(r"x\nsession: abc;y", r"x\nsession: [redacted]");
+    t.row(r"a\r\nuser[password]=x", r"a\r\nuser[password]=[redacted]");
+    t.row(
+        r"x\nuser[password]=O'Brien",
+        r"x\nuser[password]=[redacted]",
+    );
+    t.row(r"\nuser[pw]=abc&z=1", r"\nuser[pw]=[redacted]&z=1");
+    t.row(r"\nlogin[auth]=abc&z=1", r"\nlogin[auth]=[redacted]&z=1");
+    t.row(r"\npw[]=abc&z=1", r"\npw[]=[redacted]&z=1");
+    t.row(r"\n--password x y", r"\n--password [redacted] y");
+    t.row(r"\n--token 'a b' z", r"\n--token [redacted] z");
+    t.row(r"\n-u admin:pw rest", r"\n-u admin:[redacted] rest");
+    t.row(
+        r"x\n--proxy-user 'u:p w' z",
+        r"x\n--proxy-user 'u:[redacted]' z",
+    );
+
+    // The frames: groups, wrappers, escaped quotes, one level and two, after a break.
+    t.row(r#"\npassword=["a","b"]"#, r"\npassword=[redacted]");
+    t.row(r#"\npw=["a","b"]&x=1"#, r"\npw=[redacted]&x=1");
+    t.row(r#"\ntoken={"k":"v"}"#, r"\ntoken=[redacted]");
+    t.row(r#"\nauth={"k":"v"} z"#, r"\nauth=[redacted] z");
+    t.row(r#"\npassword=\"x y\"&z=1"#, r"\npassword=[redacted]&z=1");
+    t.row(r#"\nsid=\"x y\"&z=1"#, r"\nsid=[redacted]&z=1");
+    t.row(r#"\npw=\\\"x y\\\"&z=1"#, r"\npw=[redacted]&z=1");
+    t.row(r#"\npw=Str("x") z"#, r"\npw=[redacted] z");
+    t.row(r#"\nsession=Some(Str("a b")) z"#, r"\nsession=[redacted] z");
+    t.row(r"x\nname=<pw>v</pw>", r"x\nname=<pw>[redacted]</pw>");
+    // A multipart field whose `name=` follows an escaped break: the value is the part
+    // body, real line breaks and all.
+    t.row(
+        "x\\nname=\"password\"\r\n\r\nhunter2\r\n--b--",
+        "x\\nname=\"password\"\r\n\r\n[redacted]\r\n--b--",
+    );
+    t.row(
+        "x\\r\\nname='pw'\r\nContent-Type: text/plain\r\n\r\nhunter2\r\n--b--",
+        "x\\r\\nname='pw'\r\nContent-Type: text/plain\r\n\r\n[redacted]\r\n--b--",
+    );
+    t.unchanged("x\\nname=\"city\"\r\n\r\nParis\r\n--b--");
+    // Inside a quoted string the next quote closes the value, as for a real break.
+    t.row(r#"{"a":"b\npw=abc"}"#, r#"{"a":"b\npw=[redacted]"}"#);
+    t.row(r#"{"a":"b\nsid=abc;y"}"#, r#"{"a":"b\nsid=[redacted];y"}"#);
+
+    // A colon after a line-start name is a header line: P2 masks it to the end of the
+    // line (see above), whatever the key.
+    t.row(r"\npw: abc def", r"\npw: [redacted]");
+    t.row(r"\ntotp: 123456", r"\ntotp: [redacted]");
+
+    // Only the pair of characters is a break. A word that merely starts with `n`, `r`
+    // or `t` is no escape without the backslash, and `\x` and `\N` are no break.
+    t.unchanged("npw=abc&x=1");
+    t.unchanged("tpass=abc&y=1");
+    t.unchanged("x rotp=123456");
+    t.unchanged("onpw: x");
+    t.unchanged("onpw=abc");
+    t.unchanged(r"\xpw=abc");
+    t.unchanged(r"\Npw=abc");
+    t.unchanged(r"\nnsid=abc");
+    t.unchanged(r"\ntpass=abc");
+    // Names that are no secret keys keep their value after a break too, and so do
+    // keys the vocabulary matches only as a segment when the word is only part of one.
+    t.unchanged(r"\nbypass=1");
+    t.unchanged(r"\nauthor=bob&x=1");
+    t.unchanged(r"\nnotes=ok");
+    t.unchanged(r"\nsessions=ok&x=1");
+    t.unchanged(r"\ncompass=north");
+    t.unchanged(r"\nside=1");
+    t.unchanged(r"\nname=bob&city=L'Aquila");
+    // A Windows path: with no separator after the name nothing is read, and `\n`
+    // before `pw=` is indistinguishable from an escaped break, so the pair is masked
+    // (over-redaction, the same result every time and a fixed point).
+    t.unchanged(r"C:\temp\ntoken");
+    t.unchanged(r"C:\temp\notes.txt");
+    t.row(r"C:\temp\ntoken=abc", r"C:\temp\ntoken=[redacted]");
+    t.row(r"C:\temp\npw=abc", r"C:\temp\npw=[redacted]");
+
+    // Hostile, 2 MiB each: every run is read once, an escape glued to it included.
+    let times = |unit: &str| unit.repeat((2 << 20) / unit.len());
+    for (label, unit, line) in [
+        (r"`\npw=a&` x N", r"\npw=a&", r"\npw=[redacted]&"),
+        (r"`\nsid=a;` x N", r"\nsid=a;", r"\nsid=[redacted];"),
+        (
+            r"`\nuser[password]=O'B&` x N",
+            r"\nuser[password]=O'B&",
+            r"\nuser[password]=[redacted]&",
+        ),
+        (
+            r#"`\npassword=["a"],` x N"#,
+            r#"\npassword=["a"],"#,
+            r"\npassword=[redacted],",
+        ),
+        (
+            r"`\n--password x ` x N",
+            r"\n--password x ",
+            r"\n--password [redacted] ",
+        ),
+        (r"`\nn=` x N", r"\nn=", r"\nn="),
+    ] {
+        t.hostile_settles(label, times(unit), line.repeat((2 << 20) / unit.len()));
+    }
+    // A value that runs across every quote after it: one mask, to the last quote.
+    t.hostile_settles(
+        r"`\npw=a'` x N",
+        times(r"\npw=a'"),
+        r"\npw=[redacted]'".to_string(),
+    );
+    t.finish();
+}
+
+#[test]
+fn a_credential_shape_after_an_escaped_line_break_is_masked() {
+    // A token on a line of its own in a string that holds a raw request escaped: the
+    // break is a backslash and `n`, `r` or `t`, and the letter is an alphanumeric glued
+    // to the prefix, so the left boundary of P5 (a byte that is not an alphanumeric)
+    // was not met and the token was written whole. The letter of an escaped break is a
+    // boundary, as the line break itself is. Every literal is the text itself.
+    let gh = format!("ghp_{}", "a".repeat(36));
+    let aws = format!("AKIA{}", "A".repeat(16));
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl";
+    let sk = format!("sk-{}", "a".repeat(32));
+    let glpat = format!("glpat-{}", "a".repeat(20));
+    let aiza = format!("AIza{}", "a".repeat(35));
+    let gho = format!("gho_{}", "a".repeat(36));
+    let jwe = "eyJhbGciOiJSU0EtT0FFUCJ9.encryptedkeyaaaa.ivaaaaaaaa.ciphertextaaaa.tagaaaaaaaaaa";
+    let mut t = Table::default();
+
+    // The reviewer's shapes.
+    t.row(&format!(r"\n{gh}"), r"\n[redacted]");
+    t.row(&format!(r"x\n{aws}"), r"x\n[redacted]");
+    t.row(&format!(r"\n{jwt}"), r"\n[redacted]");
+    t.row(&format!(r"\n{sk}"), r"\n[redacted]");
+    t.row(r"\nxoxb-111111111111", r"\n[redacted]");
+    t.row(&format!(r"\n{glpat}"), r"\n[redacted]");
+    t.row(&format!(r"\r\n{aiza}"), r"\r\n[redacted]");
+    t.row(&format!(r"\t{gho}"), r"\t[redacted]");
+    t.row(&format!(r"\n{jwe}"), r"\n[redacted]");
+
+    // Two backslashes, three, a letter after any text, and every escape.
+    t.row(&format!(r"\\n{gh}"), r"\\n[redacted]");
+    t.row(&format!(r"\\\n{gh}"), r"\\\n[redacted]");
+    t.row(&format!(r"\\n{jwt}"), r"\\n[redacted]");
+    t.row(&format!(r"\\n{jwe}"), r"\\n[redacted]");
+    t.row(r"\\nxoxb-111111111111", r"\\n[redacted]");
+    t.row(&format!(r"abc\n{aws}"), r"abc\n[redacted]");
+    t.row(
+        &format!(r"GET /a HTTP/1.1\r\n{gh}"),
+        r"GET /a HTTP/1.1\r\n[redacted]",
+    );
+    t.row(&format!(r"\r{gh}"), r"\r[redacted]");
+    t.row(&format!(r"\n\n{gh}"), r"\n\n[redacted]");
+    t.row(
+        &format!(r"\n{gh} and\n{aws}"),
+        r"\n[redacted] and\n[redacted]",
+    );
+    t.row(
+        r"\nsk_live_aaaaaaaaaaaaaaaa and\nrk_test_aaaaaaaaaaaaaaaa",
+        r"\n[redacted] and\n[redacted]",
+    );
+    t.row(&format!(r"\nrk_live_{}", "a".repeat(16)), r"\n[redacted]");
+    t.row(&format!(r"\nxoxp-{}", "1".repeat(10)), r"\n[redacted]");
+    t.row(
+        &format!(r"\ngithub_pat_{}", "a".repeat(22)),
+        r"\n[redacted]",
+    );
+    t.row(&format!(r"\nASIA{}", "A".repeat(16)), r"\n[redacted]");
+
+    // What stood before keeps its mask: after a real break, a space, `_` or `=`.
+    t.row(&format!("\n{gh}"), "\n[redacted]");
+    t.row(&format!("x {gh}"), "x [redacted]");
+    t.row(&format!("token_{gh}"), "token_[redacted]");
+    t.row(&format!("KEY_{gh}"), "KEY_[redacted]");
+
+    // The right edge. An exact-length key id needs a boundary after it: an escaped
+    // break is one, an alphanumeric is not (unless it opens another credential).
+    t.row(&format!(r"\n{aws}\nfoo"), r"\n[redacted]\nfoo");
+    t.row(&format!(r"\n{aws}\n{gh}"), r"\n[redacted]\n[redacted]");
+    t.row(&format!(r"\n{aws}{gh}"), r"\n[redacted][redacted]");
+    t.unchanged(&format!(r"\n{aws}A"));
+    // The letters of an escape glued to the end are letters: no boundary.
+    t.unchanged(&format!(r"\n{aws}n"));
+    t.unchanged(&format!("{aws}t"));
+    t.unchanged(&format!(r"\n{aiza}r"));
+    t.unchanged(&format!(r"\n{aiza}A"));
+    t.row(&format!(r"\n{aiza}\nfoo"), r"\n[redacted]\nfoo");
+
+    // P3 and P4 never had the boundary: they stay masked.
+    t.row(r"\nBasic dXNlcjpwYXNz", r"\nBasic [redacted]");
+    t.row(r"\nbasic dXNlcjpwYXNz", r"\nbasic [redacted]");
+    t.row(
+        r"\nNegotiate AAAAAAAAAAAAAAAAAAAA",
+        r"\nNegotiate [redacted]",
+    );
+    t.row(r"\nNTLM AAAAAAAAAAAAAAAAAAAA", r"\nNTLM [redacted]");
+    t.row(
+        r"\nhttps://user:hunter2@host.test/p",
+        r"\nhttps://user:[redacted]@host.test/p",
+    );
+    t.row(
+        r"\nhttps://abcdefghijklmnopqrst@host.test/",
+        r"\nhttps://[redacted]@host.test/",
+    );
+
+    // Look-alikes. Without a backslash the letter is a letter: a word that ends in `n`,
+    // `r` or `t` in front of a prefix is the middle of a word, as before. Only the
+    // pair of characters is a boundary, in lower case; a short body is no credential.
+    t.unchanged(&format!("n{gh}"));
+    t.unchanged(&format!("t{aws}"));
+    t.unchanged(&format!("xn{gh}"));
+    t.unchanged(&format!(r"\N{gh}"));
+    t.unchanged(&format!(r"\x{gh}"));
+    t.unchanged(&format!(r"\bn{gh}"));
+    t.unchanged(&format!("Ghp_{}", "a".repeat(36)));
+    t.unchanged(r"\nghp_short");
+    t.unchanged(&format!(r"\nghp_{}", "a".repeat(35)));
+    t.unchanged(&format!(r"\nsk-{}", "a".repeat(31)));
+    t.unchanged(&format!(r"\n{}", &aws[..19]));
+    t.unchanged(r"\nxoxb-111111111");
+    t.unchanged(r"C:\temp\nsk-prod-eu-1");
+    t.unchanged(r"\neyJabc.eyJabc.sig");
+    t.unchanged(r"\nghp_");
+    t.unchanged(r"\neyJ");
+
+    // Hostile, 2 MiB each: a candidate that fails costs a constant, one that is
+    // masked is skipped whole.
+    let times = |unit: &str| unit.repeat((2 << 20) / unit.len());
+    for (label, unit) in [
+        (r"`\nghp_` x N", r"\nghp_"),
+        (r"`\neyJ` x N", r"\neyJ"),
+        (r"`\nxoxb-` x N", r"\nxoxb-"),
+        (r"`\nAKIA` x N", r"\nAKIA"),
+        (r"`\neyJaaaaaaaa.` x N", r"\neyJaaaaaaaa."),
+    ] {
+        t.hostile_settles(label, times(unit), times(unit));
+    }
+    for (label, unit) in [
+        (r"`\nxoxb-1111111111` x N", r"\nxoxb-1111111111"),
+        (
+            r"`\nghp_` and 36 a x N",
+            "\\nghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            r"`\n` and a JWT x N",
+            "\\neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl",
+        ),
+        (r"`\nAKIA` and 16 A x N", "\\nAKIAAAAAAAAAAAAAAAAA"),
+    ] {
+        t.hostile_settles(
+            label,
+            times(unit),
+            r"\n[redacted]".repeat((2 << 20) / unit.len()),
+        );
+    }
+    t.finish();
+}
+
+#[test]
+fn a_private_key_block_is_masked_whole_whatever_precedes_it() {
+    // The block is masked before `scrub_text` and P2 run, so a key name in front of
+    // it (whose own mask would eat the BEGIN line) cannot leave the key body behind.
+    let mut t = Table::default();
+    t.row(
+        "password: -----BEGIN PRIVATE KEY-----\nMIIEvQIBADAN\n-----END PRIVATE KEY-----",
+        "password: [redacted]",
+    );
+    t.row(
+        "token=-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADAN\n-----END RSA PRIVATE KEY-----",
+        "token=[redacted]",
+    );
+    t.row(
+        "private_key: -----BEGIN PRIVATE KEY-----\nMIIEvQIBADAN\n-----END PRIVATE KEY-----",
+        "private_key: [redacted]",
+    );
+    t.row(
+        "password: -----BEGIN PRIVATE KEY-----\nMII",
+        "password: [redacted]",
+    );
+    t.row(
+        "k: -----BEGIN PRIVATE KEY-----\nAAA\n-----END PRIVATE KEY-----\nafter: 1",
+        "k: [redacted]\nafter: 1",
+    );
+    t.row(
+        "Cookie: a=b\r\n-----BEGIN PRIVATE KEY-----\r\nMII\r\n-----END PRIVATE KEY-----\r\nok",
+        "Cookie: [redacted]\r\n[redacted]\r\nok",
+    );
+
+    // The PGP armor: the label ends in `PRIVATE KEY BLOCK`.
+    t.row(
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----\nabcdef\n-----END PGP PRIVATE KEY BLOCK-----",
+        "[redacted]",
+    );
+    t.row(
+        "pgp:\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nabc\n-----END PGP PRIVATE KEY BLOCK-----\nafter",
+        "pgp:\n[redacted]\nafter",
+    );
+    t.row(
+        "passwd=-----BEGIN PGP PRIVATE KEY BLOCK-----\nQWxs\n-----END PGP PRIVATE KEY BLOCK-----",
+        "passwd=[redacted]",
+    );
+
+    // Public material is not a secret, and the label length is bounded: 48 bytes
+    // match, 49 do not.
+    t.unchanged("-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----");
+    t.unchanged("-----BEGIN PGP PUBLIC KEY BLOCK-----\nmQEN\n-----END PGP PUBLIC KEY BLOCK-----");
+    t.row(
+        "-----BEGIN AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA PRIVATE KEY-----\nX\n-----END AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA PRIVATE KEY-----",
+        "[redacted]",
+    );
+    t.unchanged(
+        "-----BEGIN AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA PRIVATE KEY-----\nX\n-----END AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA PRIVATE KEY-----",
+    );
+
+    // Hostile, 4 MiB each: a header after a key name that never closes, a header
+    // followed by an endless run of unmatched END keywords, and headers that are
+    // not private-key headers at all.
+    let after_key = "password: -----BEGIN PRIVATE KEY-----\n".repeat((4 << 20) / 38 + 1);
+    t.hostile(
+        "`password: ` + BEGIN x N",
+        after_key,
+        "password: [redacted]".to_string(),
+    );
+    let ends = "-----BEGIN PRIVATE KEY-----x-----END ".repeat((4 << 20) / 37 + 1);
+    t.hostile("BEGIN + unmatched END x N", ends, "[redacted]".to_string());
+    let begins = "-----BEGIN ".repeat((4 << 20) / 11 + 1);
+    t.hostile("`-----BEGIN ` x N", begins.clone(), begins);
+    t.finish();
+}
+
+#[test]
+fn userinfo_runs_to_the_last_at_of_the_authority() {
+    // Browsers resolve the host after the last `@` of the authority, so a password
+    // that holds a raw `@` is all userinfo.
+    let mut t = Table::default();
+    t.row(
+        "https://u:p@ss@host.test/",
+        "https://u:[redacted]@host.test/",
+    );
+    t.row(
+        "https://u:p@ss@host.test/x@y",
+        "https://u:[redacted]@host.test/x@y",
+    );
+    t.row(
+        "https://u:p@ss@host.test?x=1@2",
+        "https://u:[redacted]@host.test?x=1@2",
+    );
+    t.row(
+        "https://u:p@ss@host.test#f@g",
+        "https://u:[redacted]@host.test#f@g",
+    );
+    t.row("\"https://u:p@ss@h\"@x", "\"https://u:[redacted]@h\"@x");
+    t.row("https://u:p@ss@h x@y", "https://u:[redacted]@h x@y");
+    // No colon: the length rule is applied to the whole userinfo, `@` included.
+    t.row(
+        "https://abcdefghi@jklmnopqrst@host.test/",
+        "https://[redacted]@host.test/",
+    );
+    t.unchanged("https://a@b@host.test/");
+    t.unchanged("ssh://git@github.com/o/r");
+    t.unchanged("https://host.test/a@b");
+
+    // Hostile, 4 MiB each: one endless authority of `@`s, with and without a colon.
+    let n = (4 << 20) / 2 + 1;
+    t.hostile(
+        "`https://` + `a@` x N",
+        format!("https://{}", "a@".repeat(n)),
+        "https://[redacted]@".to_string(),
+    );
+    t.hostile(
+        "`https://u:` + `p@` x N",
+        format!("https://u:{}", "p@".repeat(n)),
+        "https://u:[redacted]@".to_string(),
+    );
+    t.finish();
+}
+
+#[test]
+fn a_compact_jwe_is_masked_to_its_tag() {
+    // A compact JWE is a header and four more segments. The encrypted key, the
+    // initialisation vector and the ciphertext may be empty; the tag may not.
+    let mut t = Table::default();
+    t.row(
+        "eyJhbGciOiJSU0EtT0FFUCJ9.encryptedkeyaaaa.ivaaaaaaaa.ciphertextaaaa.tagaaaaaaaaaa",
+        "[redacted]",
+    );
+    t.row(
+        "eyJhbGciOiJkaXIifQ..ivaaaaaaaa.ciphertextaaaa.tagaaaaaaaaaa",
+        "[redacted]",
+    );
+    t.row(
+        "eyJhbGciOiJkaXIifQ...ciphertextaaaa.tagaaaaaaaaaa",
+        "[redacted]",
+    );
+    t.row(
+        "jwe=eyJhbGciOiJkaXIifQ..iv.ct.tag; next=1",
+        "jwe=[redacted]; next=1",
+    );
+    // The three-part JWT keeps its behaviour and its length gates; a fourth part is
+    // not one of its parts.
+    t.row(
+        "a eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln b",
+        "a [redacted] b",
+    );
+    t.row(
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl.tail",
+        "[redacted].tail",
+    );
+    t.unchanged("eyJabc..iv.ct.tag");
+    t.unchanged("eyJhbGciOiJkaXIifQ..iv.ct.");
+    t.unchanged("eyJhbGciOiJIUzI1NiJ9.abcdefg.sig");
+
+    // Hostile, 4 MiB: header-looking segments, five to a JWE.
+    let jwes = (4 << 20) / 60 + 1;
+    t.hostile(
+        "`eyJaaaaaaaa.` x 5N",
+        "eyJaaaaaaaa.".repeat(5 * jwes),
+        "[redacted].".repeat(jwes),
+    );
+    t.finish();
+}
+
+#[test]
+fn rust_debug_wrappers_around_a_secret_are_masked_whole() {
+    // A value printed with `{:?}` is `Str("..")`, `Some(..)` or `Bytes([..])`: the
+    // wrapper is the value, quotes and all, and the whole expression becomes
+    // `[redacted]` (the pair rule alone would take `Str(` and stop at the quote).
+    let mut t = Table::default();
+    // Real text from `flow.mutate`.
+    t.row(
+        r#"`body` must be a string or bytes, got Object({"password": Str("CNRYx9q7"), "username": Str("admin")})"#,
+        r#"`body` must be a string or bytes, got Object({"password": [redacted], "username": Str("admin")})"#,
+    );
+    t.row(
+        r#"Config { token: Some("CNRYx9q7") }"#,
+        "Config { token: [redacted] }",
+    );
+    t.row(
+        r#"Config { token: Some(Str("CNRYx9q7")), other: 1 }"#,
+        "Config { token: [redacted], other: 1 }",
+    );
+    t.row(
+        r#"got Object({"password": Bytes([67, 78, 82, 89]), "user": Str("a")})"#,
+        r#"got Object({"password": [redacted], "user": Str("a")})"#,
+    );
+    t.row(
+        r#"got Object({"password": Array([Str("a"), Str("b")])})"#,
+        r#"got Object({"password": [redacted]})"#,
+    );
+    t.row(
+        r#"got Object({"pass": Str("CNRYx9q7")})"#,
+        r#"got Object({"pass": [redacted]})"#,
+    );
+    t.row(
+        r#"got Object({"userPass": Str("CNRYx9q7")})"#,
+        r#"got Object({"userPass": [redacted]})"#,
+    );
+    // The string holds an escaped quote and a closing bracket.
+    t.row(
+        r#"got Object({"password": Str("a\"b)c")})"#,
+        r#"got Object({"password": [redacted]})"#,
+    );
+    // The `{:#?}` form puts the value on its own lines.
+    t.row(
+        "Object({\n    \"password\": Str(\n        \"CNRYx9q7\",\n    ),\n})",
+        "Object({\n    \"password\": [redacted],\n})",
+    );
+    t.row(
+        r#"Config { token: Some({"a": 1}) }"#,
+        "Config { token: [redacted] }",
+    );
+    t.row(
+        r#"got Object({"password": Array([Str("a)b")])})"#,
+        r#"got Object({"password": [redacted]})"#,
+    );
+    // Text cut by a cap in the middle of the string.
+    t.row(
+        r#"got Object({"password": Str("CNRYx9"#,
+        r#"got Object({"password": [redacted]"#,
+    );
+    // A name that is not a secret keeps its value.
+    t.unchanged(r#"got Object({"user": Str("admin")})"#);
+    t.unchanged(r#"Config { user: Some("admin") }"#);
+
+    // Hostile, 2 MiB each: wrappers that never reach a value, and brackets that
+    // never close.
+    t.hostile_completes(
+        "`password: A(` x N",
+        "password: A(A(A(".repeat((2 << 20) / 16 + 1),
+    );
+    t.hostile_completes(
+        "`password: Str(` x N",
+        "password: Str(".repeat((2 << 20) / 14 + 1),
+    );
+    t.hostile_completes(
+        "`password: Some([` x N",
+        "password: Some([".repeat((2 << 20) / 16 + 1),
+    );
+    t.finish();
+}
+
+#[test]
+fn escaped_quote_frames_are_masked_to_their_matching_closer() {
+    // A JSON object inside a JSON or YAML string has its quotes escaped, once or
+    // twice. A run of backslashes before a quote is an escaped quote, and the frame
+    // ends at the quote with the same run. The whole frame, backslashes and quotes,
+    // becomes `[redacted]`.
+    let mut t = Table::default();
+    t.row(
+        r#"{\"password\":\"CNRYx9q7\"}"#,
+        r#"{\"password\":[redacted]}"#,
+    );
+    t.row(
+        r#"{\\\"password\\\":\\\"CNRYx9q7\\\"}"#,
+        r#"{\\\"password\\\":[redacted]}"#,
+    );
+    t.row(r#"token=\"CNRYx9q7\""#, "token=[redacted]");
+    t.row(
+        r#"JSESSIONID=\"S\"; Path=/"#,
+        "JSESSIONID=[redacted]; Path=/",
+    );
+    // The extra vocabulary and camelCase names are read the same way.
+    t.row(r#"{\"pass\":\"X\"}"#, r#"{\"pass\":[redacted]}"#);
+    t.row(
+        r#"{\"userPass\":\"X\",\"user\":\"a\"}"#,
+        r#"{\"userPass\":[redacted],\"user\":\"a\"}"#,
+    );
+    // A blank after the separator, and an inner quote escaped one level deeper.
+    t.row(
+        r#"{\"password\": \"CNRYx9q7\"}"#,
+        r#"{\"password\": [redacted]}"#,
+    );
+    t.row(
+        r#"{\"password\":\"ab\\\"cd\"}"#,
+        r#"{\"password\":[redacted]}"#,
+    );
+    // A PoC YAML with a double-quoted JSON body.
+    t.row(
+        &[
+            "name: poc",
+            r#"body: "{\"user\":\"a\",\"password\":\"CNRYx9q7\"}""#,
+        ]
+        .join("\n"),
+        &[
+            "name: poc",
+            r#"body: "{\"user\":\"a\",\"password\":[redacted]}""#,
+        ]
+        .join("\n"),
+    );
+    // A frame cut by a cap runs to the end of the text.
+    t.row(r#"{\"password\":\"CNRYx9"#, r#"{\"password\":[redacted]"#);
+    // A name that is not a secret keeps its value.
+    t.unchanged(r#"{\"user\":\"a\"}"#);
+    t.unchanged(r#"{\"user\":\"a\",\"note\":\"hello\"}"#);
+
+    // Hostile, 2 MiB each: openers with no closer of their own run length, and
+    // openers that close at once.
+    t.hostile_completes(
+        "`{\\\"password\\\":\\\"` x N",
+        r#"{\"password\":\""#.repeat((2 << 20) / 17 + 1),
+    );
+    // Openers whose backslash runs all differ, so that none closes another: under a
+    // key that is not secret none may be scanned for a closer (a scan of each to the
+    // end of the text is a pass per opener, about 3 x 10^10 steps here), and under one
+    // that is the first masks the rest of the text.
+    for (key, openers) in [("a", 4000), ("password", 2900)] {
+        let text: String = (1..=openers)
+            .map(|run| format!("{key}={}\"", "\\".repeat(run)))
+            .collect();
+        t.hostile_completes(
+            &format!("`{key}=` + openers of 1 to {openers} backslashes"),
+            text,
+        );
+    }
+    t.hostile_completes(
+        "`password=\\\"` then `password=\\\\\\\"` x N",
+        r#"password=\"password=\\\""#.repeat((2 << 20) / 24 + 1),
+    );
+    t.finish();
+}
+
+#[test]
+fn camel_case_keys_are_secret_keys_in_text() {
+    // The pair scan uses the same vocabulary as rule S and D: `userPass` is `user`
+    // and `Pass`.
+    let mut t = Table::default();
+    t.row("userPass=x", "userPass=[redacted]");
+    // A digit before the capital is a boundary as a lower-case letter is.
+    t.row("db2Pass=x&y=1", "db2Pass=[redacted]&y=1");
+    t.row("a=1&sessionKey=zz&b=2", "a=1&sessionKey=[redacted]&b=2");
+    t.row("x adminPw=zz y", "x adminPw=[redacted] y");
+    t.row("totpCode=123456&x=1", "totpCode=[redacted]&x=1");
+    t.row("x authKey: y", "x authKey: [redacted]");
+    t.row("authKey: y\nok", "authKey: [redacted]\nok");
+    t.row(
+        r#"{"dbPass":"x","user":"u"}"#,
+        r#"{"dbPass":"[redacted]","user":"u"}"#,
+    );
+    t.unchanged("bypassCache=1&compassPoint=n&author=bob&Passed=1");
+    t.finish();
+}
+
+#[test]
+fn folded_header_lines_and_zero_width_blanks_are_part_of_the_header() {
+    // A header value may continue on following lines that start with a space or a
+    // tab, and a zero-width character between the name and the colon is no name.
+    let mut t = Table::default();
+    t.row(
+        "Cookie: a=b;\r\n c=CNRYx9q7\r\nHost: x",
+        "Cookie: [redacted]\r\nHost: x",
+    );
+    t.row(
+        "Cookie: a=b;\r\n\tc=X\r\n\td=Y\r\nHost: x",
+        "Cookie: [redacted]\r\nHost: x",
+    );
+    t.row(
+        "Authorization: Digest a=1,\n b=2\nnext",
+        "Authorization: [redacted]\nnext",
+    );
+    t.row("X-Api-Key: a\r\n b\r\nok", "X-Api-Key: [redacted]\r\nok");
+    t.row(
+        "Cookie:\r\n a=b;\r\n c=X\r\nHost: x",
+        "Cookie: [redacted]\r\nHost: x",
+    );
+    for zero_width in ["\u{200b}", "\u{200c}", "\u{200d}", "\u{2060}", "\u{feff}"] {
+        t.row(
+            &format!("Cookie{zero_width}: a=b; c=X"),
+            &format!("Cookie{zero_width}: [redacted]"),
+        );
+    }
+    t.row(
+        "Authorization\u{feff}: Bearer X",
+        "Authorization\u{feff}: [redacted]",
+    );
+    // Lines that do not start with a blank are not part of the header, and a header
+    // that is not a credential keeps its folded lines.
+    t.row("Cookie: a=b\r\nHost: x", "Cookie: [redacted]\r\nHost: x");
+    t.unchanged("Accept: a\r\n b\r\nHost: x");
+    t.unchanged("Cookie:");
+    t.finish();
+}
+
+#[test]
+fn xml_elements_with_a_secret_name_are_masked() {
+    let mut t = Table::default();
+    t.row(
+        "<password>CNRYx9q7</password>",
+        "<password>[redacted]</password>",
+    );
+    t.row(
+        r#"<config><dbPass type="text">CNRYx9q7</dbPass><user>a</user></config>"#,
+        r#"<config><dbPass type="text">[redacted]</dbPass><user>a</user></config>"#,
+    );
+    t.row("<token>a b c</token>", "<token>[redacted]</token>");
+    t.row(
+        "<ns:api_key>CNRYx9q7</ns:api_key>",
+        "<ns:api_key>[redacted]</ns:api_key>",
+    );
+    t.row(
+        "<password><![CDATA[CNRYx9q7]]></password>",
+        "<password>[redacted]</password>",
+    );
+    t.row(
+        r#"<password hint="a>b">CNRYx9q7</password>"#,
+        r#"<password hint="a>b">[redacted]</password>"#,
+    );
+    t.row("<password>CNRYx9q7", "<password>[redacted]");
+    // The start tag of a secret element holds frames of its own. A pair whose value
+    // is not quoted is read to the next delimiter, which `>` is not, so the rest of
+    // the tag and its content go with it: more is masked, never less.
+    t.row(r#"<pw="CNRYx9q7">)"#, r#"<pw="[redacted]">[redacted]"#);
+    t.row(r#"<pw=Str("CNRYx9q7")>)"#, "<pw=[redacted]");
+    t.row(r#"<otp: Some("CNRYx9q7")>'"#, "<otp: [redacted]");
+    t.row(
+        r#"<token pass=\"CNRYx9q7\">x</token>"#,
+        "<token pass=[redacted]",
+    );
+    // A frame in the start tag that runs past the start of the content covers it,
+    // to the end of the text or to a closer further on.
+    t.row("<otp: Some([>x</otp>", "<otp: [redacted]");
+    t.row("<otp: Some([>x</otp>]) tail", "<otp: [redacted] tail");
+    // Not secret names, empty elements, and a tag that is not closed.
+    t.unchanged("<author>bob</author>");
+    t.unchanged("<passed>yes</passed>");
+    t.unchanged("<user>alice</user>");
+    t.unchanged("<password/>");
+    t.unchanged("<password></password>");
+    t.unchanged("<password> </password>");
+    t.unchanged("a <password b");
+    t.unchanged("1 < 2 and 3 > 2");
+
+    // Hostile, 2 MiB each.
+    t.hostile_completes("`<password>` x N", "<password>".repeat((2 << 20) / 10 + 1));
+    t.hostile_completes("`<password ` x N", "<password ".repeat((2 << 20) / 10 + 1));
+    t.hostile_completes(
+        "`<password>x` x N",
+        "<password>x".repeat((2 << 20) / 11 + 1),
+    );
+    t.hostile_completes(
+        "`<password><![CDATA[` x N",
+        "<password><![CDATA[".repeat((2 << 20) / 19 + 1),
+    );
+    t.finish();
+}
+
+#[test]
+fn multipart_fields_with_a_secret_name_are_masked() {
+    let mut t = Table::default();
+    t.row(
+        "Content-Disposition: form-data; name=\"password\"\r\n\r\nCNRYx9q7\r\n--boundary--",
+        "Content-Disposition: form-data; name=\"password\"\r\n\r\n[redacted]\r\n--boundary--",
+    );
+    t.row(
+        "name=\"password\"\n\nCNRYx9q7\n--b",
+        "name=\"password\"\n\n[redacted]\n--b",
+    );
+    t.row(
+        "name='api_token'\r\n\r\nCNRYx9q7\r\n--b",
+        "name='api_token'\r\n\r\n[redacted]\r\n--b",
+    );
+    // A header line between the name and the blank line.
+    t.row(
+        "name=\"api_token\"\r\nContent-Type: text/plain\r\n\r\nCNRYx9q7\r\n--b",
+        "name=\"api_token\"\r\nContent-Type: text/plain\r\n\r\n[redacted]\r\n--b",
+    );
+    // A value of several lines runs to the boundary line, or to the end of the text.
+    t.row(
+        "name=\"private_key\"\r\n\r\nline1\r\nCNRYx9q7\r\n--b--",
+        "name=\"private_key\"\r\n\r\n[redacted]\r\n--b--",
+    );
+    t.row(
+        "name=\"private_key\"\n\nline1\nCNRYx9q7\n--b",
+        "name=\"private_key\"\n\n[redacted]\n--b",
+    );
+    t.row(
+        "name=\"password\"\r\n\r\nline1\r\nline2",
+        "name=\"password\"\r\n\r\n[redacted]",
+    );
+    // Only a line that starts with two dashes is a boundary.
+    t.row(
+        "name=\"password\"\r\n\r\nline1\r\n-x\r\nline3\r\n--b",
+        "name=\"password\"\r\n\r\n[redacted]\r\n--b",
+    );
+    // Other fields, an empty value, and a `name` with no part body after it.
+    t.unchanged("name=\"username\"\r\n\r\nalice\r\n--b");
+    t.unchanged("name=\"password\"\r\n\r\n\r\n--b");
+    t.unchanged("<input name=\"password\" value=\"x\">");
+    t.unchanged("name=\"password\"");
+
+    // Hostile, 2 MiB each: fields that are not secret and have no boundary line after
+    // them (a scan to the end of the text for each would be a pass per field), which
+    // come back unchanged.
+    for unit in ["name=\"a\"\n\nx\n", "name=\"a\"\n\n\n\n"] {
+        let text = unit.repeat((2 << 20) / unit.len() + 1);
+        t.hostile(&format!("{unit:?} x N"), text.clone(), text);
+    }
+    // Hostile, 2 MiB each: field names with no blank line after them, and many
+    // complete parts.
+    t.hostile_completes(
+        "`name=\"password\"` + CRLF x N",
+        "name=\"password\"\r\n".repeat((2 << 20) / 17 + 1),
+    );
+    t.hostile_completes(
+        "complete parts x N",
+        "name=\"password\"\r\n\r\nx\r\n".repeat((2 << 20) / 21 + 1),
+    );
+    t.finish();
+}
+
+#[test]
+fn cli_flags_with_a_secret_name_are_masked() {
+    let mut t = Table::default();
+    t.row(
+        "curl --password CNRYx9q7 https://x.test",
+        "curl --password [redacted] https://x.test",
+    );
+    t.row("run --token CNRYx9q7", "run --token [redacted]");
+    t.row("run --db-pass 'a b' next", "run --db-pass [redacted] next");
+    t.row(
+        "run --private-key \"a b\" next",
+        "run --private-key [redacted] next",
+    );
+    t.row("run --api-key=CNRYx9q7", "run --api-key=[redacted]");
+    t.row("run --token\tCNRYx9q7 x", "run --token\t[redacted] x");
+    // Flags that are not secret names, a flag with no value, and short flags.
+    t.unchanged("run --passed ok");
+    t.unchanged("run --author bob --verbose");
+    t.unchanged("run --user admin");
+    t.unchanged("run --token");
+    t.unchanged("run -p hunter2");
+    t.unchanged("run -token x");
+
+    // Hostile, 2 MiB: a flag that is the value of the one before it.
+    t.hostile_completes("`--token ` x N", "--token ".repeat((2 << 20) / 8 + 1));
+    t.finish();
+}
+
+#[test]
+fn the_pair_value_rule_matches_scrub_text() {
+    // P6 keeps its own copy of `scrub_text`'s value rule (`redact.rs` is shared and
+    // is not edited for the audit log). The two must end a masked value at the same
+    // place, whatever follows the key, so each tail is masked by `scrub_text` after
+    // a shared key and by `scrub_strict` after an extra one.
+    let tails: &[&str] = &[
+        "=abc&z=1",
+        "=abc;z=1",
+        "=abc,z=1",
+        "=abc}z",
+        "=abc z=1",
+        "=abc\u{a0}z=1",
+        "=abc\u{2028}z=1",
+        ": abc def",
+        ":abc def",
+        "= abc def",
+        "=\nabc def",
+        ":\n  abc def",
+        "=",
+        "= ",
+        "=&z=1",
+        "=\"a b\" z=1",
+        "='a b' z=1",
+        "=\"\"",
+        "=''",
+        "=\"a\\\"b\" z=1",
+        "='a\\'b' z=1",
+        "=\"a=\" z=1",
+        "=\"x\"y z",
+        "=\"unclosed z=1",
+        "='unclosed z=1",
+        "=\"a b\"=\"c d\" e=f",
+        // A quote after `=` that opens the next value is not the end of this one.
+        "=\"a b y=\"c\" z",
+        "='a b y='c' z",
+        "=\"a b' c=d",
+        ":\"a b\" ,\"c\":\"d\"",
+        // Whitespace around the separator, and a quote that is not an opener.
+        "\u{a0}=abc def",
+        "=\u{a0}abc def",
+        "=\u{b}abc def",
+        "=\"a b y=\"]c",
+        "=\"a b y=\t\"c\" z",
+        "=\"a b y:\"c\" z",
+    ];
+    let mut failures = Vec::new();
+    for tail in tails {
+        let shared = scrub_text_after(&format!("x token{tail}"), "x token");
+        let strict = scrub_strict(&format!("x pass{tail}"));
+        let strict = strict.strip_prefix("x pass");
+        if shared.as_deref() != strict {
+            failures.push(format!(
+                "tail {tail:?}: scrub_text gives {shared:?}, scrub_strict gives {strict:?}"
+            ));
+        }
+    }
+    // The one place the two differ, on purpose: `scrub_text` ends an unquoted value at
+    // any quote, `scrub_strict` runs on across a quote that something follows (`O'Brien`).
+    for (tail, want) in [("=abc\"z", "=[redacted]"), ("=abc'z", "=[redacted]")] {
+        let strict = scrub_strict(&format!("x pass{tail}"));
+        if strict != format!("x pass{want}") {
+            failures.push(format!("tail {tail:?}: scrub_strict gives {strict:?}"));
+        }
+        let shared = scrub_text_after(&format!("x token{tail}"), "x token");
+        if shared.as_deref() == Some(want) {
+            failures.push(format!(
+                "tail {tail:?}: scrub_text now masks it whole, so the difference is gone"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} tails are masked to a different end:\n{}",
+        failures.len(),
+        tails.len() + 2,
+        failures.join("\n")
+    );
+}
+
+/// `scrub_text(text)` without its leading `prefix`.
+fn scrub_text_after(text: &str, prefix: &str) -> Option<String> {
+    aitm_core::redact::scrub_text(text)
+        .strip_prefix(prefix)
+        .map(str::to_string)
+}
+
+#[test]
+fn every_prefix_of_every_shape_fires() {
+    // The prefixes the spec names (Design 14.3, P5), each with one body character
+    // and the shortest body: a prefix the table lacks or misspells fails here. The
+    // table's own entries are walked by a test in the module.
+    let shapes: &[(&[&str], &str, usize)] = &[
+        (
+            &["AKIA", "ASIA", "AGPA", "AIDA", "AROA", "ANPA", "ANVA"],
+            "A",
+            16,
+        ),
+        (&["ghp_", "gho_", "ghu_", "ghs_", "ghr_"], "a", 36),
+        (&["github_pat_"], "a", 22),
+        (&["glpat-"], "a", 20),
+        (&["xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-"], "1", 10),
+        (&["sk_live_", "sk_test_", "rk_live_", "rk_test_"], "a", 16),
+        (&["sk-"], "a", 32),
+        (&["AIza"], "a", 35),
+    ];
+    let mut failures = Vec::new();
+    for (names, body, shortest) in shapes {
+        for prefix in *names {
+            let full = format!("{prefix}{}", body.repeat(*shortest));
+            let short = format!("{prefix}{}", body.repeat(shortest - 1));
+            let glued = format!("x{full}");
+            let name = format!("[{prefix}]");
+            for (label, input, want) in [
+                ("full", &full, "[redacted]"),
+                ("one short", &short, short.as_str()),
+                ("glued to a word", &glued, glued.as_str()),
+            ] {
+                let got = scrub_strict(input);
+                if got != want {
+                    failures.push(format!("{name} {label}: {input:?} gives {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn a_bounded_scrub_cuts_first_and_masks_what_straddles_the_cut() {
+    let mut failures = Vec::new();
+    let mut check = |label: &str, got: String, want: String| {
+        if got != want {
+            failures.push(format!("{label}: want {want:?}, got {got:?}"));
+        }
+    };
+
+    // A secret at byte 200 of a 100 KiB text is masked, and the result is short.
+    let big = format!(
+        "{}password=CNRYx9q7 {}",
+        "a ".repeat(100),
+        "z".repeat(100 * 1024)
+    );
+    check(
+        "a secret inside the bound",
+        scrub_strict_bounded(&big, 256),
+        format!(
+            "{}password=[redacted] {}…",
+            "a ".repeat(100),
+            "z".repeat(38)
+        ),
+    );
+    // A secret the cut falls in: what is left of it is an unquoted value.
+    check(
+        "a secret cut in the middle",
+        scrub_strict_bounded(&format!("{}password=CNRYx9q7ab", "x ".repeat(100)), 210),
+        format!("{}password=[redacted]", "x ".repeat(100)),
+    );
+    check(
+        "a quoted secret cut in the middle",
+        scrub_strict_bounded(
+            &format!("{}password=\"CNRYx9q7ab\" z", "x ".repeat(100)),
+            213,
+        ),
+        format!("{}password=\"[redacted]", "x ".repeat(100)),
+    );
+    // The cut falls on a char boundary, and a text within the bound is not cut.
+    check(
+        "a cut inside a character",
+        scrub_strict_bounded("ééééé", 5),
+        "éé…".to_string(),
+    );
+    check(
+        "a text within the bound",
+        scrub_strict_bounded("password=abc", 100),
+        "password=[redacted]".to_string(),
+    );
+    check(
+        "a text of exactly the bound",
+        scrub_strict_bounded("password=abc", 12),
+        "password=[redacted]".to_string(),
+    );
+    check(
+        "a bound of zero",
+        scrub_strict_bounded("abc", 0),
+        "…".to_string(),
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn bracketed_values_under_a_secret_key_are_masked_whole() {
+    // A `[..]` or `{..}` value is one group: its quotes and brackets are read, and a
+    // group that is not closed (a text cut by a cap) runs to the end of the text, so
+    // the mask fails closed.
+    let mut t = Table::default();
+    t.row(
+        r#"{"passwords":["CNRYx9q7","CNRYx9q72"]}"#,
+        r#"{"passwords":[redacted]}"#,
+    );
+    t.row(
+        r#"{"cookies":[{"name":"sid","value":"CNRYx9q7"}]}"#,
+        r#"{"cookies":[redacted]}"#,
+    );
+    t.row(
+        r#"{"auth":{"u":"a","v":"CNRYx9q7"}}"#,
+        r#"{"auth":[redacted]}"#,
+    );
+    t.row(r#"{"secret":{"v":"C"}}"#, r#"{"secret":[redacted]}"#);
+    t.row(r#"{"tokens":["C"]}"#, r#"{"tokens":[redacted]}"#);
+    t.row(r#"{"api_key":["C"]}"#, r#"{"api_key":[redacted]}"#);
+    t.row(r#"{'password': ['C']}"#, "{'password': [redacted]}");
+    t.row(r#"password = ["C"]"#, "password = [redacted]");
+    // The extra vocabulary and camelCase names are read the same way.
+    t.row(r#"{"pass":["C"]}"#, r#"{"pass":[redacted]}"#);
+    t.row(r#"{"userPass":{"v":"C"}}"#, r#"{"userPass":[redacted]}"#);
+    // A closing bracket inside a string, in either quote, and an escaped quote.
+    t.row(r#"{"tokens":["a]b","c"]}"#, r#"{"tokens":[redacted]}"#);
+    t.row(r#"{'tokens': ['a]b', 'c']}"#, "{'tokens': [redacted]}");
+    t.row(r#"{"tokens":["a\"]b"]}"#, r#"{"tokens":[redacted]}"#);
+    // What follows the group stays.
+    t.row(
+        r#"{"passwords":["a"],"user":"u"}"#,
+        r#"{"passwords":[redacted],"user":"u"}"#,
+    );
+    // A parenthesis is not a bracket: an unmatched one in an element does not end the
+    // group.
+    t.row("cfg tokens: [a), CNRYx9q7]", "cfg tokens: [redacted]");
+    t.row("x tokens=[p)ss1, p)ss2]", "x tokens=[redacted]");
+    t.row(r#"{"tokens":["a", (b, "c"]}"#, r#"{"tokens":[redacted]}"#);
+    // A group that is cut.
+    t.row(r#"{"passwords":["CNRYx9"#, r#"{"passwords":[redacted]"#);
+    // Names that are not secret keep their groups.
+    t.unchanged(r#"{"user":["a","b"]}"#);
+    t.unchanged(r#"{"passed":[1]}"#);
+    t.unchanged(r#"{"items":[{"name":"x"}]}"#);
+
+    // Hostile, 2 MiB each: groups that never close, and that close at once.
+    t.hostile_completes(
+        "`password: [` x N",
+        "password: [".repeat((2 << 20) / 11 + 1),
+    );
+    t.hostile_completes(
+        "`\"tokens\":[]` x N",
+        r#""tokens":[]"#.repeat((2 << 20) / 11 + 1),
+    );
+    t.hostile_completes(
+        "`secret: {\"` x N",
+        r#"secret: {""#.repeat((2 << 20) / 10 + 1),
+    );
+    t.finish();
+}
+
+#[test]
+fn bracket_notation_form_keys_are_pairs() {
+    // `user[password]=x` is a form field named `user[password]`: the key is judged on
+    // the whole text, brackets and all, and the value is read as any pair's value.
+    let mut t = Table::default();
+    t.row(
+        "user[password]=CNRYx9q7&user[token]=CNRYx9q7",
+        "user[password]=[redacted]&user[token]=[redacted]",
+    );
+    t.row("login[password]=C", "login[password]=[redacted]");
+    t.row(
+        "password[]=C&password[]=C2",
+        "password[]=[redacted]&password[]=[redacted]",
+    );
+    t.row(
+        "user[pass]=C&a[userPass]=D",
+        "user[pass]=[redacted]&a[userPass]=[redacted]",
+    );
+    t.row("a[b][password]=C", "a[b][password]=[redacted]");
+    t.row("x user[password]=C y", "x user[password]=[redacted] y");
+    t.row("user[password]: x y", "user[password]: [redacted] y");
+    t.row(
+        "user[password]=\"a b\"&x=1",
+        "user[password]=\"[redacted]\"&x=1",
+    );
+    t.row("user[password]=C\nok", "user[password]=[redacted]\nok");
+    // Fields and indexes that are not secret keep their values.
+    t.unchanged("a[b]=c");
+    t.unchanged("items[0]=x");
+    t.unchanged("redirect[url]=https://x/");
+    t.unchanged("user[name]=bob&user[email]=a@b.test");
+    t.unchanged("a[b=c");
+    t.unchanged("a[b c]=d");
+
+    // Hostile, 2 MiB each: groups that never close, and key after key.
+    t.hostile_completes("`a[` x N", "a[".repeat((2 << 20) / 2 + 1));
+    t.hostile_completes(
+        "`user[password]=x&` x N",
+        "user[password]=x&".repeat((2 << 20) / 17 + 1),
+    );
+    t.finish();
+}
+
+#[test]
+fn userinfo_may_hold_a_quote_and_ends_at_the_quote_that_opened_the_url() {
+    // A password can hold an apostrophe or a double quote. A quote ends the authority
+    // only when it is the quote that stands in front of the scheme.
+    let mut t = Table::default();
+    t.row("https://u:O'Brien@h/x", "https://u:[redacted]@h/x");
+    t.row(
+        "postgres://u:O'Brien@db:5432/x",
+        "postgres://u:[redacted]@db:5432/x",
+    );
+    t.row("redis://:O'Brien@h:6379", "redis://:[redacted]@h:6379");
+    t.row("ftp://u:p'w'd@h", "ftp://u:[redacted]@h");
+    t.row("https://u:p\"w@h/x", "https://u:[redacted]@h/x");
+    // Quoted URLs: the opening quote ends the authority, the other quote does not.
+    t.row("\"https://u:O'Brien@h/x\"", "\"https://u:[redacted]@h/x\"");
+    t.row("'https://u:p\"w@h/x'", "'https://u:[redacted]@h/x'");
+    t.row("'https://u:pw@h'", "'https://u:[redacted]@h'");
+    t.row("\"https://u:pw@h\" x", "\"https://u:[redacted]@h\" x");
+    // A URL with no userinfo, then a quote and an address.
+    t.unchanged("see 'https://h' and 'a@b.com'");
+    t.unchanged("\"https://h/x\" \"a@b\"");
+    t.unchanged("{\"url\":\"https://h\",\"mail\":\"a@b.test\"}");
+
+    // Hostile, 2 MiB each: quoted URLs, and apostrophes in one endless authority.
+    t.hostile_completes(
+        "`'https://a:b@h' ` x N",
+        "'https://a:b@h' ".repeat((2 << 20) / 16 + 1),
+    );
+    t.hostile_completes(
+        "`https://` + `a'@` x N",
+        format!("https://{}", "a'@".repeat((2 << 20) / 3 + 1)),
+    );
+    t.finish();
+}
+
+#[test]
+fn curl_user_flags_mask_the_password_part() {
+    // `-u user:password`, `--user` and `--proxy-user` carry a password after the
+    // first colon of the next word. A word with no colon has none.
+    let mut t = Table::default();
+    t.row(
+        "curl --user admin:CNRYx9q7 https://x.test",
+        "curl --user admin:[redacted] https://x.test",
+    );
+    t.row(
+        "curl -u user:pw https://x",
+        "curl -u user:[redacted] https://x",
+    );
+    t.row(
+        "curl --proxy-user u:p https://x",
+        "curl --proxy-user u:[redacted] https://x",
+    );
+    t.row("curl -U u:p https://x", "curl -U u:[redacted] https://x");
+    t.row("run -u a:b:c x", "run -u a:[redacted] x");
+    t.row("run -u 'admin:pa ss' x", "run -u 'admin:[redacted]' x");
+    t.row("run -u \"a:b\" x", "run -u \"a:[redacted]\" x");
+    t.row("run -u\tu:p x", "run -u\tu:[redacted] x");
+    // A word with no colon, an empty password, no word, and a flag in a word.
+    t.unchanged("run -u admin x");
+    t.unchanged("run --user admin");
+    t.unchanged("run -u admin:");
+    t.unchanged("run -u");
+    t.unchanged("run -u --verbose");
+    t.unchanged("run --username a:b");
+    t.unchanged("run x-u u:p");
+    t.finish();
+}
+
+#[test]
+fn an_unquoted_value_runs_across_a_quote_that_does_not_end_it() {
+    // `scrub_text` ends an unquoted value at any quote, so `password=O'Brien` would
+    // keep `'Brien`. Under a secret key a quote that is followed by a character that
+    // does not end a value is part of the value; one followed by whitespace, `&`, `;`,
+    // `,`, `}`, `]` or the end of the text still ends it. The shared vocabulary is
+    // read before `scrub_text` can cut the value, the rest by P6.
+    let mut t = Table::default();
+    t.row(
+        "password=O'Brien&remember=1",
+        "password=[redacted]&remember=1",
+    );
+    t.row(
+        "/login?user=bob&password=O'Brien",
+        "/login?user=bob&password=[redacted]",
+    );
+    t.row(
+        "user[password]=O'Brien&x=1",
+        "user[password]=[redacted]&x=1",
+    );
+    t.row("api_key=ab\"cdef123", "api_key=[redacted]");
+    t.row("https://x/?token=O'Brien", "https://x/?token=[redacted]");
+    t.row("pw=O'C", "pw=[redacted]");
+    t.row("token=a'b'C", "token=[redacted]");
+    t.row("password=O'Brien", "password=[redacted]");
+    // camelCase, a value followed by more pairs, a `:` separator, and a value in the
+    // middle of text.
+    t.row("userPass=O'C&x=1", "userPass=[redacted]&x=1");
+    t.row("x pass: it's here", "x pass: [redacted] here");
+    t.row("a=1&secret=x\"y&b=2", "a=1&secret=[redacted]&b=2");
+    // An opening quote that never closes: the rest of the value is read the same way.
+    t.row("password=\"O'Brien&x=1", "password=\"[redacted]&x=1");
+    t.row("x password: \"O'Bri", "x password: \"[redacted]");
+    // A key nested in the value of a host and port, which the value rule leaves alone.
+    t.row(
+        "x.auth:8443/cb?token=O'Brien",
+        "x.auth:8443/cb?token=[redacted]",
+    );
+    // What still ends a value: the quote of the enclosing string, and a quote with
+    // whitespace, `&`, `;`, `,`, `}`, `]` or the end after it.
+    t.row(r#"{"a":"x token=abc"}"#, r#"{"a":"x token=[redacted]"}"#);
+    t.row("token=abc\"", "token=[redacted]\"");
+    t.row("token=abc\" next", "token=[redacted]\" next");
+    t.row("token=abc'", "token=[redacted]'");
+    t.row("x=\"a\" token=b", "x=\"a\" token=[redacted]");
+    for follower in ["&z", ";z", ",z", "}z", "]z", " z", "\tz", "\nz", "\u{a0}z"] {
+        for quote in ['\'', '"'] {
+            t.row(
+                &format!("token=abc{quote}{follower}"),
+                &format!("token=[redacted]{quote}{follower}"),
+            );
+        }
+    }
+    // A quoted value keeps its own rule.
+    t.row("token=\"a b\"", "token=\"[redacted]\"");
+    t.row("token='a b' x", "token='[redacted]' x");
+    // Names that are not secret keep a value with a quote in it.
+    t.unchanged("name=O'Brien&city=L'Aquila");
+    t.unchanged("a=b\"c");
+
+    // Hostile, 2 MiB each: a value that is nothing but quotes the value runs across,
+    // values that start where the last one ended, and quoted values that close far on.
+    let unit = "a'";
+    t.hostile_settles(
+        "`token=` + `a'` x N",
+        format!("token={}", unit.repeat((2 << 20) / unit.len())),
+        "token=[redacted]'".to_string(),
+    );
+    let unit = "x\"";
+    t.hostile_settles(
+        "`password=` + `x\"` x N",
+        format!("password={}", unit.repeat((2 << 20) / unit.len())),
+        "password=[redacted]\"".to_string(),
+    );
+    t.hostile_settles(
+        "`pw=` + `a'` x N",
+        format!("pw={}", "a'".repeat((2 << 20) / 2)),
+        "pw=[redacted]'".to_string(),
+    );
+    t.hostile_settles(
+        "`token=` x N",
+        "token=".repeat((2 << 20) / 6),
+        "token=[redacted]".to_string(),
+    );
+    t.hostile_settles(
+        "`token=\"` x N, then `x\"`",
+        format!("{}x\"", "token=\"".repeat((2 << 20) / 7)),
+        "token=\"[redacted]\"".to_string(),
+    );
+    t.finish();
+}
+
+#[test]
+fn is_benign_header_table() {
+    // The names of the spec (Design 14.2, 43 of them) less `sec-websocket-protocol`.
+    let spec_names = [
+        "accept",
+        "accept-charset",
+        "accept-encoding",
+        "accept-language",
+        "accept-ranges",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "cache-control",
+        "connection",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-length",
+        "content-type",
+        "date",
+        "dnt",
+        "expect",
+        "forwarded",
+        "host",
+        "if-modified-since",
+        "if-unmodified-since",
+        "origin",
+        "pragma",
+        "range",
+        "referer",
+        "sec-websocket-extensions",
+        "sec-websocket-version",
+        "te",
+        "transfer-encoding",
+        "upgrade",
+        "upgrade-insecure-requests",
+        "user-agent",
+        "via",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-proto",
+        "x-http-method-override",
+        "x-original-url",
+        "x-real-ip",
+        "x-requested-with",
+        "x-rewrite-url",
+    ];
+    assert_eq!(
+        spec_names.len(),
+        42,
+        "the spec lists 43 benign names and `sec-websocket-protocol` is not one of them now"
+    );
+    let mut failures = Vec::new();
+    for name in spec_names {
+        for spelling in [name.to_string(), name.to_ascii_uppercase()] {
+            if !is_benign_header(&spelling) {
+                failures.push(format!("`{spelling}` should be benign"));
+            }
+        }
+    }
+    for name in [
+        "Accept",
+        "CONTENT-TYPE",
+        "X-Forwarded-Host",
+        "Sec-Fetch-Mode",
+        "sec-ch-ua",
+        "Referer",
+        "Host",
+        "Sec-WebSocket-Extensions",
+        "Sec-WebSocket-Version",
+    ] {
+        if !is_benign_header(name) {
+            failures.push(format!("`{name}` should be benign"));
+        }
+    }
+    for name in [
+        "Authorization",
+        "Cookie",
+        "X-Custom",
+        "X-Api-Key",
+        "Set-Cookie",
+        "X-Debug-Access",
+        "sec-fetchx",
+        "Sec-Fetch",
+        // The subprotocol list carries bearer tokens (`base64url.bearer.authorization
+        // .k8s.io.<token>`): the name stays visible, the value does not.
+        "Sec-WebSocket-Protocol",
+    ] {
+        if is_benign_header(name) {
+            failures.push(format!("`{name}` should not be benign"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

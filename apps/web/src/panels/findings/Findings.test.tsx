@@ -1,8 +1,7 @@
 import { createSignal, Show } from 'solid-js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@solidjs/testing-library';
-import type { PocRun } from '~/bus/mock';
-import type { BusClient, BusState, ToolDef } from '~/bus/types';
+import type { BusClient, BusState, PocRun, ToolDef } from '~/bus/types';
 import { AppProvider } from '~/state/context';
 import { createAppStore } from '~/state/app';
 import { FindingsPanel } from '~/panels/FindingsPanel';
@@ -21,12 +20,15 @@ vi.mock('~/viewers/CodeViewer', () => ({
   ),
 }));
 
-/** A bus that serves `poc.list` from a fixed array and nothing else; `address: 'fixtures'` keeps the store from polling. */
+/**
+ * A bus that serves `poc.list` from a fixed array and nothing else. The store's poll loop is gated on
+ * `bus.state()`, not on the address; this bus answers `flow.list` with `[]`, so each poll sees an empty list.
+ */
 function fakeBus(runs: PocRun[]): BusClient {
   const [state] = createSignal<BusState>('open');
   const tools: ToolDef[] = ['poc.list', 'poc.run', 'poc.artifact', 'flow.list'].map((name) => ({ name, description: '', inputSchema: { type: 'object' } }));
   return {
-    address: 'fixtures',
+    address: '127.0.0.1:8082',
     state,
     lastError: () => null,
     role: () => 'operator',
@@ -65,7 +67,7 @@ function coreBus(summaries: { id: string; title: string; severity: PocRun['sever
   const [state] = createSignal<BusState>('open');
   const tools: ToolDef[] = ['poc.list', 'poc.get', 'poc.build', 'poc.run', 'poc.artifact', 'flow.list'].map((name) => ({ name, description: '', inputSchema: { type: 'object' } }));
   return {
-    address: 'fixtures',
+    address: '127.0.0.1:8082',
     state,
     lastError: () => null,
     role: () => 'operator',

@@ -15,9 +15,9 @@ public struct CoreID: Hashable, Sendable, Codable, CustomStringConvertible {
     /// Reconstructs an identity from a persisted `rawValue`.
     public init(rawValue: String) { self.rawValue = rawValue }
 
-    /// The well-known id for fixture / offline sample data: a single stable
-    /// originating connection, so seeded flows (Task 5) share one `CoreID`
-    /// without a live core. The live embedded connection gets a fresh id.
+    /// The well-known id for rows built without a core (imports, tests): one
+    /// stable originating connection so they share a `CoreID`. The live
+    /// embedded connection gets a fresh id.
     public static let fixture = CoreID(rawValue: "fixture")
 
     public var description: String { rawValue }
@@ -80,6 +80,11 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
     /// a non-embedded core and until the embedded core reports ready.
     public var appliedPort: Int?
     public var appliedVerifyUpstreamTLS: Bool?
+    /// The Settings ▸ Proxy system-proxy values this embedded core was last started with
+    /// (the launch preference and the bypass field as typed, `SystemProxyPreferences`), for the
+    /// same Apply & Restart dirty-check. nil for a non-embedded core and until ready.
+    public var appliedSystemProxyAuto: Bool?
+    public var appliedSystemProxyBypass: String?
 
     public init(
         id: CoreID = CoreID(),
@@ -89,7 +94,9 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
         label: String,
         proxyAddress: String? = nil,
         appliedPort: Int? = nil,
-        appliedVerifyUpstreamTLS: Bool? = nil
+        appliedVerifyUpstreamTLS: Bool? = nil,
+        appliedSystemProxyAuto: Bool? = nil,
+        appliedSystemProxyBypass: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -99,6 +106,8 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
         self.proxyAddress = proxyAddress
         self.appliedPort = appliedPort
         self.appliedVerifyUpstreamTLS = appliedVerifyUpstreamTLS
+        self.appliedSystemProxyAuto = appliedSystemProxyAuto
+        self.appliedSystemProxyBypass = appliedSystemProxyBypass
     }
 }
 

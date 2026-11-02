@@ -4,10 +4,8 @@ import SwiftUI
 
 // Aitmproxy — the native macOS operator app for the aitmproxy command bus.
 //   Aitmproxy                       the app (connects to the bus from Settings or config.yaml)
-//   APP_FIXTURES=1 Aitmproxy        show the fixture session instead of a live bus
 //   APP_STORE=<dir> Aitmproxy       keep local state (pins, saved filters) elsewhere (tests)
-//   APP_SNAPSHOT=<dir> Aitmproxy    save a PNG of every sidebar page and Settings tab in light and dark, then quit
-//   Aitmproxy --selftest            run the self-test and quit with 0 or 1 (tools/selftest.sh)
+//   APP_LIVE=1 Aitmproxy --selftest run the live self-test against a running aitm and quit with 0 or 1 (tools/selftest-live.sh)
 //   APP_ACCENT=<id> Aitmproxy       run with another accent from Theme.all (UI/Theme.swift)
 //   APP_GRID=1 Aitmproxy            draw the 8 pt grid and the layout probes over the window
 
@@ -55,6 +53,19 @@ struct AitmproxyApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Fail closed first (spec D3 items 8 and 5), before the process even becomes a
+        // foreground app and before any window, BusService, connection model or
+        // ExtensionController exists: a removed fake-data switch, or a `--selftest`
+        // without its harness, must never run the live stack on the operator's real
+        // defaults. `exit` flushes the one printed line.
+        if let why = RemovedModes.refusal(environment: ProcessInfo.processInfo.environment) {
+            print(why)
+            exit(1)
+        }
+        if SelfTest.requested, let why = SelfTest.refusal() {
+            print(why)
+            exit(1)
+        }
         // Started from a terminal, the process is not a foreground app yet.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
@@ -72,14 +83,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// Where surface-local state lives (pins, saved filters, compose history):
 /// ~/Library/Application Support/Aitmproxy/. Flows never persist here; they live in the proxy.
 enum Store {
-    /// True when APP_STORE points somewhere else (tests, snapshots).
+    /// True when APP_STORE points somewhere else (tests, the dev bundle).
     static var isOverridden: Bool {
         !(ProcessInfo.processInfo.environment["APP_STORE"] ?? "").isEmpty
     }
 
     /// The store for the connection settings (`bus.*`, `proxy.*`, `capture.enabled`):
     /// the operator's real defaults in a normal launch, an isolated suite in a
-    /// self-test, snapshot or fixture run (`SettingsDomain`), so stale Settings ▸ Bus
+    /// harness run (`APP_STORE` / `APP_LIVE`; `SettingsDomain`), so stale Settings ▸ Bus
     /// residue never steers a test and a test never overwrites it. `UserDefaults` is
     /// thread-safe but not marked `Sendable`, hence `unsafe`; the embedded core reads
     /// it off the main actor.
@@ -95,14 +106,6 @@ enum Store {
         let dir = URL.applicationSupportDirectory.appending(path: "Aitmproxy", directoryHint: .isDirectory)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
-    }
-
-    /// Fixture mode: APP_FIXTURES=1, or any snapshot/self-test run — unless
-    /// APP_LIVE=1 asks a snapshot to capture the live bus instead.
-    static var usesFixtures: Bool {
-        let env = ProcessInfo.processInfo.environment
-        if env["APP_LIVE"] == "1" { return false }
-        return env["APP_FIXTURES"] == "1" || env["APP_SNAPSHOT"] != nil || SelfTest.requested
     }
 }
 
@@ -217,6 +220,21 @@ struct FlowCommands: Commands {
             Divider()
             Button("Overview") { session.show(.overview) }
             Button("Connection Log") { session.show(.connections) }
+            // The first-run step from the menu (spec D17.10): the same `trustCA()` as the sheet, the
+            // Status card and the CA panel. ⌃⌘T is free (⌘T is New Browser Tab). Disabled while the
+            // bus is not the operator's, while a change is in flight, and once a store says trusted.
+            Button(ConnectionAction.trustCA.title) { Task { await session.trustCA() } }
+                .keyboardShortcut("t", modifiers: [.command, .control])
+                .disabled(!session.caTrustControlLive || session.caTrust?.trusted == true)
+            // The system-proxy step from the menu (spec D13 "Menu"): one item whose title follows the fact
+            // (CommandMap's toggle pair), the same `setSystemProxy()` / `restoreSystemProxy()` as the sheet,
+            // the Status page and the Flows banner. ⌥⌘P is free. Disabled while the bus is not the
+            // operator's or a change is in flight.
+            Button(session.systemProxyPointsAtUs ? ConnectionAction.unsetSystemProxy.title : ConnectionAction.setSystemProxy.title) {
+                Task { await (session.systemProxyPointsAtUs ? session.restoreSystemProxy() : session.setSystemProxy()) }
+            }
+            .keyboardShortcut("p", modifiers: [.command, .option])
+            .disabled(!session.systemProxyControlLive)
             Button("Certificate Authority…") { session.show(.ca) }
             Button("Configuration…") { session.show(.config) }
             Button(session.coreLogVisible ? "Hide Core Log" : "Core Log…") { session.coreLogVisible.toggle() }

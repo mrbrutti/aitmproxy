@@ -38,6 +38,9 @@ public struct OverviewStats: Hashable, Sendable {
 
     public var flows: Int
     public var hosts: Int
+    /// Distinct clients by `ClientInfo.groupKey` (the signing identifier when the row has
+    /// one, else the name), so two apps that share a display name count as two and a row
+    /// with no client counts as none; equals the sidebar's Apps count.
     public var clients: Int
     public var paused: Int
     /// 5xx responses, transport failures and killed flows.
@@ -57,13 +60,13 @@ public struct OverviewStats: Hashable, Sendable {
     public init(rows: [FlowRow]) {
         flows = rows.count
         hosts = Set(rows.map(\.authority)).count
-        clients = Set(rows.compactMap { $0.client?.name }).count
+        clients = Set(rows.compactMap { $0.client?.groupKey }).count
         paused = rows.filter { $0.state == .paused }.count
         errors = rows.filter { row in
             row.state == .failed || row.state == .killed || row.status.flatMap(StatusClass.init) == .serverError
         }.count
         // Saturating sums: the bus decode bounds its sizes, but rows also come from
-        // imports and fixtures, and a sum must never trap the app.
+        // imports, and a sum must never trap the app.
         requestBytes = rows.reduce(0) { ThroughputMeter.saturatingSum($0, max($1.requestBytes ?? 0, 0)) }
         responseBytes = rows.reduce(0) { ThroughputMeter.saturatingSum($0, max($1.responseBytes ?? 0, 0)) }
 

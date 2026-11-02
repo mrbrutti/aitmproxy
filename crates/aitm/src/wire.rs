@@ -20,11 +20,13 @@ use std::time::Duration;
 use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
 use aitm_core::{
-    ActionPermit, AgentState, AuditRing, Config, GuardError, Plugin, ProtocolModule, Proxy,
+    ActionPermit, AgentState, AuditRing, Config, GuardError, JobBus, Plugin, ProtocolModule, Proxy,
     Registry, ScopeEntry, ScopeRateGuard,
 };
 use aitm_plugin_maprules::MapRulesPlugin;
 use aitm_plugin_passthrough::{PassthroughList, PassthroughModule, PassthroughPlugin};
+use aitm_plugin_scanner::jobs::{Engine as ScanEngine, ScanLate};
+use aitm_plugin_scanner::{ScannerConfig, ScannerPlugin};
 use aitm_plugin_sessionio::SessionIoPlugin;
 use aitm_plugin_wsctl::WsCtlPlugin;
 use aitm_plugins::{
@@ -37,6 +39,8 @@ use aitm_proto_l4::flow::L4FlowStore;
 use aitm_proto_l4::guard::L4Guard;
 use aitm_proto_l4::{L4Module, L4Privilege};
 use aitm_proto_ws::{InjectRegistry, WsModule};
+use aitm_scan_model::CheckRegistry;
+use aitm_scan_ws::types::TlsPolicy;
 use aitm_sysproxy::plugin::SysProxyPlugin;
 use aitm_sysproxy::{SystemProxy, SystemProxyConfig};
 use tracing::{info, warn};
@@ -91,6 +95,16 @@ pub struct Features {
     /// only when [`Features::sysproxy`] is `None`. The binary passes
     /// `Settings.system_proxy`, whose `state_file` is always `Some` (plan C6).
     pub system_proxy: SystemProxyConfig,
+    /// The `scanner:` config section (spec D11): the scanner v2 engine's agent
+    /// gates, job limits, ceilings and profile sources. It lives outside
+    /// `aitm_core::Config` like the L4 config does, so `aitm-core` knows nothing
+    /// about the scanner; the binary passes `Settings.scanner`. Assembly copies
+    /// two values that are not `scanner:` keys onto the clone it hands the
+    /// plugin: `cfg.findings.dir` (where job, issue and profile state is
+    /// written) and `l4.allow_agent_inject` (so the `scan.start` L4 gate reads
+    /// one struct). The default is [`ScannerConfig::default`] — deny-by-default
+    /// agent gates, memory-only state.
+    pub scanner: ScannerConfig,
 }
 
 /// A shared L4 guard + flow store, built once by the binary and threaded into both
@@ -115,6 +129,7 @@ impl Default for Features {
             macos_capture: MacosCaptureConfig::default(),
             sysproxy: None,
             system_proxy: SystemProxyConfig::default(),
+            scanner: ScannerConfig::default(),
         }
     }
 }
@@ -124,7 +139,7 @@ impl Default for Features {
 /// Each lane crate owns a `lane()` entry point returning `Option<Arc<dyn Lane>>`;
 /// this is the one place that calls them, so a lane track lands by filling its own
 /// crate and edits no shared file ("Registration without shared files"). A slot
-/// that answers `None` — every slot while its track is unimplemented — is skipped,
+/// that answers `None` — a track whose lane this build does not ship — is skipped,
 /// and `scan.start` refuses that lane with `lane_unavailable`.
 ///
 /// The two L4 slots are called with the shared guard and flow store from
@@ -133,13 +148,35 @@ impl Default for Features {
 /// is `None` and both handles are passed as `None`; a landed L4 lane still returns
 /// `Some` then, so the refusal is `refused_l4` rather than `lane_unavailable`
 /// (spec D3's refusal order).
+///
+/// The WebSocket lane dials with [`TlsPolicy::Verify`] here; the binary selects
+/// the operator's posture with [`collect_lanes_with`] and [`ws_tls_policy`].
 #[must_use]
 pub fn collect_lanes(l4: Option<&L4Shared>) -> Vec<Arc<dyn aitm_scan_model::Lane>> {
+    collect_lanes_with(l4, TlsPolicy::Verify)
+}
+
+/// [`collect_lanes`], with the certificate policy the WebSocket lane dials with.
+///
+/// `aitm-scan-ws` verifies upstream certificates against the webpki roots by
+/// default, so a self-signed `wss://` lab target answers `Inconclusive` (the
+/// TLS handshake never completes) unless the operator's `ssl_insecure` is
+/// passed down. This is the sibling that passes it: `collect_lanes` keeps its
+/// one-argument signature (and its default-secure posture) for every caller
+/// that has no `Config` to read, and assembly calls this one with
+/// `ws_tls_policy(cfg)`. The other three slots take no TLS policy — the HTTP
+/// lane dials through `aitm-proto-http`'s sender, which already reads
+/// `cfg.ssl_insecure`, and the two L4 slots are below TLS.
+#[must_use]
+pub fn collect_lanes_with(
+    l4: Option<&L4Shared>,
+    ws_tls: TlsPolicy,
+) -> Vec<Arc<dyn aitm_scan_model::Lane>> {
     let guard = l4.map(|shared| shared.guard.clone());
     let store = l4.map(|shared| shared.store.clone());
     [
         aitm_scan_http::lane(),
-        aitm_scan_ws::lane(),
+        aitm_scan_ws::lane::build_with(ws_tls),
         aitm_scan_l4_packet::lane(guard.clone(), store.clone()),
         aitm_scan_l4_stream::lane(guard, store),
     ]
@@ -148,11 +185,32 @@ pub fn collect_lanes(l4: Option<&L4Shared>) -> Vec<Arc<dyn aitm_scan_model::Lane
     .collect()
 }
 
+/// The certificate policy scanner v2's WebSocket lane and `ws.*` script
+/// language dial with, for `cfg`.
+///
+/// `ssl_insecure: false` (the default) is [`TlsPolicy::Verify`]: the chain is
+/// checked against the webpki roots, exactly the posture `HttpModule`'s
+/// `with_insecure(cfg.ssl_insecure)` has. `ssl_insecure: true` is
+/// [`TlsPolicy::AcceptAny`]: chain validation is skipped (the handshake
+/// signature is still verified) so a lab of self-signed targets is reachable.
+/// One switch, both faces — the lane ([`collect_lanes_with`]) and the `ws.*`
+/// language (`main.rs`) — so a `wss://` target does not behave differently
+/// depending on which one reached it.
+#[must_use]
+pub fn ws_tls_policy(cfg: &Config) -> TlsPolicy {
+    if cfg.ssl_insecure {
+        TlsPolicy::AcceptAny
+    } else {
+        TlsPolicy::Verify
+    }
+}
+
 /// The native (compiled-in) scanner v2 checks this build ships (spec D1).
 ///
 /// `aitm-scan-checks-http` contributes checks to the HTTP lane's catalogue rather
-/// than a second lane, so its slot is `checks()`, not `lane()`. Empty until track
-/// T3 lands.
+/// than a second lane, so its slot is `checks()`, not `lane()`. It answers the
+/// checks track T3 has landed, which is none while that crate ships an empty
+/// catalogue.
 #[must_use]
 pub fn collect_native_checks() -> Vec<Arc<dyn aitm_scan_model::Check>> {
     aitm_scan_checks_http::checks()
@@ -212,6 +270,26 @@ pub struct Assembled {
     /// `recover_at_startup(auto)` before serving and `on_orderly_exit()` on the
     /// exit path. The injected one when [`Features::sysproxy`] was `Some`.
     pub sysproxy: Arc<SystemProxy>,
+    /// The one job bus (spec D9.2): every long-running command publishes its
+    /// progress on it and every `McpServer` this binary builds is handed this
+    /// exact `Arc` (`McpServer::with_jobs`), so a `scan.start` over one surface
+    /// reaches the subscribers of every other. Nothing subscribes until a
+    /// server does; publishing with no subscriber is not an error.
+    pub job_bus: Arc<JobBus>,
+    /// The scanner's write-once handle cell (spec D5 "Owned handles", call B3).
+    /// It comes out of assembly **unbound**: the engine's store, client, guard,
+    /// browser and L4 handles are the proxy's own, which exist only after
+    /// `build()`, so `main.rs` binds them beside `handles.bind_proxy(..)`. A
+    /// `scan.*` verb on an unbound cell errors rather than running a job over
+    /// handles that do not exist.
+    pub scan_late: Arc<ScanLate>,
+    /// The scanner engine the plugin's `load` assembled, in the cell handed out
+    /// before the registry took the plugin by value
+    /// (`ScannerPlugin::engine_cell`). It is the one way to read back the
+    /// configuration, catalogue and registry the live `scan.*` verbs act over —
+    /// what the wiring test asserts the `scanner:` section reached. Read-only:
+    /// binding the engine's handles goes through [`Assembled::scan_late`].
+    pub scanner_engine: Arc<OnceLock<Arc<ScanEngine>>>,
     /// The sealed [`Governance`] that [`Assembled::governance`] hands out;
     /// private so the `pub` fields above cannot substitute it.
     governance: Governance,
@@ -248,7 +326,13 @@ pub struct Assembled {
 ///     let cfg = Config::default();
 ///     let assembled = assemble(&cfg)?;
 ///     let governance: Governance = Governance { agent_state, audit_ring };
-///     let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+///     let services = services(
+///         &assembled.proxy,
+///         &cfg,
+///         None,
+///         TuiLog::Off,
+///         Arc::clone(&assembled.job_bus),
+///     );
 ///     let _servers = build_servers(&cfg, services, governance);
 ///     Ok(())
 /// }
@@ -270,7 +354,13 @@ pub struct Assembled {
 ///     let assembled = assemble(&cfg)?;
 ///     drop((agent_state, audit_ring));
 ///     let governance: Governance = assembled.governance();
-///     let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+///     let services = services(
+///         &assembled.proxy,
+///         &cfg,
+///         None,
+///         TuiLog::Off,
+///         Arc::clone(&assembled.job_bus),
+///     );
 ///     let _servers = build_servers(&cfg, services, governance);
 ///     Ok(())
 /// }
@@ -310,6 +400,15 @@ pub struct ScriptWiring {
     /// (`findings.record`/`get`/`remove`/`list`); each registers its own
     /// commands, so the slot holds as many providers as a deployment wires.
     pub commands: Vec<Box<dyn Plugin>>,
+    /// The check registry the scripting tier fills from every `reg.add_check`
+    /// (`ScriptTier::checks`, call B9). The scanner is registered over this
+    /// exact registry, so a script's check joins the catalogue and gets its
+    /// `check.<id>` manual command. `None` (every caller using
+    /// `..ScriptWiring::default()`) is an empty registry: no scripted checks.
+    ///
+    /// It rides here rather than on `ScriptServices` because `ScriptServices`
+    /// is constructed in seventeen files, two of them integration-shared.
+    pub script_checks: Option<Arc<CheckRegistry>>,
 }
 
 /// Assemble the proxy from configuration with the default feature set.
@@ -403,6 +502,36 @@ pub fn assemble_with_scripts(
     // everything (deny-by-default) rather than decrypt it.
     let tunnel_guard = Arc::new(LateGuard::default());
 
+    // The one job bus (spec D9.2). Every long-running command publishes on it
+    // and every server is handed this exact `Arc`, so progress from a job
+    // started on one surface reaches the subscribers of every other.
+    let job_bus = Arc::new(JobBus::default());
+
+    // The scanner's configuration (spec D11, call D11): the operator's
+    // `scanner:` section, plus the two values that are not `scanner:` keys —
+    // `findings.dir`, which decides where job, issue and profile state is
+    // written (and whether any is), and `l4.allow_agent_inject`, mirrored here
+    // so the `scan.start` L4 gate reads one struct rather than two.
+    let mut scanner_cfg = features.scanner.clone();
+    scanner_cfg.findings_dir = cfg.findings.dir.clone();
+    scanner_cfg.l4_allow_agent_inject = features.l4.allow_agent_inject;
+    // Scanner v2 registration slots (spec D1, "Registration without shared
+    // files"): the lanes each lane crate's `lane()` handed back, the native
+    // checks from `aitm_scan_checks_http::checks()`, and the scripting tier's
+    // check registry (call B9). `late` and `engine_cell` are taken before the
+    // registry takes the plugin by value: `main.rs` binds the proxy's handles
+    // into the first once the proxy exists, and the second is how the assembled
+    // engine is read back.
+    let scanner = ScannerPlugin::new(scanner_cfg)
+        .with_lanes(collect_lanes_with(
+            features.l4_shared.as_ref(),
+            ws_tls_policy(cfg),
+        ))
+        .with_native_checks(collect_native_checks())
+        .with_script_checks(scripts.script_checks.clone().unwrap_or_default());
+    let scan_late = scanner.late();
+    let scanner_engine = scanner.engine_cell();
+
     let mut builder = Proxy::builder().with_config(cfg.clone());
     // Protocol modules, in registration order (first match claims the connection):
     // PassthroughModule before HttpModule so a pinned or out-of-scope host tunnels
@@ -423,16 +552,6 @@ pub fn assemble_with_scripts(
         .register_plugin(Box::new(SubscriptionPlugin::new(push_tx.clone())))
         .register_plugin(Box::new(DetailPlugin::new()))
         .register_plugin(Box::new(MetaPlugin::new()))
-        // The deterministic scanner's command set (scan.discover): a command-only
-        // provider that observes no events. Stage 1 uses the default budgets.
-        // Scanner v2 lane slots, spec D1: the lanes and native checks this build
-        // has are collected here and handed over. The shipped engine ignores
-        // them; the v2 engine (track T1b) consumes them.
-        .register_plugin(Box::new(
-            aitm_plugin_scanner::ScannerPlugin::new(aitm_plugin_scanner::ScannerConfig::default())
-                .with_lanes(collect_lanes(features.l4_shared.as_ref()))
-                .with_native_checks(collect_native_checks()),
-        ))
         .register_plugin(Box::new(ReplayPlugin::new()))
         .register_plugin(Box::new(intercept))
         .register_plugin(Box::new(
@@ -500,6 +619,10 @@ pub fn assemble_with_scripts(
     for commands in scripts.commands {
         builder = builder.register_plugin(commands);
     }
+    // The scanner, last (call B7): its `load` registers a `check.<id>` command
+    // for every Rhai `add_check`, so the script tier must have loaded first.
+    // The scanner registers no hooks, so chain order is unaffected.
+    builder = builder.register_plugin(Box::new(scanner));
 
     // L4 (raw packet) module: opt-in and fail-closed (M5-AC17). When disabled, it is
     // not constructed and no `l4.*` command is registered. When enabled, it is always
@@ -588,6 +711,9 @@ pub fn assemble_with_scripts(
         l4_guard,
         capture_status,
         sysproxy,
+        job_bus,
+        scan_late,
+        scanner_engine,
         governance,
     })
 }
@@ -896,7 +1022,13 @@ mod tests {
     /// Invoke the registered `capture.status` the way a frontend does: through the
     /// proxy's registry, over the service handles `main` shares with the frontends.
     fn invoke_capture_status(proxy: &Proxy, cfg: &Config) -> Value {
-        let services = crate::tui::services(proxy, cfg, None, crate::tui::TuiLog::Off);
+        let services = crate::tui::services(
+            proxy,
+            cfg,
+            None,
+            crate::tui::TuiLog::Off,
+            Arc::new(JobBus::default()),
+        );
         let host = CommandHost::new(&*services.store, &*services.client, &*services.guard, None);
         proxy
             .registry()
@@ -1020,17 +1152,17 @@ mod tests {
         assert!(disabled.l4_guard.is_none());
     }
 
-    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot.
-    /// Two lanes return `Some` at this head: T4's WebSocket lane
-    /// (`aitm_scan_ws::lane`) and T6's L4 stream lane
-    /// (`aitm_scan_l4_stream::lane`, `Some` with or without the L4 handles; it
-    /// refuses at discovery when they are absent). The HTTP and L4 packet slots
-    /// are still skeletons returning `None`, which is skipped rather than
-    /// collected. Each lane track's landing bumps these literals; that track
-    /// re-pins this test.
+    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
+    /// a skeleton slot returning `None` is skipped rather than collected. Three
+    /// lanes have landed: T4 (`aitm-scan-ws`), T5 (`aitm-scan-l4-packet`, which
+    /// returns `Some` even without the L4 handles, call A18) and T6
+    /// (`aitm-scan-l4-stream`, `Some` with or without the L4 handles; it refuses
+    /// at discovery when they are absent). The HTTP slot is still a skeleton.
+    /// Each lane track's landing bumps these literals; that track re-pins this
+    /// test.
     #[test]
-    fn lane_slots_match_the_landed_lanes() {
-        assert_eq!(collect_lanes(None).len(), 2);
+    fn lane_slots_count_the_landed_lanes() {
+        assert_eq!(collect_lanes(None).len(), 3);
         assert_eq!(collect_native_checks().len(), 0);
 
         let shared = L4Shared {
@@ -1040,7 +1172,296 @@ mod tests {
             })),
             store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
         };
-        assert_eq!(collect_lanes(Some(&shared)).len(), 2);
+        assert_eq!(collect_lanes(Some(&shared)).len(), 3);
+    }
+
+    /// Task 19 (T4 hand-off): the operator's `ssl_insecure` reaches the WS
+    /// lane's dialer. The lane verifies upstream certificates by default, so a
+    /// self-signed `wss://` lab target is Inconclusive unless the binary
+    /// selects `TlsPolicy::AcceptAny`. `dyn Lane` exposes nothing about its
+    /// transport (`TcpTransport::tls_policy` is `pub(crate)` in
+    /// `aitm-scan-ws`), so the assertion is on the policy this module hands the
+    /// builder, plus the fact that the insecure build is still the one `ws`
+    /// lane.
+    #[test]
+    fn the_ws_lane_receives_ssl_insecure() {
+        use aitm_scan_model::LaneKind;
+
+        let mut cfg = Config::default();
+        assert_eq!(
+            ws_tls_policy(&cfg),
+            TlsPolicy::Verify,
+            "the default posture"
+        );
+
+        cfg.ssl_insecure = true;
+        assert_eq!(
+            ws_tls_policy(&cfg),
+            TlsPolicy::AcceptAny,
+            "ssl_insecure: true relaxes the WS lane's chain validation"
+        );
+
+        let lanes = collect_lanes_with(None, ws_tls_policy(&cfg));
+        assert!(
+            lanes.iter().any(|lane| lane.lane() == LaneKind::Ws),
+            "the WS lane is among the collected lanes: {:?}",
+            lanes.iter().map(|lane| lane.lane()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A check that sends nothing, standing in for one a Rhai `reg.add_check`
+    /// declared. The model crate's `NullCheck` lives behind its `testing`
+    /// feature, which this crate does not enable, so the wiring test carries its
+    /// own two-line check rather than growing a dependency.
+    struct WiredCheck(aitm_scan_model::CheckMeta);
+
+    impl WiredCheck {
+        fn new(id: &str) -> Self {
+            Self(aitm_scan_model::CheckMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                class: "none".to_string(),
+                lanes: vec![aitm_scan_model::LaneKind::Http],
+                kinds: vec![aitm_scan_model::InsertionKind::Query],
+                intensity: aitm_scan_model::Intensity::Passive,
+                cost: aitm_scan_model::CheckCost::Light,
+                technique: aitm_scan_model::Technique::Observe,
+                severity: aitm_poc::Severity::Info,
+                confidence_max: aitm_scan_model::Confidence::Tentative,
+                needs_baseline: false,
+                wants_traits: None,
+                targets_session: false,
+                scope: aitm_scan_model::CheckScope::Point,
+                cwe: None,
+                description: "Concludes nothing.".to_string(),
+                remediation: None,
+                origin: aitm_scan_model::CheckOrigin::Custom {
+                    path: "wired.rhai".to_string(),
+                },
+            })
+        }
+    }
+
+    impl aitm_scan_model::Check for WiredCheck {
+        fn meta(&self) -> &aitm_scan_model::CheckMeta {
+            &self.0
+        }
+
+        fn run<'a>(
+            &'a self,
+            _point: &'a aitm_scan_model::InsertionPoint,
+            _host: &'a dyn aitm_scan_model::ProbeHost,
+        ) -> futures::future::BoxFuture<'a, aitm_scan_model::Verdict> {
+            Box::pin(async {
+                aitm_scan_model::Verdict {
+                    outcome: aitm_scan_model::Outcome::Clean,
+                    confidence: aitm_scan_model::Confidence::Tentative,
+                    evidence: aitm_scan_model::Evidence::default(),
+                    detail: "nothing to report".to_string(),
+                    poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
+                }
+            })
+        }
+    }
+
+    /// A plugin that registers a check — not a command — while it loads, which
+    /// is what the Rhai tier does for every `reg.add_check` in a script.
+    struct CheckPusher {
+        checks: Arc<aitm_scan_model::CheckRegistry>,
+        id: &'static str,
+    }
+
+    impl Plugin for CheckPusher {
+        fn name(&self) -> &str {
+            "check-pusher"
+        }
+
+        fn load(&mut self, _reg: &mut Registry) {
+            self.checks
+                .add("test-script", Arc::new(WiredCheck::new(self.id)))
+                .expect("the registry is empty, so the id is free");
+        }
+    }
+
+    /// Spec D9.2 and D5 (call B3): assembly builds the one [`aitm_core::JobBus`]
+    /// every server is handed and the write-once cell `main.rs` binds the
+    /// scanner's owned handles into once the proxy exists. Straight out of
+    /// assembly nobody subscribes to the bus and nothing is bound, so a `scan.*`
+    /// verb that reached the engine before `bind_proxy` is told plainly that the
+    /// services are missing instead of running a job over handles that do not
+    /// exist yet.
+    #[test]
+    fn assembled_exposes_a_job_bus_and_an_unbound_scan_late() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("job-bus");
+        let assembled = assemble(&cfg).expect("assemble");
+
+        assert_eq!(assembled.job_bus.receiver_count(), 0);
+        assert!(!assembled.scan_late.is_bound());
+        let err = assembled
+            .scan_late
+            .get()
+            .expect_err("the cell is unbound until main.rs binds it");
+        assert!(
+            err.to_string().contains("not bound"),
+            "the unbound error names the condition: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// Task 15 and call B7: an ordinary assembly carries the whole scanner v2
+    /// verb surface plus one `check.<id>` command per catalogue entry. Which
+    /// entries exist depends on the lanes this build links (the interim HTTP
+    /// lane's five while no lane crate supplies `http`; T2's once it does), so
+    /// the manual verbs are checked against the engine's own catalogue, and the
+    /// interim ids only while the `http` lane is the interim one.
+    #[test]
+    fn scan_verbs_and_manual_checks_are_registered() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("scan-verbs");
+        let assembled = assemble(&cfg).expect("assemble");
+        let reg = assembled.proxy.registry();
+        let engine = assembled
+            .scanner_engine
+            .get()
+            .expect("the scanner plugin built its engine during assembly")
+            .clone();
+        let catalogue = engine.catalogue();
+        let ids: Vec<String> = catalogue
+            .all()
+            .iter()
+            .map(|c| c.meta().id.clone())
+            .collect();
+        assert!(!ids.is_empty(), "the catalogue is never empty");
+        for id in &ids {
+            assert!(
+                reg.command(&format!("check.{id}")).is_some(),
+                "check.{id} is registered for catalogue entry {id}"
+            );
+        }
+        let http_is_interim = engine.lane_entries().iter().any(|e| {
+            e.lane == aitm_scan_model::LaneKind::Http
+                && e.source == aitm_scan_model::LaneSource::Interim
+        });
+        if http_is_interim {
+            for id in [
+                "xss-reflected",
+                "open-redirect",
+                "reflection",
+                "security-header",
+                "cookie-flag",
+            ] {
+                assert!(
+                    ids.iter().any(|have| have == id),
+                    "interim check {id} is in the catalogue"
+                );
+            }
+        }
+
+        for name in [
+            "scan.start",
+            "scan.map",
+            "scan.status",
+            "scan.list",
+            "scan.cancel",
+            "scan.issues",
+            "scan.issue",
+            "scan.issue.update",
+            "scan.sitemap",
+            "scan.checks",
+            "scan.profile.list",
+            "scan.profile.get",
+            "scan.profile.save",
+            "scan.profile.delete",
+            "scan.session.preview",
+            "scan.discover",
+            "scan.passive",
+            "scan.report",
+        ] {
+            assert!(reg.command(name).is_some(), "{name} is registered");
+        }
+
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// Call B7: the scanner's `load` mints a `check.<id>` command for every
+    /// check the scripting tier declared, so it has to be registered **after**
+    /// the script tier — a plugin that adds a check while it loads (what a Rhai
+    /// `reg.add_check` does) must be visible to the scanner, not half a chain
+    /// too late.
+    #[test]
+    fn scanner_loads_after_the_script_tier() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("script-checks");
+        let checks = Arc::new(aitm_scan_model::CheckRegistry::new());
+        let assembled = assemble_with_scripts(
+            &cfg,
+            &Features::default(),
+            ScriptWiring {
+                plugins: vec![Box::new(CheckPusher {
+                    checks: Arc::clone(&checks),
+                    id: "wired-check",
+                })],
+                script_checks: Some(Arc::clone(&checks)),
+                ..ScriptWiring::default()
+            },
+        )
+        .expect("assemble with a scripting tier");
+
+        assert_eq!(
+            checks.len(),
+            1,
+            "the tier registered its check while loading"
+        );
+        assert!(
+            assembled
+                .proxy
+                .registry()
+                .command("check.wired-check")
+                .is_some(),
+            "the scanner loaded after the tier and saw its check"
+        );
+
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// Spec D11 (call D11): the plugin runs on the `scanner:` section the config
+    /// file parsed — never `ScannerConfig::default()` — and the binary copies the
+    /// two values that are not `scanner:` keys onto it: `findings.dir`, where job,
+    /// issue and profile state is written, and `l4.allow_agent_inject`, so the
+    /// `scan.start` L4 gate reads one struct rather than two.
+    #[test]
+    fn scanner_config_reaches_the_plugin() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("scanner-cfg");
+        cfg.findings.dir = Some(temp_ca_dir("scanner-findings"));
+        let features = Features {
+            scanner: aitm_plugin_scanner::ScannerConfig {
+                max_jobs: 7,
+                default_profile: "light-http".to_string(),
+                ..aitm_plugin_scanner::ScannerConfig::default()
+            },
+            l4: L4Config {
+                allow_agent_inject: true,
+                ..L4Config::default()
+            },
+            ..Features::default()
+        };
+
+        let assembled = assemble_with(&cfg, &features).expect("assemble");
+        let engine = assembled
+            .scanner_engine
+            .get()
+            .expect("the plugin's `load` built the engine");
+        assert_eq!(engine.cfg.max_jobs, 7);
+        assert_eq!(engine.cfg.default_profile, "light-http");
+        assert_eq!(engine.cfg.findings_dir, cfg.findings.dir);
+        assert!(engine.cfg.l4_allow_agent_inject);
+
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
     }
 
     /// L4PAR-AC34 / spec §2.1: the hook both the server path and `aitm tui` hand
@@ -1340,7 +1761,13 @@ mod sysproxy_tests {
 
     /// Invoke a registered command the way a frontend does, as `frontend`.
     fn invoke(proxy: &Proxy, cfg: &Config, name: &str, frontend: Frontend) -> Value {
-        let services = crate::tui::services(proxy, cfg, None, crate::tui::TuiLog::Off);
+        let services = crate::tui::services(
+            proxy,
+            cfg,
+            None,
+            crate::tui::TuiLog::Off,
+            Arc::new(JobBus::default()),
+        );
         let host = CommandHost::new(&*services.store, &*services.client, &*services.guard, None)
             .with_frontend(frontend);
         proxy

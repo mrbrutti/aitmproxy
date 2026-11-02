@@ -3,6 +3,7 @@ import Foundation
 /// Hosts and apps pinned to the sidebar's Working group (`pins.json`).
 public struct Pins: Codable, Hashable, Sendable {
     public var hosts: [String]
+    /// Group keys (`ClientInfo.groupKey`: the signing identifier when the row has one, else the name).
     public var apps: [String]
 
     public init(hosts: [String] = [], apps: [String] = []) {
@@ -61,7 +62,7 @@ public struct SelectionSummary: Hashable, Sendable {
             if let req = row.requestBytes, let resp = row.responseBytes {
                 sized += 1
                 // Saturating: the bus decode bounds its sizes, but rows also come from
-                // imports and fixtures, and a sum must never trap the app.
+                // imports, and a sum must never trap the app.
                 bytes = ThroughputMeter.saturatingSum(bytes, ThroughputMeter.saturatingSum(max(req, 0), max(resp, 0)))
             }
             if let d = row.duration { duration += d }

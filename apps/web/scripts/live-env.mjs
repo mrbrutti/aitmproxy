@@ -131,9 +131,11 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
   const dir = mkdtempSync(join(tmpdir(), 'aitm-live-'));
   const token = 'live-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   // Configuring `mcp.operator_token` (any non-empty secret) ENABLES operator access: the server then
-  // mints a FRESH per-run operator *bridge* token and prints `web UI (operator): http://…/#t=<tok>`
-  // on stdout (the secret itself never appears in a URL/log). We parse that URL + token below so the
-  // CUA can drive the web surface as a real `Frontend::Operator` (vs the agent `--token` = Mcp).
+  // mints a FRESH per-run operator *bridge* token and prints it in its stdout start-up block
+  // (`web::startup_summary`) on the line `  Operator   http://…/#t=<tok>&expect=operator`, next to
+  // the agent `  Web UI     http://…/#t=<tok>` line; the secret itself never appears in a URL/log.
+  // We parse that URL + token below so a script can connect to /bus as a real `Frontend::Operator`
+  // (vs the agent `--token` = Mcp), exactly as the UI opened from that URL does.
   const operatorSecret = 'opsecret-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   const pocDir = join(dir, 'poc');
   const pocOut = join(dir, 'poc-out');
@@ -163,24 +165,25 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
   for (const d of [pocDir, pocOut]) if (!existsSync(d)) spawn('mkdir', ['-p', d]);
   const child = spawn(aitmBin, ['--config', cfg, 'web', '--listen', `127.0.0.1:${webPort}`, '--token', token], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info' },
+    env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info', AITM_AUDIT_LOG: process.env.AITM_AUDIT_LOG ?? 'off' },
   });
   let stderr = '';
   let out = '';
   let operatorUiUrl = null;
-  const opMatch = () => out.match(/web UI \(operator\):\s*(\S+)/);
+  // The `Operator` line of the stdout start-up block (see the comment above `operatorSecret`).
+  const opMatch = () => out.match(/^\s*Operator\s+(https?:\/\/\S+)/m);
   child.stderr.on('data', (d) => {
     stderr += d;
     log(String(d).trimEnd());
   });
   await new Promise((res, rej) => {
-    // Readiness: the server logs "web UI listening" via tracing (stderr) and prints the agent +
-    // operator URLs on stdout. Resolve once the operator URL is captured, or on the generic
-    // listen/agent line (older builds / operator disabled).
+    // Readiness: the server logs "web UI listening" via tracing (stderr) and prints the start-up
+    // block with the `Web UI` and `Operator` URLs on stdout. Resolve once the operator URL is
+    // captured, or on the listening log / the `Web UI` line (operator access not configured).
     const check = () => {
       const m = opMatch();
       if (m) operatorUiUrl = m[1];
-      if (operatorUiUrl || /web UI (listening|: http|\(agent\))/i.test(out + stderr)) res();
+      if (operatorUiUrl || /web UI listening/i.test(stderr) || /^\s*Web UI\s+https?:\/\//m.test(out)) res();
     };
     child.stdout.on('data', (d) => {
       out += d;
@@ -223,12 +226,25 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
   };
 }
 
-/** Minimal JSON-RPC client over the /bus bridge (same wire as the UI's ws.ts). */
+/**
+ * Minimal JSON-RPC client over the /bus bridge (same wire as the UI's ws.ts). `token` is a bridge
+ * token: the agent one (`startAitm().token`) connects as `Frontend::Mcp`, the operator one
+ * (`startAitm().operatorToken`) as `Frontend::Operator`. `role` is the role the server echoed in
+ * the `initialize` result (`"operator"` / `"mcp"` / …), the same field ws.ts reads; a refused token
+ * (`{"id":null,"error":{"code":-32001,…}}` then a Policy close) fails every call in flight with
+ * the bridge's text instead of hanging `initialize`.
+ */
 export async function connectBus(busUrl, token) {
   const ws = new WebSocket(busUrl, { headers: { Origin: `http://${new URL(busUrl).host}` } });
   let id = 0;
   const pending = new Map();
   const notifications = [];
+  const failAll = (why) => {
+    for (const [n, p] of pending) {
+      pending.delete(n);
+      p.reject(new Error(`rpc ${p.method}: ${why}`));
+    }
+  };
   ws.onmessage = (ev) => {
     for (const line of String(ev.data).split('\n')) {
       if (!line.trim()) continue;
@@ -237,9 +253,14 @@ export async function connectBus(busUrl, token) {
         const p = pending.get(m.id);
         pending.delete(m.id);
         m.error ? p.reject(new Error(`rpc ${p.method}: ${JSON.stringify(m.error)}`)) : p.resolve(m.result);
+      } else if (m.id === null && m.error) {
+        // The bridge's reply to a bad token line is addressed to no request and the connection
+        // ends right after it.
+        failAll(`bus refused the token: ${JSON.stringify(m.error)}`);
       } else notifications.push(m);
     }
   };
+  ws.onclose = (ev) => failAll(`bus closed (code ${ev.code}${ev.reason ? `, ${ev.reason}` : ''})`);
   await new Promise((r, j) => ((ws.onopen = r), (ws.onerror = () => j(new Error('bus connect failed')))));
   ws.send(JSON.stringify({ token }) + '\n');
   const rpc = (method, params = {}) =>
@@ -248,7 +269,8 @@ export async function connectBus(busUrl, token) {
       pending.set(n, { resolve, reject, method });
       ws.send(JSON.stringify({ jsonrpc: '2.0', id: n, method, params }) + '\n');
     });
-  await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'live-env', version: '0' } });
+  const info = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'live-env', version: '0' } });
+  const role = typeof info?.role === 'string' ? info.role : null;
   const tools = async () => (await rpc('tools/list', {})).tools;
   /** Calls a tool; throws on isError with the tool's message. Returns structuredContent (or text). */
   const call = async (name, args = {}) => {
@@ -262,7 +284,7 @@ export async function connectBus(busUrl, token) {
       return t;
     }
   };
-  return { rpc, call, tools, notifications, close: () => ws.close() };
+  return { rpc, call, tools, notifications, role, close: () => ws.close() };
 }
 
 /** Polls `fn` until it returns a truthy value or the deadline passes. */

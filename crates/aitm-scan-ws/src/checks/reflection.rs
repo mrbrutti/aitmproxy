@@ -26,8 +26,9 @@ use std::sync::{Arc, OnceLock};
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
-    Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, Technique, Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Evidence, InsertionKind,
+    InsertionPoint, Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, Technique,
+    Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -79,6 +80,7 @@ fn meta() -> &'static CheckMeta {
         needs_baseline: false,
         wants_traits: None,
         targets_session: false,
+        scope: CheckScope::Point,
         cwe: Some(79),
         description:
             "Sends a marked canary in a WebSocket field and reports it when the server echoes it \
@@ -175,6 +177,8 @@ impl Check for InputReflection {
                 // No `ws:` PoC step exists in v2, so a hint would describe a
                 // reproduction the runner cannot execute (plan call 19).
                 poc_hint: None,
+                location: None,
+                more: Vec::new(),
             }
         })
     }

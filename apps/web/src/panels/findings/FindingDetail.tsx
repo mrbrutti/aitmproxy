@@ -3,7 +3,7 @@
 
 import { createEffect, createMemo, createResource, createSignal, For, Match, on, onCleanup, Show, Switch, type Component } from 'solid-js';
 import { Portal } from 'solid-js/web';
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import { Badge, Button, Icon, Menu, Popover, type AnchorRect } from '~/components';
 import { methodHue, statusHue, type FlowSummary } from '~/model/flow';
 import { useApp } from '~/state/context';
