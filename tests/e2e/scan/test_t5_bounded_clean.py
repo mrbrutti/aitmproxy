@@ -23,10 +23,12 @@ SKIP (77) conditions, each naming the missing thing:
   * the core does not advertise the `scan.*` verbs this cell calls (pre-T1b core);
   * `scan.checks` lists no check for the `l4_packet` lane (the T5 lane is not on this build);
   * the L4 module is not enabled on the core (no `l4.capture.status`);
-  * `l4.capture.status` says `available: false` -- the packet lane needs raw pcap privilege
-    (macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW). On Matt's Mac
-    /dev/bpf* is root-only, so this cell SKIPs there with the core's own `reason` until BPF
-    is granted or a Linux rig runs it;
+  * `l4.privilege` (or, on a pre-p1b core, `l4.capture.status`) says packet capture is not
+    available: the cell SKIPs with `packet-capture permission not granted (...)` naming the
+    product's own path (macOS: the Aitmproxy app's packet-capture helper; Linux: the
+    packet-capture helper, or the core process holding CAP_NET_RAW on a test rig), followed
+    by the core's own reason. A core that holds the capability through the helper rather
+    than its own process SKIPs too, naming that route (the proof is per-process today);
   * the core accepted the job but reported the `l4_packet` lane as skipped (its reason).
 
 serial: it runs a privileged loopback capture and a packet fuzz run. Exit 0 / 1 / 77.
@@ -62,6 +64,9 @@ CASES = 100
 LIVENESS_EVERY = 25
 # 100 cases + 1 baseline + 4 scheduled liveness probes (cases 25, 50, 75, 100).
 EXPECTED_FRAMES = CASES + 1 + CASES // LIVENESS_EVERY
+# How many cases a healthy target on a loaded rig may fail to answer inside the 500 ms
+# window before this cell calls it a regression (each costs one liveness probe frame).
+MAX_SILENT_READS = 5
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.checks")
 JOB_TIMEOUT = 600.0
 
@@ -107,7 +112,8 @@ def main() -> int:
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
         status = packet_lane_gate(op, *VERBS)
-        note("l4.capture.status", {k: v for k, v in status.items() if k != "reason"})
+        note("l4.capture.status", {k: v for k, v in status.items() if k not in ("reason", "privilege")})
+        note("l4.privilege (None on a core without the verb)", status.get("privilege"))
 
         section("observer 1: start the operator's own loopback capture before a single case is sent")
         started_cap = op.confirm("l4.capture.start", {"interface": iface, "direction": "inbound"})
@@ -121,6 +127,11 @@ def main() -> int:
 
         section(f"act: a bounded packet-lane job -- {CASES} cases, liveness every {LIVENESS_EVERY}")
         profile = {
+            "name": "e2e-t5-bounded-clean",
+            # The packet lane's checks are `intrusive` (spec D8.4); the engine skips a
+            # check above the profile's intensity (scheduler), and `intrusive` is
+            # operator-only (amendment 13), which this cell is.
+            "intensity": "intrusive",
             "lanes": ["l4_packet"],
             "target": {"origins": [], "l4": [{"ip": ip, "port": port, "proto": proto}]},
             # One insertion point: with the default IPv4/UDP field table the lane
@@ -140,7 +151,7 @@ def main() -> int:
                "the l4_packet lane is in lanes.run", started.get("lanes"))
 
         final = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
-        note("scan.status (terminal)", {k: final.get(k) for k in ("state", "phase", "stopped_reason", "l4", "issues")})
+        note("scan.status (terminal)", {k: final.get(k) for k in ("state", "phase", "stopped_reason", "error", "lanes", "points", "checks", "l4", "issues")})
 
         section("assert: the job finished done, clean, and inside its budget")
         expect(final.get("state") == "done", "the job finished `done`", final.get("state"))
@@ -162,10 +173,20 @@ def main() -> int:
         injected = [p for p in packets if p.get("injected") is True]
         note("capture", f"{len(packets)} packets total, {len(to_port)} to port {port}, "
                         f"{len(injected)} flagged injected")
-        expect(len(to_port) == EXPECTED_FRAMES,
-               f"the capture holds exactly {EXPECTED_FRAMES} frames to port {port} "
-               f"({CASES} cases + 1 baseline + {CASES // LIVENESS_EVERY} scheduled liveness probes)",
+        # Exactly 105 on a quiet rig. A case whose 500 ms reply window a loaded rig read
+        # as silent costs one more frame: the first liveness probe of its pair passes on a
+        # healthy target, so no retry (the strict correlation of amendment 66 no longer
+        # lets a stray loopback frame end the window early; rig runs 10-12 saw 106, i.e.
+        # one such case). This is the INDEPENDENT bound on what the lane sent (the
+        # status.l4 counters above are the lane reporting on itself), so the allowance is
+        # a small regression bound, not the protocol's worst case (tester finding F2).
+        extra_probes = len(to_port) - EXPECTED_FRAMES
+        expect(0 <= extra_probes <= MAX_SILENT_READS,
+               f"the capture holds {EXPECTED_FRAMES} frames to port {port} "
+               f"({CASES} cases + 1 baseline + {CASES // LIVENESS_EVERY} scheduled liveness probes), "
+               f"plus at most {MAX_SILENT_READS} liveness probes for cases a loaded rig read as silent",
                len(to_port))
+        note("extra liveness probes beyond the budgeted 105", extra_probes)
         stray_dst = sorted({str(p.get("dst")) for p in to_port if p.get("dst") != "127.0.0.1"})
         expect(not stray_dst, "every frame to the pinned port has dst 127.0.0.1", stray_dst)
         stray_injected = [{"dst": p.get("dst"), "dst_port": p.get("dst_port")} for p in injected

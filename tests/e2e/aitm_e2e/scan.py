@@ -51,7 +51,9 @@ __all__ = [
     "SCAN_VERBS_D3",
     "REFLECTED_XSS_CLASSES",
     "WS_CSWSH_CLASS",
-    "WS_INJECTION_CLASS",
+    "WS_REFLECTION_CLASS",
+    "WS_OVERSIZE_CLASS",
+    "WS_OVERSIZE_CHECK_ID",
     "JOB_NOTIFICATION_METHOD",
     "TERMINAL_STATES",
     "TERMINAL_EVENTS",
@@ -75,6 +77,8 @@ __all__ = [
     "issue",
     "brief",
     "sitemap",
+    "PACKET_LANE_VIA",
+    "PACKET_PERMISSION_PENDING",
     "packet_lane_gate",
     "read_capture_packets",
     "ScanTarget",
@@ -131,14 +135,22 @@ ROLES = ("operator", "agent")
 # The token is settled: `reflected-xss` is the only member today.
 REFLECTED_XSS_CLASSES: tuple[str, ...] = ("reflected-xss",)
 
-# The WebSocket issue families (D3 manifest rows `ws-cswsh` / `ws-input-reflection`,
-# whose classes are these). Check ids are a separate vocabulary: `ws-oversize-frame`
-# is a check id, not a class.
-WS_CSWSH_CLASS = "ws-cswsh"
-WS_INJECTION_CLASS = "ws-injection"
+# Integration-shared edit, sanctioned by the coordinator (2026-11-01): T4's SHIPPED
+# class names are the WebSocket vocabulary, and `ws-cswsh` / `ws-injection` are retired.
+# The classes T4's checks declare (`crates/aitm-scan-ws/src/checks/*.rs`) are `cswsh`,
+# `ws-auth-bypass`, `ws-input-reflection`, `ws-oversize-frame` and `ws-subprotocol`;
+# injection over frames reports the family tokens `sqli` / `ssti` / `cmdi`.
+# Check ids are still a separate vocabulary and differ from the class for CSWSH
+# (id `cswsh`, class `cswsh`) and subprotocol (id `ws-subprotocol-observe`,
+# class `ws-subprotocol`); for oversize the id and the class are both
+# `ws-oversize-frame`, so both constants are spelled out below.
+WS_CSWSH_CLASS = "cswsh"
+WS_REFLECTION_CLASS = "ws-input-reflection"
+WS_OVERSIZE_CLASS = "ws-oversize-frame"
+WS_OVERSIZE_CHECK_ID = "ws-oversize-frame"
 
 _CONTRACT = Path(repo_root()) / "crates" / "aitm" / "tests" / "frontends.rs"
-_ERROR_CODE_RE = re.compile(r"scan: ([a-z_]+):")
+_ERROR_CODE_RE = re.compile(r"scan: ([a-z0-9_]+):")
 _HTTP_TIMEOUT = 5.0
 
 
@@ -207,15 +219,39 @@ def require_lane(client, lane: str, role: str = "operator") -> None:
         skip(f"lane {lane} has no scan.checks entry on this build")
 
 
-def require_checks(client, *ids: str, role: str = "operator") -> None:
+def require_checks(client, *ids: str, role: str = "operator", needs: str | None = None) -> None:
     """SKIP 77 naming every check id of `ids` the live `scan.checks` catalogue lacks
     (a check that has not landed on this build is a loud SKIP, never a silent pass).
-    Goes through `scan_call`, so the ledger records the call at `role`."""
+    `needs` names the track that lands them (appended to the reason). Goes through
+    `scan_call`, so the ledger records the call at `role`."""
     require_verbs(client, "scan.checks")
     live = {c.get("id") for c in _catalogue(client, role)}
     missing = [i for i in ids if i not in live]
     if missing:
-        skip("missing check id " + ", ".join(missing) + " in scan.checks (not on this build)")
+        reason = "missing check id " + ", ".join(missing) + " in scan.checks (not on this build)"
+        skip(reason + (f"; {needs}" if needs else ""))
+
+
+def lane_source(client, lane: str, role: str = "operator") -> str | None:
+    """`scan.checks`' `lanes[].source` for `lane`: `"crate"` (a lane crate's lane),
+    `"interim"` (the engine's own HTTP lane, which stands in until `aitm-scan-http`
+    lands) or None when the core does not list the lane at all or predates the
+    key (T1b, 2026-11-01: additive, so an older core simply reports None)."""
+    require_verbs(client, "scan.checks")
+    result = scan_call(client, role, "scan.checks", {})
+    rows = result.get("lanes", []) if isinstance(result, dict) else []
+    for row in rows:
+        if isinstance(row, dict) and row.get("lane") == lane:
+            return str(row.get("source", "crate"))
+    return None
+
+
+def require_crate_lane(client, lane: str, needs: str, role: str = "operator") -> None:
+    """SKIP 77 while `lane` is served by the engine's interim lane rather than a
+    lane crate; `needs` names the track that lands the crate. A core that does not
+    report lane sources is left alone (the cell then asserts on real behaviour)."""
+    if lane_source(client, lane, role) == "interim":
+        skip(f"{lane} lane is the interim lane; {needs}")
 
 
 def _catalogue(client, role: str) -> list[dict]:
@@ -327,6 +363,11 @@ atexit.register(ledger_flush)
 # ---------------------------------------------------------------------------
 
 
+def _sets_use_browser(d) -> bool:
+    """Whether a profile or overrides dict pins `crawl.use_browser` itself."""
+    return isinstance(d, dict) and isinstance(d.get("crawl"), dict) and "use_browser" in d["crawl"]
+
+
 def _job_args(profile, profile_name, target, overrides) -> dict:
     given = [k for k, v in (("profile", profile), ("profile_name", profile_name), ("target", target)) if v is not None]
     if len(given) != 1:
@@ -338,6 +379,17 @@ def _job_args(profile, profile_name, target, overrides) -> dict:
         args["profile_name"] = profile_name
     if target is not None:
         args["target"] = target
+    # Sanctioned default (coordinator, 2026-11-01): a cell that does not ask for
+    # the browser runs the client crawl. On a rig with obscura present the
+    # engine's `use_browser: auto` would pick the browser, and a browser proxy
+    # port shared with another session's core makes every navigation time out.
+    # A cell that sets `crawl.use_browser` itself (profile or overrides) is
+    # left alone (test_t2_crawl needs the real browser).
+    if not _sets_use_browser(profile) and not _sets_use_browser(overrides):
+        overrides = dict(overrides or {})
+        crawl = dict(overrides.get("crawl") or {})
+        crawl["use_browser"] = "never"
+        overrides["crawl"] = crawl
     if overrides is not None:
         args["overrides"] = overrides
     return args
@@ -509,28 +561,88 @@ def sitemap(client, role: str, job: str, *, limit: int = 1024) -> tuple[list[dic
         seen.add(cursor)
 
 
+# The privilege route the packet-lane proof accepts today (l4-capture-privilege spec
+# §2.2 `l4.privilege`: a capability's `via` is `process` or `helper`). A tuple so the
+# helper route is a one-line widening once that route is proven (T5 live proof, 2026-11-01).
+PACKET_LANE_VIA: tuple[str, ...] = ("process",)
+
+# The per-platform SKIP reason when packet capture is not granted to the core process.
+# It names the PRODUCT's own privilege path (macOS: the Aitmproxy app's packet-capture
+# helper, `aitm-l4-helper`; Linux: the packet-capture helper, or CAP_NET_RAW held by the
+# core process on a test rig) -- never a third-party daemon and never a line to type.
+PACKET_PERMISSION_PENDING: dict[str, str] = {
+    "darwin": "packet-capture permission not granted (aitm-l4-helper phase 1 pending)",
+    "linux": "packet-capture permission not granted (the core process has no CAP_NET_RAW; "
+             "the packet-capture helper of spec 2026-10-31-l4-capture-privilege-design.md is pending)",
+}
+_PACKET_PERMISSION_PENDING_OTHER = (
+    "packet-capture permission not granted (no packet-capture privilege path is defined for "
+    "this platform by spec 2026-10-31-l4-capture-privilege-design.md)")
+
+
+def _packet_permission_pending() -> str:
+    return PACKET_PERMISSION_PENDING.get(sys.platform, _PACKET_PERMISSION_PENDING_OTHER)
+
+
+def _privilege_gate(privilege: dict) -> None:
+    """SKIP 77 unless the `l4.privilege` report says `capture` AND `inject` are
+    `available` via a route in `PACKET_LANE_VIA`. Anything else is a SKIP with the
+    report's own reason, never a FAIL: a core serving through the helper, or one still
+    waiting for approval, is not broken."""
+    caps = privilege.get("capabilities") if isinstance(privilege.get("capabilities"), dict) else {}
+    for name in ("capture", "inject"):
+        cap = caps.get(name) if isinstance(caps.get(name), dict) else {}
+        if cap.get("state") != "available":
+            reason = cap.get("reason") or f"l4.privilege reports {name} {cap.get('state')!r}"
+            skip(f"{_packet_permission_pending()}; core says: {reason}")
+    for name in ("capture", "inject"):
+        via = caps[name].get("via")
+        if via not in PACKET_LANE_VIA:
+            skip(f"the packet-lane proof expects capture via process on this PR; the core reports "
+                 f"via {via} (widen PACKET_LANE_VIA when that route is proven)")
+
+
 def packet_lane_gate(client, *verbs: str, role: str = "operator") -> dict:
     """SKIP 77 unless this core can really run the L4 PACKET lane: every verb of
     `verbs` live, an `l4_packet` lane in `scan.checks`, the L4 module compiled in and
-    enabled, and raw capture privilege. Returns the `l4.capture.status` reply."""
+    enabled, and packet-capture privilege held by the core process.
+
+    Privilege is read from `l4.privilege` (l4-capture-privilege spec §2.2) when the core
+    advertises it: `capabilities.capture` and `capabilities.inject` must both be
+    `{"state": "available", "via": <one of PACKET_LANE_VIA>}`. On a pre-p1b core without
+    the verb it falls back to `l4.capture.status.available`. Either way a missing grant
+    SKIPs with `PACKET_PERMISSION_PENDING[platform]; core says: <reason>`.
+
+    Returns the `l4.capture.status` reply plus `"privilege"`: the `l4.privilege` reply,
+    or None on a core without the verb. Neither holds a token."""
     if verbs:
         require_verbs(client, *verbs)
     require_lane(client, "l4_packet", role)
-    if "l4.capture.status" not in set(client.tool_names()):
+    tools = set(client.tool_names())
+    if "l4.capture.status" not in tools:
         skip("the L4 module is not enabled on this core (no l4.capture.status): the packet lane "
              "needs l4.enabled and the feature-compiled l4 module")
     status, reply = client.try_call("l4.capture.status")
     if status != "ok" or not isinstance(reply, dict):
         skip(f"l4.capture.status did not answer with an availability object: {str(reply)[:200]}")
-    if reply.get("available") is not True:
-        skip(f"the L4 packet lane needs raw pcap privilege, and this core has none: {reply.get('reason')} "
-             "(macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW)")
-    return reply
+    privilege: dict | None = None
+    if "l4.privilege" in tools:
+        p_status, privilege = client.try_call("l4.privilege")
+        if p_status != "ok" or not isinstance(privilege, dict):
+            skip(f"l4.privilege did not answer with a privilege report: {str(privilege)[:200]}")
+        _privilege_gate(privilege)
+    elif reply.get("available") is not True:
+        skip(f"{_packet_permission_pending()}; core says: {reply.get('reason')}")
+    return {**reply, "privilege": privilege}
 
 
 def read_capture_packets(client, flow_id: str, page: int = 500) -> list[dict]:
-    """Every packet of an L4 capture flow, walking `l4.flow.get {offset, limit}`
-    while the reply says `truncated`. Not a scan verb: not in the ledger."""
+    """Every packet of an L4 capture flow, walking `l4.flow.get {offset, limit}` until
+    `packet_count` packets have been read. The reply's `truncated` / `next_offset` say
+    only that the reply's *byte* budget cut a page short (`FLOW_GET_MAX_REPLY_BYTES`),
+    never that the `limit` window ended, so a walk keyed on `truncated` alone stopped
+    after one page and undercounted a 600-packet flow as 500 (T5 rig run 6/7, 2026-11-02).
+    Not a scan verb: not in the ledger."""
     out: list[dict] = []
     offset = 0
     while True:
@@ -539,10 +651,17 @@ def read_capture_packets(client, flow_id: str, page: int = 500) -> list[dict]:
             raise RuntimeError(f"l4.flow.get: expected an object, got {type(doc).__name__}")
         got = doc.get("packets") or []
         out.extend(got)
+        total = doc.get("packet_count")
+        if not got:
+            break
         nxt = doc.get("next_offset")
-        if not doc.get("truncated") or not isinstance(nxt, int) or nxt <= offset or not got:
-            return out
-        offset = nxt
+        if doc.get("truncated") and isinstance(nxt, int) and nxt > offset:
+            offset = nxt
+        else:
+            offset += len(got)
+        if isinstance(total, int) and offset >= total:
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -716,12 +835,13 @@ class TargetLogs:
 
 class ScanTarget:
     """`aitm-testtarget-serve --mode <mode> --port 0 [--tls-port 0 --tls-h1-port 0]
-    [--control-port 0] [--l4]` (T10 spec D1). Parses the stdout block
+    [--control-port 0] [--l4] [--latency-ms N]` (T10 spec D1). Parses the stdout block
     `listening http://..`, `tls https://..`, `tls_h1 https://..`, `control http://..`,
     `ready`; L4 addresses come from `GET /services` on the control origin."""
 
     def __init__(self, mode: str = "vulnerable", *, tls: bool = True, control: bool = True,
-                 l4: bool = False, start_timeout: float = 15.0):
+                 l4: bool = False, start_timeout: float = 15.0,
+                 latency_ms: int | None = None):
         if l4 and not control:
             raise ValueError("ScanTarget: l4=True needs control=True (--l4 needs --control-port)")
         bin_ = testtarget_bin()
@@ -742,6 +862,10 @@ class ScanTarget:
             argv += ["--control-port", "0"]
         if l4:
             argv.append("--l4")
+        if latency_ms:
+            # `--latency-ms N`: every HTTP response and WS frame waits N ms (not the
+            # L4 speakers), so a UI can be observed while a scan is still running.
+            argv += ["--latency-ms", str(int(latency_ms))]
         self.argv = argv
         self.proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)

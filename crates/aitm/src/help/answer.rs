@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use aitm_cli::dispatch::{locate, Located};
 use aitm_core::Config;
 use aitm_plugin_rhai::RhaiConfig;
+use aitm_plugin_scanner::ScannerConfig;
 use aitm_proto_l4::config::L4Config;
 use aitm_sysproxy::SystemProxyConfig;
 use aitm_term::caps::Caps;
@@ -235,6 +236,7 @@ fn default_settings() -> Settings {
         l4: L4Config::default(),
         macos_capture: MacosCaptureConfig::default(),
         system_proxy: SystemProxyConfig::default(),
+        scanner: ScannerConfig::default(),
     }
 }
 
@@ -258,7 +260,7 @@ mod tests {
     /// The env of a page built with the catalogue (19 groups, M-W2-1).
     const CATALOGUE_ENV: &[(&str, &str)] = &[("AITM_BUNDLED_SCRIPTS", BUNDLED)];
 
-    /// The env of a page built without it (17 groups, plan C30).
+    /// The env of a page built without it (18 groups, plan C30).
     const NO_CATALOGUE_ENV: &[(&str, &str)] = &[("AITM_NO_BUNDLED_SCRIPTS", "1")];
 
     /// The version the top page is built with: injected, so the literal is
@@ -575,7 +577,7 @@ mod tests {
         let config = TempConfig::new("bad", "listen: [\n");
         let (answer, warned) = ask_with(Some(&config.path), &explicit(&[]), NO_CATALOGUE_ENV);
         let text = page(&answer);
-        // The default command set: the 17 built-in groups, the top page as
+        // The default command set: the 18 built-in groups, the top page as
         // usual.
         assert!(text.starts_with("aitm 0.5.11 — "), "{text}");
         assert!(text.contains("\n  scope "), "{text}");

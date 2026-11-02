@@ -143,6 +143,11 @@ pub(crate) struct ConnInfo {
     pub(crate) peer: SocketAddr,
     pub(crate) opened_ms: u64,
     pub(crate) requests: AtomicU32,
+    /// Client streams opened on the wire (HEADERS frames on new odd ids),
+    /// counted by [`crate::h2count::H2StreamCounter`] before hyper parses
+    /// them (D2 `streams`, amendment 51). Only meaningful, and only
+    /// serialized as a number, when `alpn` is `h2`.
+    pub(crate) streams: AtomicU32,
     /// Set when `/ws` answered 101 on this connection: from then on only the
     /// frame loop's end closes it ([`ControlLog::close_conn_upgraded`]).
     pub(crate) upgraded: AtomicBool,
@@ -165,7 +170,14 @@ impl ConnInfo {
         self.upgraded.load(Ordering::SeqCst)
     }
 
+    /// Whether the connection negotiated HTTP/2 (the only case in which
+    /// `streams` has a meaning).
+    fn is_h2(&self) -> bool {
+        self.alpn.as_deref() == Some("h2")
+    }
+
     fn to_json(&self) -> Value {
+        let streams = self.is_h2().then(|| self.streams.load(Ordering::SeqCst));
         json!({
             "conn_id": self.conn_id,
             "listener": self.listener,
@@ -174,6 +186,7 @@ impl ConnInfo {
             "opened_ms": self.opened_ms,
             "closed_ms": *lock(&self.closed_ms),
             "requests": self.requests.load(Ordering::SeqCst),
+            "streams": streams,
         })
     }
 }
@@ -611,6 +624,7 @@ impl ControlLog {
             peer,
             opened_ms: Self::now_ms(),
             requests: AtomicU32::new(0),
+            streams: AtomicU32::new(0),
             upgraded: AtomicBool::new(false),
             closed_ms: Mutex::new(None),
         });
@@ -1187,6 +1201,34 @@ mod tests {
         assert_eq!(row["peer"], serde_json::json!("127.0.0.1:40000"));
         assert_eq!(row["closed_ms"], serde_json::Value::Null);
         assert_eq!(row["requests"], serde_json::json!(0));
+        // Umbrella amendment 51: an `h2` row carries the stream counter from
+        // the start (nothing opened yet), never `null`.
+        assert_eq!(row["streams"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn conns_streams_is_null_unless_alpn_is_h2() {
+        // Spec D2 (amendment 51): `streams` is a number only on an `h2`
+        // connection; plain and `http/1.1` rows say `null`.
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        let plain = log.open_conn(Listener::Plain, None, peer());
+        let h1 = log.open_conn(Listener::TlsH1, Some("http/1.1"), peer());
+        let h2 = log.open_conn(Listener::Tls, Some("h2"), peer());
+        h2.streams.fetch_add(3, Ordering::SeqCst);
+
+        let rows = log.conns_json();
+        let rows = rows["entries"].as_array().expect("entries");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["conn_id"], serde_json::json!(plain.conn_id.clone()));
+        assert_eq!(rows[0]["streams"], serde_json::Value::Null);
+        assert_eq!(rows[1]["conn_id"], serde_json::json!(h1.conn_id.clone()));
+        assert_eq!(rows[1]["streams"], serde_json::Value::Null);
+        assert_eq!(rows[2]["conn_id"], serde_json::json!(h2.conn_id.clone()));
+        assert_eq!(rows[2]["streams"], serde_json::json!(3));
+        // The raw JSON spells the key out for the null rows too (a consumer
+        // can tell "not h2" from "field missing").
+        let text = serde_json::to_string(&rows[0]).expect("json");
+        assert!(text.contains("\"streams\":null"), "{text}");
     }
 
     // --- Tester additions (stage 5): redaction edges, failed TLS, shapes, overflow ---

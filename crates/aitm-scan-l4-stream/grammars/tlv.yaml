@@ -1,0 +1,24 @@
+# The generic TLV grammar (spec S3 row 1, S4).
+#
+# This is the one grammar nobody writes by hand: `infer` reads a length
+# relation out of the captured seeds and `descriptor_to_spec` builds this
+# document from it, so every field below is # filled in by inference —
+# the `prefix` width from the recovered offset (the field is dropped
+# altogether when the length comes first), the `length` type from the
+# recovered width and byte order, and its `len` relation from what the
+# field was found to count.
+#
+# The document kept here is the shape with a two-byte prefix and a two-byte
+# big-endian length counting the body; `tlv.rs` asserts that inference still
+# generates exactly it, so the file and the code cannot drift apart.
+grammar: tlv
+transport: tcp
+reply: >-
+  Opaque framing: any byte that comes back is a reply, and a TCP service
+  that stays open without answering is alive too.
+message:
+  # Fixed bytes before the length: magic, version, a message type. Not
+  # mutated — rewriting them only makes the peer hang up.
+  - { name: prefix, type: bytes, size: 2, mutable: false }
+  - { name: length, type: u16 be, len: { of: rest, inclusive: false, adjust: 0 } }
+  - { name: payload, type: bytes }

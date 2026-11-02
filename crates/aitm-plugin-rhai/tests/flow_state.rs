@@ -216,6 +216,7 @@ fn response_edits_and_marks_apply_back() {
             trailers: HeaderMap::new(),
             body: Body::Bytes(b"ok".to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         });
     }
     let mut st = FlowState::snapshot(&flow, &Event::Response(flow.id()), MAX_BODY);

@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use aitm_plugin::language::ProtocolLanguage;
+use aitm_scan_model::registry::CheckRegistry;
 
 use crate::commands::ScriptCommands;
 use crate::config::{RhaiConfig, RhaiLimits};
@@ -50,6 +51,11 @@ pub struct ScriptTier {
     /// The sandbox limits the engine was built with, for a host to check its
     /// own body cap against.
     pub limits: RhaiLimits,
+    /// Every check the loaded scripts declared with `reg.add_check`, in the one
+    /// catalogue the scanner reads (spec D9.3). The host hands this to the
+    /// scanner; a `script.reload` swaps that script's entries in place, so the
+    /// scanner needs no reload of its own (plan call B9).
+    pub checks: Arc<CheckRegistry>,
 }
 
 /// Build the whole tier: one engine, every declared script compiled on it, the
@@ -77,6 +83,7 @@ pub fn build_with_languages(
     let limits = cfg.limits.clone();
     let findings = Arc::clone(&services.findings);
     let loader = Arc::new(RhaiLoader::new_with_languages(cfg, services, languages)?);
+    let checks = loader.checks();
     let (scripts, errors) = loader.load_all();
     let set = ScriptSet::new(scripts);
     let error_sink = loader.error_sink();
@@ -89,6 +96,7 @@ pub fn build_with_languages(
         host: ScriptHost::new(set),
         errors,
         limits,
+        checks,
     })
 }
 

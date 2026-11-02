@@ -8,12 +8,13 @@
 //! because a hint is an in-process instruction to the PoC builder, not a result
 //! (spec D2, Architect's call 23).
 
+use aitm_core::redact::scrub_text_wide;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::FlowRef;
 use crate::vocab::{
-    CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, PointTrait,
-    Technique,
+    CheckCost, CheckOrigin, CheckScope, Confidence, InsertionKind, Intensity, LaneKind, Outcome,
+    PointTrait, Technique,
 };
 
 /// The largest excerpt [`Evidence::excerpt`] will produce, in bytes (spec D2).
@@ -56,6 +57,12 @@ pub struct CheckMeta {
     /// Whether the check may mutate `session`-trait points. No v2 check does.
     #[serde(default)]
     pub targets_session: bool,
+    /// How often the scheduler runs the check: per point, per node, per origin.
+    ///
+    /// Absent from a pre-T1b catalogue entry, which reads as
+    /// [`CheckScope::Point`] — once per insertion point.
+    #[serde(default)]
+    pub scope: CheckScope,
     /// The CWE this class maps to.
     #[serde(default)]
     pub cwe: Option<u32>,
@@ -69,6 +76,16 @@ pub struct CheckMeta {
 }
 
 /// A check's result for one insertion point (spec D2).
+///
+/// **One verdict, or one per exposed path.** A check returns one root verdict
+/// and may attach sibling verdicts in [`Verdict::more`] (coordinator item (g),
+/// 2026-11-01). Each verdict's [`Verdict::location`], when present, overrides
+/// the issue location's `path` (and `name`), so an origin-scoped check such as
+/// an exposed-path probe produces one issue per entry — the dedupe key hashes
+/// class + location, which is what keeps `/.git/` and `/.env` apart. The
+/// engine flattens `more` **one level**: a `more` inside a `more` entry is
+/// ignored. Both fields are additive; a verdict written before them reads as
+/// "no override, no siblings".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Verdict {
@@ -83,6 +100,68 @@ pub struct Verdict {
     /// In-process instruction to the PoC builder; never serialised (call 23).
     #[serde(skip)]
     pub poc_hint: Option<PocHint>,
+    /// Where this verdict's issue lives when that differs from the point: the
+    /// engine takes `path` (and `name`) from here over the point's own.
+    #[serde(default)]
+    pub location: Option<VerdictLocation>,
+    /// Sibling verdicts from the same run, each becoming its own issue;
+    /// flattened one level by the engine.
+    #[serde(default)]
+    pub more: Vec<Verdict>,
+}
+
+impl Verdict {
+    /// Scrub every free-text field a check may have copied from a response, in
+    /// place: `detail`, the [`Evidence`] (through [`Evidence::scrub`]), the
+    /// [`VerdictLocation`]'s `path` and `name` (scrubbed then bounded like an
+    /// excerpt: a check that copies a response `Location` header into `path`
+    /// must not hand its `?token=` to the bus caller or the issue store), and
+    /// the same for every `more` sibling (amendment 67, call C5).
+    ///
+    /// One rule for both consumers: the Rhai bridge applies it where a script's
+    /// verdict is built, the manual `check.<id>` path applies it before the
+    /// verdict reaches the bus caller. The scrubber is `aitm_core::redact::
+    /// scrub_text_wide`, and the scrub is idempotent — `[redacted]` has nothing
+    /// left to redact — so a verdict the bridge already scrubbed comes through
+    /// the manual path unchanged.
+    pub fn scrub(&mut self) {
+        self.detail = scrub_text_wide(&self.detail);
+        self.evidence.scrub();
+        if let Some(location) = &mut self.location {
+            location.path = location
+                .path
+                .as_deref()
+                .map(|text| Evidence::excerpt(&scrub_text_wide(text)));
+            location.name = location
+                .name
+                .as_deref()
+                .map(|text| Evidence::excerpt(&scrub_text_wide(text)));
+        }
+        for sibling in &mut self.more {
+            sibling.scrub();
+        }
+    }
+
+    /// [`Verdict::scrub`] by value.
+    pub fn scrubbed(mut self) -> Self {
+        self.scrub();
+        self
+    }
+}
+
+/// The part of an issue location a verdict may override (coordinator item (g)).
+///
+/// An absent field keeps the point's value; a check that found `/.git/` sets
+/// `path` and leaves `name` to the point.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct VerdictLocation {
+    /// The request path the issue is at, overriding the point's.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The parameter or element name, overriding the point's.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// What a check tells the engine to assert when it reproduces the finding.
@@ -108,8 +187,9 @@ pub struct ControlHint {
 
 /// The proof carried by a verdict and, later, by an issue (spec D2).
 ///
-/// Every string here is bounded and already scrubbed by the caller: the model
-/// only enforces the bound, through [`Evidence::excerpt`].
+/// Every string here is bounded and scrubbed before it travels: a check hands
+/// the raw text, and [`Evidence::scrub`] (reached through [`Verdict::scrub`])
+/// scrubs it and then bounds `matched` through [`Evidence::excerpt`].
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Evidence {
@@ -137,10 +217,23 @@ pub struct Evidence {
 }
 
 impl Evidence {
+    /// Scrub the two free-text fields in place: `payload` is scrubbed;
+    /// `matched` is scrubbed **then** bounded to [`MAX_EXCERPT_BYTES`]
+    /// (amendment 16's order: a cut before the scrub could leave a fragment of
+    /// a credential the scrubber no longer recognises).
+    pub fn scrub(&mut self) {
+        self.payload = self.payload.as_deref().map(scrub_text_wide);
+        self.matched = self
+            .matched
+            .as_deref()
+            .map(|text| Self::excerpt(&scrub_text_wide(text)));
+    }
+
     /// A copy of `text` cut to at most [`MAX_EXCERPT_BYTES`] bytes, never
     /// splitting a character.
     ///
-    /// This is a bound, not a scrub: the caller passes text that has already been
+    /// This is a bound, not a scrub: [`Evidence::scrub`] scrubs first and then
+    /// calls this; a caller using it directly passes text that has already been
     /// through `aitm_core::redact` / `scrub_text_wide`.
     pub fn excerpt(text: &str) -> String {
         if text.len() <= MAX_EXCERPT_BYTES {
@@ -168,6 +261,13 @@ pub struct Timing {
     pub slope: f32,
     /// Pearson correlation coefficient of the fit.
     pub r: f32,
+    /// Whether the check judged the fit a correlation (spec D8.2: a blind timing
+    /// technique may claim `firm` only after a correlated repeat).
+    ///
+    /// The check decides, not the reader of the evidence: it knows how many
+    /// repeats it ran and against which threshold. Absent means `false`.
+    #[serde(default)]
+    pub correlated: bool,
 }
 
 /// Response-length evidence for a boolean-blind technique.
@@ -247,6 +347,8 @@ mod tests {
                 assertions: vec![aitm_poc::Assertion::Status(200)],
                 control: None,
             }),
+            location: None,
+            more: Vec::new(),
         };
 
         let json = serde_json::to_string(&verdict).expect("serializes");
@@ -274,6 +376,7 @@ mod tests {
             needs_baseline: false,
             wants_traits: None,
             targets_session: false,
+            scope: CheckScope::Point,
             cwe: Some(89),
             description: "A database error signature reveals the injected quote.".into(),
             remediation: Some("Use parameterised queries.".into()),
@@ -349,6 +452,89 @@ mod tests {
         }
     }
 
+    /// Coordinator decision 4 (spec D4): `scope` is additive. A catalogue entry
+    /// written before T1b carries no `scope` key and reads as the per-point
+    /// default, so the scheduler keeps scheduling it once per insertion point.
+    #[test]
+    fn check_scope_defaults_to_point() {
+        let json = r#"{
+            "id": "sqli-error",
+            "name": "SQL injection (error-based)",
+            "class": "sqli",
+            "lanes": ["http"],
+            "kinds": ["query"],
+            "intensity": "medium",
+            "cost": "light",
+            "technique": "error",
+            "severity": "high",
+            "confidence_max": "firm",
+            "description": "A database error signature reveals the injected quote.",
+            "origin": {"kind": "native"}
+        }"#;
+
+        let meta: CheckMeta = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(meta.scope, CheckScope::Point);
+        assert_eq!(CheckScope::default(), CheckScope::Point);
+
+        assert_eq!(
+            serde_json::to_string(&CheckScope::Origin).expect("serializes"),
+            "\"origin\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CheckScope::Node).expect("serializes"),
+            "\"node\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CheckMeta>(
+                &serde_json::to_string(&CheckMeta {
+                    scope: CheckScope::Origin,
+                    ..meta.clone()
+                })
+                .expect("serializes")
+            )
+            .expect("deserializes")
+            .scope,
+            CheckScope::Origin
+        );
+    }
+
+    /// Coordinator decision 3 (spec D8.2, AC T3-4): a timing check records
+    /// whether the fit actually correlated, and evidence written before T1b
+    /// reads as "not correlated" rather than claiming a correlation it never had.
+    #[test]
+    fn timing_correlated_defaults_false() {
+        const WITHOUT: &str = r#"{
+            "requested_s": [1.0, 3.0],
+            "observed_ms": [1020, 3030],
+            "baseline_ms": [18, 19],
+            "slope": 1005.0,
+            "r": 0.999
+        }"#;
+
+        let timing: Timing = serde_json::from_str(WITHOUT).expect("deserializes");
+        assert!(!timing.correlated);
+
+        let with: Timing = serde_json::from_str(
+            r#"{
+            "requested_s": [1.0, 3.0],
+            "observed_ms": [1020, 3030],
+            "baseline_ms": [18, 19],
+            "slope": 1005.0,
+            "r": 0.999,
+            "correlated": true
+        }"#,
+        )
+        .expect("deserializes");
+        assert!(with.correlated);
+
+        let json = serde_json::to_string(&with).expect("serializes");
+        assert!(json.contains(r#""correlated":true"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<Timing>(&json).expect("round trips"),
+            with
+        );
+    }
+
     #[test]
     fn l4_oracle_icmp_wire_shape() {
         assert_eq!(
@@ -390,5 +576,241 @@ mod tests {
 
         let back: L4Evidence = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, evidence);
+    }
+
+    /// Tester: an unknown `scope` token on a catalogue entry is a parse error,
+    /// not a silent fall-back to `point` — the scheduler must never run a check
+    /// at the wrong cadence because a script misspelt its scope.
+    #[test]
+    fn check_meta_with_an_unknown_scope_token_is_an_error() {
+        let json = r#"{
+            "id": "x", "name": "x", "class": "x",
+            "lanes": ["http"], "kinds": ["query"],
+            "intensity": "passive", "cost": "light", "technique": "passive",
+            "severity": "info", "confidence_max": "tentative",
+            "description": "x", "origin": {"kind": "native"},
+            "scope": "everywhere"
+        }"#;
+        let err = serde_json::from_str::<CheckMeta>(json).expect_err("an unknown scope is refused");
+        assert!(err.to_string().contains("everywhere"), "{err}");
+    }
+
+    /// Amendment 67 (call C5): one shared scrub for both consumers. `detail`
+    /// is scrubbed at the root and in every `more` sibling, `evidence.matched`
+    /// is scrubbed **then** bounded (amendment 16: the exact 256-byte literal
+    /// the bridge test pins — cut first, the scrub would leave 249 bytes), and
+    /// the scrub is idempotent so a verdict the bridge scrubbed comes through
+    /// the manual path unchanged. The `location` override is free text a check
+    /// may have copied from a response `Location` header, so its `path` and
+    /// `name` are scrubbed then bounded like an excerpt, root and sibling
+    /// (PR 3a panel, security Minor 1).
+    #[test]
+    fn verdict_scrub_covers_detail_evidence_and_siblings() {
+        let verdict = Verdict {
+            outcome: Outcome::Vulnerable,
+            confidence: Confidence::Firm,
+            evidence: Evidence {
+                payload: Some("q=1&access_token=tok-123".into()),
+                matched: Some(format!(
+                    "{} Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi",
+                    "a".repeat(230)
+                )),
+                ..Evidence::default()
+            },
+            detail: "echo: Authorization: Bearer abc.def.ghi".into(),
+            poc_hint: None,
+            location: Some(VerdictLocation {
+                path: Some("/reset?token=eyJhbGciOi.eyJzdWIi.c2ln".into()),
+                name: Some("n".repeat(1024 * 1024)),
+            }),
+            more: vec![Verdict {
+                outcome: Outcome::Vulnerable,
+                confidence: Confidence::Firm,
+                evidence: Evidence {
+                    payload: Some("sid=s3cr3t".into()),
+                    matched: Some("Cookie: sid=s3cr3t-cookie".into()),
+                    ..Evidence::default()
+                },
+                detail: "sibling Cookie: sid=s3cr3t".into(),
+                poc_hint: None,
+                location: Some(VerdictLocation {
+                    path: Some("/cb?sid=abc123".into()),
+                    name: None,
+                }),
+                more: Vec::new(),
+            }],
+        };
+
+        let once = verdict.clone().scrubbed();
+        assert_eq!(once.detail, "echo: Authorization: [redacted]");
+        assert_eq!(
+            once.evidence.payload.as_deref(),
+            Some("q=1&access_token=[redacted]")
+        );
+        let matched = once.evidence.matched.as_deref().expect("matched is kept");
+        assert_eq!(matched.len(), MAX_EXCERPT_BYTES);
+        assert_eq!(
+            matched,
+            format!("{} Cookie: [redacted]; Autho", "a".repeat(230))
+        );
+        assert!(!matched.contains("s3cr3t"), "{matched:?}");
+        assert_eq!(once.more.len(), 1);
+        assert_eq!(once.more[0].detail, "sibling Cookie: [redacted]");
+        assert_eq!(
+            once.more[0].evidence.matched.as_deref(),
+            Some("Cookie: [redacted]")
+        );
+        assert_eq!(
+            once.more[0].evidence.payload.as_deref(),
+            Some("sid=[redacted]")
+        );
+        // A `location` copied from a response is scrubbed then bounded, root
+        // and sibling; an absent field stays absent.
+        let location = once.location.as_ref().expect("location is kept");
+        assert_eq!(location.path.as_deref(), Some("/reset?token=[redacted]"));
+        assert_eq!(
+            location.name.as_deref(),
+            Some("n".repeat(MAX_EXCERPT_BYTES).as_str())
+        );
+        assert_eq!(
+            once.more[0].location,
+            Some(VerdictLocation {
+                path: Some("/cb?sid=[redacted]".into()),
+                name: None,
+            })
+        );
+        // Untouched: the scrub is about free text only.
+        assert_eq!(once.outcome, Outcome::Vulnerable);
+        assert_eq!(once.confidence, Confidence::Firm);
+
+        // In-place form agrees with the by-value form, and twice is once.
+        let mut in_place = verdict;
+        in_place.scrub();
+        assert_eq!(in_place, once);
+        in_place.scrub();
+        assert_eq!(in_place, once, "scrub is idempotent");
+    }
+
+    /// Coordinator item (g) (2026-11-01): the multi-verdict contract is
+    /// additive. A verdict written before it carries neither `location` nor
+    /// `more` and reads as "no override, no siblings"; a `VerdictLocation`
+    /// round-trips its `path` so the engine can place one issue per exposed path.
+    #[test]
+    fn verdict_more_and_location_default_empty() {
+        let json = r#"{
+            "outcome": "vulnerable",
+            "confidence": "firm",
+            "evidence": {},
+            "detail": "exposed"
+        }"#;
+        let verdict: Verdict = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(verdict.location, None);
+        assert!(verdict.more.is_empty());
+
+        let located = Verdict {
+            outcome: Outcome::Vulnerable,
+            confidence: Confidence::Firm,
+            evidence: Evidence::default(),
+            detail: "git metadata exposed".into(),
+            poc_hint: None,
+            location: Some(VerdictLocation {
+                path: Some("/.git/".into()),
+                name: None,
+            }),
+            more: vec![Verdict {
+                outcome: Outcome::Vulnerable,
+                confidence: Confidence::Firm,
+                evidence: Evidence::default(),
+                detail: "env file exposed".into(),
+                poc_hint: None,
+                location: Some(VerdictLocation {
+                    path: Some("/.env".into()),
+                    name: Some("env".into()),
+                }),
+                more: Vec::new(),
+            }],
+        };
+        let json = serde_json::to_string(&located).expect("serializes");
+        assert!(
+            json.contains(r#""location":{"path":"/.git/","name":null}"#),
+            "{json}"
+        );
+        let back: Verdict = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, located);
+        assert_eq!(
+            back.location.as_ref().and_then(|l| l.path.as_deref()),
+            Some("/.git/")
+        );
+        assert_eq!(back.more.len(), 1);
+        assert_eq!(
+            back.more[0]
+                .location
+                .as_ref()
+                .and_then(|l| l.path.as_deref()),
+            Some("/.env")
+        );
+        assert_eq!(
+            VerdictLocation::default(),
+            VerdictLocation {
+                path: None,
+                name: None
+            }
+        );
+    }
+
+    /// Tester (amendment 67): the scrub is a no-op on a verdict with nothing
+    /// to redact — empty detail, no evidence, no siblings — and it recurses
+    /// through nested siblings (a sibling's own `more`), not only one level,
+    /// so no depth of the multi-verdict contract carries raw text.
+    #[test]
+    fn verdict_scrub_leaves_a_clean_verdict_alone_and_reaches_nested_siblings() {
+        let clean = Verdict {
+            outcome: Outcome::Clean,
+            confidence: Confidence::Tentative,
+            evidence: Evidence::default(),
+            detail: String::new(),
+            poc_hint: None,
+            location: None,
+            more: Vec::new(),
+        };
+        assert_eq!(
+            clean.clone().scrubbed(),
+            clean,
+            "nothing to redact, nothing changed"
+        );
+
+        let leaf = Verdict {
+            detail: "deep Cookie: sid=deep-secret".into(),
+            evidence: Evidence {
+                payload: Some("access_token=deep".into()),
+                matched: Some("Authorization: Bearer deep".into()),
+                ..Evidence::default()
+            },
+            ..clean.clone()
+        };
+        let middle = Verdict {
+            detail: "middle: nothing secret".into(),
+            more: vec![leaf],
+            ..clean.clone()
+        };
+        let root = Verdict {
+            detail: "root: nothing secret".into(),
+            more: vec![middle],
+            ..clean
+        };
+
+        let out = root.scrubbed();
+        assert_eq!(out.detail, "root: nothing secret");
+        assert_eq!(out.more[0].detail, "middle: nothing secret");
+        let deep = &out.more[0].more[0];
+        assert_eq!(deep.detail, "deep Cookie: [redacted]");
+        assert_eq!(
+            deep.evidence.matched.as_deref(),
+            Some("Authorization: [redacted]")
+        );
+        assert_eq!(
+            deep.evidence.payload.as_deref(),
+            Some("access_token=[redacted]")
+        );
     }
 }

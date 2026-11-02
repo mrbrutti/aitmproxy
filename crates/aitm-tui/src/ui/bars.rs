@@ -10,9 +10,9 @@ use ratatui::text::{Line, Span};
 use crate::action::Level;
 use crate::app::{App, BusStatus, Chip, Mode, PromptKind};
 use crate::model::{human_bytes, AgentPolicy};
+use crate::text::{cells, truncate, width};
 use crate::theme::Theme;
 use crate::tokens::glyph;
-use crate::ui::text::{cells, truncate, width};
 use crate::ui::FrameView;
 
 /// The toolbar shows its `: palette · layout · b sidebar` hints from this
@@ -119,9 +119,10 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     ]);
 
     let agent_style = match app.agent.policy {
-        Some(AgentPolicy::All) | Some(AgentPolicy::ReadOnly) => {
-            theme.agent().add_modifier(Modifier::BOLD)
-        }
+        Some(AgentPolicy::All)
+        | Some(AgentPolicy::Auto)
+        | Some(AgentPolicy::Ask)
+        | Some(AgentPolicy::ReadOnly) => theme.agent().add_modifier(Modifier::BOLD),
         Some(AgentPolicy::Paused) | None => theme.text_tertiary().add_modifier(Modifier::BOLD),
     };
     let agent_label = match app.agent.policy {
@@ -131,7 +132,7 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             p.label(),
             app.agent.actions_last_minute
         ),
-        None => format!("{} Agent · n/a (F1)", glyph::AGENT),
+        None => format!("{} Agent · n/a", glyph::AGENT),
     };
     let layout = match app.layout {
         crate::app::Layout::Horizontal => "▄▄ below",
@@ -143,9 +144,9 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let pw = pill.width();
     let cols = usize::from(area.width);
     let mut right = vec![Span::styled(format!("[{agent_label}]"), agent_style)];
-    // The key hints are a courtesy; below this width — or when the pill,
+    // The key hints are a courtesy; below this width (or when the pill,
     // which now carries the system-proxy word, would otherwise be clipped
-    // against the agent toggle — they are dropped.
+    // against the agent toggle) they are dropped.
     let hints = Span::styled(
         format!("  {} palette  {}  b sidebar", glyph::PALETTE, layout),
         theme.text_tertiary(),
@@ -177,7 +178,7 @@ pub fn chips(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.surface());
     let mut spans = vec![Span::raw(" ")];
     for (i, c) in Chip::ALL.iter().enumerate() {
-        if matches!(c, Chip::Http | Chip::H1 | Chip::Json) {
+        if matches!(c, Chip::Http | Chip::Tcp | Chip::H1 | Chip::Json) {
             spans.push(Span::styled("│ ", theme.rule()));
         }
         let label = c.label();
@@ -241,7 +242,7 @@ pub fn intercept(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &m
             Line::from(vec![
                 Span::styled(
                     format!(
-                        " {} Intercept armed — every request pauses here",
+                        " {} Intercept armed: every request pauses here",
                         glyph::INTERCEPT
                     ),
                     theme.intercept_armed_quiet().add_modifier(Modifier::BOLD),
@@ -361,13 +362,8 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
             ("o", "open"),
             ("Esc", "back"),
         ],
-        Mode::Scan => vec![
-            ("r", "scan"),
-            ("↑↓", "points"),
-            ("⏎", "flow"),
-            ("F", "findings"),
-            ("Esc", "back"),
-        ],
+        // The active tab's keys (D11), kept with the view that owns them.
+        Mode::Scan => crate::ui::scan::hints(app).to_vec(),
         _ => vec![("Esc", "back")],
     };
     let hint_line = |hints: &[(&str, &str)]| -> Line<'static> {
@@ -388,7 +384,12 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
             Level::Warn => theme.intercept_armed_quiet(),
             Level::Error => theme.fg(&crate::tokens::color::status::SERVER_ERROR),
         };
-        Line::styled(t.text.clone(), style.add_modifier(Modifier::BOLD))
+        // The toast may quote the core (an availability reason, an error):
+        // through the app's own inert rule like every other core string.
+        Line::styled(
+            crate::l4::inert(&t.text),
+            style.add_modifier(Modifier::BOLD),
+        )
     } else {
         let vis = view.visible.len();
         let pos = view
@@ -429,7 +430,7 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
         BusStatus::Connected { address, role, .. } => {
             if app.role_mismatch() {
                 // AC8: the token did not resolve to the expected role (or no
-                // role was echoed) — warn rather than proceed silently.
+                // role was echoed): warn rather than proceed silently.
                 let resolved = role.as_deref().unwrap_or("role unknown");
                 let expected = app.expect_role.as_deref().unwrap_or("");
                 (
@@ -470,18 +471,21 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
 
     let rw = cells(right.width());
     let cw = cells(center.width());
-    // Drop hints from the right before touching the centre counts.
+    // Drop hints from the right before touching the centre counts. Every
+    // sum saturates (fix round H, H47): the three widths are each clamped
+    // to `u16::MAX` by `cells`, so a plain add could still wrap.
+    let needed = cw.saturating_add(2).saturating_add(rw);
     let mut left_line = hint_line(&hints);
-    while !hints.is_empty() && cells(left_line.width()).saturating_add(cw + 2 + rw) > area.width {
+    while !hints.is_empty() && cells(left_line.width()).saturating_add(needed) > area.width {
         hints.pop();
         left_line = hint_line(&hints);
     }
     let lw = cells(left_line.width());
     buf.set_line(area.x, area.y, &left_line, area.width.saturating_sub(rw));
-    if lw + rw < area.width {
+    if lw.saturating_add(rw) < area.width {
         buf.set_line(area.x + area.width - rw, area.y, &right, rw);
         let free = area.width - lw - rw;
-        if cw + 2 <= free {
+        if cw.saturating_add(2) <= free {
             let x = area.x + lw + (free - cw) / 2;
             buf.set_line(x, area.y, &center, cw);
         } else if free > 4 {
@@ -500,14 +504,14 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         PromptKind::Palette => (":", "command or tool · ↑↓ choose · ⏎ run · Esc"),
         PromptKind::Filter => (
             "/",
-            "~u url ~d host ~m method ~s status ~a agent ~paused · & | ! ( )",
+            "~u url ~d host ~m method ~s status ~a agent ~paused ~l4 ~tcp ~udp ~icmp · & | ! ( )",
         ),
         PromptKind::Comment => ("comment:", "⏎ save · Esc"),
         PromptKind::Mark => ("mark:", "colours separated by spaces · ⏎ save"),
         PromptKind::Pin => ("pin host:", "⏎ pin"),
         PromptKind::ScopeAdd => (
             "scope add:",
-            "host · host:port · *.wildcard — a human action",
+            "host · host:port · *.wildcard (a human action)",
         ),
         PromptKind::PocName => (
             "poc name:",
@@ -535,11 +539,16 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             "eval:",
             "JavaScript expression · ⏎ run (browser.eval) · Esc",
         ),
+        // The Profiles editor's prompts (scanner v2 spec D4, D11).
+        PromptKind::ScanOrigin => ("origin:", "scheme://host[:port] · ⏎ add"),
+        PromptKind::ScanField => ("value:", "⏎ set · Esc"),
+        PromptKind::ScanProfileName => ("profile name:", "a-z 0-9 . _ - lowercase · ⏎ save as"),
+        PromptKind::ScanL4Target => ("l4 target:", "ip:port[/tcp|udp][ grammar] · ⏎ add"),
     };
     let text = match (kind, &app.confirm) {
         (PromptKind::Confirm, Some(c)) => {
             format!(
-                " {sigil} {} — {} [y/N] {}",
+                " {sigil} {}: {} [y/N] {}",
                 c.name, c.description, app.prompt
             )
         }

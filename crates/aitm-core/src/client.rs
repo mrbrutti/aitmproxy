@@ -98,6 +98,15 @@ impl PipelineClient {
     }
 }
 
+/// `authority` with `scheme`'s default port filled when it carries none, the
+/// spelling the guard keys its per-service error budget on.
+fn guard_authority(scheme: &str, authority: &str) -> String {
+    match crate::Authority::parse_with_default(authority, crate::Authority::default_port(scheme)) {
+        Ok(a) => a.to_string(),
+        Err(_) => authority.to_string(),
+    }
+}
+
 impl ProxyClient for PipelineClient {
     fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         // One code path: the shipped behaviour is `send_opts` with the defaults
@@ -110,26 +119,72 @@ impl ProxyClient for PipelineClient {
         req: HttpRequest,
         opts: SendOptions,
     ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        self.send_inner(req, opts, SendKind::Proxied)
+    }
+
+    /// Spec amendment 80: a probe's 5xx answer is a completed exchange, not an
+    /// upstream failure; only transport failures and timeouts charge the
+    /// host's error budget on this path.
+    fn send_probe(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        self.send_inner(req, opts, SendKind::Probe)
+    }
+}
+
+/// Which breaker semantics a send gets (spec amendment 80).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendKind {
+    /// Proxied or reissued traffic: a 5xx answer charges the host's error
+    /// budget like an upstream failure does.
+    Proxied,
+    /// A scanner probe: a 5xx answer is a completed exchange; only an upstream
+    /// failure or a timeout charges the budget.
+    Probe,
+}
+
+impl PipelineClient {
+    /// The one send path behind [`ProxyClient::send_opts`] and
+    /// [`ProxyClient::send_probe`]: `kind` says whether a 5xx answer charges
+    /// the host's error budget. An upstream failure always charges it.
+    fn send_inner(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+        kind: SendKind,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         Box::pin(async move {
+            // The guard keys its error budget and disable window per authority
+            // (host + port); ask and charge it under the authority with the
+            // scheme's default port filled, so `example.test` and
+            // `example.test:443` are one service to it and an unported request
+            // is not refused by another port's window.
+            let authority = guard_authority(&req.scheme, &req.authority);
             // Hold the permit for the whole send (concurrency released on drop).
-            let _permit = self.guard.check_active(&req.authority)?;
+            let _permit = self.guard.check_active(&authority)?;
             let response = match self.sender.send_with(&req, opts.version).await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    // An upstream failure counts against the host's error budget.
-                    self.guard.record_error(&req.authority);
+                    // An upstream failure counts against the target's error budget.
+                    self.guard.record_error(&authority);
                     return Err(e);
                 }
             };
-            if response.status >= 500 {
-                self.guard.record_error(&req.authority);
+            if kind == SendKind::Proxied && response.status >= 500 {
+                self.guard.record_error(&authority);
             }
+            // The socket the sender read the answer from, when it knows: that
+            // is the flow's upstream connection (amendment 59; the wire shape
+            // is `flow.detail`'s `server_conn`).
+            let server_conn = response.peer.map(|peer| upstream_conn(peer, &req.scheme));
             let flow = HttpFlow {
                 id: FlowId::new(),
                 request: req,
                 response: Some(response),
                 client_conn: loopback_conn(),
-                server_conn: None,
+                server_conn,
                 metadata: FlowMeta {
                     is_replay: true,
                     marks: opts.marks,
@@ -152,6 +207,20 @@ fn loopback_conn() -> ConnInfo {
         sni: None,
         alpn: None,
         tls: false,
+        established: SystemTime::now(),
+    }
+}
+
+/// The upstream connection of a locally-reissued request, from the socket the
+/// sender reports it read the response from. `tls` follows the request's
+/// scheme; SNI and ALPN are not threaded through `HttpResponse` (the h1/h2
+/// fact is `HttpResponse::version`), so both stay `None`.
+fn upstream_conn(peer: SocketAddr, scheme: &str) -> ConnInfo {
+    ConnInfo {
+        peer,
+        sni: None,
+        alpn: None,
+        tls: scheme.eq_ignore_ascii_case("https"),
         established: SystemTime::now(),
     }
 }
@@ -214,6 +283,12 @@ mod tests {
     }
 
     fn ok_response() -> HttpResponse {
+        ok_response_from(None)
+    }
+
+    /// A 200 answer that names (or does not name) the upstream socket the
+    /// sender read it from, the way `HttpSender` reports its dialled peer.
+    fn ok_response_from(peer: Option<SocketAddr>) -> HttpResponse {
         HttpResponse {
             status: 200,
             version: HttpVersion::Http11,
@@ -221,6 +296,25 @@ mod tests {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer,
+        }
+    }
+
+    /// Answers 200 from a fixed upstream socket (or from none), the way a
+    /// real sender reports the peer it connected to.
+    struct PeerSender(Option<SocketAddr>);
+
+    impl RequestSender for PeerSender {
+        fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+            let peer = self.0;
+            Box::pin(async move { Ok(ok_response_from(peer)) })
+        }
+    }
+
+    fn stored_server_conn(store: &MemFlowStore, id: FlowId) -> Option<ConnInfo> {
+        match store.get(id).expect("flow stored") {
+            Flow::Http(f) => f.server_conn,
+            _ => panic!("expected an HTTP flow"),
         }
     }
 
@@ -396,6 +490,19 @@ mod tests {
 
     /// A sender whose connection dies mid-send, the way a dropped upstream TCP
     /// connection surfaces to the client.
+    /// An upstream that answers every request 503: a completed exchange that
+    /// is also a server error.
+    struct ServerErrorSender;
+    impl RequestSender for ServerErrorSender {
+        fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+            Box::pin(async {
+                let mut resp = ok_response();
+                resp.status = 503;
+                Ok(resp)
+            })
+        }
+    }
+
     struct DroppingSender;
 
     impl RequestSender for DroppingSender {
@@ -404,10 +511,121 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_probe_s_5xx_answers_leave_the_host_enabled_but_its_transport_failures_disable_it() {
+        let budget = 3;
+        let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
+            host_error_budget: budget,
+            per_host_rps: 1000,
+            ..Default::default()
+        }));
+        guard.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let store = Arc::new(MemFlowStore::new());
+
+        // N 5xx answers through the probe path: the host stays enabled.
+        let answering =
+            PipelineClient::new(store.clone(), guard.clone(), Arc::new(ServerErrorSender));
+        for _ in 0..budget {
+            let flow = answering
+                .send_probe(req("ex.test"), SendOptions::default())
+                .await
+                .expect("a 5xx is an answer");
+            assert_eq!(flow.response.as_ref().map(|r| r.status), Some(503));
+        }
+        assert!(
+            guard.check_active("ex.test").is_ok(),
+            "5xx answers to probes do not charge the error budget"
+        );
+
+        // N transport failures through the same path: the host is disabled.
+        let dropping = PipelineClient::new(store.clone(), guard.clone(), Arc::new(DroppingSender));
+        for _ in 0..budget {
+            dropping
+                .send_probe(req("ex.test"), SendOptions::default())
+                .await
+                .expect_err("the upstream dropped");
+        }
+        assert!(
+            matches!(
+                guard.check_active("ex.test"),
+                Err(crate::error::GuardError::HostDisabled)
+            ),
+            "transport failures on probes still disable the host"
+        );
+
+        // The proxied path keeps today's semantics: 5xx answers charge it.
+        let guard2 = Arc::new(StdGuard::new(crate::config::LimitConfig {
+            host_error_budget: budget,
+            per_host_rps: 1000,
+            ..Default::default()
+        }));
+        guard2.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let proxied = PipelineClient::new(store, guard2.clone(), Arc::new(ServerErrorSender));
+        for _ in 0..budget {
+            proxied
+                .send_opts(req("ex.test"), SendOptions::default())
+                .await
+                .expect("a 503 is an answer on the proxied path too");
+        }
+        assert!(
+            matches!(
+                guard2.check_active("ex.test"),
+                Err(crate::error::GuardError::HostDisabled)
+            ),
+            "proxied/reissued 5xx answers still charge the budget"
+        );
+    }
+
     /// Tester: an upstream that drops mid-send stores no half-flow and still
     /// charges the host's error budget — the bulk `record: Never` path must not
     /// become a way to hammer a dead host for free. With a budget of one, the
     /// single failure disables the host, which is how the charge is observed.
+    /// Spec amendment 74: the client asks and charges the guard under the
+    /// authority with the scheme's default port filled, so an https request to
+    /// `ex.test` is the service `ex.test:443` — and `ex.test:8080` is another.
+    /// A bracketed IPv6 authority folds to the same key the guard reads back.
+    #[tokio::test]
+    async fn the_budget_is_charged_under_the_scheme_default_port() {
+        for (authority, same, other) in [
+            ("ex.test", "ex.test:443", "ex.test:8080"),
+            ("[::1]", "[::1]:443", "[::1]:8080"),
+        ] {
+            let store = Arc::new(MemFlowStore::new());
+            let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
+                host_error_budget: 1,
+                per_host_rps: 1000,
+                ..Default::default()
+            }));
+            guard.add_scope(ScopeEntry {
+                host: authority.into(),
+            });
+            let client = PipelineClient::new(store, guard.clone(), Arc::new(DroppingSender));
+            client
+                .send_opts(req(authority), SendOptions::default())
+                .await
+                .expect_err("the upstream dropped");
+            assert!(
+                matches!(
+                    guard.check_active(same),
+                    Err(crate::error::GuardError::HostDisabled)
+                ),
+                "{authority}: the failure was charged under {same}"
+            );
+            assert!(
+                guard.check_active(other).is_ok(),
+                "{authority}: {other} is another service and stays enabled"
+            );
+        }
+    }
+
+    /// Spec amendment 80: a scanner probe's 5xx answer is a completed exchange
+    /// and never charges the host's error budget, while a transport failure on
+    /// the same path still does (and still disables the host). The proxied
+    /// path (`send_opts`) keeps charging 5xx answers.
     #[tokio::test]
     async fn send_opts_upstream_drop_stores_nothing_and_charges_the_error_budget() {
         for record in [RecordPolicy::Always, RecordPolicy::Never] {
@@ -448,17 +666,6 @@ mod tests {
     /// the error budget, so an unrecorded bulk run cannot outrun the breaker.
     #[tokio::test]
     async fn send_opts_never_still_charges_a_5xx() {
-        struct ServerErrorSender;
-        impl RequestSender for ServerErrorSender {
-            fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
-                Box::pin(async {
-                    let mut resp = ok_response();
-                    resp.status = 503;
-                    Ok(resp)
-                })
-            }
-        }
-
         let store = Arc::new(MemFlowStore::new());
         let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
             host_error_budget: 1,
@@ -484,6 +691,27 @@ mod tests {
         assert!(
             guard.check_active("ex.test").is_err(),
             "the 5xx charged the host's error budget"
+        );
+    }
+
+    /// The guard's typed refusal survives `anyhow` boxing: `JobClient` (T1b)
+    /// downcasts every `send_opts` error to tell `RateLimited { retry_after }`
+    /// (pace and retry) from `OutOfScope` (give up on the host) apart.
+    #[tokio::test]
+    async fn send_opts_guard_error_is_downcastable() {
+        let store = Arc::new(MemFlowStore::new());
+        let guard = scoped_guard();
+        let client = PipelineClient::new(store, guard, Arc::new(RecordingSender::new()));
+
+        let err = client
+            .send_opts(req("other.test"), SendOptions::default())
+            .await
+            .expect_err("other.test is not in scope");
+        assert_eq!(
+            err.downcast_ref::<crate::error::GuardError>(),
+            Some(&crate::error::GuardError::OutOfScope(
+                "other.test:443".into()
+            ))
         );
     }
 
@@ -514,5 +742,166 @@ mod tests {
             .unwrap();
         assert_eq!(flow.metadata.marks, odd);
         assert_eq!(stored_marks(&store, flow.id), odd);
+    }
+
+    /// Tester: the pacing half of the ladder the engine's `JobClient` relies on.
+    /// A per-host rate refusal surfaces as the typed `RateLimited { retry_after }`
+    /// (so the client can sleep exactly that long and retry), the guard refuses
+    /// before the sender is reached, and nothing is stored.
+    #[tokio::test]
+    async fn send_opts_rate_limit_error_is_downcastable_with_retry_after() {
+        let store = Arc::new(MemFlowStore::new());
+        let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
+            per_host_rps: 0,
+            ..Default::default()
+        }));
+        guard.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let sender = Arc::new(RecordingSender::new());
+        let client = PipelineClient::new(store.clone(), guard, sender.clone());
+
+        let err = client
+            .send_opts(req("ex.test"), SendOptions::default())
+            .await
+            .expect_err("a zero per-host rate refuses every send");
+
+        assert_eq!(
+            err.downcast_ref::<crate::error::GuardError>(),
+            Some(&crate::error::GuardError::RateLimited {
+                retry_after: std::time::Duration::from_secs(1)
+            })
+        );
+        assert_eq!(
+            sender.calls.load(Ordering::SeqCst),
+            0,
+            "the guard refuses before the sender is reached"
+        );
+        assert_eq!(store.count(), 0, "a refused send stores nothing");
+    }
+
+    /// Amendment 59 (core half): the peer the sender connected to becomes the
+    /// client-sent flow's `server_conn` — the wire carrier `flow.detail`
+    /// already emits — with `tls` from the scheme and no SNI/ALPN (call C4).
+    #[tokio::test]
+    async fn a_client_sent_flow_carries_the_peer_the_sender_connected_to() {
+        let upstream: SocketAddr = "10.0.0.5:8443".parse().unwrap();
+        let store = Arc::new(MemFlowStore::new());
+        let guard = scoped_guard();
+        let client =
+            PipelineClient::new(store.clone(), guard, Arc::new(PeerSender(Some(upstream))));
+
+        let flow = client
+            .send_opts(req("ex.test"), SendOptions::default())
+            .await
+            .unwrap();
+
+        let conn = flow
+            .server_conn
+            .as_ref()
+            .expect("the sender named its peer");
+        assert_eq!((conn.peer, conn.tls), (upstream, true));
+        assert_eq!(conn.sni, None);
+        assert_eq!(conn.alpn, None);
+        assert_eq!(
+            flow.response.as_ref().and_then(|r| r.peer),
+            Some(upstream),
+            "the response keeps the peer it was read from"
+        );
+
+        let stored = stored_server_conn(&store, flow.id).expect("the stored flow carries the peer");
+        assert_eq!((stored.peer, stored.tls), (upstream, true));
+        assert_eq!(stored.sni, None);
+        assert_eq!(stored.alpn, None);
+        assert_eq!(stored.established, conn.established);
+    }
+
+    /// A sender that cannot tell where its answer came from leaves
+    /// `server_conn` empty, so T3's "peer unknown" fallback stays reachable.
+    #[tokio::test]
+    async fn a_sender_that_knows_no_peer_leaves_server_conn_none() {
+        let store = Arc::new(MemFlowStore::new());
+        let guard = scoped_guard();
+        let client = PipelineClient::new(store.clone(), guard, Arc::new(PeerSender(None)));
+
+        let flow = client
+            .send_opts(req("ex.test"), SendOptions::default())
+            .await
+            .unwrap();
+
+        assert!(flow.server_conn.is_none());
+        assert_eq!(flow.response.as_ref().and_then(|r| r.peer), None);
+        assert!(stored_server_conn(&store, flow.id).is_none());
+    }
+
+    /// Tester (amendment 59): `record: Never` keeps the flow off the store,
+    /// not the peer off the flow — a bulk sender's probe host still reads
+    /// `server_conn.peer` off the returned flow (the lane hosts'
+    /// `baseline_peer_addr()`), while the store stays empty.
+    #[tokio::test]
+    async fn a_record_never_send_stores_nothing_yet_reports_the_peer() {
+        let upstream: SocketAddr = "10.0.0.5:8443".parse().unwrap();
+        let store = Arc::new(MemFlowStore::new());
+        let client = PipelineClient::new(
+            store.clone(),
+            scoped_guard(),
+            Arc::new(PeerSender(Some(upstream))),
+        );
+        let opts = SendOptions {
+            record: RecordPolicy::Never,
+            ..SendOptions::default()
+        };
+
+        let flow = client.send_opts(req("ex.test"), opts).await.unwrap();
+
+        assert_eq!(
+            flow.server_conn.as_ref().map(|c| (c.peer, c.tls)),
+            Some((upstream, true)),
+            "the returned flow names the peer whether or not it is stored"
+        );
+        assert_eq!(store.count(), 0, "record: Never stores nothing");
+    }
+
+    /// Tester (amendment 59, call C4): `tls` follows the request's scheme —
+    /// `http` is a cleartext upstream connection, and the comparison is
+    /// ASCII case-insensitive, so `HTTPS` reads as TLS too.
+    #[tokio::test]
+    async fn upstream_conn_tls_follows_the_requests_scheme() {
+        let upstream: SocketAddr = "10.0.0.5:8080".parse().unwrap();
+        let store = Arc::new(MemFlowStore::new());
+        let client = PipelineClient::new(
+            store.clone(),
+            scoped_guard(),
+            Arc::new(PeerSender(Some(upstream))),
+        );
+
+        let mut plain = req("ex.test");
+        plain.scheme = "http".into();
+        let flow = client
+            .send_opts(plain, SendOptions::default())
+            .await
+            .unwrap();
+        let conn = flow
+            .server_conn
+            .as_ref()
+            .expect("the sender named its peer");
+        assert_eq!((conn.peer, conn.tls), (upstream, false));
+        assert_eq!(
+            stored_server_conn(&store, flow.id).map(|c| c.tls),
+            Some(false),
+            "the stored copy agrees"
+        );
+
+        let mut shouted = req("ex.test");
+        shouted.scheme = "HTTPS".into();
+        let flow = client
+            .send_opts(shouted, SendOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            flow.server_conn.as_ref().map(|c| c.tls),
+            Some(true),
+            "the scheme comparison folds ASCII case"
+        );
     }
 }

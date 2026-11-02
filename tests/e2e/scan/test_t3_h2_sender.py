@@ -12,8 +12,10 @@ Assert: `probes.by_lane.http > 0`; the seeded reflected XSS on `/search`
 (a `REFLECTED_XSS_CLASSES` class, the pinned token) and the seeded SQLi error on
 `/products` (class `sqli`) are found
 on V and neither is found on P; `flow.detail` of `evidence.probe_flows[0]` of one
-of those issues renders `request.version` as `h2` or `HTTP/2` (the cell prints
-which; plan call P7).
+of those issues renders `response.version` as `h2` or `HTTP/2` (the version the
+sender negotiated, plan session call S1; the recorded request keeps the version
+it was built with, so `request.version` is only the fallback when a build has no
+response version; the cell prints which; plan call P7).
 
 Observer, independent of the scanner: the target's own control origin,
 `GET /log/http` -- `request` entries with `version: "h2"` and
@@ -119,10 +121,10 @@ def main() -> None:
             check(chosen is not None and flows,
                   "an issue carries evidence.probe_flows (the probes were recorded)")
             detail = op.call("flow.detail", {"id": flows[0], "body": "none"})
-            version = ((detail.get("request") or {}).get("version")
-                       if isinstance(detail, dict) else None)
+            version = ((detail.get("response") or {}).get("version")
+                       or (detail.get("request") or {}).get("version") or "")
             check(version in ("h2", "HTTP/2"),
-                  f"probe flow {flows[0]} request.version is h2 (rendered {version!r})")
+                  f"probe flow {flows[0]} response.version is h2 (rendered {version!r})")
             ok(f"this build renders the h2 version as {version!r} (plan call P7 accepts either)")
 
             section("the patched twin yields neither class over h2")

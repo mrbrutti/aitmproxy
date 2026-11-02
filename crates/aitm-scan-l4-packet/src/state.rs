@@ -102,6 +102,39 @@ pub struct CaseRecord {
     /// recorded here rather than inferred later from the run's stop (review
     /// finding Q2).
     pub candidate: Candidate,
+    /// Why this case carries no reply, when the lane knows the reason: the
+    /// `no_reply (icmp_ratelimit)` note of spec amendment 46. `None` for every
+    /// other case.
+    pub note: Option<CaseNote>,
+}
+
+/// Why a case reads the way it does, when the lane knows a reason the class
+/// alone does not carry.
+///
+/// Today there is one: a silent case on a point whose baseline is an ICMP
+/// error. A remote target's kernel rate-limits the errors it generates, so the
+/// silence is the rate limiter, not the service; the case is recorded with the
+/// note, is no crash candidate, and spends no liveness probe (spec D8.4,
+/// amendment 46). Every reason is a unit variant, so the only labels that can
+/// exist are the ones [`CaseNote::label`] spells. The note carries no wire
+/// bytes, so `Debug` prints it whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseNote {
+    /// Nothing came back on an ICMP-paced point: the target host's kernel
+    /// rate-limits the ICMP errors it answers with. The operator reads it as
+    /// `no_reply (icmp_ratelimit)`.
+    IcmpRatelimit,
+}
+
+impl CaseNote {
+    /// The note as the operator reads it in a verdict detail:
+    /// `no_reply (icmp_ratelimit)`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match *self {
+            CaseNote::IcmpRatelimit => "no_reply (icmp_ratelimit)".to_string(),
+        }
+    }
 }
 
 /// Whether a case reached the wire, and what came back when it did.
@@ -137,6 +170,7 @@ impl CaseRecord {
             sent_hex,
             outcome: CaseOutcome::Unsent,
             candidate: Candidate::No,
+            note: None,
         }
     }
 
@@ -230,6 +264,7 @@ impl fmt::Debug for CaseRecord {
             )
             .field("outcome", &self.outcome)
             .field("candidate", &self.candidate)
+            .field("note", &self.note)
             .finish()
     }
 }
@@ -337,6 +372,21 @@ impl PointRun {
         u32::try_from(self.cases.iter().filter(|case| case.sent()).count()).unwrap_or(u32::MAX)
     }
 
+    /// How many of the run's cases carry the `no_reply (icmp_ratelimit)` note
+    /// of amendment 46: silent cases on a point whose baseline is an ICMP
+    /// error, which the target host's kernel rate-limited. Counts that note
+    /// alone, so a note of another kind is never mistaken for it.
+    #[must_use]
+    pub fn no_reply_count(&self) -> u32 {
+        u32::try_from(
+            self.cases
+                .iter()
+                .filter(|case| matches!(case.note, Some(CaseNote::IcmpRatelimit)))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
     /// How many of the run's cases came back outside the latency window.
     #[must_use]
     pub fn outlier_count(&self) -> u32 {
@@ -373,30 +423,31 @@ pub struct JobStats {
     pub stopped: Option<StopReason>,
 }
 
-/// The identity a job is begun under: the id the engine knows it by and the
-/// marker its points, seeds and runners are keyed by.
+/// The identity a job is begun under: the id the engine knows it by, which
+/// both its state and its runners are keyed by.
+///
+/// The job id is the whole key — never `JobCtx::marker`, which mints a fresh
+/// token on every call and is therefore no stable key (T5 live proof, 4b). The
+/// marker the discovery canary seed is built from is handed to `discover_all`
+/// directly and is no part of this identity (quality panel Minor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobKey<'a> {
-    /// The engine's job id.
+    /// The engine's job id: stable and unique, so it keys the job's state and
+    /// its runners.
     pub job_id: &'a str,
-    /// The job's marker.
-    pub marker: &'a str,
 }
 
 impl<'a> JobKey<'a> {
-    /// The key for `job_id` running under `marker`.
+    /// The key for `job_id`.
     #[must_use]
-    pub const fn new(job_id: &'a str, marker: &'a str) -> Self {
-        Self { job_id, marker }
+    pub const fn new(job_id: &'a str) -> Self {
+        Self { job_id }
     }
 }
 
 /// One job's state. Private: everything outside reaches it through
 /// [`LaneState`], which keeps the locking in one place.
 struct JobState {
-    /// The job's marker: what its runners are keyed by, so evicting the job
-    /// can evict them too (review findings SEC2/Q4).
-    marker: String,
     plans: Vec<TargetPlan>,
     point_ids: HashSet<String>,
     retired: HashSet<String>,
@@ -411,7 +462,6 @@ struct JobState {
 
 impl JobState {
     fn new(
-        marker: &str,
         plans: Vec<TargetPlan>,
         point_ids: Vec<String>,
         cases_requested: u32,
@@ -420,7 +470,6 @@ impl JobState {
     ) -> Self {
         let points = u32::try_from(point_ids.len()).unwrap_or(u32::MAX);
         Self {
-            marker: marker.to_string(),
             plans,
             point_ids: point_ids.into_iter().collect(),
             retired: HashSet::new(),
@@ -489,11 +538,12 @@ impl LaneState {
     /// `cases_cap` is `min(cases_requested, CASES_CEILING)`. Re-beginning a
     /// known job replaces its state; beginning a ninth job evicts the oldest.
     ///
-    /// Returns the markers of every job whose state this call dropped — the
-    /// evicted ones and, when a known job is re-begun, its previous marker.
-    /// The caller forgets their runners, so the registry is bounded by the
-    /// same window this state is (review findings SEC2/Q4).
-    #[must_use = "forget the returned markers' runners"]
+    /// Returns the **job ids** of every job whose state this call dropped — the
+    /// evicted ones and, when a known job is re-begun, its own id. The caller
+    /// forgets those jobs' runners, which the registry keys by job id, so the
+    /// registry is bounded by the same window this state is (review findings
+    /// SEC2/Q4; keyed by job id, not marker, since T5 live proof 4b).
+    #[must_use = "forget the returned jobs' runners"]
     pub fn begin_job(
         &self,
         job: JobKey<'_>,
@@ -504,7 +554,6 @@ impl LaneState {
         dry_run: bool,
     ) -> Vec<String> {
         let state = JobState::new(
-            job.marker,
             plans,
             point_ids,
             cases_requested,
@@ -514,16 +563,17 @@ impl LaneState {
         let mut inner = lock(&self.inner);
         let mut forgotten = Vec::new();
         match inner.jobs.insert(job.job_id.to_string(), state) {
-            // A re-begun job's old runners hold its old plans and its old run.
-            Some(previous) => forgotten.push(previous.marker),
+            // A re-begun job's old runners hold its old plans and its old run,
+            // so the caller forgets this job id before the new host registers.
+            Some(_previous) => forgotten.push(job.job_id.to_string()),
             None => inner.order.push_back(job.job_id.to_string()),
         }
         while inner.order.len() > MAX_JOBS_REMEMBERED {
             let Some(oldest) = inner.order.pop_front() else {
                 break;
             };
-            if let Some(evicted) = inner.jobs.remove(&oldest) {
-                forgotten.push(evicted.marker);
+            if inner.jobs.remove(&oldest).is_some() {
+                forgotten.push(oldest);
             }
         }
         forgotten
@@ -691,12 +741,14 @@ impl LaneState {
 /// Hand the job's L4 counters back to the engine — the **only** place the lane
 /// reports them (plan call C1b).
 ///
-/// T1b adds a default-bodied `JobCtx::report_l4(&self, counters: L4Counters)`;
-/// Task 13 flips this body to `job.report_l4(counters)` once `origin/main`
-/// carries it. Until then the lane's counters still reach the operator through
-/// `PacketLane::counters(job_id)`, which stays either way.
+/// `JobCtx::report_l4` carries them; the engine folds each report into
+/// `JobStatus.l4` by per-field maximum, so a lane that re-tallies never walks
+/// `scan.status` backwards. A context that tracks no L4 counters ignores the
+/// report, and the operator still reads them from
+/// [`LaneState::counters`](LaneState::counters) through
+/// `PacketLane::counters(job_id)`.
 pub(crate) fn report_counters(job: &dyn JobCtx, counters: L4Counters) {
-    let _ = (job, counters);
+    job.report_l4(counters);
 }
 
 #[cfg(test)]
@@ -756,6 +808,7 @@ mod tests {
                 latency_outlier: false,
             },
             candidate: Candidate::No,
+            note: None,
         }
     }
 
@@ -764,7 +817,7 @@ mod tests {
         let state = LaneState::new();
 
         let _ = state.begin_job(
-            JobKey::new("scan-big", "m-scan-big"),
+            JobKey::new("scan-big"),
             vec![plan_fixture()],
             points(1),
             9000,
@@ -777,7 +830,7 @@ mod tests {
         );
 
         let _ = state.begin_job(
-            JobKey::new("scan-small", "m-scan-small"),
+            JobKey::new("scan-small"),
             vec![plan_fixture()],
             points(1),
             500,
@@ -797,7 +850,7 @@ mod tests {
     fn allocation_is_ceil_and_bounded() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-a", "m-scan-a"),
+            JobKey::new("scan-a"),
             vec![plan_fixture()],
             points(14),
             100,
@@ -822,7 +875,7 @@ mod tests {
     fn consecutive_timeouts_stop() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-t", "m-scan-t"),
+            JobKey::new("scan-t"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -850,7 +903,7 @@ mod tests {
 
         // A clean case after two silent ones resets the ladder.
         let _ = state.begin_job(
-            JobKey::new("scan-r", "m-scan-r"),
+            JobKey::new("scan-r"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -870,7 +923,7 @@ mod tests {
     fn unsendable_counts_separately() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-u", "m-scan-u"),
+            JobKey::new("scan-u"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -891,7 +944,7 @@ mod tests {
     fn crash_retires_point() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-c", "m-scan-c"),
+            JobKey::new("scan-c"),
             vec![plan_fixture()],
             points(2),
             100,
@@ -924,7 +977,7 @@ mod tests {
     fn unknown_job_is_none() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-known", "m-scan-known"),
+            JobKey::new("scan-known"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -960,7 +1013,7 @@ mod tests {
         let state = LaneState::new();
         for i in 1..=9 {
             let _ = state.begin_job(
-                JobKey::new(&format!("j{i}"), &format!("m-j{i}")),
+                JobKey::new(&format!("j{i}")),
                 vec![plan_fixture()],
                 points(1),
                 100,
@@ -974,16 +1027,18 @@ mod tests {
         assert!(state.counters("j9").is_some());
     }
 
-    /// Review findings SEC2/Q4 (round-1 leftover): `begin_job` hands back the
-    /// markers of every job state it dropped, so the caller can forget their
-    /// runners. The ninth job returns the evicted first marker; re-beginning a
-    /// known job returns that job's previous marker and evicts nothing.
+    /// Review findings SEC2/Q4 (round-1 leftover), now keyed by job id (T5 live
+    /// proof, 4b): `begin_job` hands back the **job ids** of every job state it
+    /// dropped, so the caller can forget their runners. The ninth job returns
+    /// the evicted first job's id; re-beginning a known job returns its own id
+    /// and evicts nothing. The engine never reuses a job id in production — this
+    /// re-begin only exercises the window bookkeeping.
     #[test]
-    fn begin_job_returns_forgotten_markers() {
+    fn begin_job_returns_forgotten_job_ids() {
         let state = LaneState::new();
-        let begin = |id: &str, marker: &str| {
+        let begin = |id: &str| {
             state.begin_job(
-                JobKey::new(id, marker),
+                JobKey::new(id),
                 vec![plan_fixture()],
                 points(1),
                 100,
@@ -994,15 +1049,16 @@ mod tests {
 
         for i in 1..=8 {
             assert!(
-                begin(&format!("j{i}"), &format!("m-j{i}")).is_empty(),
+                begin(&format!("j{i}")).is_empty(),
                 "job {i} evicted nothing"
             );
         }
-        // The ninth job evicts the oldest, so its marker comes back.
-        assert_eq!(begin("j9", "m-j9"), vec!["m-j1".to_string()]);
-        // Re-beginning a known job returns its previous marker, evicting
-        // nothing: the slot is reused, not taken a second time.
-        assert_eq!(begin("j9", "m-j9-again"), vec!["m-j9".to_string()]);
+        // The ninth job evicts the oldest, so its id comes back.
+        assert_eq!(begin("j9"), vec!["j1".to_string()]);
+        // Re-beginning a known job returns its own id, evicting nothing: the
+        // slot is reused, and the caller forgets that id's old runners before
+        // the new host registers.
+        assert_eq!(begin("j9"), vec!["j9".to_string()]);
     }
 
     #[test]
@@ -1061,11 +1117,69 @@ mod tests {
         assert!(printed.contains("4 bytes"), "{printed}");
     }
 
+    /// Tester (T5 stage 5, amendment 46) and the quality panel: the note is a
+    /// unit variant whose operator wording is `no_reply (icmp_ratelimit)` —
+    /// the string the crash and reaction details are asserted on —
+    /// `no_reply_count` counts the `IcmpRatelimit` cases and nothing else, and
+    /// `Debug` prints the note while still hiding the wire bytes.
+    #[test]
+    fn case_note_label_counts_and_debug() {
+        assert_eq!(CaseNote::IcmpRatelimit.label(), "no_reply (icmp_ratelimit)");
+
+        let mut noted = case(1, CaseClass::Silence);
+        noted.note = Some(CaseNote::IcmpRatelimit);
+        let run = PointRun {
+            point_id: "p0".to_string(),
+            target: "127.0.0.1:9/udp".to_string(),
+            field: FieldPath::Raw,
+            rng_seed: 1,
+            dry_run: false,
+            recovery_wait: Duration::from_secs(10),
+            baseline: Some(CaseClass::Icmp {
+                icmp_type: 3,
+                code: 3,
+            }),
+            cases: vec![
+                case(
+                    0,
+                    CaseClass::Icmp {
+                        icmp_type: 3,
+                        code: 3,
+                    },
+                ),
+                noted.clone(),
+                case(2, CaseClass::Silence),
+            ],
+            crash: None,
+            stopped: None,
+        };
+        assert_eq!(
+            run.no_reply_count(),
+            1,
+            "only the noted case counts, not every silence"
+        );
+        assert_eq!(
+            PointRun {
+                cases: Vec::new(),
+                ..run
+            }
+            .no_reply_count(),
+            0
+        );
+
+        let printed = format!("{noted:?}");
+        assert!(
+            printed.contains("note: Some(IcmpRatelimit)"),
+            "the note is printed: {printed}"
+        );
+        assert!(!printed.contains("deadbeef"), "the hex is not: {printed}");
+    }
+
     #[test]
     fn run_cache_round_trip() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-run", "m-scan-run"),
+            JobKey::new("scan-run"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -1093,10 +1207,29 @@ mod tests {
         assert!(state.run("scan-nope", "p0").is_none());
     }
 
+    /// Task 4a: the counters reach the engine through `JobCtx::report_l4`,
+    /// once per call and unchanged, and reporting costs no budget.
     #[test]
-    fn report_counters_shim_is_a_no_op() {
+    fn report_counters_forwards_to_the_job() {
         let job = TestJob::new(ScanProfile::default());
-        report_counters(&*job, L4Counters::default());
+        let counters = L4Counters {
+            cases: 7,
+            crashes: 1,
+            liveness_failures: 2,
+            retired_elements: 1,
+        };
+        report_counters(&*job, counters);
+
+        assert_eq!(job.l4_reports(), vec![counters]);
+        assert_eq!(
+            job.reported_l4(),
+            Some(L4Counters {
+                cases: 7,
+                crashes: 1,
+                liveness_failures: 2,
+                retired_elements: 1,
+            })
+        );
         assert_eq!(job.charged(), 0);
     }
 
@@ -1106,7 +1239,7 @@ mod tests {
     fn allocation_when_points_outnumber_cases() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-p", "m-scan-p"),
+            JobKey::new("scan-p"),
             vec![plan_fixture()],
             points(14),
             10,
@@ -1123,7 +1256,7 @@ mod tests {
         assert_eq!(state.stats("scan-p").expect("known").points, 14);
 
         let _ = state.begin_job(
-            JobKey::new("scan-z", "m-scan-z"),
+            JobKey::new("scan-z"),
             vec![plan_fixture()],
             Vec::new(),
             7,
@@ -1135,7 +1268,7 @@ mod tests {
 
         // A profile asking for zero cases allocates nothing.
         let _ = state.begin_job(
-            JobKey::new("scan-0", "m-scan-0"),
+            JobKey::new("scan-0"),
             vec![plan_fixture()],
             points(3),
             0,
@@ -1151,7 +1284,7 @@ mod tests {
     fn ceiling_allocation_is_exhausted_at_5000() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-max", "m-scan-max"),
+            JobKey::new("scan-max"),
             vec![plan_fixture()],
             points(1),
             u32::MAX,
@@ -1178,7 +1311,7 @@ mod tests {
 
         // Exactly the ceiling is not clamped.
         let _ = state.begin_job(
-            JobKey::new("scan-5000", "m-scan-5000"),
+            JobKey::new("scan-5000"),
             vec![plan_fixture()],
             points(1),
             5000,
@@ -1187,7 +1320,7 @@ mod tests {
         );
         assert_eq!(state.stats("scan-5000").expect("known").cases_cap, 5000);
         let _ = state.begin_job(
-            JobKey::new("scan-5001", "m-scan-5001"),
+            JobKey::new("scan-5001"),
             vec![plan_fixture()],
             points(1),
             5001,
@@ -1203,7 +1336,7 @@ mod tests {
     fn zero_threshold_stops_on_the_first_silence() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-0t", "m-scan-0t"),
+            JobKey::new("scan-0t"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -1215,7 +1348,7 @@ mod tests {
             Err(StopReason::ConsecutiveTimeouts(1))
         );
         let _ = state.begin_job(
-            JobKey::new("scan-1t", "m-scan-1t"),
+            JobKey::new("scan-1t"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -1235,7 +1368,7 @@ mod tests {
     fn first_stop_reason_wins() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-s", "m-scan-s"),
+            JobKey::new("scan-s"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -1261,7 +1394,7 @@ mod tests {
     fn re_begin_replaces_state_and_keeps_its_slot() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("j-first", "m-j-first"),
+            JobKey::new("j-first"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -1273,7 +1406,7 @@ mod tests {
         }
         state.record_crash("j-first", "p0");
         let _ = state.begin_job(
-            JobKey::new("j-first", "m-j-first"),
+            JobKey::new("j-first"),
             vec![plan_fixture()],
             points(2),
             50,
@@ -1288,7 +1421,7 @@ mod tests {
 
         for i in 2..=8 {
             let _ = state.begin_job(
-                JobKey::new(&format!("j{i}"), &format!("m-j{i}")),
+                JobKey::new(&format!("j{i}")),
                 vec![plan_fixture()],
                 points(1),
                 100,
@@ -1298,7 +1431,7 @@ mod tests {
         }
         assert!(state.counters("j-first").is_some(), "eight jobs fit");
         let _ = state.begin_job(
-            JobKey::new("j9", "m-j9"),
+            JobKey::new("j9"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -1348,7 +1481,7 @@ mod tests {
     fn cases_remaining_counts_down_from_the_cap() {
         let state = LaneState::new();
         let _ = state.begin_job(
-            JobKey::new("scan-rem", "m-scan-rem"),
+            JobKey::new("scan-rem"),
             vec![plan_fixture()],
             points(1),
             3,
@@ -1449,17 +1582,18 @@ mod tests {
         assert_eq!(run.reactions(), vec![(CaseClass::Reset, 1)]);
     }
 
-    /// Tester (fix rounds, review findings SEC2/Q4): a re-begun job keeps its
-    /// eviction slot, so when the ninth job arrives the re-begun first job is
-    /// still the one evicted — and the marker handed back is its *current*
-    /// marker (the re-begin already returned the previous one), so the caller
-    /// forgets exactly the runners that exist, never a marker twice.
+    /// Tester (fix rounds, review findings SEC2/Q4; keyed by job id, T5 live
+    /// proof 4b): a re-begun job keeps its eviction slot, so when the ninth job
+    /// arrives the re-begun first job is still the one evicted. Every return is
+    /// a job id now; the engine never reuses a job id in production, so this
+    /// re-begin only exercises the window bookkeeping. Forgetting the same id
+    /// twice (once at re-begin, once at eviction) is idempotent.
     #[test]
-    fn ninth_job_evicts_a_re_begun_first_job_by_its_current_marker() {
+    fn ninth_job_evicts_a_re_begun_first_job_by_its_job_id() {
         let state = LaneState::new();
-        let begin = |id: &str, marker: &str| {
+        let begin = |id: &str| {
             state.begin_job(
-                JobKey::new(id, marker),
+                JobKey::new(id),
                 vec![plan_fixture()],
                 points(1),
                 100,
@@ -1468,24 +1602,24 @@ mod tests {
             )
         };
         for i in 1..=8 {
-            assert!(begin(&format!("j{i}"), &format!("m-j{i}")).is_empty());
+            assert!(begin(&format!("j{i}")).is_empty());
         }
-        // The first job is re-begun under a new marker: its old marker comes
-        // back, nothing is evicted, and all eight jobs are still known.
-        assert_eq!(begin("j1", "m-j1-again"), vec!["m-j1".to_string()]);
+        // The first job is re-begun: its own id comes back, nothing is
+        // evicted, and all eight jobs are still known.
+        assert_eq!(begin("j1"), vec!["j1".to_string()]);
         for i in 1..=8 {
             assert!(state.counters(&format!("j{i}")).is_some(), "j{i} is known");
         }
-        // The ninth job evicts the oldest slot — still j1 — and returns the
-        // marker j1 now runs under, not the one already forgotten.
-        assert_eq!(begin("j9", "m-j9"), vec!["m-j1-again".to_string()]);
+        // The ninth job evicts the oldest slot — still j1 — and returns j1's
+        // id again; forgetting its runners a second time is a no-op.
+        assert_eq!(begin("j9"), vec!["j1".to_string()]);
         assert_eq!(state.counters("j1"), None);
         for i in 2..=9 {
             assert!(state.counters(&format!("j{i}")).is_some(), "j{i} survives");
         }
         // Re-beginning an evicted job is a new job: it takes a fresh slot at
         // the back and the window evicts the oldest survivor, j2.
-        assert_eq!(begin("j1", "m-j1-third"), vec!["m-j2".to_string()]);
+        assert_eq!(begin("j1"), vec!["j2".to_string()]);
         assert_eq!(state.counters("j2"), None, "j2 was the oldest by then");
         assert!(state.counters("j1").is_some());
     }

@@ -174,6 +174,7 @@ public enum CommandMap {
             E("Proxy", "Scope…", "⇧⌘O", items: one("Scope…", "⇧⌘O")),
             E("Proxy", "Breakpoint Rules…", "⇧⌘B", items: one("Breakpoint Rules…", "⇧⌘B")),
             E("Proxy", "Trust the aitmproxy CA", "⌃⌘T", items: one("Trust the aitmproxy CA", "⌃⌘T")),
+            E("Proxy", "Set as / Restore System Proxy", "⌥⌘P", items: toggle(["Set as System Proxy", "Restore System Proxy"], "⌥⌘P")),
             E("Proxy", "Certificate Authority…", nil, items: one("Certificate Authority…", nil)),
             E("Proxy", "Configuration…", nil, items: one("Configuration…", nil)),
             E("Proxy", "Browser", "⇧⌘W", items: one("Browser", "⇧⌘W")),

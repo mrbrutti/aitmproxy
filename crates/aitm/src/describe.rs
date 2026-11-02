@@ -58,7 +58,7 @@ use aitm_sysproxy::{Mechanism, SystemProxy};
 use crate::config_file::Settings;
 use crate::macos_capture::status::{CaptureStatus, CaptureStatusPlugin};
 use crate::scripts::LateHandles;
-use crate::wire::{collect_lanes, collect_native_checks, L4Shared};
+use crate::wire::{collect_lanes_with, collect_native_checks, ws_tls_policy, L4Shared};
 use crate::{bundled, env};
 
 /// What the schema-only registry is built from: the operator's settings (the
@@ -147,6 +147,7 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
         languages.push(lang.as_ref());
     }
     let tier = build_with_languages(rhai, services, &languages)?;
+    let script_checks = tier.checks.clone();
     let script_errors: Vec<String> = tier.errors.iter().map(ToString::to_string).collect();
     // The `l4:` / `ws:` PoC-step handlers from the same language instances the
     // engine installed, as `run()` builds them.
@@ -180,11 +181,6 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
     reg.add_plugin(Box::new(SubscriptionPlugin::new(push_tx)));
     reg.add_plugin(Box::new(DetailPlugin::new()));
     reg.add_plugin(Box::new(MetaPlugin::new()));
-    reg.add_plugin(Box::new(
-        ScannerPlugin::new(ScannerConfig::default())
-            .with_lanes(collect_lanes(l4_shared.as_ref()))
-            .with_native_checks(collect_native_checks()),
-    ));
     reg.add_plugin(Box::new(ReplayPlugin::new()));
     reg.add_plugin(Box::new(intercept));
     reg.add_plugin(Box::new(
@@ -224,6 +220,24 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
     ));
     reg.add_plugin(Box::new(tier.commands));
     reg.add_plugin(Box::new(FindingsPlugin::new()));
+    // The scanner, last of the first-party plugins as `wire.rs` registers it:
+    // the operator's `scanner:` section plus the two values that are not its
+    // keys, the lanes, the native checks over the inert `StdGuard` (as the map
+    // rules above; nothing is bound, so the h2 observe checks could open
+    // nothing), and the Rhai tier's check
+    // registry (call B9).
+    let mut scanner_cfg = settings.scanner.clone();
+    scanner_cfg.findings_dir = core.findings.dir.clone();
+    scanner_cfg.l4_allow_agent_inject = l4.allow_agent_inject;
+    reg.add_plugin(Box::new(
+        ScannerPlugin::new(scanner_cfg)
+            .with_lanes(collect_lanes_with(l4_shared.as_ref(), ws_tls_policy(&core)))
+            .with_native_checks(collect_native_checks(
+                core.browser.ssrf.clone(),
+                Arc::new(StdGuard::default()),
+            ))
+            .with_script_checks(script_checks),
+    ));
     // Opt-in, as in `wire.rs`; the privilege is pre-answered so no probe runs.
     if let Some(shared) = l4_shared {
         reg.add_plugin(Box::new(L4Module::with_shared(

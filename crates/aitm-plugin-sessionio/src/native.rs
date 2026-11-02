@@ -302,6 +302,7 @@ fn rec_to_resp(r: &RespRec) -> HttpResponse {
         trailers: rec_to_headers(&r.trailers),
         body: rec_to_body(&r.body),
         timestamp: r.timestamp,
+        peer: None,
     }
 }
 

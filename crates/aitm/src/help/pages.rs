@@ -332,6 +332,7 @@ mod tests {
 
     use aitm_core::{Command, CommandHost, Config, ParamSchema, Params, Registry, TypeDesc, Value};
     use aitm_plugin_rhai::RhaiConfig;
+    use aitm_plugin_scanner::ScannerConfig;
     use aitm_proto_l4::config::L4Config;
     use aitm_sysproxy::SystemProxyConfig;
     use aitm_term::caps::Caps;
@@ -349,17 +350,18 @@ mod tests {
     /// The env of a page built with the catalogue (19 groups, M-W2-1).
     const CATALOGUE_ENV: &[(&str, &str)] = &[("AITM_BUNDLED_SCRIPTS", BUNDLED)];
 
-    /// The env of a page built without it (17 groups, plan C30).
+    /// The env of a page built without it (18 groups, plan C30).
     const NO_CATALOGUE_ENV: &[(&str, &str)] = &[("AITM_NO_BUNDLED_SCRIPTS", "1")];
 
     /// The version the top page is built with: injected, so the literal is
     /// stable.
     const VERSION: &str = "0.5.11";
 
-    /// The 17 built-in groups (catalogue off).
-    const BUILT_IN_GROUPS: [&str; 17] = [
-        "agent", "browser", "ca", "capture", "config", "findings", "flow", "map", "poc", "proxy",
-        "request", "scan", "scope", "script", "session", "tls", "ws",
+    /// The 18 built-in groups (catalogue off; `check` is native since the
+    /// scanner v2 engine, main #232).
+    const BUILT_IN_GROUPS: [&str; 18] = [
+        "agent", "browser", "ca", "capture", "check", "config", "findings", "flow", "map", "poc",
+        "proxy", "request", "scan", "scope", "script", "session", "tls", "ws",
     ];
 
     /// M-W2-1, byte for byte.
@@ -522,6 +524,7 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
             l4: L4Config::default(),
             macos_capture: MacosCaptureConfig::default(),
             system_proxy: SystemProxyConfig::default(),
+            scanner: ScannerConfig::default(),
         }
     }
 
@@ -601,7 +604,7 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
     }
 
     #[test]
-    fn top_level_without_the_catalogue_has_seventeen_groups() {
+    fn top_level_without_the_catalogue_has_eighteen_groups() {
         let described = registry_with("top-bare", NO_CATALOGUE_ENV);
         let page = top_level(&described.registry, VERSION);
         let out = render(&piped_utf8(), &page);
@@ -613,7 +616,7 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
             .collect();
         assert_eq!(names, BUILT_IN_GROUPS);
         let rendered = block_lines(&out, "Groups:");
-        assert_eq!(rendered.len(), 17, "{out}");
+        assert_eq!(rendered.len(), 18, "{out}");
         assert!(
             !rendered.iter().any(|line| line.starts_with("  check ")),
             "{out}"

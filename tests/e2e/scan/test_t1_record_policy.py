@@ -131,6 +131,9 @@ def main() -> int:
               f"at least one issue-evidence probe flow was kept by issues_only ({len(probe_rows)} non-crawl scan row(s))")
         no_issue = [(r.get("id"), r.get("path")) for r in probe_rows
                     if not any(m.startswith("issue:") for m in marks_of(r))]
+        # Amendment 79 (T2 follow-up): the lane crate's /robots.txt and /sitemap.xml
+        # seed fetches bypass the recorder, so no seed row can appear here; the
+        # assertion below is hard on both lane sources.
         check(not no_issue, f"no probe flow without an issue: every non-crawl scan row carries issue:<id> "
               f"(offenders: {no_issue[:5]})")
         n_target = len(target.logs.scanner_requests(seq0))

@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 use aitm_core::{
     saturating_i64, AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink,
     BrowserDriver, Command, CommandHost, EgressConfinement, Event, Flow, FlowId, FlowQuery,
-    FlowStore, Frontend, McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity,
-    SsrfPolicy,
+    FlowStore, Frontend, JobBus, JobEvent, McpTransport, ProxyClient, Registry, ScopeRateGuard,
+    Sensitivity, SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::sync::{broadcast, Notify};
@@ -32,6 +32,14 @@ use crate::transport::{self, LoopbackTcp};
 /// subscriber's notification lane is bounded to this many lines before the oldest
 /// are dropped and the connection is flagged `lagged`; replies are never bounded.
 pub const DEFAULT_PUSH_CAPACITY: usize = 4096;
+
+/// The JSON-RPC notification method a [`aitm_core::JobEvent`] is rendered as
+/// (spec D3 "Progress push", D9.2). The server does not interpret the event's
+/// `kind`: a frontend that knows the kind reads `params`, one that does not
+/// ignores the line. `aitm-scan-model` carries the same literal for its own
+/// consumers; `aitm-mcp` does not depend on it, so the two are pinned by the
+/// contract tests, not by a shared item.
+pub const JOB_NOTIFICATION_METHOD: &str = "notifications/aitm/job";
 
 /// The default for [`McpServer::write_timeout`], which defines what the deadline
 /// bounds. At 30 s, one 16 MiB frame can still finish at about 0.53 MiB/s, far
@@ -1047,6 +1055,17 @@ pub struct McpServer {
     /// call is a no-op rather than a second dispatcher delivering every event
     /// twice.
     dispatcher_spawned: AtomicBool,
+    /// The generic job-progress bus (D9.2) this server renders as
+    /// [`JOB_NOTIFICATION_METHOD`] lines and hands to every `CommandHost`, so a
+    /// long-running command can publish progress. `None` = no job push on this
+    /// server and `host.jobs()` is `None` (a publisher then simply has nowhere
+    /// to publish; nothing fails).
+    jobs: Option<Arc<JobBus>>,
+    /// Set by the first [`McpServer::spawn_push_dispatcher`] call that finds a
+    /// bus attached, so a second call does not deliver every job event twice.
+    /// Separate from `dispatcher_spawned`: the two streams are attached
+    /// independently, so a server may have either, both, or neither.
+    job_dispatcher_spawned: AtomicBool,
     /// Outstanding operator confirm-over-the-wire tokens (spec D4).
     confirm_tokens: Arc<ConfirmTokens>,
     /// How long a minted confirm token stays valid.
@@ -1113,6 +1132,8 @@ impl McpServer {
             conn_seq: Arc::new(AtomicU64::new(0)),
             conn_salt: draw_conn_salt(),
             dispatcher_spawned: AtomicBool::new(false),
+            jobs: None,
+            job_dispatcher_spawned: AtomicBool::new(false),
             confirm_tokens: Arc::new(ConfirmTokens::default()),
             confirm_ttl: DEFAULT_CONFIRM_TTL,
             audit_ring: Arc::new(AuditRing::default()),
@@ -1156,6 +1177,25 @@ impl McpServer {
     pub fn with_push(mut self, tx: broadcast::Sender<Event>) -> Self {
         self.push_tx = Some(tx);
         self
+    }
+
+    /// Attach the generic job-progress bus (D9.2). Every event published on it
+    /// is rendered as a [`JOB_NOTIFICATION_METHOD`] line and fanned out with
+    /// `fanout_state` semantics by the dispatcher
+    /// [`McpServer::spawn_push_dispatcher`] starts, and the same bus is handed to
+    /// every `CommandHost` this server builds, so a long-running command
+    /// publishes to the bus its own frontend reads.
+    ///
+    /// Wiring creates one bus and hands the same `Arc` to every server (agent,
+    /// in-process TUI, web bridge), so a job started on one is watched on all.
+    pub fn with_jobs(mut self, bus: Arc<JobBus>) -> Self {
+        self.jobs = Some(bus);
+        self
+    }
+
+    /// The job bus attached by [`McpServer::with_jobs`], if any.
+    pub fn jobs(&self) -> Option<Arc<JobBus>> {
+        self.jobs.clone()
     }
 
     /// Set the per-connection push-sink capacity (notification lines before the
@@ -1202,26 +1242,40 @@ impl McpServer {
         self.write_timeout
     }
 
-    /// Spawn this server's push dispatcher: one task that drains the core event
-    /// broadcast attached by [`McpServer::with_push`] and fans each event to the
-    /// matching subscriptions through [`McpServer::push_flow_event`]. A no-op
-    /// when no broadcast was attached, and idempotent: a second call on the same
-    /// server spawns nothing, so no subscriber receives an event twice.
+    /// Spawn this server's push dispatchers: one task per attached stream.
+    ///
+    /// - The **flow** stream: the core event broadcast attached by
+    ///   [`McpServer::with_push`], each event fanned to the matching
+    ///   subscriptions through [`McpServer::push_flow_event`].
+    /// - The **job** stream: the [`JobBus`] attached by [`McpServer::with_jobs`],
+    ///   each event rendered through [`McpServer::push_job_event`] (D9.2).
+    ///
+    /// Each half is a no-op when its stream was not attached, and each is
+    /// idempotent on its own flag: a second call on the same server spawns
+    /// nothing, so no subscriber receives an event twice.
     ///
     /// `serve` calls this before it listens. A server that is driven without
     /// `serve` (the web `/bus` bridge, which calls `handle_on` directly) must call
     /// it itself, or its subscriptions sit in a registry nothing ever feeds.
     ///
-    /// The task holds this server and runs until the broadcast closes, that is
-    /// until every sender has dropped. In the real wiring that is the life of
-    /// the runtime: the server's own registry retains a sender (the
-    /// `SubscriptionPlugin`'s), so the task, and the server with it, lives until
-    /// the runtime shuts down.
+    /// A task holds this server and runs until its channel closes, that is until
+    /// every sender has dropped. In the real wiring that is the life of the
+    /// runtime: the server's own registry retains a flow sender (the
+    /// `SubscriptionPlugin`'s) and the server itself retains the job bus, so the
+    /// tasks, and the server with them, live until the runtime shuts down.
     ///
     /// # Panics
     ///
     /// Outside a Tokio runtime, like `tokio::spawn`.
     pub fn spawn_push_dispatcher(self: &Arc<Self>) {
+        self.spawn_flow_dispatcher();
+        self.spawn_job_dispatcher();
+    }
+
+    /// The flow half of [`McpServer::spawn_push_dispatcher`]: the core event
+    /// broadcast attached by [`McpServer::with_push`]. A no-op without one, and
+    /// idempotent.
+    fn spawn_flow_dispatcher(self: &Arc<Self>) {
         let Some(tx) = &self.push_tx else {
             return;
         };
@@ -1238,6 +1292,35 @@ impl McpServer {
                     Ok(ev) => dispatch_server.push_flow_event(&ev),
                     // The dispatcher fell behind the ring: skip the missed
                     // events rather than block the chain (spec D3.5).
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    /// The job half of [`McpServer::spawn_push_dispatcher`]: the [`JobBus`]
+    /// attached by [`McpServer::with_jobs`] (D9.2). A no-op without one, and
+    /// idempotent on its own flag, so a server may carry either stream, both, or
+    /// neither. The subscription is taken here, before the task is spawned, so an
+    /// event published the moment this returns is already in the receiver's ring.
+    ///
+    /// Progress is disposable: a dispatcher that falls behind the bus's ring skips
+    /// the missed events (`Lagged`) rather than stall a job, because push is only
+    /// a trigger — a frontend polls `scan.status` for truth (spec D3).
+    fn spawn_job_dispatcher(self: &Arc<Self>) {
+        let Some(bus) = &self.jobs else {
+            return;
+        };
+        if self.job_dispatcher_spawned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let dispatch_server = Arc::clone(self);
+        let mut rx = bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => dispatch_server.push_job_event(&ev),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -1341,6 +1424,45 @@ impl McpServer {
             "jsonrpc": "2.0",
             "method": "notifications/aitm/state",
             "params": state,
+        })
+        .to_string();
+        self.subscriptions
+            .fanout_state(&line, &|| self.agent_pushes_muted());
+    }
+
+    /// Render `ev` as a [`JOB_NOTIFICATION_METHOD`] line and fan it to every
+    /// subscribed connection, with the same `fanout_state` semantics as
+    /// [`McpServer::push_state`] (every connection holding any `flow.subscribe`
+    /// subscription, at most one line each, role-aware, muted for agents under
+    /// `paused`). Non-blocking.
+    ///
+    /// `params` is the event's payload when that is an object (anything else is
+    /// dropped: a notification's params must be an object), with `job`, `kind`,
+    /// `event` and `seq` inserted **only when the payload does not already carry
+    /// them** — the publisher owns the vocabulary and the server never overwrites
+    /// its view of it (call B16). The server interprets nothing else: an unknown
+    /// `kind` is forwarded verbatim.
+    pub fn push_job_event(&self, ev: &JobEvent) {
+        let mut params = match to_json(&ev.payload) {
+            JsonValue::Object(fields) => fields,
+            _ => Map::new(),
+        };
+        params
+            .entry("job")
+            .or_insert_with(|| JsonValue::String(ev.job.clone()));
+        params
+            .entry("kind")
+            .or_insert_with(|| JsonValue::String(ev.kind.clone()));
+        params
+            .entry("event")
+            .or_insert_with(|| JsonValue::String(ev.event.clone()));
+        params
+            .entry("seq")
+            .or_insert_with(|| JsonValue::Number(ev.seq.into()));
+        let line = json!({
+            "jsonrpc": "2.0",
+            "method": JOB_NOTIFICATION_METHOD,
+            "params": JsonValue::Object(params),
         })
         .to_string();
         self.subscriptions
@@ -1466,6 +1588,8 @@ impl McpServer {
             conn_seq,
             conn_salt,
             dispatcher_spawned,
+            jobs,
+            job_dispatcher_spawned,
             confirm_tokens,
             confirm_ttl,
             audit_ring,
@@ -1494,6 +1618,8 @@ impl McpServer {
             conn_seq,
             conn_salt,
             dispatcher_spawned,
+            jobs,
+            job_dispatcher_spawned,
             confirm_tokens,
             confirm_ttl,
             audit_ring,
@@ -1897,6 +2023,12 @@ impl McpServer {
             Some(rec) => host.with_finding_recorder(rec.as_ref()),
             None => host,
         };
+        // So a long-running command can publish progress to the very bus this
+        // server's dispatcher renders (D9.2).
+        let host = match &self.jobs {
+            Some(bus) => host.with_jobs(bus.clone()),
+            None => host,
+        };
         // `summarize` reads the args and result, so keep a copy of the typed args
         // before `invoke` consumes them (D3b).
         let args_for_summary = args.clone();
@@ -2040,10 +2172,15 @@ impl McpServer {
             // Sensitive command with no such gate is refused here (deny-by-default).
             (AgentPolicy::All, Sensitivity::Sensitive) => defers_to_command_gate(cmd.name()),
             (AgentPolicy::Auto, Sensitivity::Read | Sensitivity::Write) => true,
-            // Autonomous with zero Sensitive actions: `Auto` always refuses a
-            // Sensitive command for the agent, config gate on or not — switch to
-            // `All` (unconditional) or `Ask` (operator approval) to permit one.
-            (AgentPolicy::Auto, Sensitivity::Sensitive) => false,
+            // Autonomous with zero Sensitive actions: `Auto` refuses a Sensitive
+            // command for the agent, config gate on or not — switch to `All`
+            // (unconditional) or `Ask` (operator approval) to permit one. The one
+            // exception is a command that gates the agent *itself* under `auto`
+            // (`defers_to_command_gate_under_auto`): it is let through to answer
+            // in its own refusal vocabulary, and still refuses (call B6).
+            (AgentPolicy::Auto, Sensitivity::Sensitive) => {
+                defers_to_command_gate_under_auto(cmd.name())
+            }
             (AgentPolicy::Ask, Sensitivity::Read | Sensitivity::Write) => true,
             // `Ask` parks a Sensitive agent call for operator approval (spec D4) —
             // except the operator-only commands (`agent.set`/`agent.approve`), which
@@ -2471,6 +2608,10 @@ fn defers_to_command_gate(name: &str) -> bool {
         "ca.install"
             | "ca.uninstall"
             | "scope.add"
+            // `scan.start` reads the agent policy and its own
+            // `scanner.allow_agent_active` / `scanner.allow_agent_l4_fuzz` gates
+            // itself, and answers with its own `scan: refused_*` code (spec D11).
+            | "scan.start"
             // The L4 Sensitive verbs each carry a per-capability agent gate
             // (`l4.allow_agent_*`, surfaced as the Mcp-only `L4AgentGate` wrapper and,
             // for widen, inside `l4.scope.add`): under `All` the call is deferred to
@@ -2486,6 +2627,20 @@ fn defers_to_command_gate(name: &str) -> bool {
             | "l4.intercept.forward"
             | "l4.intercept.drop"
     )
+}
+
+/// Whether a Sensitive command refuses the agent *itself* under `AgentPolicy::Auto`,
+/// so the policy gate lets it answer instead of pre-empting it with the generic
+/// `auto` refusal (call B6).
+///
+/// A command listed here **must** refuse an agent under `auto` on its own — the
+/// server makes no decision for it beyond letting the call through, and a command
+/// that forgot would run. In exchange the caller gets one code vocabulary
+/// (`scan: refused_agent: ...`) instead of two refusal texts for the same posture.
+/// Every other Sensitive command keeps today's flat `auto` refusal, including the
+/// L4 verbs, whose per-capability gates speak only under `all`.
+fn defers_to_command_gate_under_auto(name: &str) -> bool {
+    matches!(name, "scan.start")
 }
 
 /// Whether `name` is an operator/CLI-only command the agent can never run — so it
@@ -4910,6 +5065,464 @@ mod tests {
             PARK_POLICY_RECHECK >= Duration::from_millis(100)
                 && PARK_POLICY_RECHECK <= Duration::from_millis(250),
             "PARK_POLICY_RECHECK is {PARK_POLICY_RECHECK:?}, outside 100 to 250 ms"
+        );
+    }
+    // ------------------- Task 5: the generic job bus → `notifications/aitm/job`
+
+    /// A `Value` object from `(key, value)` pairs, so a test payload reads as the
+    /// JSON it renders to.
+    fn job_object(fields: Vec<(&str, Value)>) -> Value {
+        Value::Object(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+    }
+
+    /// A progress event for job `scan-1a2b3c4d` carrying `payload`.
+    fn job_event(event: &str, seq: u64, payload: Value) -> JobEvent {
+        JobEvent {
+            job: "scan-1a2b3c4d".to_string(),
+            kind: "scan".to_string(),
+            event: event.to_string(),
+            seq,
+            payload,
+        }
+    }
+
+    /// The one line a connection's sink holds, parsed.
+    fn job_one_line(conn: &ConnCtx) -> JsonValue {
+        let sink = conn.out.as_ref().expect("the connection has a sink");
+        let lines = sink.drain();
+        assert_eq!(lines.len(), 1, "exactly one pushed line: {lines:?}");
+        serde_json::from_str(&lines[0]).expect("the pushed line is JSON")
+    }
+
+    /// Spec D3 "Progress push" / D9.2: a `JobEvent` renders as one
+    /// `notifications/aitm/job` line whose `params` is the payload object with the
+    /// envelope fields (`job`, `kind`, `event`, `seq`) folded in.
+    #[test]
+    fn job_event_renders_as_a_job_notification() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let (srv, _store) = revoke_server_with_store(&state);
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+
+        srv.push_job_event(&job_event(
+            "progress",
+            3,
+            job_object(vec![(
+                "status",
+                job_object(vec![("state", Value::Str("running".into()))]),
+            )]),
+        ));
+
+        let line = job_one_line(&operator);
+        assert_eq!(line["jsonrpc"], json!("2.0"), "{line}");
+        assert_eq!(line["method"], json!("notifications/aitm/job"), "{line}");
+        assert_eq!(line["method"], json!(JOB_NOTIFICATION_METHOD), "{line}");
+        assert_eq!(line["params"]["job"], json!("scan-1a2b3c4d"), "{line}");
+        assert_eq!(line["params"]["kind"], json!("scan"), "{line}");
+        assert_eq!(line["params"]["event"], json!("progress"), "{line}");
+        assert_eq!(line["params"]["seq"], json!(3), "{line}");
+        assert_eq!(
+            line["params"]["status"]["state"],
+            json!("running"),
+            "{line}"
+        );
+    }
+
+    /// The payload wins: an envelope field is inserted only when the publisher did
+    /// not already carry it (B16 — the server renders a vocabulary it does not
+    /// interpret and never overwrites the publisher's own view of it).
+    #[test]
+    fn job_payload_fields_win_over_envelope() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let (srv, _store) = revoke_server_with_store(&state);
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+
+        srv.push_job_event(&job_event(
+            "progress",
+            3,
+            job_object(vec![("seq", Value::Int(9))]),
+        ));
+
+        let line = job_one_line(&operator);
+        assert_eq!(line["params"]["seq"], json!(9), "{line}");
+        assert_eq!(
+            line["params"]["event"],
+            json!("progress"),
+            "an absent field still comes from the envelope: {line}"
+        );
+    }
+
+    /// `fanout_state` semantics: a job line is not enqueued for an agent-role
+    /// subscription while the policy is `paused`; operator subscriptions keep
+    /// receiving it (spec D3, "role-aware; muted for agents under `paused`").
+    #[test]
+    fn job_lines_are_muted_for_agents_under_paused() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let (srv, _store) = revoke_server_with_store(&state);
+        let agent = revoke_subscribe(&srv, ConnCtx::agent());
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+
+        state.set_policy(AgentPolicy::Paused);
+        srv.push_job_event(&job_event("progress", 1, job_object(vec![])));
+
+        assert_eq!(
+            agent
+                .out
+                .as_ref()
+                .expect("the agent connection has a sink")
+                .queued_len(),
+            0,
+            "the agent subscription is muted under `paused`"
+        );
+        assert_eq!(
+            operator
+                .out
+                .as_ref()
+                .expect("the operator connection has a sink")
+                .queued_len(),
+            1,
+            "the operator subscription is never muted"
+        );
+    }
+
+    /// D9.2: a server built `with_jobs` spawns, from `spawn_push_dispatcher`, a
+    /// task that renders every published event — with no core event broadcast
+    /// attached, so the job stream is independent of the flow stream.
+    #[tokio::test]
+    async fn with_jobs_dispatcher_delivers_published_events() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let bus = Arc::new(JobBus::default());
+        let srv = Arc::new(
+            McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+                .with_agent_state(state)
+                .with_services(
+                    Arc::new(MemFlowStore::new()),
+                    Arc::new(NoClient),
+                    Arc::new(StdGuard::default()),
+                    None,
+                )
+                .with_jobs(bus.clone()),
+        );
+        assert!(srv.jobs().is_some(), "setup: the bus is wired");
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+        srv.spawn_push_dispatcher();
+
+        bus.publish(job_event("started", 1, job_object(vec![])));
+
+        let sink = operator.out.clone().expect("the connection has a sink");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let lines = loop {
+            let lines = sink.drain();
+            if !lines.is_empty() {
+                break lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no job line was delivered within 2 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(lines.len(), 1, "exactly one line: {lines:?}");
+        let line: JsonValue = serde_json::from_str(&lines[0]).expect("the line is JSON");
+        assert_eq!(line["method"], json!("notifications/aitm/job"), "{line}");
+        assert_eq!(line["params"]["event"], json!("started"), "{line}");
+    }
+
+    /// A Sensitive stub that refuses the way the real `scan.start` does: with its
+    /// own `scan: <code>: <message>` vocabulary.
+    struct JobGateStub(&'static str);
+
+    impl Command for JobGateStub {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn sensitivity(&self) -> Sensitivity {
+            Sensitivity::Sensitive
+        }
+        fn schema(&self) -> ParamSchema {
+            ParamSchema {
+                description: "A Sensitive stub that refuses with its own code.".into(),
+                params: vec![],
+                result: TypeDesc::Str,
+            }
+        }
+        fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+            anyhow::bail!("scan: refused_agent: test gate")
+        }
+    }
+
+    /// The `result` of an agent `tools/call <name>` on `srv`.
+    fn job_agent_call(srv: &McpServer, name: &str) -> JsonValue {
+        let reply = srv
+            .handle_on(
+                &ConnCtx::agent(),
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": {}}})
+                .to_string(),
+            )
+            .expect("the call replies");
+        let reply: JsonValue = serde_json::from_str(&reply).expect("the reply is JSON");
+        reply["result"].clone()
+    }
+
+    /// AC T1-4 / call B6: under both `auto` and `all` the policy gate lets
+    /// `scan.start` answer the agent itself, so the refusal carries the command's
+    /// own `scan: refused_*` code; every other Sensitive command keeps today's
+    /// generic refusal under `auto`.
+    #[test]
+    fn scan_start_is_deferred_to_its_command_gate_under_auto_and_all() {
+        for policy in [AgentPolicy::Auto, AgentPolicy::All] {
+            let state = Arc::new(AgentState::new(policy));
+            let mut registry = Registry::new();
+            registry.add_command(Arc::new(JobGateStub("scan.start")));
+            registry.add_command(Arc::new(JobGateStub("l4.inject")));
+            let srv = McpServer::new(Arc::new(registry), McpTransport::Stdio)
+                .with_agent_state(state)
+                .with_services(
+                    Arc::new(MemFlowStore::new()),
+                    Arc::new(NoClient),
+                    Arc::new(StdGuard::default()),
+                    None,
+                );
+
+            let result = job_agent_call(&srv, "scan.start");
+            assert_eq!(result["isError"], json!(true), "{policy:?}: {result}");
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("the result carries text");
+            assert!(
+                text.contains("scan: refused_agent: test gate"),
+                "{policy:?}: the command's own code answers the agent: {text}"
+            );
+        }
+
+        // No other Sensitive verb changes: `l4.inject` keeps the `auto` refusal.
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let mut registry = Registry::new();
+        registry.add_command(Arc::new(JobGateStub("l4.inject")));
+        let srv = McpServer::new(Arc::new(registry), McpTransport::Stdio)
+            .with_agent_state(state)
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+        let result = job_agent_call(&srv, "l4.inject");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("the result carries text");
+        assert!(
+            text.contains("permits no sensitive actions"),
+            "l4.inject keeps the generic `auto` refusal: {text}"
+        );
+        assert!(
+            !text.contains("scan: refused_agent"),
+            "the command never ran: {text}"
+        );
+    }
+
+    /// A Read stub reporting whether the host it ran against carries the job bus.
+    struct JobsProbe;
+
+    impl Command for JobsProbe {
+        fn name(&self) -> &str {
+            "jobs.probe"
+        }
+        fn sensitivity(&self) -> Sensitivity {
+            Sensitivity::Read
+        }
+        fn schema(&self) -> ParamSchema {
+            ParamSchema {
+                description: "Report whether the host carries a job bus.".into(),
+                params: vec![],
+                result: TypeDesc::Bool,
+            }
+        }
+        fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+            Ok(Value::Bool(host.jobs().is_some()))
+        }
+    }
+
+    /// D9.2: the host the server assembles per `tools/call` carries the bus it was
+    /// built `with_jobs`, so a long-running command can publish progress; without
+    /// the wiring it carries none (and such a command simply publishes nowhere).
+    #[test]
+    fn command_host_carries_the_job_bus() {
+        fn probe(srv: &McpServer) -> JsonValue {
+            let reply = srv
+                .handle(
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "jobs.probe", "arguments": {}}})
+                    .to_string(),
+                )
+                .expect("the call replies");
+            let reply: JsonValue = serde_json::from_str(&reply).expect("the reply is JSON");
+            assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
+            reply["result"]["structuredContent"].clone()
+        }
+        fn server() -> McpServer {
+            let mut registry = Registry::new();
+            registry.add_command(Arc::new(JobsProbe));
+            McpServer::new(Arc::new(registry), McpTransport::Stdio).with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            )
+        }
+
+        assert_eq!(
+            probe(&server().with_jobs(Arc::new(JobBus::default()))),
+            json!(true)
+        );
+        assert_eq!(probe(&server()), json!(false));
+    }
+
+    // ------------------- Task 5 (tester): edges of the job push and the gate
+
+    /// B16: a notification's `params` must be an object. A publisher whose
+    /// payload is not one (a string, a number, null) still gets a well-formed
+    /// line: the envelope fields alone, and nothing of the stray payload.
+    #[test]
+    fn job_payload_that_is_not_an_object_yields_envelope_only_params() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let (srv, _store) = revoke_server_with_store(&state);
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+
+        for payload in [Value::Str("stray".into()), Value::Int(7), Value::Null] {
+            srv.push_job_event(&job_event("progress", 4, payload.clone()));
+            let line = job_one_line(&operator);
+            let params = line["params"]
+                .as_object()
+                .unwrap_or_else(|| panic!("params is an object for {payload:?}: {line}"));
+            let mut keys: Vec<&str> = params.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["event", "job", "kind", "seq"],
+                "only the envelope for {payload:?}: {line}"
+            );
+            assert_eq!(line["params"]["seq"], json!(4), "{line}");
+            assert_eq!(line["params"]["job"], json!("scan-1a2b3c4d"), "{line}");
+            assert!(
+                !line.to_string().contains("stray"),
+                "a non-object payload never leaks into the line: {line}"
+            );
+        }
+    }
+
+    /// `spawn_push_dispatcher` is idempotent on the job stream too: two calls on
+    /// one server deliver each published event once, not twice.
+    #[tokio::test]
+    async fn job_dispatcher_is_spawned_once() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let bus = Arc::new(JobBus::default());
+        let srv = Arc::new(
+            McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+                .with_agent_state(state)
+                .with_services(
+                    Arc::new(MemFlowStore::new()),
+                    Arc::new(NoClient),
+                    Arc::new(StdGuard::default()),
+                    None,
+                )
+                .with_jobs(bus.clone()),
+        );
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+        srv.spawn_push_dispatcher();
+        srv.spawn_push_dispatcher();
+        assert_eq!(
+            bus.receiver_count(),
+            1,
+            "a second spawn takes no second subscription"
+        );
+
+        bus.publish(job_event("started", 1, job_object(vec![])));
+        bus.publish(job_event("finished", 2, job_object(vec![])));
+
+        let sink = operator.out.clone().expect("the connection has a sink");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut lines = Vec::new();
+        while lines.len() < 2 && Instant::now() < deadline {
+            lines.extend(sink.drain());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Give a (wrongly) doubled dispatcher time to show itself.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        lines.extend(sink.drain());
+        let events: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                let v: JsonValue = serde_json::from_str(l).expect("JSON");
+                v["params"]["event"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        assert_eq!(
+            events,
+            ["started", "finished"],
+            "each event exactly once, in order: {lines:?}"
+        );
+    }
+
+    /// Call B6 widens the `auto` gate by exactly one name. Every other Sensitive
+    /// command — whatever it is called, `scan.*` included — keeps the generic
+    /// refusal and is never invoked.
+    #[test]
+    fn only_scan_start_defers_to_its_command_under_auto() {
+        let others = [
+            "l4.inject",
+            "l4.scope.add",
+            "poc.run",
+            "scan.map",
+            "scan.cancel",
+            "scan.issue.update",
+            "scan.start.now",
+            "proxy.system.enable",
+        ];
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let mut registry = Registry::new();
+        registry.add_command(Arc::new(JobGateStub("scan.start")));
+        for name in others {
+            registry.add_command(Arc::new(JobGateStub(name)));
+        }
+        let srv = McpServer::new(Arc::new(registry), McpTransport::Stdio)
+            .with_agent_state(state)
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+
+        for name in others {
+            let result = job_agent_call(&srv, name);
+            assert_eq!(result["isError"], json!(true), "{name}: {result}");
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("the result carries text");
+            assert!(
+                text.contains("permits no sensitive actions"),
+                "{name} keeps the generic `auto` refusal: {text}"
+            );
+            assert!(
+                !text.contains("test gate"),
+                "{name} was invoked under `auto`: {text}"
+            );
+        }
+
+        let result = job_agent_call(&srv, "scan.start");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("the result carries text");
+        assert!(
+            text.contains("scan: refused_agent: test gate"),
+            "scan.start alone answers in its own vocabulary: {text}"
         );
     }
 }

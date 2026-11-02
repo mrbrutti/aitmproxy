@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 62] = [
+const EXPECTED_TOOLS: [&str; 103] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -89,10 +89,62 @@ const EXPECTED_TOOLS: [&str; 62] = [
     "map.list",
     "map.remove",
     // The deterministic scanner: `ScannerPlugin` is registered unconditionally in
-    // `wire.rs`, so its commands are on every surface.
+    // `wire.rs`, so its commands are on every surface. `scan.discover`,
+    // `scan.passive` and `scan.report` are the v1 verbs, re-implemented over the
+    // job model; the rest are the scanner v2 job family of spec D3.
     "scan.discover",
     "scan.passive",
     "scan.report",
+    "scan.start",
+    "scan.map",
+    "scan.status",
+    "scan.list",
+    "scan.cancel",
+    "scan.issues",
+    "scan.issue",
+    "scan.issue.update",
+    "scan.sitemap",
+    "scan.checks",
+    "scan.profile.list",
+    "scan.profile.get",
+    "scan.profile.save",
+    "scan.profile.delete",
+    "scan.session.preview",
+    // One manual verb per registered check (spec D3 `check.<id>`): the ten T3
+    // natives of `aitm-scan-checks-http` (PR 2a) and the three passive checks
+    // the scanner engine itself ships (`reflection`, `security-header`,
+    // `cookie-flag`), which stay on the surface whatever lane holds the http
+    // slot (spec amendment 24: "the passives stay").
+    "check.xss-reflected",
+    "check.open-redirect",
+    "check.sqli-boolean",
+    "check.sqli-time",
+    "check.cmdi-time",
+    "check.h2-settings-observe",
+    "check.h2-pseudo-header-validation",
+    "check.h2-header-crlf-tolerance",
+    "check.h2-cl-te-downgrade-indicator",
+    "check.h2-rapid-reset-mitigation",
+    "check.reflection",
+    "check.security-header",
+    "check.cookie-flag",
+    // The T4 WS lane's eight checks (`aitm-scan-ws`), each with its `check.<id>`
+    // manual verb once the lane registers with the engine.
+    "check.cswsh",
+    "check.ws-auth-bypass-handshake",
+    "check.ws-cmdi-echo",
+    "check.ws-input-reflection",
+    "check.ws-oversize-frame",
+    "check.ws-sql-error",
+    "check.ws-ssti",
+    "check.ws-subprotocol-observe",
+    "check.l4-packet-crash",
+    "check.l4-packet-reaction",
+    // The T6 L4 stream lane's three checks (`aitm-scan-l4-stream`), one campaign
+    // per point shared by all three (spec S6.3).
+    "check.l4-crash",
+    "check.l4-parser-fault",
+    "check.l4-latency-outlier",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.
@@ -284,8 +336,17 @@ fn ac7_exact_tool_set() {
     assert_eq!(headers_schema["additionalProperties"]["type"], "string");
 }
 
+/// The `scan.*` verbs whose spec D3 parameter object is literally `{}`, so an
+/// empty `properties` is their correct schema rather than a missing one. D3's
+/// verb table gives `scan.profile.list` params `{}` (it takes no argument: it
+/// lists every profile). Every other `scan.*` verb must carry at least one
+/// property; keep this list exhaustive, not a convenience.
+const SCAN_TOOLS_WITHOUT_PARAMS: [&str; 1] = ["scan.profile.list"];
+
 /// AC18: every `scan.*` tool the proxy lists carries an input schema an MCP
-/// client can build a call from: an object whose `properties` is non-empty.
+/// client can build a call from: an object whose `properties` is non-empty,
+/// except the D3 no-parameter verbs in `SCAN_TOOLS_WITHOUT_PARAMS`, which must
+/// still expose an object schema with an (empty) `properties` map.
 /// It iterates whatever `scan.*` tools are registered, so a new scan verb is
 /// covered without editing this test; it first asserts the three verbs that
 /// must always be there, so an unregistered command fails it rather than slipping
@@ -322,6 +383,14 @@ fn scan_tools_have_non_empty_input_schemas() {
         let properties = schema["properties"]
             .as_object()
             .unwrap_or_else(|| panic!("`{name}` inputSchema.properties is an object: {schema}"));
+        if SCAN_TOOLS_WITHOUT_PARAMS.contains(&name) {
+            assert!(
+                properties.is_empty(),
+                "`{name}` takes no D3 parameter, so its properties must be empty; \
+                 drop it from SCAN_TOOLS_WITHOUT_PARAMS now that it has one: {schema}"
+            );
+            continue;
+        }
         assert!(
             !properties.is_empty(),
             "`{name}` inputSchema.properties must not be empty: {schema}"

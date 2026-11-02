@@ -591,6 +591,7 @@ mod tests {
     use aitm_cli::dispatch::{check_flags, group_of, locate, Located};
     use aitm_core::{Config, TypeDesc};
     use aitm_plugin_rhai::RhaiConfig;
+    use aitm_plugin_scanner::ScannerConfig;
     use aitm_proto_l4::config::L4Config;
     use aitm_sysproxy::SystemProxyConfig;
 
@@ -635,6 +636,7 @@ mod tests {
             },
             macos_capture: MacosCaptureConfig::default(),
             system_proxy: SystemProxyConfig::default(),
+            scanner: ScannerConfig::default(),
         };
         let env: BTreeMap<String, String> =
             BTreeMap::from([("AITM_BUNDLED_SCRIPTS".to_string(), BUNDLED.to_string())]);

@@ -23,9 +23,9 @@
 use std::sync::{Arc, OnceLock};
 
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, FlowRef, InsertionKind,
-    InsertionPoint, Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, Technique,
-    Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Evidence, FlowRef,
+    InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost,
+    Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -69,6 +69,7 @@ fn catalogue_entry() -> &'static CheckMeta {
         needs_baseline: false,
         wants_traits: None,
         targets_session: false,
+        scope: CheckScope::Point,
         cwe: Some(1336),
         description: format!(
             "Sends an arithmetic template canary ({SSTI_A}*{SSTI_B}) in four template \
@@ -134,6 +135,8 @@ async fn probe_each_template(host: &dyn ProbeHost) -> Verdict {
                     "template expression evaluated: {SSTI_A}*{SSTI_B} rendered next to the marker"
                 ),
                 poc_hint: None,
+                location: None,
+                more: Vec::new(),
             };
         }
     }
@@ -150,6 +153,8 @@ async fn probe_each_template(host: &dyn ProbeHost) -> Verdict {
             probes.len()
         ),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 

@@ -1749,6 +1749,7 @@ fn oversized_response() -> HttpResponse {
         trailers: HeaderMap::new(),
         body: Body::Bytes(b"request body exceeds the configured limit".to_vec()),
         timestamp: SystemTime::now(),
+        peer: None,
     }
 }
 

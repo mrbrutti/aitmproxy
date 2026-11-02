@@ -54,8 +54,8 @@ pub fn config(tag: &str) -> Config {
 pub fn assemble_services(cfg: &Config) -> (Proxy, Services, Governance) {
     let assembled = assemble(cfg).expect("assemble");
     let governance = assembled.governance();
-    let Assembled { proxy, .. } = assembled;
-    let services = tui::services(&proxy, cfg, None, TuiLog::Off);
+    let Assembled { proxy, job_bus, .. } = assembled;
+    let services = tui::services(&proxy, cfg, None, TuiLog::Off, job_bus);
     (proxy, services, governance)
 }
 
@@ -138,6 +138,8 @@ pub fn live_commands(features: &Features, rhai: RhaiConfig) -> Vec<(String, Stri
                 executor: Some(tier.executor.clone()),
                 poc_step_handlers,
                 commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
+                // #232 (scanner v2): the script tier's check registry, as `main.rs` passes it.
+                script_checks: Some(tier.checks.clone()),
             },
         )
         .expect("the proxy assembles in a temp CA dir");

@@ -17,6 +17,7 @@ use aitm::macos_capture::config::MacosCaptureConfig;
 use aitm::wire::Features;
 use aitm_core::{Config, ParamDef, ParamSchema, Registry, TypeDesc};
 use aitm_plugin_rhai::RhaiConfig;
+use aitm_plugin_scanner::ScannerConfig;
 use aitm_proto_l4::config::L4Config;
 use aitm_proto_l4::L4Privilege;
 use aitm_sysproxy::SystemProxyConfig;
@@ -26,10 +27,11 @@ mod support;
 /// The shipped catalogue, reached through the injected env (plan rule 13).
 const BUNDLED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/bundled");
 
-/// The 17 built-in groups (catalogue off, `l4.enabled` off).
-const BUILT_IN_GROUPS: [&str; 17] = [
-    "agent", "browser", "ca", "capture", "config", "findings", "flow", "map", "poc", "proxy",
-    "request", "scan", "scope", "script", "session", "tls", "ws",
+/// The 18 built-in groups (catalogue off, `l4.enabled` off; `check` is
+/// native since the scanner v2 engine, main #232).
+const BUILT_IN_GROUPS: [&str; 18] = [
+    "agent", "browser", "ca", "capture", "check", "config", "findings", "flow", "map", "poc",
+    "proxy", "request", "scan", "scope", "script", "session", "tls", "ws",
 ];
 
 /// The 19 groups of plan mock-up M-W2-1 (catalogue on, `l4.enabled` off).
@@ -49,6 +51,7 @@ fn settings(tag: &str) -> Settings {
         l4: L4Config::default(),
         macos_capture: MacosCaptureConfig::default(),
         system_proxy: SystemProxyConfig::default(),
+        scanner: ScannerConfig::default(),
     }
 }
 
@@ -176,7 +179,9 @@ fn describe_with_the_bundled_catalogue_lists_check_and_l4_scripts() {
     );
     assert_eq!(group_names(&described.registry), CATALOGUE_GROUPS);
     let check = verbs_of(&described.registry, "check");
-    assert_eq!(check.len(), 15, "check verbs: {check:?}");
+    // 26 natives since the scanner v2 track (main #232, #301) plus the 15
+    // bundled Rhai checks, all under one `check` group.
+    assert_eq!(check.len(), 41, "check verbs: {check:?}");
     assert!(check.iter().all(|v| v.starts_with("check.")));
     assert_eq!(
         verbs_of(&described.registry, "l4"),
@@ -303,7 +308,9 @@ fn describe_matches_the_live_registry_with_the_catalogue_and_l4_enabled() {
         ours, live,
         "with the catalogue and l4.enabled describe::registry drifted from the live assembly"
     );
-    assert_eq!(ours.len(), 113, "plan Task 10's command count");
+    // Plan Task 10 counted 113 before main's scanner track registered the
+    // fifteen `scan.*` job verbs and 26 native `check.*` (2026-11-02).
+    assert_eq!(ours.len(), 154, "plan Task 10's command count");
     assert_eq!(group_names(&described.registry), CATALOGUE_GROUPS);
     let l4 = verbs_of(&described.registry, "l4");
     assert_eq!(l4.len(), 25, "{l4:?}");

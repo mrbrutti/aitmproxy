@@ -273,6 +273,7 @@ fn entry_to_http(entry: &HarEntry) -> anyhow::Result<HttpFlow> {
         trailers: HeaderMap::new(),
         body: content_to_body(&entry.response.content)?,
         timestamp: UNIX_EPOCH,
+        peer: None,
     };
     Ok(HttpFlow {
         id: FlowId::new(),

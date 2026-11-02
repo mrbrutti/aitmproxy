@@ -40,6 +40,9 @@ final class Session {
     }()
     /// The sidebar sub-item narrowing the list, if any.
     var group: FlowGroup?
+    /// Group keys of the Apps rows currently showing their domains (icons spec D4). Session-only,
+    /// never persisted: selecting an app opens it (`show`), the chevron toggles it (`toggleExpanded`).
+    var expandedApps: Set<String> = []
     var details: [FlowID: FlowDetail] = [:] {
         didSet { rowsVersion &+= 1 }
     }
@@ -53,24 +56,22 @@ final class Session {
     var l4Details: [FlowID: L4Flow] = [:] {
         didSet { rowsVersion &+= 1 }
     }
-    /// Whether this app is driving its own embedded user-level core, which cannot do
-    /// raw L4 (AC18) — set by the connection model. The self-contained embedded core
-    /// degrades every wire verb to `L4Unavailable`; a privileged / remote core over
-    /// the bus drives L4 fully.
-    var l4EmbeddedCore = false
-    /// The last `L4Unavailable` reason a wire verb returned, surfaced in the banner.
-    var l4LastWireError: String?
+    /// Capture/inject availability as the core's own `l4.capture.status` reply says (spec §1); `.pending` until the first read.
+    var l4CaptureAvailability: L4Availability = .pending
+    /// In-path intercept availability from `l4.intercept.status`; `.pending` until the first read.
+    var l4InterceptAvailability: L4Availability = .pending
+    /// The core's L4 scope entries from `l4.scope.list`.
+    var l4Scope: [L4ScopeItem] = []
+    /// Parked packets from `l4.intercept.list`, read only while intercept is available (spec §4).
+    var l4Parked: [L4ParkedPacket] = []
+    /// `tools/list` says `l4.scope.add` is `confirmable`: the operator scope-add control may render (spec §3).
+    var l4CanAddScope = false
     /// The four per-capability agent gates read from `l4.agent.status` (AC11).
     var l4AgentGates: L4AgentGates?
 
-    /// Whether the macOS L4 surface can drive the wire against the current core.
-    var l4Availability: L4Availability {
-        L4Availability.resolve(embeddedCore: l4EmbeddedCore, wireError: l4LastWireError)
-    }
     /// The L4 commands are advertised by the current core (feature-detected).
     var l4Enabled: Bool { tools.contains { $0.name == "l4.flow.list" } }
     var l4HasSetter: Bool { tools.contains { $0.name == "l4.agent.set" } }
-    var l4HasIntercept: Bool { tools.contains { $0.name == "l4.intercept.start" } }
     /// `scan.discover` is advertised by the current core (feature-detected): the Scan page is offered, else hidden.
     var scanEnabled: Bool { ScanForm.isOffered(in: tools) }
     var selection: Set<FlowID> = []
@@ -180,6 +181,11 @@ final class Session {
     /// Set when the operator's Expected role (Settings ▸ Bus) disagrees with the
     /// resolved role, or the server echoed no role to confirm it (spec AC8).
     var roleWarning = false
+    /// The connection is the operator's (the role the server echoed at `initialize`); nil
+    /// (unconfirmed) or `"agent"` is not. The operator-only L4 verbs and the L4 scope add gate on it.
+    var isOperator: Bool { resolvedRole == "operator" }
+    /// Why an operator-only control is disabled or a call refused at its send site.
+    static let operatorOnlyReason = "Needs the operator token (Settings ▸ Bus)"
     /// Bumped by Proxy ▸ Reconnect Bus (⌃⌘R) so the shell re-resolves the
     /// endpoint and reconnects — picking up a newly pasted operator token.
     var reconnectTick = 0
@@ -191,11 +197,19 @@ final class Session {
     /// tests) use the well-known `CoreID.fixture`. The seam for multi-core: a second
     /// connection is additive because every stored flow already carries its originating id.
     let activeCoreID = CoreID()
-    var scopeHosts: [String] = []
-    /// The macOS system proxy as the core reports it. nil = unknown (never rendered as off); written by
-    /// the system-proxy session's PR4 from `proxy.status.system_proxy` and the `proxy.system.set`/`unset`
-    /// replies — nothing in this app writes it until then (traffic-route spec D6, plan call 4).
-    var systemProxy: SystemProxyState?
+    var scopeHosts: [String] = [] {
+        // The core's list is the fact: a host it now lists is no longer an add in flight (S-081).
+        didSet { scopeAdds.confirm(listed: scopeHosts) }
+    }
+    /// Scope adds the operator typed that the core has not listed yet: sending, queued for
+    /// replay after a core restart, or failed with the core's reason (S-081).
+    var scopeAdds = ScopeAddQueue()
+    /// The macOS system proxy's endpoint half as the core reports it: the facts' `state`, one source
+    /// (`BusService.refreshProxyStatus()` and the set/unset replies write the facts; Session+SystemProxy.swift).
+    /// nil = unknown (never rendered as off): no facts, or a verb word that names no endpoint
+    /// (traffic-route spec D6, plan call 4). `ConnectionSummary.make` keeps a separate `systemProxy:`
+    /// parameter for a CFNetwork read this app does not make.
+    var systemProxy: SystemProxyState? { systemProxyFacts?.state }
     /// `proxy.status.decrypt` as last polled (traffic-route spec D6): how many hosts Scope decrypts and the
     /// core's own empty-Scope sentence. nil until the first live read or on an older core; `make` ignores
     /// it while the bus lane is not `.ok`, so no reset on disconnect is needed.
@@ -247,6 +261,16 @@ final class Session {
     var caTrustLastError: CATrustFailure?
     /// The first-run sheet (Shell/SetupSheet.swift) is up.
     var setupSheetVisible = false
+
+    // MARK: System proxy (spec 2026-10-31-system-proxy-automation §D13; the actions live in Session+SystemProxy.swift)
+
+    /// The verb's compact object from the last `proxy.status`, or the last full `proxy.system.status` /
+    /// set / unset reply (the same keys plus `guidance` and `remedy`). nil until read and while the bus
+    /// is down (`forgetSystemProxy`); `systemProxy` is its endpoint half.
+    var systemProxyFacts: SystemProxyFacts?
+    /// A `proxy.system.set` / `unset` call is in flight from THIS app. The facts' `setting` is another
+    /// client's change; `systemProxyControlLive` closes the controls for either.
+    var systemProxySetting = false
 
     init() {
         pins = Pins.load(from: pinsURL)
@@ -356,12 +380,14 @@ final class Session {
     /// Bumped whenever `rows` or `details` change, so the cache knows.
     @ObservationIgnored private var rowsVersion = 0
 
-    /// Clients and hosts for the sidebar's Apps / Domains groups, most flows first.
-    var clients: [(ClientInfo, Int)] {
-        var counts: [ClientInfo: Int] = [:]
-        for row in rows { if let c = row.client { counts[c, default: 0] += 1 } }
-        return counts.sorted { $0.value == $1.value ? $0.key.name < $1.key.name : $0.value > $1.value }
-    }
+    /// Clients and hosts for the sidebar's Apps / Domains groups, most flows first. Clients are the
+    /// Kit's one grouping rule (by `groupKey`, icons plan Task 2) so the Apps header equals the
+    /// Overview tile.
+    var clients: [(ClientInfo, Int)] { ClientTree.clients(in: rows) }
+
+    /// The domains under one Apps row (icons spec D4): the hosts the app with group key `key`
+    /// talked to, most flows first; their counts sum to that app's `clients` count.
+    func hosts(forClient key: String) -> [(String, Int)] { ClientTree.hosts(forClient: key, in: rows) }
 
     var hosts: [(String, Int)] {
         var counts: [String: Int] = [:]
@@ -402,32 +428,30 @@ final class Session {
     }
 
     /// Choose a sidebar page; a sub-item narrows to its group, the group header clears it.
+    /// Selecting an app, or a domain under one, also opens that app's domains (icons spec D4:
+    /// collapsing is explicit via the chevron and keeps the selection and the narrowing).
     func show(_ page: SidebarPage, group: FlowGroup? = nil) {
         self.page = page
         self.group = group
+        if case .client(let key) = group { expandedApps.insert(key) }
+        if case .clientHost(let key, _) = group { expandedApps.insert(key) }
     }
 
-    func pin(_ group: FlowGroup) {
-        switch group {
-        case .host(let h): pins.pinHost(h)
-        case .client(let c): pins.pinApp(c)
-        }
+    /// The Apps row's chevron: open or close one app's domains without touching the selection.
+    func toggleExpanded(_ key: String) {
+        if expandedApps.contains(key) { expandedApps.remove(key) } else { expandedApps.insert(key) }
     }
+
+    // Group → pin mapping lives in the Kit (`Pins.pin/unpin/contains(_ group:)`, icons plan Task 2):
+    // `.host`/`.clientHost` pin the host, `.client` pins the app by its group key.
+    func pin(_ group: FlowGroup) { pins.pin(group) }
 
     func unpin(_ group: FlowGroup) {
-        switch group {
-        case .host(let h): pins.unpinHost(h)
-        case .client(let c): pins.unpinApp(c)
-        }
+        pins.unpin(group)
         if self.group == group { self.group = nil }
     }
 
-    func isPinned(_ group: FlowGroup) -> Bool {
-        switch group {
-        case .host(let h): pins.hosts.contains(h)
-        case .client(let c): pins.apps.contains(c)
-        }
-    }
+    func isPinned(_ group: FlowGroup) -> Bool { pins.contains(group) }
 
     // MARK: Intents — state (the actions live in Session+Verbs.swift)
 

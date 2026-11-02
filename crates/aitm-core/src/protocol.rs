@@ -57,14 +57,17 @@ pub struct NextLayerHint {
     pub first_bytes: Vec<u8>,
     /// `true` when handed off from an HTTP upgrade.
     pub from_upgrade: bool,
-    /// The signing identifier of the process that opened the client connection, as
-    /// a capture backend observed it. `None` on the explicit-proxy path; set by a
-    /// capture ingress. Backend-supplied text about a client: carried as data, never
-    /// a scope or guard input. Stored on the flow as `FlowMeta::source_app`.
+    /// Identifier of the process that opened the client connection: the signing
+    /// identifier a capture backend observed, or — on the explicit-proxy path —
+    /// the core's own resolution of a loopback client (a bundle identifier or an
+    /// executable basename). `None` unless the core could name the client. Text
+    /// about a client: carried as data, never a scope or guard input. Stored on
+    /// the flow as `FlowMeta::source_app`.
     pub peer_identity: Option<String>,
     /// The capture backend that delivered the client connection (its interface
-    /// name, `"macos-ne"`). `None` on the explicit-proxy path; set by a capture
-    /// ingress.
+    /// name, `"macos-ne"`). `None` on the explicit-proxy path, even when the core
+    /// named the client: [`NextLayerHint::tunnel_authority`] reads it as "`dst`
+    /// is the real destination", which is only true for a capture ingress.
     pub capture_interface: Option<String>,
 }
 
@@ -273,5 +276,34 @@ impl ModuleCtx {
         dst: SocketAddr,
     ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
         self.connector.connect(authority, dst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NextLayerHint;
+    use crate::authority::Authority;
+
+    /// AC5: `tunnel_authority` keys the SNI-only port choice on
+    /// `capture_interface`, never on `peer_identity`. A proxied hint the core
+    /// named (`peer_identity` set, `capture_interface` null) still defaults the
+    /// SNI tunnel to 443 — not to `dst`'s port, which on this path is the
+    /// client's own ephemeral port.
+    #[test]
+    fn tunnel_authority_ignores_peer_identity_on_the_proxied_path() {
+        let hint = NextLayerHint {
+            dst: "127.0.0.1:50000".parse().expect("socket literal"),
+            is_tls: true,
+            client_hello_sni: Some("example.com".to_string()),
+            alpn: Vec::new(),
+            first_bytes: Vec::new(),
+            from_upgrade: false,
+            peer_identity: Some("curl".to_string()),
+            capture_interface: None,
+        };
+        assert_eq!(
+            hint.tunnel_authority(),
+            Some(Authority::new("example.com", 443))
+        );
     }
 }

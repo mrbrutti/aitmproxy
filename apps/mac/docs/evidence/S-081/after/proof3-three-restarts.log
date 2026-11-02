@@ -1,0 +1,24 @@
+app pid=12188
+origin 461 -1264
+17:29:24.321 shot 20-scope-page
+core 12202 "structuredContent":[],"isError":false}
+17:29:26.961 shot 21-r1-probe
+17:29:28.245 shot 22-r1-t0
+17:29:29.432 shot 23-r1-t0.5
+17:29:34.067 shot 24-r1-t4.5
+core 15320 "structuredContent":["restart1.test"],"isError":false}
+17:29:36.627 shot 21-r2-probe
+17:29:37.935 shot 22-r2-t0
+17:29:39.162 shot 23-r2-t0.5
+17:29:43.816 shot 24-r2-t4.5
+core 15422 "structuredContent":["restart1.test","restart2.test"],"isError":false}
+17:29:46.391 shot 21-r3-probe
+17:29:47.698 shot 22-r3-t0
+17:29:48.945 shot 23-r3-t0.5
+17:29:53.624 shot 24-r3-t4.5
+core 15533 "structuredContent":["restart1.test","restart2.test","restart3.test"],"isError":false}
+17:29:56.937 shot 25-remove-after-restart
+core 15533 "structuredContent":["restart2.test","restart3.test"],"isError":false}
+17:30:00.959 shot 26-up-add
+core 15533 "structuredContent":["restart2.test","restart3.test","up2.test"],"isError":false}
+proof3 exit 0

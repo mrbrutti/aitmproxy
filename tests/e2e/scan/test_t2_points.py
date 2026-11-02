@@ -34,6 +34,7 @@ from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     boot_target,
     map_job,
+    require_crate_lane,
     require_lane,
     require_verbs,
     sitemap,
@@ -45,7 +46,7 @@ from aitm_e2e.scan import (  # noqa: E402
 JOB_TIMEOUT = 900.0
 
 WANTED_KINDS = {"json_value", "xml_value", "multipart_value", "header", "cookie",
-                "path_segment", "path_filename"}
+                "path_segment", "path_filename", "entire_body"}
 BOUNDARY = "aitm-e2e-boundary-7f3a"
 MULTIPART = (
     f"--{BOUNDARY}\r\n"
@@ -74,6 +75,7 @@ def main() -> None:
                 op = BusClient.operator(core)
                 require_verbs(op, "scan.map", "scan.status", "scan.sitemap")
                 require_lane(op, "http")
+                require_crate_lane(op, "http", "needs T2 (aitm-scan-http)")
                 proxy = cfg.proxy_port
 
                 section("real proxied captures of the seeded point routes")
@@ -124,6 +126,18 @@ def main() -> None:
                 check(WANTED_KINDS <= kinds, f"kinds cover {sorted(WANTED_KINDS)} (missing: {sorted(WANTED_KINDS - kinds)})")
 
                 section("the individual points")
+                # Amendment 65 (T2 follow-up): every body also yields one `entire_body`
+                # point; a JSON or XML document's carries the `structured` trait so
+                # document-level checks (xxe, nosqli-json) have a point to take and
+                # value-level checks can tell it apart. The value points stay.
+                whole = [p for p in points if p.get("kind") == "entire_body"]
+                whole_by_path = {url_path(p): p for p in whole}
+                check("/xml" in whole_by_path and "/api/profile" in whole_by_path,
+                      f"entire_body points exist on /xml and /api/profile ({sorted(k for k in whole_by_path if k)})")
+                structured = {k: "structured" in (whole_by_path[k].get("traits") or [])
+                              for k in ("/xml", "/api/profile") if k in whole_by_path}
+                check(bool(structured) and all(structured.values()),
+                      f"the XML and JSON entire_body points carry the structured trait ({structured})")
                 json_pts = [p for p in points if p.get("kind") == "json_value"]
                 check(any(p.get("path") == "profile.address.city" for p in json_pts),
                       f"a json_value point has path profile.address.city ({[p.get('path') for p in json_pts]})")

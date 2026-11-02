@@ -1,0 +1,39 @@
+# Modbus/TCP, as spec S2's worked example describes it: a 7-byte MBAP header
+# (transaction id, protocol id, length, unit id) framing a PDU.
+#
+# The lane only ever generates the four read function codes. The write and
+# diagnostic codes are listed in `pdu.function`'s `one_of` because that list
+# is the type-substitution mutator's vocabulary, and the mutator must be seen
+# to refuse them: `denylist::refuses` drops every case that renders one, and
+# `Modbus::generate` filters the same list through the same function before it
+# picks a code.
+grammar: modbus
+transport: tcp
+default_ports: [502]
+reply: >
+  The server answers on the same connection with the same transaction id and
+  protocol id, its own MBAP length, the unit id, and the echoed function code
+  followed by a byte count and the register or coil data it read. A function
+  code with the high bit set (0x83 for a read of holding registers) is an
+  exception reply: it carries a single exception-code byte instead of data,
+  and it is a protocol error rather than a fault — the server answered, so it
+  is alive.
+message:
+  - name: header
+    type: group
+    fields:
+      # The transaction id is echoed by the server, which is how a reply is
+      # matched to its request; no mutator touches it.
+      - { name: transaction_id, type: u16 be, mutable: false }
+      - { name: protocol_id, type: u16 be, value: 0 }
+      - { name: length, type: u16 be, len: { of: [unit_id, pdu] } }
+      - { name: unit_id, type: u8, value: 1 }
+  - name: pdu
+    type: group
+    fields:
+      # 1 read coils, 2 read discrete inputs, 3 read holding registers,
+      # 4 read input registers; 5, 6, 8, 15 and 16 write, reset or diagnose
+      # and are refused by the denylist.
+      - { name: function, type: u8, value: 3, one_of: [1, 2, 3, 4, 5, 6, 8, 15, 16] }
+      - { name: address, type: u16 be, value: 0 }
+      - { name: quantity, type: u16 be, range: [1, 125], value: 1 }

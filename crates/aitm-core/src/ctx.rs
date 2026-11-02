@@ -36,6 +36,21 @@ pub trait ProxyClient: Send + Sync {
         let _ = opts;
         self.send(req)
     }
+
+    /// Send `req` as a **scanner probe** (spec amendment 80). A probe exists to
+    /// provoke the target, so a 5xx *answer* is a completed exchange and must
+    /// not count toward the host's error budget; a transport failure or a
+    /// timeout still does, and still disables the host. Proxied and reissued
+    /// traffic keeps [`ProxyClient::send_opts`]'s semantics. The default cannot
+    /// tell the two apart and falls back to `send_opts`; `PipelineClient`
+    /// overrides it.
+    fn send_probe(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        self.send_opts(req, opts)
+    }
 }
 
 /// Where to click in the browser.
@@ -248,6 +263,7 @@ pub struct CommandHost<'a> {
     config: Option<std::sync::Arc<crate::config::Config>>,
     finding_recorder: Option<&'a dyn FindingRecorder>,
     egress: Option<std::sync::Arc<crate::egress::EgressConfinement>>,
+    jobs: Option<std::sync::Arc<crate::jobs::JobBus>>,
 }
 
 impl<'a> CommandHost<'a> {
@@ -276,6 +292,7 @@ impl<'a> CommandHost<'a> {
             config: None,
             finding_recorder: None,
             egress: None,
+            jobs: None,
         }
     }
 
@@ -333,6 +350,21 @@ impl<'a> CommandHost<'a> {
     /// takes `&Arc<Self>`). `None` when no posture is wired.
     pub fn egress_handle(&self) -> Option<std::sync::Arc<crate::egress::EgressConfinement>> {
         self.egress.clone()
+    }
+
+    /// Attach the process-wide job bus, so a command that runs work in the
+    /// background can publish progress to whatever frontends are listening.
+    /// Shared by `Arc` because the publisher outlives this borrowed host.
+    pub fn with_jobs(mut self, jobs: std::sync::Arc<crate::jobs::JobBus>) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    /// An owned handle to the attached job bus, or `None` when the frontend
+    /// wired none. A command must work without it: no bus means no listener,
+    /// never a refusal.
+    pub fn jobs(&self) -> Option<std::sync::Arc<crate::jobs::JobBus>> {
+        self.jobs.clone()
     }
 
     /// Declare which frontend built this host (defaults to [`Frontend::Mcp`]).
@@ -678,5 +710,32 @@ mod host_identity_tests {
         let labelled = CommandHost::new(&store, &client, &guard, None).with_client_label("x");
         assert_eq!(labelled.client_label(), Some("x"));
         assert_eq!(labelled.connection_id(), None);
+    }
+}
+
+/// Pins the optional job bus a frontend may attach to a [`CommandHost`].
+#[cfg(test)]
+mod job_bus_tests {
+    use super::*;
+    use crate::guard::StdGuard;
+    use crate::jobs::JobBus;
+    use crate::store::MemFlowStore;
+    use std::sync::Arc;
+
+    #[test]
+    fn command_host_jobs_defaults_to_none_and_with_jobs_sets_it() {
+        let store = MemFlowStore::new();
+        let client = NoopClient;
+        let guard = StdGuard::default();
+
+        // No bus unless a frontend wires one: a command must cope without it.
+        let fresh = CommandHost::new(&store, &client, &guard, None);
+        assert!(fresh.jobs().is_none());
+
+        // The very bus that was attached comes back, not a clone of its contents.
+        let bus = Arc::new(JobBus::default());
+        let wired = CommandHost::new(&store, &client, &guard, None).with_jobs(bus.clone());
+        let got = wired.jobs().expect("the bus is wired");
+        assert!(Arc::ptr_eq(&got, &bus));
     }
 }

@@ -342,8 +342,24 @@ pub struct L4Options {
     pub consecutive_timeouts: u32,
     /// The lane's own send-rate cap, in bytes per second.
     pub max_bytes_per_s: u32,
+    /// Minimum spacing, in milliseconds, between consecutive stimuli to a point
+    /// whose baseline is an ICMP error (a closed port): the kernel rate-limits
+    /// ICMP errors to about one per second per destination, so an unpaced run
+    /// reads silence where the port is simply closed (amendment 46).
+    ///
+    /// Clamped **up** to the `scanner.ceilings.l4_icmp_pace_ms_min` floor
+    /// (default 1000), which the engine reports in `scan.start`'s `clamped`.
+    pub icmp_pace_ms: u32,
     /// The messages mutation starts from. Empty means the grammar supplies them.
     pub seeds: Vec<L4Seed>,
+    /// The packet or message fields the lane may mutate, as field paths
+    /// (`tcp.flags`, `udp.length`, `raw`, a grammar field path).
+    ///
+    /// Empty — the default — means the lane's own full default table. A path the
+    /// lane refuses to fuzz (spec D8.4 names `dst`, `dst_port`, `interface`,
+    /// `ether.src`/`dst` and `ipv4.src`/`ipv6.src`) is rejected by the lane's
+    /// `Lane::validate`, so the job never starts.
+    pub fields: Vec<String>,
     /// Build every case and report what would be sent, sending nothing.
     pub dry_run: bool,
 }
@@ -356,7 +372,9 @@ impl Default for L4Options {
             liveness_every: 25,
             consecutive_timeouts: 20,
             max_bytes_per_s: 65_536,
+            icmp_pace_ms: 1100,
             seeds: Vec::new(),
+            fields: Vec::new(),
             dry_run: false,
         }
     }
@@ -648,6 +666,44 @@ mod tests {
         .is_valid());
     }
 
+    /// Coordinator decision 2 (spec D8.4): an operator may name the L4 fields
+    /// the lane fuzzes. The key is additive — a profile written before T1b, and
+    /// every built-in, reads as an empty list, which means "the lane's full
+    /// default table".
+    #[test]
+    fn l4_fields_default_empty_and_round_trip() {
+        let minimal: ScanProfile =
+            serde_yaml::from_str("name: mini\n").expect("a minimal profile parses");
+        assert!(minimal.l4.fields.is_empty());
+        assert!(L4Options::default().fields.is_empty());
+
+        let named: ScanProfile = serde_yaml::from_str("name: t\nl4:\n  fields: [tcp.flags, raw]\n")
+            .expect("a profile naming fields parses");
+        assert_eq!(
+            named.l4.fields,
+            vec!["tcp.flags".to_string(), "raw".to_string()]
+        );
+
+        let yaml = serde_yaml::to_string(&named).expect("serializes as YAML");
+        assert_eq!(
+            serde_yaml::from_str::<ScanProfile>(&yaml).expect("round trips"),
+            named
+        );
+
+        for profile in builtin_profiles() {
+            assert!(
+                profile.l4.fields.is_empty(),
+                "{}: a built-in names no L4 field",
+                profile.name
+            );
+        }
+
+        // The profile tree stays strict: a typo inside `l4` is still an error.
+        let err = serde_yaml::from_str::<ScanProfile>("name: t\nl4:\n  feilds: [raw]\n")
+            .expect_err("a mistyped key is an error");
+        assert!(err.to_string().contains("feilds"), "{err}");
+    }
+
     #[test]
     fn ignore_rule_wire_key_is_trait() {
         let json = serde_json::to_string(&IgnoreRule {
@@ -656,5 +712,71 @@ mod tests {
         })
         .expect("rule serializes");
         assert_eq!(json, r#"{"kind":null,"name_regex":null,"trait":"session"}"#);
+    }
+
+    /// Amendment 46 (ICMP-paced points): the pace is a profile knob with a
+    /// default of 1100 ms, and an old profile written before the knob existed
+    /// still deserialises — it simply gets the default.
+    #[test]
+    fn l4_options_default_icmp_pace_is_1100() {
+        assert_eq!(L4Options::default().icmp_pace_ms, 1100);
+
+        let old: L4Options = serde_json::from_str(r#"{"cases": 5}"#)
+            .expect("a profile written before the knob existed still parses");
+        assert_eq!(old.cases, 5);
+        assert_eq!(old.icmp_pace_ms, 1100);
+
+        let set: L4Options =
+            serde_json::from_str(r#"{"cases": 5, "icmp_pace_ms": 2000}"#).expect("the knob parses");
+        assert_eq!(set.icmp_pace_ms, 2000);
+    }
+
+    /// Tester (T5 stage 5): the new knob keeps `L4Options`' own contract —
+    /// `deny_unknown_fields`, so a near-miss spelling is reported by name
+    /// instead of silently taking the default pace; and `u32`, so a negative or
+    /// out-of-range value is an error rather than a wrapped one. The round trip
+    /// through JSON and YAML returns the same options.
+    #[test]
+    fn l4_options_rejects_a_mistyped_pace_key_and_an_unrepresentable_value() {
+        for key in ["icmp_pace", "icmp_pace_msec", "icmpPaceMs", "pace_ms"] {
+            let json = format!(r#"{{"cases": 5, "{key}": 2000}}"#);
+            let err = serde_json::from_str::<L4Options>(&json)
+                .expect_err("a mistyped key is an error, never a silent default");
+            assert!(
+                err.to_string().contains(key),
+                "the error should name {key}: {err}"
+            );
+        }
+
+        for value in ["-1", "1.5", "4294967296", "\"1100\"", "null"] {
+            let json = format!(r#"{{"icmp_pace_ms": {value}}}"#);
+            assert!(
+                serde_json::from_str::<L4Options>(&json).is_err(),
+                "{value} is not a pace in milliseconds"
+            );
+        }
+
+        let max: L4Options = serde_json::from_str(r#"{"icmp_pace_ms": 4294967295}"#)
+            .expect("the largest representable pace parses");
+        assert_eq!(max.icmp_pace_ms, u32::MAX);
+
+        let options = L4Options {
+            icmp_pace_ms: 2500,
+            ..L4Options::default()
+        };
+        let json = serde_json::to_string(&options).expect("options serialize");
+        assert!(
+            json.contains("\"icmp_pace_ms\":2500"),
+            "the wire key is snake_case: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<L4Options>(&json).expect("round trip"),
+            options
+        );
+        let yaml = serde_yaml::to_string(&options).expect("options serialize as yaml");
+        assert_eq!(
+            serde_yaml::from_str::<L4Options>(&yaml).expect("yaml round trip"),
+            options
+        );
     }
 }

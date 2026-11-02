@@ -125,12 +125,18 @@ public struct ToolDescriptor: Hashable, Sendable {
     public let inputSchema: JSONValue
     /// `inputSchema.properties`, classified.
     public let parameters: [ParamDescriptor]
+    /// The entry's `confirmable` flag: the command can answer `needs_confirmation`
+    /// and be re-issued with `_confirm` (`crates/aitm-mcp/src/schema.rs`). Absent
+    /// in the `tools/list` entry (an older core) ⇒ `false`: a UI renders a
+    /// confirm-driven control only when the core says it can confirm.
+    public let confirmable: Bool
 
-    public init(name: String, description: String, inputSchema: JSONValue) {
+    public init(name: String, description: String, inputSchema: JSONValue, confirmable: Bool = false) {
         self.name = name
         self.description = description
         self.inputSchema = inputSchema
         self.parameters = ParamDescriptor.parameters(from: inputSchema)
+        self.confirmable = confirmable
     }
 
     init(json: JSONValue) throws(BusError) {
@@ -138,6 +144,7 @@ public struct ToolDescriptor: Hashable, Sendable {
         self.init(
             name: name,
             description: json["description"]?.stringValue ?? "",
-            inputSchema: json["inputSchema"] ?? .object([:]))
+            inputSchema: json["inputSchema"] ?? .object([:]),
+            confirmable: json["confirmable"]?.boolValue ?? false)
     }
 }

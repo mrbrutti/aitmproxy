@@ -1,4 +1,4 @@
-//! `aitm-tui` — aitmproxy's terminal operator UI (foundation §2.10(c)).
+//! `aitm-tui`: aitmproxy's terminal operator UI (foundation §2.10(c)).
 //!
 //! A ratatui client of the command bus: the same flow list, inspector,
 //! intercept bar, compose, scope, PoC and agent surfaces as the macOS and web
@@ -22,7 +22,9 @@ pub mod l4;
 pub mod languages;
 pub mod model;
 pub mod open;
+pub mod scan;
 pub mod syntax;
+pub mod text;
 pub mod theme;
 pub mod tokens;
 pub mod ui;
@@ -197,15 +199,15 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The commands the bus serves today — `tools/list` of the core as of
+/// The commands the bus serves today: `tools/list` of the core as of
 /// the 2026-10-29 M4 merge: foundation §4.1's 22, plus `flow.detail` (F5),
 /// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
 /// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
 /// `poc.list` / `poc.get` / `poc.artifact` (F13), the M3 Rhai commands
 /// `findings.list`, `script.reload`, `script.validate`, the M6 parity
-/// additions — `ws.intercept` / `ws.frame` / `ws.send` (F9), `session.save` /
+/// additions, `ws.intercept` / `ws.frame` / `ws.send` (F9), `session.save` /
 /// `session.load` / `flow.export` / `flow.import` (F10), `tls.passthrough.*`
-/// (F11), `map.add` / `map.list` / `map.remove` (Map) — and the M4 additions:
+/// (F11), `map.add` / `map.list` / `map.remove` (Map), and the M4 additions:
 /// `agent.status` / `agent.set` / `agent.activity` / `agent.approve` (F1) and
 /// `flow.subscribe` / `flow.unsubscribe` (F4). `crates/aitm/tests/tui_live_bus.rs`
 /// pins this list against the running server's `tools/list`.
@@ -286,6 +288,57 @@ pub const CORE_TOOLS: &[&str] = &[
     "scan.passive",
     // Scanner plugin (Stage 2): findings report + index over recorded findings (Read).
     "scan.report",
+    // Scanner v2 (spec 2026-10-31-aitmproxy-scanner-v2-design, D3): the job verb
+    // family. `scan.start` is Sensitive; `scan.map`, `scan.cancel` and the profile
+    // mutators are Write; the rest are Read.
+    "scan.start",
+    "scan.map",
+    "scan.status",
+    "scan.list",
+    "scan.cancel",
+    "scan.issues",
+    "scan.issue",
+    "scan.issue.update",
+    "scan.sitemap",
+    "scan.checks",
+    "scan.profile.list",
+    "scan.profile.get",
+    "scan.profile.save",
+    "scan.profile.delete",
+    "scan.session.preview",
+    // One manual verb per registered check (spec D3 `check.<id>`): the ten T3
+    // natives of `aitm-scan-checks-http` (PR 2a) and the three passive checks
+    // the scanner engine itself ships (`reflection`, `security-header`,
+    // `cookie-flag`), which stay on the surface whatever lane holds the http
+    // slot (spec amendment 24: "the passives stay").
+    "check.xss-reflected",
+    "check.open-redirect",
+    "check.sqli-boolean",
+    "check.sqli-time",
+    "check.cmdi-time",
+    "check.h2-settings-observe",
+    "check.h2-pseudo-header-validation",
+    "check.h2-header-crlf-tolerance",
+    "check.h2-cl-te-downgrade-indicator",
+    "check.h2-rapid-reset-mitigation",
+    "check.reflection",
+    "check.security-header",
+    "check.cookie-flag",
+    // The T4 WS lane's eight checks (`aitm-scan-ws`), each with its `check.<id>`
+    // manual verb.
+    "check.cswsh",
+    "check.ws-auth-bypass-handshake",
+    "check.ws-cmdi-echo",
+    "check.ws-input-reflection",
+    "check.ws-oversize-frame",
+    "check.ws-sql-error",
+    "check.ws-ssti",
+    "check.ws-subprotocol-observe",
+    "check.l4-packet-crash",
+    "check.l4-packet-reaction",
+    "check.l4-crash",
+    "check.l4-parser-fault",
+    "check.l4-latency-outlier",
 ];
 
 /// An [`App`] for in-crate tests: `cols`×`rows`, connected to a bus that
@@ -303,6 +356,7 @@ pub(crate) fn connected_app(cols: u16, rows: u16) -> App {
             name: (*name).to_string(),
             description: format!("{name} (test)"),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            confirmable: false,
         })
         .collect();
     let _ = app.on_bus(BusEvent::Connected {
@@ -339,7 +393,7 @@ mod tests {
     /// exactly once and nothing more; its address `test` is not loopback
     /// (so a screenshot goes through `poc.artifact`, never the local disk);
     /// it is the size asked for; and it carries no flows, details, scope or
-    /// findings — every test writes those itself.
+    /// findings; every test writes those itself.
     #[test]
     fn connected_app_offers_every_core_tool_and_nothing_else() {
         let app = connected_app(120, 30);

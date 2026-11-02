@@ -1,5 +1,6 @@
 //! Stage F — CUA (human-driven) real-key acceptance of the **TUI** L4 operator
-//! surface (L4OPS-AC14, plan Task 17), against a **real spawned core + bus**.
+//! surface (L4OPS-AC14, plan Task 17; L4 parity plan task B9), against a
+//! **real spawned core + bus**.
 //!
 //! This is the §4.3 CUA path for the ratatui surface, held to Matt's standing
 //! acceptance bar — real scenarios, real keys, a real core, a real bus; never a
@@ -11,18 +12,34 @@
 //! reducer, exactly as the real UI loop does, and reads the screen by drawing
 //! the TUI's own `ui::render` into an off-screen buffer. Nothing here calls an
 //! `Action` variant directly: every step is a keystroke a real operator types.
+//! A second, independent operator connection (the "witness") reads the core's
+//! audit ring (`agent.activity`) and the status verbs, so what the TUI shows is
+//! checked against what the core says, never against the TUI itself.
 //!
 //! **What is driven, over the real bus, with real keys:**
+//! - the slow poll reads `l4.capture.status` / `l4.intercept.status` (L4 parity
+//!   spec §1): on this unprivileged host capture is `needs_privilege` and
+//!   intercept `unsupported_platform` (macOS), with the core's `reason`;
 //! - the union flow list renders real L4 capture rows (fed through the
 //!   protocol-general capture ingress, L4OPS-AC17 — the *same* `L4Guard`), with
 //!   the L4 badge + transport sub-label (AC7);
 //! - selecting an L4 flow opens the L4 inspector: packet list, the honest
-//!   indented **text** layer tree, and the honest hex-degradation note (AC8);
+//!   indented **text** layer tree, and the packet's on-wire bytes as an inert
+//!   hex dump — the operator is trusted control, so `l4.flow.get` carries
+//!   `bytes` (spec §2.2); no control byte reaches the terminal (AC40);
+//! - the Intercept pane is **one documented-limited line with the core's
+//!   reason** and the Forward/Drop/Mutate/Revert keys (`a` `d` `m` `u`) emit
+//!   no bus request at all (L4PAR-AC11);
+//! - `:l4 capture lo0` is refused locally with the core's reason and the `L`
+//!   panel shows `capture unavailable — <reason>` (L4PAR-AC15); the witness
+//!   confirms the ring holds no `l4.capture.start` / `l4.intercept.*` from the
+//!   `aitm-tui` connection and no `L4 unavailable` result for them (AC33);
 //! - the YAML craft editor builds a `PacketSpec` through the real, pure
 //!   `l4.craft` into a hex preview (AC8);
 //! - inject reaches the wire **only** through `l4.inject`, and on this
-//!   unprivileged host the wire verb surfaces the typed `L4Unavailable` reason —
-//!   no fake success, no panic (AC10 / AC18);
+//!   unprivileged host the `s` key is refused locally with the core's
+//!   `l4.capture.status` reason (L4 parity B10 / AC33): no `l4.inject` on the
+//!   ring, no `L4 unavailable` result, no fake success, no panic (AC10 / AC18);
 //! - scope-as-authorisation: a capture-only flow refuses inject with the scope
 //!   reason, and the real guard refuses an out-of-scope capture at the ingress
 //!   outright — stronger than the UI's dimming (AC9);
@@ -31,13 +48,16 @@
 //!
 //! **Privilege reality (CLI/Linux-first).** This macOS dev host cannot open
 //! `/dev/bpf` for raw L4, so the spawned core's startup probe reports
-//! capture/inject unavailable and the wire verbs fail closed with a typed
-//! `L4Unavailable` — a **required** scenario here (AC18). Because the gated
-//! wrapper suppresses the operator confirm-prompt while unavailable, the inject
-//! **confirm overlay** (dest + summary + scope + permit budget) and the real
-//! packet round-trip against the `aitm-testtarget` L4 service are the
+//! capture/inject unavailable (`l4.capture.status` → `needs_privilege` + reason)
+//! and the wire verbs fail closed with a typed `L4Unavailable` — a **required**
+//! scenario here (AC18). The TUI reads that status every slow poll and refuses
+//! `s` locally with the same reason (B10), so the honest-degradation claim is
+//! the witness's `l4.capture.status`, not a wire call that can only fail. The
+//! inject **confirm overlay** (dest + summary + scope + permit budget) and the
+//! real packet round-trip against the `aitm-testtarget` L4 service are the
 //! **privileged/Linux-gated** half: driven for real only under `AITM_L4_TESTS=1`
-//! on an elevated host; asserted-degraded otherwise.
+//! on an elevated host; asserted-refused otherwise. The parked-packet verdicts
+//! (Forward/Drop on a real parked packet) are Linux NFQUEUE only.
 //!
 //! **Sandbox.** The Claude sandbox cannot bind TCP; when the bus bind is refused
 //! the test prints a note and returns, as `tui_live_bus.rs` does. Run it for real
@@ -47,11 +67,12 @@ mod support;
 
 use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aitm::ingress::{CaptureIngress, CapturedUnit, IngressOutcome};
 use aitm::tui::{self, build_servers};
 use aitm::wire::{assemble_with, Assembled, Features};
+use aitm_bus_client::{BusClient, TcpTransport};
 use aitm_core::{Config, McpTransport};
 use aitm_mcp::McpServer;
 use aitm_proto_l4::config::L4Config;
@@ -64,6 +85,7 @@ use aitm_testtarget::l4::{L4Config as TargetL4Config, L4Service};
 use aitm_tui::action::{BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
+use aitm_tui::l4::{L4Availability, L4Pane};
 use aitm_tui::model::FlowKind;
 use aitm_tui::theme::Theme;
 use aitm_tui::TransportChoice;
@@ -71,6 +93,7 @@ use anyhow::Context as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
@@ -87,6 +110,8 @@ const IFACE: &str = "lo0";
 const POLL: Duration = Duration::from_millis(50);
 /// The widest the whole drive is allowed to wait on the bus.
 const DEADLINE: Duration = Duration::from_secs(8);
+/// The ring's display label for the TUI's connection (`aitm_tui::bus::CLIENT_NAME`).
+const TUI_LABEL: &str = "aitm-tui";
 
 /// Whether the privileged real-packet half runs on this host. Loopback raw L4
 /// needs `CAP_NET_RAW` / `/dev/bpf`, which a plain dev host lacks; gated behind
@@ -217,6 +242,71 @@ fn is_permission_denied(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Unix-epoch milliseconds now: the `since` the witness hands `agent.activity`.
+fn epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+// ---- the witness: an independent operator connection ------------------------
+
+/// A second operator connection to the same live bus, over the same
+/// `TcpTransport` any other client uses. It reads the status verbs and the
+/// audit ring so every claim about the TUI is checked from outside it.
+async fn connect_witness(addr: SocketAddr) -> BusClient {
+    let transport = TcpTransport::connect(addr, OPERATOR_TOKEN)
+        .await
+        .expect("the witness connects to the live bus");
+    let client = BusClient::new(Box::new(transport));
+    client
+        .initialize("l4-cua-witness", "0")
+        .await
+        .expect("the witness completes the MCP handshake");
+    client
+}
+
+/// The ring entries the TUI's connection made strictly after `since` (its
+/// `initialize.clientInfo.name` is the `aitm-tui` label).
+async fn tui_ring(witness: &BusClient, since: i64) -> Vec<Value> {
+    let entries = witness
+        .call("agent.activity", json!({ "since": since }))
+        .await
+        .expect("agent.activity answers the operator");
+    entries
+        .as_array()
+        .expect("agent.activity returns an array")
+        .iter()
+        .filter(|e| e.get("client_label").and_then(Value::as_str) == Some(TUI_LABEL))
+        .cloned()
+        .collect()
+}
+
+/// The `command` names of `entries` that `pred` accepts.
+fn commands(entries: &[Value], pred: impl Fn(&str) -> bool) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|e| e.get("command").and_then(Value::as_str))
+        .filter(|c| pred(c))
+        .map(String::from)
+        .collect()
+}
+
+/// The entries whose result is an error carrying `L4 unavailable` (AC33's
+/// forbidden outcome for an enabled control).
+fn unavailable_results(entries: &[Value]) -> Vec<&Value> {
+    entries
+        .iter()
+        .filter(|e| {
+            e.get("result")
+                .and_then(|r| r.get("error"))
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("L4 unavailable"))
+        })
+        .collect()
+}
+
 // ---- the real-key driver ----------------------------------------------------
 
 /// The screen as text, styles dropped: `app` drawn through the TUI's own
@@ -253,19 +343,35 @@ struct Cua {
 impl Cua {
     /// Press one bare key, exactly as the UI loop does: map it for the current
     /// mode, fold the resulting action, forward its bus requests, then drain the
-    /// bus for a beat so replies land before the next assertion.
-    async fn key(&mut self, code: KeyCode) {
-        self.key_mods(code, KeyModifiers::NONE).await;
+    /// bus for a beat so replies land before the next assertion. Returns the
+    /// requests the reducer emitted for the key — the only road to the bus, so
+    /// an empty return is proof the key sent nothing.
+    async fn key(&mut self, code: KeyCode) -> Vec<BusRequest> {
+        self.key_mods(code, KeyModifiers::NONE).await
     }
 
-    async fn key_mods(&mut self, code: KeyCode, mods: KeyModifiers) {
+    async fn key_mods(&mut self, code: KeyCode, mods: KeyModifiers) -> Vec<BusRequest> {
         let ev = KeyEvent::new(code, mods);
+        let mut sent = Vec::new();
         if let Some(action) = aitm_tui::keys::map(ev, self.app.mode) {
             for r in self.app.update(action) {
+                sent.push(r.clone());
                 let _ = self.req_tx.send(r).await;
             }
         }
         self.pump(Duration::from_millis(200)).await;
+        sent
+    }
+
+    /// Type `:<line>` into the palette and press Enter, key by key; returns
+    /// every request the keystrokes emitted.
+    async fn type_line(&mut self, line: &str) -> Vec<BusRequest> {
+        let mut sent = self.key(KeyCode::Char(':')).await;
+        for c in line.chars() {
+            sent.extend(self.key(KeyCode::Char(c)).await);
+        }
+        sent.extend(self.key(KeyCode::Enter).await);
+        sent
     }
 
     /// Drain the live bus, folding each event through the reducer and forwarding
@@ -315,6 +421,14 @@ impl Cua {
         text_of(&self.app, self.app.width, self.app.height)
     }
 
+    /// The status bar's current toast text, empty when none.
+    fn toast(&self) -> String {
+        self.app
+            .current_toast()
+            .map(|t| t.text.clone())
+            .unwrap_or_default()
+    }
+
     /// Press Down in the flow list until the selected flow is the L4 flow on
     /// `iface`, or give up after a bounded number of steps.
     async fn select_l4_on(&mut self, iface: &str) {
@@ -330,6 +444,17 @@ impl Cua {
         );
     }
 
+    /// Tab through the inspector panes until `pane` is the one shown.
+    async fn pane(&mut self, pane: L4Pane) {
+        for _ in 0..L4Pane::ALL.len() {
+            if self.app.l4.pane == pane {
+                return;
+            }
+            self.key(KeyCode::Tab).await;
+        }
+        assert_eq!(self.app.l4.pane, pane, "reached the {pane:?} pane");
+    }
+
     /// Dump the current screen to the test log under a heading (the CUA's
     /// terminal snapshots; visible with `-- --nocapture`).
     fn snapshot(&self, heading: &str) {
@@ -340,6 +465,16 @@ impl Cua {
 /// Print a bold step banner to the run log.
 fn step(n: u32, what: &str) {
     eprintln!("\n########## STEP {n}: {what} ##########");
+}
+
+/// The tool names of the `Call` requests in `reqs` that `pred` accepts.
+fn calls(reqs: &[BusRequest], pred: impl Fn(&str) -> bool) -> Vec<String> {
+    reqs.iter()
+        .filter_map(|r| match r {
+            BusRequest::Call { name, .. } if pred(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---- the acceptance drive ----------------------------------------------------
@@ -365,7 +500,10 @@ async fn tui_l4_cua_against_a_live_core() {
     .expect("assemble a core with l4 enabled");
     let governance = assembled.governance();
     let Assembled {
-        proxy, l4_ingress, ..
+        proxy,
+        l4_ingress,
+        job_bus,
+        ..
     } = assembled;
     let ingress = l4_ingress.expect("l4.enabled wires the capture ingress (AC17)");
 
@@ -385,6 +523,7 @@ async fn tui_l4_cua_against_a_live_core() {
     // `lo0`. This is the protocol-general capture path (one capture session is one
     // flow); privilege is only the pcap backend's, which the ingress bypasses — the
     // frames are guarded by the same `L4Guard` either way.
+    let first_frame = udp_frame(7, &[b'p', b'r', 0]);
     for i in 0..2u8 {
         let r = ingress.accept(captured(
             IFACE,
@@ -398,7 +537,7 @@ async fn tui_l4_cua_against_a_live_core() {
     // (D) Serve the agent-facing server on loopback TCP, exactly as `aitm tui`
     // builds it (`services` → `build_servers`). Skip cleanly if the sandbox
     // refuses the bind.
-    let services = tui::services(&proxy, &cfg, None, tui::TuiLog::Off);
+    let services = tui::services(&proxy, &cfg, None, tui::TuiLog::Off, job_bus);
     let server = build_servers(&cfg, services, governance)
         .0
         .expect("a loopback-TCP transport yields an agent server");
@@ -424,7 +563,25 @@ async fn tui_l4_cua_against_a_live_core() {
         );
     }
 
-    // (F) The real TUI bus client over the real `TcpTransport`, operator token.
+    // (F) The witness: an independent operator connection that reads the core's
+    // status verbs and audit ring, so the TUI is checked from outside itself.
+    let witness = connect_witness(addr).await;
+    let core_capture = witness
+        .call("l4.capture.status", json!({}))
+        .await
+        .expect("l4.capture.status answers the witness");
+    let core_intercept = witness
+        .call("l4.intercept.status", json!({}))
+        .await
+        .expect("l4.intercept.status answers the witness");
+    eprintln!("[witness] l4.capture.status = {core_capture}");
+    eprintln!("[witness] l4.intercept.status = {core_intercept}");
+    let core_capture = L4Availability::from_reply(&core_capture);
+    let core_intercept = L4Availability::from_reply(&core_intercept);
+    // Everything the TUI's connection puts on the ring is strictly after this.
+    let t0 = epoch_ms();
+
+    // (G) The real TUI bus client over the real `TcpTransport`, operator token.
     let (connect, label) = aitm_tui::connector(TransportChoice::Tcp {
         addr,
         token: OPERATOR_TOKEN.into(),
@@ -439,12 +596,17 @@ async fn tui_l4_cua_against_a_live_core() {
     let mut cua = Cua { app, req_tx, ev_rx };
 
     // ---- STEP 0: connect; feature-detect l4.* ; the first live poll lands ----
-    step(0, "connect to the live core; feature-detect the L4 surface");
+    step(
+        0,
+        "connect to the live core; feature-detect the L4 surface; availability lands (spec §1)",
+    );
     cua.pump_until("the L4 surface and first poll", |a| {
         a.has_tool("l4.flow.list")
             && a.flows.iter().any(|r| r.kind == FlowKind::L4)
             && !a.l4.scope.is_empty()
             && a.l4.gates.present
+            && !a.l4.capture.is_pending()
+            && !a.l4.intercept.is_pending()
     })
     .await;
     assert!(
@@ -455,10 +617,48 @@ async fn tui_l4_cua_against_a_live_core() {
         cua.app.has_tool("l4.agent.set"),
         "the operator gate setter is present"
     );
+    // The TUI's availability is exactly what the core told the witness.
+    assert_eq!(
+        cua.app.l4.capture, core_capture,
+        "the TUI's capture availability is the core's l4.capture.status"
+    );
+    assert_eq!(
+        cua.app.l4.intercept, core_intercept,
+        "the TUI's intercept availability is the core's l4.intercept.status"
+    );
+    if !privileged_wire() {
+        assert!(
+            !cua.app.l4.capture.available,
+            "an unprivileged host cannot capture"
+        );
+        assert_eq!(
+            cua.app.l4.capture.code.as_deref(),
+            Some("needs_privilege"),
+            "capture/inject need /dev/bpf or CAP_NET_RAW here"
+        );
+        assert!(
+            cua.app
+                .l4
+                .capture
+                .reason
+                .as_deref()
+                .is_some_and(|r| !r.is_empty()),
+            "the core states its reason"
+        );
+    }
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            cua.app.l4.intercept.code.as_deref(),
+            Some("unsupported_platform"),
+            "in-path intercept is Linux NFQUEUE only"
+        );
+    }
     eprintln!(
-        "[bus] l4.* tools present; {} L4 scope entries; gates present={}",
+        "[bus] l4.* tools present; {} L4 scope entries; gates present={}; capture {:?}; intercept {:?}",
         cua.app.l4.scope.len(),
-        cua.app.l4.gates.present
+        cua.app.l4.gates.present,
+        cua.app.l4.capture.code,
+        cua.app.l4.intercept.code
     );
 
     // ---- STEP 1: the union flow list renders real L4 rows (AC7) ----
@@ -473,10 +673,10 @@ async fn tui_l4_cua_against_a_live_core() {
         "the L4 badge + UDP sub-label renders: {list}"
     );
 
-    // ---- STEP 2: open the L4 inspector; packets + text layer tree + hex (AC8) ----
+    // ---- STEP 2: open the L4 inspector; packets + text layer tree + hex (AC8, §2) ----
     step(
         2,
-        "open the lo0 capture flow → packet list, text layer tree, honest hex (AC8)",
+        "open the lo0 capture flow → packet list, text layer tree, inert hex of the real bytes (AC8, spec §2)",
     );
     cua.select_l4_on(IFACE).await;
     cua.key(KeyCode::Enter).await; // Flows → Inspector
@@ -485,6 +685,8 @@ async fn tui_l4_cua_against_a_live_core() {
         Mode::Inspector,
         "Enter opens the L4 inspector"
     );
+    cua.pane(L4Pane::Packets).await;
+    cua.pump(Duration::from_millis(300)).await; // the packet window for the selection
     cua.snapshot("L4 inspector — Packets pane");
     let insp = cua.screen();
     assert!(
@@ -494,9 +696,160 @@ async fn tui_l4_cua_against_a_live_core() {
     for layer in ["IPv4", "UDP"] {
         assert!(insp.contains(layer), "decoded layer {layer} shown: {insp}");
     }
+    // Spec §2.2: the operator is trusted control, so `l4.flow.get` carries the
+    // packet bytes; the pane renders them as `hex_dump` rows (AC40: inert).
+    let hex_head = format!("hex: {} bytes", first_frame.len());
     assert!(
-        insp.to_lowercase().contains("not carried by l4.flow.get"),
-        "honest hex-degradation note (l4.flow.get carries no bytes): {insp}"
+        insp.contains(&hex_head),
+        "the on-wire byte count of the real frame heads the hex view ({hex_head}): {insp}"
+    );
+    assert!(
+        insp.contains("70 72 00"),
+        "the first packet's payload bytes `p r \\0` are in the hex rows: {insp}"
+    );
+    assert!(
+        !insp.contains("no bytes from this core"),
+        "bytes were not withheld from the operator: {insp}"
+    );
+    assert!(
+        insp.chars().all(|c| c >= ' ' || c == '\n'),
+        "no control character reaches the terminal from the packet view: {insp:?}"
+    );
+    eprintln!(
+        "[inspector] {} bytes of the real frame rendered as inert hex",
+        first_frame.len()
+    );
+
+    // ---- STEP 2b: the Intercept pane is documented-limited; a/d/m/u send nothing (L4PAR-AC11) ----
+    step(
+        2,
+        "b: the Intercept pane shows the core's reason; Forward/Drop/Mutate/Revert keys send nothing (L4PAR-AC11)",
+    );
+    cua.pane(L4Pane::Intercept).await;
+    cua.snapshot("L4 inspector — Intercept pane");
+    let bar = cua.screen();
+    if cua.app.l4.intercept.available {
+        eprintln!(
+            "[intercept] available on this host: the parked walk is the Linux half; pane:\n{bar}"
+        );
+    } else {
+        let reason = core_intercept.reason.clone().unwrap_or_default();
+        let line = format!("in-path intercept unavailable — {reason}");
+        assert!(
+            bar.contains(&line),
+            "one documented-limited line with the core's reason ({line}): {bar}"
+        );
+        for hint in ["Forward", "Drop", "Mutate"] {
+            assert!(!bar.contains(hint), "no live {hint} hint: {bar}");
+        }
+        for (key, what) in [
+            ('a', "Forward"),
+            ('d', "Drop"),
+            ('m', "Mutate"),
+            ('u', "Revert"),
+        ] {
+            let sent = cua.key(KeyCode::Char(key)).await;
+            assert!(
+                sent.is_empty(),
+                "`{key}` ({what}) emitted no bus request: {sent:?}"
+            );
+            let toast = cua.toast();
+            assert!(
+                toast.contains(&reason),
+                "`{key}` ({what}) toasts the core's reason: {toast:?}"
+            );
+        }
+        assert_eq!(cua.app.mode, Mode::Inspector, "still in the inspector");
+        eprintln!("[intercept] documented-limited; a/d/m/u emitted nothing; toast carries the core's reason");
+    }
+
+    // ---- STEP 2c: `:l4 capture lo0` refused locally; the L panel shows the reasons (L4PAR-AC15) ----
+    step(
+        2,
+        "c: `:l4 capture lo0` is refused locally with the core's reason; `L` shows capture/intercept lines (L4PAR-AC15)",
+    );
+    cua.key(KeyCode::Esc).await; // Inspector → Flows
+    assert_eq!(cua.app.mode, Mode::Flows, "Esc returns to the flow list");
+    if cua.app.l4.capture.available {
+        eprintln!(
+            "[capture] available on this host: the start/stop walk is tests/e2e/l4/test_l4_parity_priv.py's; not started here"
+        );
+    } else {
+        let reason = core_capture.reason.clone().unwrap_or_default();
+        let sent = cua.type_line("l4 capture lo0").await;
+        assert!(
+            calls(&sent, |n| n.starts_with("l4.")).is_empty(),
+            "`:l4 capture lo0` put no l4.* call on the bus: {sent:?}"
+        );
+        let toast = cua.toast();
+        assert_eq!(
+            toast,
+            format!("capture unavailable: {reason}"),
+            "the toast is the plan's literal plus the core's reason"
+        );
+        cua.key(KeyCode::Char('L')).await;
+        assert_eq!(cua.app.mode, Mode::L4, "`L` opens the L4 panel");
+        cua.snapshot("L4 panel — availability and capture commands");
+        let panel = cua.screen();
+        assert!(
+            panel.contains(&format!("capture unavailable — {reason}")),
+            "the panel line is the core's capture reason: {panel}"
+        );
+        if let Some(r) = core_intercept.reason.as_deref() {
+            assert!(
+                panel.contains(&format!("intercept unavailable — {r}")),
+                "the panel line is the core's intercept reason: {panel}"
+            );
+        }
+        assert!(
+            panel.contains("no running capture"),
+            "captures == []: {panel}"
+        );
+        assert!(
+            panel.contains(":l4 capture <iface> [inbound|outbound]"),
+            "the capture command is offered as a command, not a key: {panel}"
+        );
+        cua.key(KeyCode::Esc).await;
+        assert_eq!(cua.app.mode, Mode::Flows, "Esc closes the panel");
+        eprintln!("[capture] `:l4 capture lo0` refused locally; the panel quotes both reasons");
+    }
+
+    // ---- STEP 2d: the witness reads the ring (AC11 / AC15 / AC33) ----
+    step(
+        2,
+        "d: the core's audit ring holds no l4.capture.start / l4.intercept.* from aitm-tui and no L4-unavailable result for them (AC33)",
+    );
+    cua.pump(Duration::from_millis(300)).await;
+    let ring = tui_ring(&witness, t0).await;
+    let seen = commands(&ring, |_| true);
+    eprintln!(
+        "[ring] {} entries from `{TUI_LABEL}` since t0; distinct commands: {:?}",
+        ring.len(),
+        {
+            let mut d = seen.clone();
+            d.sort();
+            d.dedup();
+            d
+        }
+    );
+    assert!(
+        !ring.is_empty(),
+        "the TUI's connection is attributed as `{TUI_LABEL}` on the ring (its polls are there)"
+    );
+    // `l4.intercept.status` is the spec §1 slow-poll read and is legitimate;
+    // every other `l4.intercept.*` (the verdicts, and `.list`, which must not be
+    // polled while unavailable) and `l4.capture.start` must be absent.
+    let forbidden = commands(&ring, |c| {
+        c == "l4.capture.start" || (c.starts_with("l4.intercept.") && c != "l4.intercept.status")
+    });
+    assert!(
+        forbidden.is_empty(),
+        "no l4.capture.start / l4.intercept.* (other than the status poll) from the TUI: {forbidden:?}"
+    );
+    let bad = unavailable_results(&ring);
+    assert!(
+        bad.is_empty(),
+        "no `L4 unavailable` result for anything the TUI called so far: {bad:?}"
     );
 
     // ---- STEP 3: the craft editor builds a PacketSpec via real l4.craft (AC8) ----
@@ -504,17 +857,9 @@ async fn tui_l4_cua_against_a_live_core() {
         3,
         "Tab to the craft editor; `b` builds the PacketSpec → hex preview (AC8)",
     );
-    for _ in 0..3 {
-        if cua.app.l4.pane == aitm_tui::l4::L4Pane::Craft {
-            break;
-        }
-        cua.key(KeyCode::Tab).await;
-    }
-    assert_eq!(
-        cua.app.l4.pane,
-        aitm_tui::l4::L4Pane::Craft,
-        "reached the Craft pane"
-    );
+    cua.key(KeyCode::Enter).await; // Flows → Inspector (the L4 row is still selected)
+    assert_eq!(cua.app.mode, Mode::Inspector, "back in the L4 inspector");
+    cua.pane(L4Pane::Craft).await;
     cua.snapshot("L4 inspector — Craft editor (YAML PacketSpec)");
     assert!(
         cua.screen().contains("layers:"),
@@ -534,52 +879,100 @@ async fn tui_l4_cua_against_a_live_core() {
         cua.app.l4.craft.preview_layers
     );
 
-    // ---- STEP 4: inject reaches the wire ONLY via l4.inject; honest degradation ----
+    // ---- STEP 4: inject reaches the wire ONLY via l4.inject; refused locally while unavailable ----
     step(
         4,
-        "`s` injects via l4.inject only; the wire verb degrades honestly (AC10/AC18)",
+        "`s` injects via l4.inject only; while capture/inject is unavailable it is refused locally with the core's reason (AC10/AC18, L4 parity B10/AC33)",
     );
-    cua.key(KeyCode::Char('s')).await; // L4Inject
-    if privileged_wire() && cua.app.mode == Mode::L4Confirm {
-        // Privileged host: the confirm overlay shows the wire summary, then `y`
-        // re-issues with the `_confirm` token and the real packet reaches the
-        // target. (Linux / elevated only.)
-        cua.snapshot("L4 inject — confirm overlay (privileged)");
-        let ov = cua.screen();
+    let craft_header = cua.screen();
+    let ring_before = tui_ring(&witness, t0).await;
+    let injects_before = commands(&ring_before, |c| c == "l4.inject").len();
+    let sent = cua.key(KeyCode::Char('s')).await; // L4Inject
+    if cua.app.l4.capture.available {
         assert!(
-            ov.contains("127.0.0.1"),
-            "confirm shows the destination: {ov}"
+            craft_header.contains("s inject (guarded)"),
+            "the craft header offers the guarded inject: {craft_header}"
         );
-        assert!(
-            ov.to_lowercase().contains("scope"),
-            "confirm shows the scope: {ov}"
+        assert_eq!(
+            calls(&sent, |n| n.starts_with("l4.")),
+            vec!["l4.inject".to_string()],
+            "the inject key reaches the wire only through l4.inject"
         );
-        assert!(
-            ov.contains("budget"),
-            "confirm shows the permit budget: {ov}"
-        );
-        cua.key(KeyCode::Char('y')).await;
-        cua.pump(Duration::from_millis(400)).await;
-        cua.snapshot("L4 inject — after confirm (privileged real packet)");
-        eprintln!("[inject] privileged path: confirmed and sent a real packet");
+        if privileged_wire() && cua.app.mode == Mode::WireConfirm {
+            // Privileged host: the confirm overlay shows the wire summary, then
+            // `y` re-issues with the `_confirm` token and the real packet
+            // reaches the target. (Linux / elevated only.)
+            cua.snapshot("L4 inject — confirm overlay (privileged)");
+            let ov = cua.screen();
+            assert!(
+                ov.contains("127.0.0.1"),
+                "confirm shows the destination: {ov}"
+            );
+            assert!(
+                ov.to_lowercase().contains("scope"),
+                "confirm shows the scope: {ov}"
+            );
+            assert!(
+                ov.contains("budget"),
+                "confirm shows the permit budget: {ov}"
+            );
+            cua.key(KeyCode::Char('y')).await;
+            cua.pump(Duration::from_millis(400)).await;
+            cua.snapshot("L4 inject — after confirm (privileged real packet)");
+            eprintln!("[inject] privileged path: confirmed and sent a real packet");
+        } else {
+            cua.pump(Duration::from_millis(400)).await;
+            cua.snapshot("L4 inject — sent; awaiting the core's confirm reply");
+            eprintln!("[inject] capture available but the confirm overlay did not open; the wire reply is the core's");
+        }
     } else {
-        // This macOS host: the gated wrapper suppresses the confirm-prompt while
-        // unavailable, so inject goes straight to the wire verb, which fails
-        // closed with the typed reason — no overlay, no fake success, no panic.
-        cua.pump(Duration::from_millis(400)).await;
-        cua.snapshot("L4 inject — honest L4Unavailable degradation");
-        let screen = cua.screen().to_lowercase();
+        // This host: `l4.capture.status` says capture/inject is unavailable
+        // (`needs_privilege`, the witness read it in STEP 0). The TUI refuses
+        // the key locally with that reason: no `l4.inject` on the bus, no
+        // overlay, no fake success, no panic. The honest-degradation claim is
+        // the core's status, not a wire call that can only fail (AC33).
+        let reason = core_capture.reason.clone().unwrap_or_default();
         assert!(
-            screen.contains("unavailable"),
-            "the wire verb surfaces the typed L4Unavailable reason: {}",
-            cua.screen()
+            craft_header.contains("s inject (unavailable)"),
+            "the craft header says inject is unavailable: {craft_header}"
+        );
+        assert!(
+            !craft_header.contains("s inject (guarded)"),
+            "no guarded hint while unavailable: {craft_header}"
+        );
+        assert!(
+            calls(&sent, |n| n.starts_with("l4.")).is_empty(),
+            "`s` put no l4.* call on the bus while unavailable: {sent:?}"
+        );
+        assert_eq!(
+            cua.toast(),
+            format!("inject unavailable: {reason}"),
+            "the toast is the plan's literal plus the core's l4.capture.status reason"
         );
         assert_ne!(
             cua.app.mode,
-            Mode::L4Confirm,
+            Mode::WireConfirm,
             "no overlay without privilege"
         );
-        eprintln!("[inject] honest degradation: l4.inject → L4Unavailable (no fake success)");
+        assert!(cua.app.l4.pending.is_none(), "no inject left pending");
+        cua.pump(Duration::from_millis(400)).await;
+        cua.snapshot("L4 inject — refused locally with the core's reason");
+        let ring = tui_ring(&witness, t0).await;
+        let injects = commands(&ring, |c| c == "l4.inject");
+        assert_eq!(
+            injects.len(),
+            injects_before,
+            "the witness sees no new l4.inject from `{TUI_LABEL}`: {injects:?}"
+        );
+        let bad = unavailable_results(&ring);
+        assert!(
+            bad.is_empty(),
+            "no `L4 unavailable` result for anything the TUI called (AC33): {bad:?}"
+        );
+        eprintln!(
+            "[inject] refused locally: `inject unavailable: {reason}`; l4.capture.status code {:?}; no l4.inject on the ring",
+            core_capture.code
+        );
     }
 
     // ---- STEP 5: scope-as-authorisation — the guard refuses out-of-scope capture (AC9) ----
@@ -630,6 +1023,10 @@ async fn tui_l4_cua_against_a_live_core() {
         agent.contains("L4 agent capabilities"),
         "the L4 capability section renders: {agent}"
     );
+    assert!(
+        agent.contains("policy: "),
+        "the first line is the core's policy, not a stale banner (L4PAR-AC17): {agent}"
+    );
     let inject_gate_before = cua.app.l4.gates.inject;
     cua.key(KeyCode::Char('i')).await; // toggle the Inject gate → l4.agent.set
     cua.pump(Duration::from_millis(300)).await;
@@ -648,9 +1045,10 @@ async fn tui_l4_cua_against_a_live_core() {
     eprintln!("\n########## TUI L4 CUA: all steps passed against the live core ##########");
     if !privileged_wire() {
         eprintln!(
-            "NOTE: wire verbs degraded honestly (L4Unavailable) on this unprivileged host; the \
-             confirm overlay + real-packet round-trip + in-path intercept bar are the \
-             privileged/Linux-gated half — run with AITM_L4_TESTS=1 on an elevated Linux host."
+            "NOTE: on this unprivileged host the TUI refused inject locally with the core's \
+             l4.capture.status reason (no wire call that can only fail); the confirm overlay + \
+             real-packet round-trip + in-path intercept bar are the privileged/Linux-gated half \
+             — run with AITM_L4_TESTS=1 on an elevated Linux host."
         );
     }
 

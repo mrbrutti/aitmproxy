@@ -8,6 +8,11 @@ use serde_json::Value;
 
 use crate::model::{AgentPolicy, AgentState, Finding, FlowDetail, ProxyStatus};
 
+/// The reserved argument a confirm-over-the-wire re-issue carries (spec D3,
+/// D7; `server.rs` `needs_confirmation`). No tool schema declares it: the bus
+/// task's prune keeps it and the overlay's `confirmed_args` adds it.
+pub const CONFIRM_KEY: &str = "_confirm";
+
 /// A tool the bus offers, enough to build the palette and a form: the
 /// `tools/list` entry exactly as the bus client decodes it. [`ToolSchema`]
 /// adds the form-building view of its schema.
@@ -70,12 +75,82 @@ pub enum Action {
     /// The Scan view (scanner-integration Stage 1). Opens the view only and
     /// shows the scope-bound target; viewing never crawls.
     OpenScan,
+    /// The L4 panel (`L`, `:l4`): capture / intercept availability from the
+    /// status verbs, the running captures and the capture commands (L4 parity
+    /// spec §1, AC15). Opening it sends nothing.
+    OpenL4,
     /// Scan view `r`: launch a scope-bound `scan.discover` (deny-by-default:
     /// an out-of-scope target is refused; a running crawl blocks re-launch).
     ScanLaunch,
-    /// Scan view Tab: move the cursor between the endpoints list and the
-    /// injection-points list, so either can be walked and opened with ⏎.
-    ScanFocusToggle,
+    /// Scan view `1`..`4`: show that tab (spec D2, D11).
+    ScanTab(crate::scan::ScanTab),
+    /// Scan view Tab: focus the active tab's next pane (spec D11).
+    ScanPaneNext,
+    /// Scan view BackTab: focus the active tab's previous pane.
+    ScanPanePrev,
+    /// Jobs tab `x`: cancel the job under the cursor over the wire,
+    /// `scan.cancel {job}` tagged `scan.cancel:<job>` (spec D11). Idempotent
+    /// with no extra prompt: the tag dedupe sends it once until the reply; on
+    /// a terminal job the key is inert and the banner reads `already <state>`.
+    ScanCancel,
+    /// Profiles and Jobs `s`: launch `scan.start` with the editor's typed
+    /// draft, else the Profiles list cursor's name (spec D7, D11). Inert
+    /// while the UI-3 gate holds a reason or a launch is in flight.
+    ScanStart,
+    /// Profiles and Jobs `m`: the same with `scan.map`, falling back to the
+    /// legacy `scan.discover` on the draft's first origin when the bus
+    /// lacks `scan.map` (spec D2, D7).
+    ScanMap,
+    /// Issues tab `S` `C` `L` `T` `J`: cycle one `scan.issues` filter and
+    /// refetch the list (spec D11).
+    ScanFilter(crate::scan::IssueFilterKey),
+    /// Issues tab `R`: clear every filter and refetch (spec D11).
+    ScanFilterReset,
+    /// Issues tab `c` / `f` / `u`: set the cursor's issue to confirmed,
+    /// false_positive or open over the wire, `scan.issue.update {id,
+    /// status}` tagged `scan.issue.update:<id>` (spec D11); the reply
+    /// replaces the issue and its row.
+    ScanIssueStatus(aitm_scan_model::IssueStatus),
+    /// Issues tab `P`: open Findings on the finding of the cursor's issue
+    /// (its `poc_ref` in the `poc_path`, or the issue's name as the title),
+    /// else toast (spec D11).
+    ScanOpenPoc,
+    /// Site map `n`: fetch the next page of `scan.sitemap` with the
+    /// `next_cursor` the last reply carried, appending it (spec D11); inert
+    /// without one.
+    ScanNextPage,
+    /// Profiles `e` (or ⏎ on a field): edit the field under the Fields
+    /// cursor by its kind (spec D11): an enum cycles forward, a bool or lane
+    /// flips, a number or the name opens `PromptKind::ScanField` prefilled,
+    /// `origins` and `checks` focus their pane, `l4_targets` opens the L4
+    /// target prompt.
+    ScanEdit,
+    /// Profiles Space: flip a lane or bool field, or cycle the tri-state of
+    /// the check-tree node under the Checks cursor (spec D11).
+    ScanToggle,
+    /// Profiles `w`: `scan.profile.save {profile}` with the typed draft; a
+    /// builtin (or an unnamed draft) asks `PromptKind::ScanProfileName`
+    /// first (spec D11).
+    ScanSave,
+    /// Profiles `D`: delete the non-builtin profile under the cursor after
+    /// the one-line `y/N` confirm (spec D11), `scan.profile.delete {name}`
+    /// tagged `scan.profile.delete:<name>`.
+    ScanDelete,
+    /// Profiles `N`: open the editor over `ScanProfile::default()` (spec
+    /// D11).
+    ScanNewProfile,
+    /// Profiles `o`: the typed-origin prompt (`PromptKind::ScanOrigin`,
+    /// spec D8, D11); the origin joins the draft when the scope covers it.
+    ScanOriginPrompt,
+    /// Profiles `a` in the Origins pane: add the highlighted picker row to
+    /// the draft (spec D11).
+    ScanOriginAdd,
+    /// Profiles `d` in the Origins pane: remove the highlighted row's
+    /// origin from the draft (spec D11).
+    ScanOriginRemove,
+    /// Profiles `t`: the L4 target prompt (`PromptKind::ScanL4Target`,
+    /// `ip:port[/tcp|udp][ grammar]`, spec D11).
+    ScanL4TargetPrompt,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,
@@ -122,8 +197,15 @@ pub enum Action {
     L4Build,
     /// Inject the crafted packet (`l4.inject`), triggering confirm-over-the-wire.
     L4Inject,
-    /// Answer the inject confirm overlay: `true` re-issues with `_confirm`.
-    L4Confirm(bool),
+    /// Answer the wire-confirm overlay: `true` re-issues with `_confirm`.
+    WireConfirm(bool),
+    /// Craft pane `m`: apply the editor's spec to the selected intercept
+    /// flow's parked packet (`l4.intercept.mutate {id, spec}`, L4 parity spec
+    /// §4 / AC12). The id is the parked packet's from `l4.intercept.list`.
+    L4MutateParked,
+    /// Craft pane `u`: discard the staged edit of that parked packet
+    /// (`l4.intercept.revert {id}`).
+    L4RevertParked,
     /// Toggle one per-feature agent gate in the Agent view (`l4.agent.set`).
     L4ToggleGate(crate::l4::L4Gate),
 }
@@ -176,6 +258,17 @@ pub enum BusRequest {
         name: String,
         args: Value,
     },
+    /// Any tool by name with an opaque `tag` the reply echoes (scanner v2
+    /// D4): the bus task runs it exactly like [`BusRequest::Call`] and
+    /// answers with [`BusEvent::CallTaggedOk`] or
+    /// [`BusEvent::CallTaggedFailed`] carrying the same tag, so the reducer
+    /// can match a reply to the job or record it was issued for even when
+    /// the call failed. The task never reads the tag.
+    CallTagged {
+        tag: String,
+        name: String,
+        args: Value,
+    },
 }
 
 /// Severity of a status-line toast.
@@ -225,6 +318,20 @@ pub enum BusEvent {
         name: String,
         message: String,
     },
+    /// A [`BusRequest::CallTagged`] completed; `tag` is the request's tag
+    /// verbatim, `name` the tool and `value` its structured result.
+    CallTaggedOk {
+        tag: String,
+        name: String,
+        value: Value,
+    },
+    /// A [`BusRequest::CallTagged`] did not complete, for the same reasons
+    /// as [`BusEvent::CallFailed`]; `tag` is the request's tag verbatim.
+    CallTaggedFailed {
+        tag: String,
+        name: String,
+        message: String,
+    },
     /// A notice with no tool behind it (a per-flow poll warning, a malformed
     /// `flow.detail` reply).
     Toast(Level, String),
@@ -237,6 +344,17 @@ pub enum BusEvent {
     L4Scope(Vec<Value>),
     /// `l4.agent.status`: the four per-feature agent gate states.
     L4Agent(Value),
+    /// `l4.capture.status` + `l4.intercept.status` (L4 parity spec §1), read on
+    /// every slow pass: the two availabilities and the running capture ids.
+    L4Availability {
+        capture: crate::l4::L4Availability,
+        intercept: crate::l4::L4Availability,
+        captures: Vec<String>,
+    },
+    /// `l4.intercept.list` (spec §4): the parked packets, oldest first, each an
+    /// `{id, flow, state, dir, length, layers, parked_at}` object. Read only
+    /// while intercept is available.
+    L4Parked(Vec<Value>),
 }
 
 /// One declared parameter of a tool's `inputSchema`, as a form row.

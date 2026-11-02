@@ -35,9 +35,12 @@ SKIP (77) conditions, each naming the missing thing:
   * the core does not advertise the `scan.*` verbs this cell calls (pre-T1b core);
   * `scan.checks` lists no check for the `l4_packet` lane (the T5 lane is not on this build);
   * the L4 module is not enabled on the core (no `l4.capture.status`);
-  * `l4.capture.status` says `available: false` -- the packet lane needs raw pcap privilege
-    (macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW). On Matt's Mac
-    /dev/bpf* is root-only, so this cell SKIPs there with the core's own `reason`;
+  * `l4.privilege` (or, on a pre-p1b core, `l4.capture.status`) says packet capture is not
+    available: the cell SKIPs with `packet-capture permission not granted (...)` naming the
+    product's own path (macOS: the Aitmproxy app's packet-capture helper; Linux: the
+    packet-capture helper, or the core process holding CAP_NET_RAW on a test rig), followed
+    by the core's own reason. A core that holds the capability through the helper rather
+    than its own process SKIPs too, naming that route (the proof is per-process today);
   * the core accepted a job but reported the `l4_packet` lane as skipped (its reason).
 
 serial: it crashes a real service four times and fuzzes real ports. Exit 0 / 1 / 77.
@@ -95,6 +98,10 @@ def sha256_hex(data: bytes) -> str:
 
 def packet_profile(ip: str, port: int, proto: str, l4_opts: dict) -> dict:
     return {
+        "name": "e2e-t5-crash-oracle",
+        # The packet lane's checks are `intrusive` (spec D8.4): below that the engine
+        # schedules none of them (operator-only, amendment 13).
+        "intensity": "intrusive",
         "lanes": ["l4_packet"],
         "target": {"origins": [], "l4": [{"ip": ip, "port": port, "proto": proto}]},
         "l4": dict(l4_opts),
@@ -180,13 +187,18 @@ def main() -> int:
         )
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
-        packet_lane_gate(op, *VERBS)
+        status = packet_lane_gate(op, *VERBS)
+        note("l4.privilege (None on a core without the verb)", status.get("privilege"))
 
         section("(a) T5-2a: a real CLOSED UDP port answers ICMP 3/3, a real CLOSED TCP port answers RST")
         closed_udp = free_port()
         closed_tcp = free_port()
         note("closed ports (nothing is bound here)", {"udp": closed_udp, "tcp": closed_tcp})
-        check_kernel_reaction(op, "127.0.0.1", closed_udp, "udp", "udp.length",
+        # `raw`, not a header field: a datagram whose `udp.length` is mutated is dropped
+        # by the receiving stack before the port lookup, so it draws no ICMP at all
+        # (rig run 6: 2 of 10 header cases sendable, all silent); only a well-formed
+        # datagram to a closed port is answered with ICMP 3/3 (write-up section iii).
+        check_kernel_reaction(op, "127.0.0.1", closed_udp, "udp", "raw",
                               {"kind": "icmp", "type": 3, "code": 3}, "closed-udp")
         check_kernel_reaction(op, "127.0.0.1", closed_tcp, "tcp", "tcp.flags",
                               {"kind": "reset"}, "closed-tcp")

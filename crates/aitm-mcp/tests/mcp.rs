@@ -8394,6 +8394,7 @@ async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
         trailers: HeaderMap::new(),
         body: Body::Bytes(vec![0u8; 2048]),
         timestamp: SystemTime::now(),
+        peer: None,
     });
     f.metadata.created = created;
     f.metadata.duration = Some(Duration::from_millis(412));
@@ -8502,6 +8503,7 @@ async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
         trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: SystemTime::now(),
+        peer: None,
     });
     f.metadata.created = created;
     f.metadata.duration = Some(Duration::from_millis(1500));
@@ -8574,6 +8576,7 @@ async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
         trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: SystemTime::now(),
+        peer: None,
     });
     f.metadata.created = created;
     f.metadata.duration = Some(Duration::from_millis(900));
@@ -8644,6 +8647,7 @@ async fn push_on_error_carries_the_abandoned_response_sizes() {
         trailers: HeaderMap::new(),
         body: Body::Streamed(StreamBody),
         timestamp: SystemTime::now(),
+        peer: None,
     });
     let id = store.insert(flow);
 
@@ -8703,6 +8707,7 @@ async fn push_summary_equals_flow_get_on_the_null_and_saturated_paths() {
         trailers: HeaderMap::new(),
         body: Body::Streamed(StreamBody),
         timestamp: SystemTime::now(),
+        peer: None,
     });
     f.metadata.created = UNIX_EPOCH - Duration::from_secs(1);
     let streaming_id = store.insert(streaming);
@@ -8719,6 +8724,7 @@ async fn push_summary_equals_flow_get_on_the_null_and_saturated_paths() {
         trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: SystemTime::now(),
+        peer: None,
     });
     f.metadata.duration = Some(Duration::MAX);
     f.intercept = InterceptState::Killed;
