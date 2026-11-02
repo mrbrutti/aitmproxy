@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# e2e: tier=manual surface=acceptance
 """Read the six bus truths of a RUNNING core, read-only, token never printed.
 
 Usage:
@@ -20,7 +19,7 @@ import re
 import subprocess
 import sys
 
-E2E = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+E2E = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, E2E)
 from aitm_e2e.bus import BusClient, ToolError  # noqa: E402
 

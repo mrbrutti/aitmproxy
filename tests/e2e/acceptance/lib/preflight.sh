@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# e2e: tier=manual surface=acceptance
 # Release acceptance, step D2: read the operator's REAL starting state, read-only.
 #
 # Writes every reading to $1 (default /tmp/claude/acceptance/state-<timestamp>.txt) and

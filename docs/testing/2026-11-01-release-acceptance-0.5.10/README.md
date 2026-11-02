@@ -98,7 +98,7 @@ CLI: PASS 2 · FAIL 3 · SKIP 3. Every FAIL has an owner; none is new.
 | MAC-6 Set as System Proxy | SKIP needs Matt's yes | — | — | — |
 | MAC-7 Capture All Apps | already on (`capture.enabled 1`, provider attached) — the step becomes "verify the words for on, nothing in scope": lane "on, nothing in scope", remedy "Add a host to Scope (for now as example.com:443); nothing is captured until then" | SKIP needs the window to read | `capture.status enabled true, attached, 0 handed off` | — |
 | MAC-8 real browser rows | SKIP needs MAC-5/6 | — | — | — |
-| MAC-9 Apps sidebar | **FAIL (missing feature), read from the bus** | every one of the 16 flows is proxied with `source_app: null`, so the sidebar can show no app; this is Matt's "NOTHING is there". With All Apps on, extension-captured flows would carry `source_app`, but nothing is in Scope so the extension claims nothing (`flows_handed_off 0`) | `flow.table`: `source_app null` ×16, `capture_interface null` ×16 | missing feature: attribution for proxied flows (session core-name-the-client-app); plus the empty Scope (operator state, words in MAC-3/7) |
+| MAC-9b Apps sidebar, proxied flows | **FAIL (missing feature), read from the bus** | every one of the 16 flows is proxied with `source_app: null`, so the sidebar can show no app; this is Matt's "NOTHING is there". With All Apps on, extension-captured flows would carry `source_app`, but nothing is in Scope so the extension claims nothing (`flows_handed_off 0`) | `flow.table`: `source_app null` ×16, `capture_interface null` ×16 | missing feature: attribution for proxied flows (session core-name-the-client-app); plus the empty Scope (operator state, words in MAC-3/7) |
 | MAC-10…16 | SKIP needs the window / Matt's yes | — | — | — |
 
 ## Journey TUI (spec D4), Journey WEB (spec D5)
@@ -135,8 +135,8 @@ and left no state file (the one-shot's in-process core minted nothing: `ca/` unc
 | Negatives | 1 | 0 | 4 | 0 |
 
 **Verdict so far: 0.5.10 fails the acceptance on the CLI journey (CLI-1/2/4/5) and on Apps
-attribution (MAC-9).** Owners: PR #271 (CLI-1, CLI-2, log noise in CLI-7/N4), the
-`claude/cli-oneshot-live-core` PR (CLI-4, CLI-5), the proxied-flow attribution feature (MAC-9).
+attribution (MAC-9b).** Owners: PR #271 (CLI-1, CLI-2, log noise in CLI-7/N4), the
+`claude/cli-oneshot-live-core` PR (CLI-4, CLI-5), the proxied-flow attribution feature (MAC-9b).
 The release-blocking question for 0.5.11 is whether those three are in it.
 
 ## Leftovers
