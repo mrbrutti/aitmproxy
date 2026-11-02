@@ -516,7 +516,7 @@ crates/aitm-scan-http/
   Candidate order (what survives the cap): query values; path segments and filename; body
   (by `body_format`: Form → `body_param`; Json → `json_value` per leaf with `path`; Xml →
   `xml_value`/`xml_attr` per slot with `path`; Multipart → `multipart_value` per named part and
-  `multipart_filename` per part with a filename; Other → one `entire_body` named `body`; None /
+  `multipart_filename` per part with a filename; Other → one `entire_body` named `body` (amendment 65, follow-up: every body gets one, recorded first; XML/JSON carry `structured`); None /
   Unavailable / body over `MAX_BODY_PARSE_BYTES` → no body points, a `tracing::debug` line);
   headers; cookies; then, only at `intensity >= Medium`, `param_name_query` per query key and
   `param_name_body` per form key or top-level JSON key. Dedupe on `(kind, name, path)`.
@@ -560,7 +560,7 @@ crates/aitm-scan-http/
   `example == Some("<redacted>")`, `(ParamNameQuery,"q",None)`, `(ParamNameQuery,"next",None)`,
   `(ParamNameBody,"profile",None)`, `(ParamNameBody,"n",None)`; it does **not** contain
   `(Cookie,"sid",_)`, `(Header,"Authorization",_)`, `(Header,"Host",_)`,
-  `(Header,"Content-Type",_)`, `(Header,"Content-Length",_)` or any `EntireBody`;
+  `(Header,"Content-Type",_)`, `(Header,"Content-Length",_)` (amendment 65, follow-up: the JSON flow now also carries one `(EntireBody,"body",None)` with traits `[Json, Structured]`, recorded first among its body points);
   `ignored == 2`; `seen` contains `ParamRef { kind: Cookie, name: "sid" }` and
   `ParamRef { kind: Header, name: "Authorization" }`; every point has `method == Some("POST")`,
   `url == Some("http://t:8080/files/reports/summary.pdf?q=1&next=https://e.test/")`,
@@ -576,8 +576,8 @@ crates/aitm-scan-http/
   multipart body yields `(MultipartValue,"title",None)` with `example == Some("hello")`,
   `(MultipartValue,"doc",None)` and `(MultipartFilename,"doc",None)` with `traits == [Filename]`
   and `example == Some("a.txt")`.
-  `entire_body_only_for_unrecognised`: `text/plain` body `hello` → one `(EntireBody,"body",None)`;
-  the JSON flow above yields none. `streamed_and_huge_bodies_skip`: a `Streamed` body and a
+  `entire_body_for_an_unrecognised_body` (renamed in the amendment-65 follow-up): `text/plain` body `hello` → one `(EntireBody,"body",None)`;
+  every other body also yields one (JSON/XML flagged `structured`), see the follow-up Review-log rows. `streamed_and_huge_bodies_skip`: a `Streamed` body and a
   3 MiB `Other` body yield no body points and no panic. `session_header_name_marks_trait`:
   material headers `[("X-Api-Key","k")]` → `(Header,"X-Api-Key")` carries `Session` and is
   ignored by the default rule; with `ignore: []` it is returned with `example == Some("<redacted>")`.
