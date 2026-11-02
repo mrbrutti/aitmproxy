@@ -333,32 +333,58 @@ impl fmt::Display for StopReason {
 ///
 /// Exactly one of `h2_not_negotiated`, `connect_refused`, `tls`, `timeout`,
 /// `transport`, `other` — a closed set, so the engine's `crawl.errors` log and
-/// any frontend reading it never see a foreign error string. The chain is
-/// walked from the outermost context inwards and the first link that reads as
-/// one of the tokens wins; a link is classified by its concrete type where the
-/// crate can see it (`std::io::Error`, `tokio::time::error::Elapsed`) and by
-/// its text otherwise. The text rules exist because this crate depends on
-/// `aitm-core` only: `h2_not_negotiated:` is the literal
-/// `aitm-proto-http/src/sender.rs` writes, and a browser driver's error has
-/// already been flattened to a scrubbed string by the time it arrives.
+/// any frontend reading it never see a foreign error string.
+///
+/// Type wins over text. The chain is walked twice, outermost context inwards:
+///
+/// 1. **Typed.** A link whose concrete type the crate can see decides on its
+///    own, whatever prose was wrapped around it: a `std::io::Error` of kind
+///    `ConnectionRefused` is `connect_refused`, `TimedOut` is `timeout`, and
+///    `ConnectionReset`, `BrokenPipe`, `UnexpectedEof` or `ConnectionAborted`
+///    is `transport`; a `tokio::time::error::Elapsed` is `timeout`; a link
+///    whose text starts with `h2_not_negotiated:` (the literal
+///    `aitm-proto-http/src/sender.rs` writes, which this crate cannot see as a
+///    type because it depends on `aitm-core` only) is `h2_not_negotiated`.
+/// 2. **Text.** Only when no link is typed: the first link whose words read as
+///    a token wins, in the order `connect_refused`, `timeout`, `tls`,
+///    `transport`. These rules exist for a browser driver's error, which has
+///    already been flattened to a scrubbed string by the time it arrives. A
+///    link whose text starts with `scan:` is one of the lane's own refusals
+///    (the scope guard, the budget) and is never read: it is `other` unless a
+///    typed link says otherwise.
 pub(crate) fn crawl_error_token(err: &anyhow::Error) -> &'static str {
+    use std::io::ErrorKind;
+
     for link in err.chain() {
-        let text = link.to_string();
-        if text.starts_with("h2_not_negotiated:") {
+        if let Some(io) = link.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                ErrorKind::ConnectionRefused => return "connect_refused",
+                ErrorKind::TimedOut => return "timeout",
+                ErrorKind::ConnectionReset
+                | ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::ConnectionAborted => return "transport",
+                _ => {}
+            }
+        }
+        if link.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
+            return "timeout";
+        }
+        if link.to_string().starts_with("h2_not_negotiated:") {
             return "h2_not_negotiated";
         }
+    }
+
+    for link in err.chain() {
+        let text = link.to_string();
+        if text.starts_with("scan:") {
+            continue;
+        }
         let lower = text.to_ascii_lowercase();
-        let io = link.downcast_ref::<std::io::Error>();
-        if io.map(std::io::Error::kind) == Some(std::io::ErrorKind::ConnectionRefused)
-            || lower.contains("refused")
-        {
+        if lower.contains("refused") {
             return "connect_refused";
         }
-        if link.downcast_ref::<tokio::time::error::Elapsed>().is_some()
-            || lower.contains("timed out")
-            || lower.contains("timeout")
-            || lower.contains("deadline")
-        {
+        if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline") {
             return "timeout";
         }
         if lower.contains("tls")
@@ -368,7 +394,8 @@ pub(crate) fn crawl_error_token(err: &anyhow::Error) -> &'static str {
         {
             return "tls";
         }
-        if io.is_some()
+        // Any other `io::Error` is a transport failure of some kind.
+        if link.downcast_ref::<std::io::Error>().is_some()
             || lower.contains("reset")
             || lower.contains("broken pipe")
             || lower.contains("eof")
@@ -630,10 +657,14 @@ mod tests {
             crawl_error_token(&anyhow::anyhow!("the request timed out")),
             "timeout"
         );
+        // The lane's own deadline refusal (`crawl::browser::bounded`) carries
+        // a typed `TimedOut` link under its `scan:` prose; the prose alone
+        // says nothing to the classifier.
         assert_eq!(
-            crawl_error_token(&anyhow::anyhow!(
-                "scan: the job deadline passed before the browser answered"
-            )),
+            crawl_error_token(
+                &anyhow::Error::new(IoError::from(ErrorKind::TimedOut))
+                    .context("scan: the job deadline passed before the browser answered")
+            ),
             "timeout"
         );
 
@@ -681,7 +712,31 @@ mod tests {
         })
         .await
         .expect_err("the sleep outlasts the timeout");
-        assert_eq!(crawl_error_token(&anyhow::Error::new(elapsed)), "timeout");
+        let err = anyhow::Error::new(elapsed).context("scan: the browser timed out after 1ms");
+        assert_eq!(crawl_error_token(&err), "timeout");
+    }
+
+    /// Type wins over text: a typed `ConnectionRefused` under a context whose
+    /// prose would read as `transport` is `connect_refused`, an `io::Error` of
+    /// kind `TimedOut` is `timeout`, and one of the lane's own `scan:` refusals
+    /// is `other`, never a text match on a word it happens to contain.
+    #[test]
+    fn crawl_error_token_reads_the_type_before_the_text() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        let refused = anyhow::Error::new(IoError::new(ErrorKind::ConnectionRefused, "nope"))
+            .context("connection to t:8080 failed");
+        assert_eq!(crawl_error_token(&refused), "connect_refused");
+
+        let timed_out = anyhow::Error::new(IoError::new(ErrorKind::TimedOut, "slow"));
+        assert_eq!(crawl_error_token(&timed_out), "timeout");
+
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!(
+                "scan: the scope guard refused http://t:8080/x: rate"
+            )),
+            "other"
+        );
     }
 
     /// S-M3: a frontier holds queued and visited URLs, and a stored seed

@@ -498,8 +498,13 @@ async fn bounded<T>(
     job: &dyn JobCtx,
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
+    // Both time-bound failures keep a typed cause under their `scan:` context
+    // (`crawl_error_token` reads the type, never this crate's own prose).
     let Some(limit) = remaining(job) else {
-        anyhow::bail!("scan: the job deadline passed before the browser answered");
+        return Err(
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut))
+                .context("scan: the job deadline passed before the browser answered"),
+        );
     };
     match tokio::time::timeout(limit, future).await {
         Ok(Ok(value)) => Ok(value),
@@ -507,9 +512,8 @@ async fn bounded<T>(
         // or the statement it rejected), so it is scrubbed here, once, before
         // any call site logs it or `prime_session` propagates it (AC T2-6).
         Ok(Err(err)) => Err(anyhow::anyhow!("{}", scrub_error(&err))),
-        // "timed out" is the word `crawl_error_token` reads, so a page the
-        // browser never answered counts as `timeout`, not `other`.
-        Err(_) => anyhow::bail!("scan: the browser timed out after {limit:?}"),
+        Err(elapsed) => Err(anyhow::Error::new(elapsed)
+            .context(format!("scan: the browser timed out after {limit:?}"))),
     }
 }
 
@@ -2499,6 +2503,63 @@ mod tests {
         assert_eq!(
             *job.inner.crawl_errors.lock().unwrap(),
             vec![(ROOT.to_string(), "tls".to_string())]
+        );
+    }
+
+    /// A driver whose navigation never answers.
+    struct HangingNavBrowser;
+
+    impl BrowserDriver for HangingNavBrowser {
+        fn navigate(&self, _url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// A page the browser never answers within the job's deadline is reported
+    /// as `timeout`, read off the `tokio` timeout's own type (`bounded` keeps
+    /// the `Elapsed` under its context), not off the prose around it.
+    #[tokio::test]
+    async fn a_browser_call_that_never_answers_reports_timeout() {
+        let mut inner = FakeJob::new(
+            ScanProfile::default(),
+            Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+        );
+        inner.deadline = Instant::now() + Duration::from_millis(100);
+        let job = JobWithDriver {
+            inner,
+            driver: Arc::new(HangingNavBrowser),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a page the browser never answered is skipped, not fatal");
+        assert_eq!(report.pages, 0);
+
+        assert_eq!(
+            *job.inner.crawl_errors.lock().unwrap(),
+            vec![(ROOT.to_string(), "timeout".to_string())]
         );
     }
 
