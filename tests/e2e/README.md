@@ -93,7 +93,10 @@ python3 tests/e2e/run.py ne --manual        # include manual (human-in-the-loop)
 
 Env: `AITM_BIN` (path to the `aitm` binary; default `target/debug/aitm`),
 `AITM_OBSCURA=1` + `AITM_OBSCURA_BIN` (require/locate real obscura),
-`AITM_E2E_MANUAL=1` (set by `--manual`).
+`AITM_E2E_MANUAL=1` (set by `--manual`),
+`AITM_E2E_KEEP_WORKDIR=1` (keep each cell's core workdir — `bus.addr`, `aitm.stderr.log`,
+`aitm.stdout.log` under `/tmp/aitm-e2e-*` — after the run, so a failure inside the engine can be
+read from the core's own log; pair it with `RUST_LOG=info,aitm::scanner=debug` on a rig).
 
 ## Adding a suite
 
