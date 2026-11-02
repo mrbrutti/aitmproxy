@@ -393,10 +393,10 @@ Kept by the main session during stage 6. One row per finding.
 | docs | spec pass 5 | Minor | Sp34 round E's size was 45 not 35; Sp25 named no accepter | fixed in adc4c826 |
 | docs | spec pass 5 | Minor | Sp35 T13's Tests line still said `--lib` | fixed in adc4c826 |
 | log | spec pass 5 | Minor | Sp36 table split by a blank line, row 310 doubled, Sp29 self-referential | fixed in adc4c826 |
-| T13 | panel pass 6 | — | Verdicts over 57aaa068..adc4c826: security PASS (no row), quality PASS (Q30 Minor), spec PASS (Sp37, Sp38 Minor) | round G = the docs commit that adds this row + the reflow commit |
+| T13 | panel pass 6 | — | Verdicts over 57aaa068..adc4c826: security PASS (no row), quality PASS (Q30 Minor), spec PASS (Sp37, Sp38 Minor) | round G = d8de9401 (documents) + 342ae1af (reflow) |
 | T13 | quality pass 6 | Minor | Q30 the module-doc reflow stopped one line short | fixed in 342ae1af |
-| docs | spec pass 6 | Minor | Sp37 plan item 4, spec D2 "Start" and Claims hook (3) still described the inline `match` / the bare `?` | fixed in round G's docs commit (this row's commit) |
-| docs | spec pass 6 | Minor | Sp38 "six greps", "one sentence", round F's size absent | fixed in round G's docs commit (this row's commit) |
+| docs | spec pass 6 | Minor | Sp37 plan item 4, spec D2 "Start" and Claims hook (3) still described the inline `match` / the bare `?` | fixed in d8de9401 |
+| docs | spec pass 6 | Minor | Sp38 "six greps", "one sentence", round F's size absent | fixed in d8de9401 |
 
 ## Follow-ups recorded by this plan (not this PR)
 
