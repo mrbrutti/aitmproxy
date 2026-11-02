@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use aitm::describe;
 use aitm::scripts::LateHandles;
 use aitm::tui::{self, Services, TuiLog};
 use aitm::wire::{assemble, assemble_with_scripts, Assembled, Features, Governance, ScriptWiring};
@@ -115,6 +116,54 @@ pub fn built_in_groups(features: &Features) -> (BTreeSet<String>, Vec<String>) {
             .collect();
         drop(assembled);
         (groups, names)
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// Every command the binary registers for `features` with a default config and
+/// the given Rhai config, through `assemble_with_scripts` exactly as `main`
+/// wires it (the tier's host plugin, its executor, an empty PoC step registry,
+/// its commands, then the `FindingsPlugin`), as `(name, describe::fingerprint)`
+/// pairs in registration order. The live side of the `describe_registry` pins
+/// (plan C28): [`built_in_groups`] generalised over the Rhai config, so the
+/// bundled catalogue can be appended by the caller. The CA is minted in a
+/// throwaway [`temp_ca_dir`] that is removed before returning; the function
+/// builds its own current-thread runtime for the tier's `Handle`, so call it
+/// from a plain `#[test]`, never from inside another runtime.
+pub fn live_commands(features: &Features, rhai: RhaiConfig) -> Vec<(String, String)> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime for the script tier");
+    let dir = temp_ca_dir("live-commands");
+    let mut cfg = Config::default();
+    cfg.ca.dir = dir.clone();
+
+    let result = rt.block_on(async {
+        let tier =
+            build_with_languages(rhai, startup_services(), &[]).expect("the rhai tier builds");
+        let assembled = assemble_with_scripts(
+            &cfg,
+            features,
+            ScriptWiring {
+                plugins: vec![
+                    Box::new(tier.host.with_max_body(cfg.limits.max_body_bytes)) as Box<dyn Plugin>
+                ],
+                executor: Some(tier.executor.clone()),
+                poc_step_handlers: PocStepRegistry::new(),
+                commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
+            },
+        )
+        .expect("the proxy assembles in a temp CA dir");
+
+        let registry = assembled.proxy.registry_arc();
+        let pairs: Vec<(String, String)> = registry
+            .commands()
+            .map(|cmd| (cmd.name().to_string(), describe::fingerprint(&cmd.schema())))
+            .collect();
+        drop(assembled);
+        pairs
     });
     let _ = std::fs::remove_dir_all(&dir);
     result
