@@ -135,19 +135,43 @@ Linux rate-limits ICMP errors per destination (`net.ipv4.icmp_ratelimit = 1000` 
 
 ### (v) Real-bus cells on the rig (Task 4b, follow-up PR off main 7f942f9f)
 
-**Result:** all three T5 cells PASS on the rig through the real engine (`run.py scan`, real `aitm` core with file caps, real `aitm-testtarget-serve`, `tcpdump` witness), rig run 11 at `ef950434`, 2026-11-02 07:09 UTC (`cells-t5-lines.txt`, `cells-summary.txt`), again at the merged head `c5c96d1e` (run 12, `cells-run12-{summary.txt,t5-lines.txt,scan.log}`) and at the code head `346a1156` (run 13, `cells-run13-*`); the final-head run after the stage-6 fix round is quoted in the plan's Shipped section (`/tmp/claude/t5-proof-linux/cells-t5-lines.txt`, `cells-summary.txt`, `cells-scan.log`; rig `~/t5-proof/20261102T070921Z/`):
+**Result:** all three T5 cells PASS on the rig through the real engine (`run.py scan`, real `aitm` core with file caps, real `aitm-testtarget-serve`, `tcpdump` witness), both in the runner and each alone on a quiet `lo`, at the final code head `4bcd6c6f` (run 16, 2026-11-02 09:54 UTC, rig `~/t5-proof/20261102T095438Z/`, Mac copies `/tmp/claude/t5-proof-linux/cells-run16-{summary.txt,scan.log,t5-lines.txt,test_t5_*.log}`), after passing in the runner at `ef950434` (run 11), `c5c96d1e` (run 12), `346a1156` (run 13), `c8180905` (run 14) and `e9ff8566` (run 15, direct leg too):
 
 ```
-  PASS  scan/test_t5_bounded_clean.py  (9.1s)
-  PASS  scan/test_t5_pins_dryrun.py  (1.0s)
-  PASS  scan/test_t5_crash_oracle.py  (48.6s)
-e2e summary: 24 pass, 14 skip, 0 fail
+  PASS  scan/test_t5_bounded_clean.py  (5.9s)
+  PASS  scan/test_t5_pins_dryrun.py  (0.8s)
+  PASS  scan/test_t5_crash_oracle.py  (41.7s)
+e2e summary: 29 pass, 6 skip, 3 fail
   ledger: 18/18 scan verbs called by at least one cell
+direct test_t5_bounded_clean exit: 0 (19 ok lines, 0 FAIL lines)
+direct test_t5_pins_dryrun exit: 0 (14 ok lines, 0 FAIL lines)
+direct test_t5_crash_oracle exit: 0 (34 ok lines, 0 FAIL lines)
 ```
 
-Ledger (spec D3, from the runner): the T5 cells exercised `scan.start`, `scan.status` and `scan.checks` (all three), and `scan.issues` + `scan.issue` (`test_t5_crash_oracle`), all at the operator role. `tcpdump` on `lo` for the whole surface: 17 965 frames, 226 ICMP, 501 UDP, 168 RST; 106 datagrams to each of the two echo targets (bounded-clean and the P job: 100 cases + 1 baseline + 4 scheduled probes + one liveness probe for a case the loaded rig read as silent), 23 to the V-crash target (2 loop cases + baseline + probes + 3 replays), 11 to the closed UDP port (10 cases + baseline), 215 replies back to our source port.
+The three FAILs in the runner leg are other tracks' cells (`test_t1_contract`, `test_t3_h2_observe`, `test_t2_session_reuse`, unchanged since run 14; not verified on plain main, reported to the coordinator). The independent witness on the closed-UDP oracle job and on the job-derived source ports:
 
-What the cells proved. The runner prints a cell's own lines only when it fails, so the per-assertion detail below comes from run 10 (`cells-run10-scan.log`, the run in which `test_t5_crash_oracle` still failed on `location.l4` and printed every line, and `test_t5_bounded_clean` on the frame count), from the lane's traced trail of that run (`cells-run10-vjob-trail.txt`), and, for the passing cells, from the final run's direct per-cell logs (`cells-final-test_t5_*.log`, each cell run once more on its own with stdout kept):
+```
+ICMP port-unreachable lines by quoted port:
+      105 udp port 29166 unreachable      <- the kernel answering the echo replies to a job's socketless source port
+      105 udp port 23733 unreachable      <- the other echo job's (both ports are in the 16384..32768 window of amendment 73 b)
+       11 udp port 43449 unreachable      <- the closed-UDP oracle job: 10 cases + 1 baseline
+closed-UDP oracle reactions (quoted port 43449; +gap to the previous reaction of this port):
+  +0.000s ... ICMP 127.0.0.1 udp port 43449 unreachable, length 52
+  +1.108s ... length 53
+  +1.103s ... length 54
+  +1.106s ... length 68
+  +1.107s ... length 100
+  +1.100s ... length 292
+  +1.103s ... length 556
+  +1.105s ... length 556
+  +1.105s ... length 53
+  +1.112s ... length 54
+  +1.097s ... length 68
+```
+
+Ledger (spec D3, from the runner): the T5 cells exercised `scan.start`, `scan.status` and `scan.checks` (all three), and `scan.issues` + `scan.issue` (`test_t5_crash_oracle`), all at the operator role. `tcpdump` on `lo` for the whole surface (run 16, the surface now holding the T2/T4/T6 cells too): 67 674 frames, 226 ICMP, 2 125 UDP, 805 RST; 106 datagrams to each of the two echo targets (bounded-clean and the P job: 100 cases + 1 baseline + 4 scheduled probes + one liveness probe for a case the loaded rig read as silent; run 11 saw the same 106/106), 11 ICMP reactions quoting the closed UDP port (10 cases + baseline), 105 kernel port-unreachables for each echo job's replies to its socketless derived source port.
+
+What the cells proved. The runner prints a cell's own lines only when it fails, so the per-assertion detail below comes from run 10 (`cells-run10-scan.log`, the run in which `test_t5_crash_oracle` still failed on `location.l4` and printed every line, and `test_t5_bounded_clean` on the frame count), from the lane's traced trail of that run (`cells-run10-vjob-trail.txt`), and, for the passing cells, from run 16's direct per-cell logs (`cells-run16-test_t5_*.log`, each cell run once more on its own with stdout kept):
 
 - `test_t5_bounded_clean`: `scan.start` → job `done`, `lanes.run == ["l4_packet"]`, `points: found 1, audited 1`, `checks: scheduled 2, done 2`, `status.l4 = { cases: 100, crashes: 0, liveness_failures: 0, retired_elements: 0 }`, zero issues; the operator's own `l4.capture` (inbound) holds every frame to the pinned port with `dst 127.0.0.1`; the patched target logged no downtime.
 - `test_t5_pins_dryrun`: `scan.start` with `fields: ["ipv4.src"]` and with `["dst"]` refused synchronously with `scan: invalid_profile: field path "ipv4.src" is pinned and cannot be fuzzed` (no job created); a dry run reports `dry_run: true`, finishes `done`, sends nothing (`status.l4.cases == 0`, no frame on the capture).
