@@ -77,6 +77,18 @@ pub enum ScriptError {
     /// the loader built its engine; registration never last-wins (Task 2 Review
     /// Focus, surfaced on the loader's build path by Task 7).
     LanguageCollision { namespace: String, name: String },
+    /// A `reg.add_check(meta, closure)` declared a `CheckMeta` map that is
+    /// missing or invalid on one key, so the catalogue cannot schedule it (D4
+    /// "Missing or invalid meta is a load error naming the key"). The bridge
+    /// that raises it is Task 13; the type is defined here.
+    CheckMeta {
+        script: String,
+        /// The check's `id`, if it parsed far enough to have one.
+        check: Option<String>,
+        /// The offending key (`kinds`, `class`, …).
+        key: String,
+        message: String,
+    },
 }
 
 impl From<RegisterError> for ScriptError {
@@ -200,6 +212,11 @@ const HELP_CAP: &str = "raise the script's `const API` to the capability's versi
 const HELP_COLLISION: &str = "two protocol languages registered the same host function; each \
                               namespace must be owned by one language.";
 
+const HELP_CHECK_META: &str = "every key of `CheckMeta` is required except `wants_traits`, `cwe`, \
+                               `remediation`, `needs_baseline`, `targets_session`, `scope`; \
+                               `origin` is supplied by the host, not the script; see \
+                               docs/scanner.md";
+
 impl std::fmt::Display for ScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -273,6 +290,16 @@ impl std::fmt::Display for ScriptError {
                 f,
                 "error: host function '{namespace}.{name}' is registered by two protocol \
                  languages\n  help: {HELP_COLLISION}"
+            ),
+            ScriptError::CheckMeta {
+                script,
+                check,
+                key,
+                message,
+            } => write!(
+                f,
+                "script `{script}`: reg.add_check `{}`: `{key}`: {message}\n  help: {HELP_CHECK_META}",
+                check.as_deref().unwrap_or("?")
             ),
         }
     }

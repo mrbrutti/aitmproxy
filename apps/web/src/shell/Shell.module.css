@@ -1,4 +1,4 @@
-/* The shell (§2.6): sidebar 240 | main; main = toolbar 44 / chip bar 36 / [filter bar] / body;
+/* The shell (§2.6): sidebar 240 | main; main = toolbar 44 / [role banners] / chip bar 36 / [filter bar] / body;
    status bar 28 spans the full width. The body is list (+ intercept bar) | splitter | lower. */
 .app {
   height: 100%;
@@ -32,9 +32,13 @@
 .main {
   grid-row: 1 / 2;
   display: grid;
-  grid-template-rows: var(--size-toolbar) var(--size-filter-bar) auto minmax(0, 1fr);
+  /* toolbar / banners (0 high when none) / chip bar / filter bar or its empty placeholder / body */
+  grid-template-rows: var(--size-toolbar) auto var(--size-filter-bar) auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
+}
+.banners {
+  min-width: 0;
 }
 
 .body {
@@ -51,11 +55,25 @@
   grid-template-columns: minmax(240px, 1fr) 1px minmax(240px, var(--split, 50%));
 }
 
+/* The list pane is a column: [L4 capture bar, sized to its content] / list (fills) / [intercept
+   bar, sized to its content]. A grid with fixed row tracks put the L4 bar in the 1fr row and the
+   list in an implicit auto row, which clipped the bar's scope rows and add form; flex lets the one
+   growing item be the list whether or not the bars are present. */
 .listPane {
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   min-width: 0;
+}
+.listPane > :not(.listFill) {
+  flex: none;
+}
+.listFill {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .splitter {

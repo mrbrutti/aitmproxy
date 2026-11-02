@@ -22,7 +22,7 @@ import {
   type MarkColor,
 } from '~/model/flow';
 
-export type Chip = 'all' | 'http' | 'https' | 'ws' | 'h1' | 'h2' | ContentFamily;
+export type Chip = 'all' | 'http' | 'https' | 'ws' | 'tcp' | 'udp' | 'l4' | 'h1' | 'h2' | ContentFamily;
 
 export type SidebarItem =
   | { kind: 'all' }
@@ -963,6 +963,12 @@ export function createAppStore(bus: BusClient) {
           return f.scheme === 'https';
         case 'ws':
           return f.kind === 'websocket';
+        case 'tcp':
+        case 'udp':
+        case 'l4':
+          // An L4 chip never matches an HTTP/WebSocket summary; the flow list appends the matching
+          // L4 session rows itself (`panels/l4/model.l4ChipMatches`).
+          return false;
         case 'h1':
           return f.httpVersion === 'HTTP/1.1';
         case 'h2':

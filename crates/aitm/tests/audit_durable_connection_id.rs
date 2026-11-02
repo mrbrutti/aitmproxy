@@ -85,7 +85,13 @@ fn the_durable_line_of_a_real_audited_call_carries_the_servers_connection_id() {
     cfg.mcp.policy = AgentPolicy::Auto;
     cfg.ca.dir = scratch("ca");
     let assembled = assemble(&cfg).expect("assemble");
-    let services = tui::services(&assembled.proxy, &cfg, None, TuiLog::Off);
+    let services = tui::services(
+        &assembled.proxy,
+        &cfg,
+        None,
+        TuiLog::Off,
+        Arc::clone(&assembled.job_bus),
+    );
     let srv = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
     let srv = tui::with_shared_governance(srv, &assembled.agent_state, &assembled.audit_ring)
         .with_durable_audit(log.clone());

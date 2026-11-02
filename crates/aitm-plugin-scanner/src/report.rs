@@ -70,27 +70,11 @@ pub(crate) fn target_matches(filter: &str, record_target: &str) -> bool {
 
 /// Convert a `serde_json::Value` (as `aitm_findings::render_index` returns)
 /// into the transport-neutral `aitm_core::Value`.
+///
+/// One mapping serves the whole crate: the body lives in
+/// [`crate::util::json_to_value`], which the scanner v2 engine calls directly.
 pub fn index_to_value(index: serde_json::Value) -> aitm_core::Value {
-    match index {
-        serde_json::Value::Null => aitm_core::Value::Null,
-        serde_json::Value::Bool(b) => aitm_core::Value::Bool(b),
-        // An integer stays an `Int`, any other number is a `Float`, and a number
-        // with neither form is `Null` — a value is never invented.
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .map(aitm_core::Value::Int)
-            .or_else(|| n.as_f64().map(aitm_core::Value::Float))
-            .unwrap_or(aitm_core::Value::Null),
-        serde_json::Value::String(s) => aitm_core::Value::Str(s),
-        serde_json::Value::Array(items) => {
-            aitm_core::Value::Array(items.into_iter().map(index_to_value).collect())
-        }
-        serde_json::Value::Object(map) => aitm_core::Value::Object(
-            map.into_iter()
-                .map(|(k, v)| (k, index_to_value(v)))
-                .collect(),
-        ),
-    }
+    crate::util::json_to_value(index)
 }
 
 #[cfg(test)]

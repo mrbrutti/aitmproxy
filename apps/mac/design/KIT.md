@@ -148,8 +148,21 @@ rows inset 8 from the sidebar edge.
 | hover | TODO (story S-…): no hover fill yet | | |
 | focused / keyboard | TODO (story S-…): arrow keys and a focus ring | | |
 
-A sub-row (`subItem`: pinned host, client) is 28 tall, inset 28, with a
-monogram in place of the glyph and a plain count (label role, secondary).
+**App row** (Apps group, one per distinct identifier). Anatomy: chevron 12
+(`Glyph.chevron`, `Ink.tertiary`) in a 16 frame at inset 12 · client mark
+16 at inset 28 · gap 8 (`Space.sm`) · name (body) · spacer · count. Height
+28 (`Size.control`); selected fill `Ground.active` when the app is the
+current group. Selecting an app opens it, the chevron toggles without
+selecting; no animation on the chevron (it turns 90° when open). Tooltip:
+the identifier. Under an open app, one **domain sub-row** per host, host
+monogram (`◎`) at inset 52, its count being that app's flows to that host;
+the counts under an app sum to the app's count. The three insets are
+12 (chevron) / 28 (mark, and every flat sub-row) / 52 (domain under an app).
+
+A sub-row (`subItem`: Domains host, pinned host, pinned app, domain under
+an app) is 28 tall, inset 28 (52 under an app), with a mark in place of the
+glyph (host monogram for hosts, client mark for a pinned app) and a plain
+count (label role, secondary). Pinned apps do not expand.
 
 ### Group label (`SidebarView.group`)
 Section role: 11/500, uppercase, tracking 0.6, `Ink.tertiary`; padding
@@ -160,10 +173,24 @@ Label role 12. Plain count: secondary text, no fill. Queue count (Scope,
 Findings): primary text on `Ground.raised` capsule, min 18 × 18, inset 6.
 Agent count: `Agent.deep` on `Agent.tint`. Counts sit only on queues.
 
-### Monogram (`Monogram`, `MonogramView`)
-16 × 16, radius 4, `Ground.raised` fill (the AppKit one adds a 1 px
-`Line.control` stroke), one character 11/500 in `Ink.secondary`. The real
-app icon replaces it when the client resolves to one. TODO (story S-…).
+### Client mark (`ClientMark`, `FlowCellView.clientIcon`)
+16 × 16 (`Size.icon`). The real app icon when the client's identifier
+resolves to an app bundle (a non-template copy, shared per owner app);
+else the `terminal` process mark (token `glyph.process`, `Glyph.process`)
+12 (`Size.iconInline`) regular in the 16 frame, `Ink.secondary`; blank (an
+empty 16 square) while the verdict is pending, never the process mark.
+Flat: no disc, no background, no tint on the real icon; selection does not
+template it. The same mark in the sidebar app rows, the pinned apps and the
+flow table's Client column; the identifier is the tooltip.
+| State | Mark |
+| --- | --- |
+| app | the bundle's icon, 16 × 16 |
+| process (no bundle) | `terminal` 12 in `Ink.secondary` |
+| pending | empty 16 square |
+
+The **host monogram** (`Monogram`) remains for host rows and domain
+sub-rows: 16 × 16, radius 4, `Ground.raised` fill, one character (`◎`)
+11/500 in `Ink.secondary`.
 
 ### Toolbar
 Window toolbar, 44 tall, shared background hidden. Left: sidebar toggle,
@@ -209,14 +236,15 @@ Bar 36 tall, inset 10, chips 2 apart, a 1 × 14 `Line.border` hairline with
 no zebra, 1 px `Line.rule` under each row, cells inset 8, header 28 with
 section-role titles (11/500, kern 0.5, tertiary) and a 1 px `Line.border`
 under it; sort shown as a tertiary ↑ / ↓. Columns: dot 24 · # 52 · URL ≥ 200
-(host primary, path link, query tertiary) · Client 96 (monogram + name,
-ui face) · Method 72 (badge) · Status 72 · Time 124 · Duration 88 ·
-Request 80 · Response 80 · SSL 40 · Edited 64 · Origin 72 · Mark 20.
+(host primary, path link, query tertiary) · Client 96 (icon + name,
+ui face; tooltip the identifier) · Method 72 (badge) · Status 72 ·
+Time 124 · Duration 88 · Request 80 · Response 80 · SSL 40 · Edited 64 ·
+Origin 72 · Mark 20.
 | State | Fill | Dot | Left edge 2 px | Status cell | Else |
 | --- | --- | --- | --- | --- | --- |
 | normal | `Ground.surface` | class colour | none | code, 13/500 class colour | |
 | selected | `Ground.active` (never the accent); cells keep their colours | | | | |
-| hover | `Ground.hover`; never selects (not captured in the gallery) | | | | |
+| hover | `Ground.hover`; never selects | | | | |
 | pending | surface | `Intercept.base` | none | `—` in `Status.pending` | duration `…` |
 | paused | surface | `Intercept.base` | `Intercept.base` | `Paused` badge, deep on tint | pencil in Edited when mutated |
 | killed | surface | `Status.killed` | none | `killed` grey | URL struck through, tertiary |
