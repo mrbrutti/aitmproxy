@@ -11,11 +11,16 @@
 //!   in the pinned format. Exactly one of `path`/`source`. Only a `.rhai` path
 //!   is read, so the command is not a general file probe for an agent
 //!   frontend; `source` is bounded by the sandbox `max_string_size`.
-//! - **`script.reload { name }`** recompiles a loaded script from its file and
+//! - **`script.reload { name }`** recompiles a loaded script from its file,
 //!   swaps its hooks live through the [`ScriptHandle`] it shares with the
-//!   plugin; a recompile that fails leaves the previous good AST in service.
-//!   Commands and options the script's `load(reg)` registered are not
-//!   re-run — those still need a restart (the registry is sealed once built).
+//!   plugin, then re-runs the script's `load(reg)` so the checks it declares
+//!   with `reg.add_check` replace its previous ones in the live catalogue
+//!   (plan call B9) and its declared option defaults are refreshed. A recompile
+//!   that fails leaves the previous good AST and checks in service; a `load`
+//!   that fails is reported (and shown as `last_error`) with the hooks already
+//!   swapped. Commands and options the `load` registers cannot be installed —
+//!   the platform registry is sealed once built — so those still need a
+//!   restart.
 //! - **`script.findings { limit? }`** reads the in-memory [`FindingSink`] back:
 //!   every finding a script emitted with `finding(...)` this run, as an object
 //!   (newest last), and how many the bounded sink dropped. Distinct from the
@@ -57,7 +62,7 @@ use aitm_core::{
 use crate::config::{ScriptEntry, ScriptMeta};
 use crate::host_core::{severity_name, Finding, FindingSink};
 use crate::loader::{Registers, RhaiLoader, Validated};
-use crate::plugin::{ErrorSink, ScriptHandle, ScriptSet};
+use crate::plugin::{ErrorSink, LoadedScript, ScriptHandle, ScriptSet};
 
 /// Registers the tier's commands. Built by `wire::build` over the same loader,
 /// sink and script set the [`crate::plugin::ScriptHost`] uses; the host
@@ -166,8 +171,9 @@ struct ScriptFindings {
 /// `on_request` runs on the next event. `restart_required` is `true` only when
 /// the script registers commands or options — those still need a restart,
 /// because the command/option `Registry` is sealed once built. Saving over a
-/// script that is already loaded swaps its AST through the shared handle,
-/// exactly as `script.reload` does, so the new hooks run live too.
+/// script that is already loaded swaps its AST through the shared handle and
+/// re-runs its `load(reg)`, exactly as `script.reload` does, so the new hooks
+/// run live and its checks are replaced in the catalogue too.
 struct Save {
     loader: Arc<RhaiLoader>,
     scripts: ScriptSet,
@@ -308,9 +314,10 @@ impl Command for Reload {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Recompile a loaded script from its file and swap its hooks live; a \
+            description: "Recompile a loaded script from its file, swap its hooks live and \
+                          re-run its load(reg) so its checks are replaced in the catalogue; a \
                           failed recompile keeps the previous version. Commands and options it \
-                          registered at load are unchanged until restart."
+                          registers at load are unchanged until restart."
                 .to_string(),
             params: vec![param(
                 "name",
@@ -329,7 +336,8 @@ impl Command for Reload {
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         check_agent_gate(host, self.loader.allow_agent_authoring())?;
         let name = text(&args, "name")?;
-        let handle = find_script(&self.scripts, &name)?;
+        let script = find_loaded(&self.scripts, &name)?;
+        let handle = script.handle();
         let (ast, meta) = self
             .loader
             .compile(handle.path())
@@ -338,6 +346,7 @@ impl Command for Reload {
         let hooks = meta.hooks.clone();
         handle.swap(ast, meta);
         self.errors.clear(&name);
+        rerun_load_after_swap(&script, &name)?;
         tracing::info!(
             target: "aitm_plugin_rhai::loader",
             script = %name,
@@ -547,9 +556,11 @@ impl Command for Save {
 
         let registers = &validated.registers;
         let registers_present = !registers.commands.is_empty() || !registers.options.is_empty();
-        let restart_required = match self.scripts.find_handle(&name) {
-            Some(handle) => {
-                // Overwrite: `script.reload` semantics over the file just written.
+        let restart_required = match self.scripts.find(&name) {
+            Some(script) => {
+                // Overwrite: `script.reload` semantics over the file just written,
+                // checks included.
+                let handle = script.handle();
                 let (ast, fresh) = self
                     .loader
                     .compile(&path)
@@ -561,6 +572,7 @@ impl Command for Save {
                 // cannot keep its operator-level seam powers (fail-closed).
                 handle.set_authoring_trust(CallerTrust::from(host.frontend()));
                 self.errors.clear(&name);
+                rerun_load_after_swap(&script, &name)?;
                 tracing::info!(
                     target: "aitm_plugin_rhai::loader",
                     script = %name,
@@ -600,7 +612,8 @@ impl Command for Save {
                         restart_required = registers_present,
                         "script saved and appended live; its hooks run with no restart"
                     );
-                } else if let Some(handle) = self.scripts.find_handle(&name) {
+                } else if let Some(script) = self.scripts.find(&name) {
+                    let handle = script.handle();
                     let (ast, fresh) = self
                         .loader
                         .compile(&path)
@@ -609,6 +622,7 @@ impl Command for Save {
                     handle.set_enabled(enable);
                     handle.set_authoring_trust(CallerTrust::from(host.frontend()));
                     self.errors.clear(&name);
+                    rerun_load_after_swap(&script, &name)?;
                     tracing::info!(
                         target: "aitm_plugin_rhai::loader",
                         script = %name,
@@ -740,7 +754,28 @@ impl Command for List {
 /// by-name script command shares: it names the miss and lists what is loaded.
 /// Read from the live set, so a script appended at runtime is found.
 fn find_script(scripts: &ScriptSet, name: &str) -> anyhow::Result<Arc<ScriptHandle>> {
-    scripts.find_handle(name).ok_or_else(|| {
+    find_loaded(scripts, name).map(|script| script.handle())
+}
+
+/// After a recompiled AST was swapped in (`script.reload`, or `script.save`
+/// over a loaded script), re-run the script's `load(reg)`: the new source
+/// decides which checks this script now provides, and the bridge replaces
+/// exactly this script's catalogue entries (and refreshes its option
+/// defaults). The hooks are already live, so a failure here is reported as
+/// such — not as "nothing changed" — in one wording for both commands.
+fn rerun_load_after_swap(script: &LoadedScript, name: &str) -> anyhow::Result<()> {
+    script.rerun_load().map_err(|err| {
+        anyhow::anyhow!(
+            "script `{name}` recompiled and its hooks are live, but its load(reg) failed, \
+             so its checks were not re-registered: {err}"
+        )
+    })
+}
+
+/// The loaded script itself (`script.reload` re-runs its `load`), or the same
+/// "no such script" error listing what is loaded.
+fn find_loaded(scripts: &ScriptSet, name: &str) -> anyhow::Result<Arc<LoadedScript>> {
+    scripts.find(name).ok_or_else(|| {
         let loaded = scripts.names();
         anyhow::anyhow!(
             "no loaded script is named `{name}`; loaded: {}",

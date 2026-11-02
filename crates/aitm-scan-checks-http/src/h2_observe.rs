@@ -270,6 +270,15 @@ impl Kind {
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
+            // Observe-only kinds (SETTINGS, CL.TE indicator, rapid-reset) probe
+            // the connection/origin once, not per insertion point (spec D8:
+            // h2 observe-only checks run once per origin); the malformed-header
+            // kinds still probe each point.
+            scope: if matches!(spec.technique, Technique::Observe) {
+                aitm_scan_model::CheckScope::Origin
+            } else {
+                aitm_scan_model::CheckScope::Point
+            },
             cwe: spec.cwe,
             description: spec.description.to_string(),
             remediation: Some(spec.remediation.to_string()),
@@ -727,6 +736,8 @@ fn settings_verdict(obs: &RawH2Observation) -> Verdict {
         },
         detail: format!("the peer advertised SETTINGS: {listed}"),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 
@@ -796,6 +807,8 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
         },
         detail: format!("no reset-rate mitigation observed in {RESET_PAIRS} reset pairs"),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 
@@ -859,6 +872,8 @@ fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
             },
             detail,
             poc_hint: None,
+            location: None,
+            more: Vec::new(),
         };
     }
     if unobserved > 0 {

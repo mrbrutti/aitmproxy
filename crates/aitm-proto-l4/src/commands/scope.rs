@@ -13,7 +13,7 @@ use aitm_core::{
     Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
 
-use crate::guard::L4Guard;
+use crate::guard::{L4Guard, ANY_INTERFACE};
 use crate::types::{L4ScopeEntry, L4ScopeId, L4ScopeSource, RateCap};
 
 /// Proof that `l4.scope.add` was dispatched on a **trusted-control** path (spec §3,
@@ -126,7 +126,9 @@ impl Command for ScopeAdd {
                     name: "interface".into(),
                     ty: TypeDesc::Str,
                     required: true,
-                    description: "The interface this entry covers (e.g. `lo0`).".into(),
+                    description:
+                        "The interface this entry covers (e.g. `lo0`), or `*` for any interface."
+                            .into(),
                 },
                 ParamDef {
                     name: "direction".into(),
@@ -286,16 +288,24 @@ impl Command for ScopeList {
 /// The longest interface name the OS accepts (`IFNAMSIZ` is 16 including the NUL).
 const IFNAMSIZ_MAX: usize = 15;
 
-/// Accept an `interface` only if it is an OS interface name:
-/// `^[A-Za-z0-9._:-]{1,15}$`. Both add paths (operator-confirmed and agent) build
-/// their entry through [`entry_from_params`], so both are covered; a rejected value
-/// is echoed escaped (`{:?}`), never raw, so a control or ANSI sequence cannot reach
-/// a terminal or a UI through the error text.
+/// Accept an `interface` only if it is an OS interface name,
+/// `^[A-Za-z0-9._:-]{1,15}$`, or exactly the [`ANY_INTERFACE`] wildcard `"*"` (the
+/// D9.5 rule the guard matches: an entry on `"*"` covers a target on any interface,
+/// which is how an unprivileged socket client such as the stream lane is authorised;
+/// the operator declares a destination, not a NIC). `"**"`, `"*x"` and every other
+/// string with a `*` stay refused. Both add paths (operator-confirmed and agent)
+/// build their entry through [`entry_from_params`], so both are covered; a rejected
+/// value is echoed escaped (`{:?}`), never raw, so a control or ANSI sequence cannot
+/// reach a terminal or a UI through the error text.
 fn validate_interface(s: &str) -> anyhow::Result<String> {
+    if s == ANY_INTERFACE {
+        return Ok(s.to_string());
+    }
     let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-');
     if s.is_empty() || s.len() > IFNAMSIZ_MAX || !s.chars().all(name_char) {
         anyhow::bail!(
-            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got {s:?}"
+            "param `interface` must be `*` (any interface) or 1-15 characters of \
+             [A-Za-z0-9._:-] (IFNAMSIZ), got {s:?}"
         );
     }
     Ok(s.to_string())
@@ -494,28 +504,38 @@ mod tests {
         let err = with_interface("").expect_err("an empty interface is refused");
         assert_eq!(
             err.to_string(),
-            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got \"\""
+            "param `interface` must be `*` (any interface) or 1-15 characters of \
+             [A-Za-z0-9._:-] (IFNAMSIZ), got \"\""
         );
         let err = with_interface("abcdefghijklmnop").expect_err("16 characters is refused");
         assert_eq!(
             err.to_string(),
-            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got \
-             \"abcdefghijklmnop\""
+            "param `interface` must be `*` (any interface) or 1-15 characters of \
+             [A-Za-z0-9._:-] (IFNAMSIZ), got \"abcdefghijklmnop\""
         );
         let err = with_interface("lo0\n").expect_err("a control character is refused");
         assert_eq!(
             err.to_string(),
-            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got \
-             \"lo0\\n\""
+            "param `interface` must be `*` (any interface) or 1-15 characters of \
+             [A-Za-z0-9._:-] (IFNAMSIZ), got \"lo0\\n\""
         );
         let err = with_interface("\x1b[31mlo0").expect_err("an ANSI escape is refused");
         assert_eq!(
             err.to_string(),
-            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got \
-             \"\\u{1b}[31mlo0\""
+            "param `interface` must be `*` (any interface) or 1-15 characters of \
+             [A-Za-z0-9._:-] (IFNAMSIZ), got \"\\u{1b}[31mlo0\""
         );
         assert!(with_interface("lo 0").is_err(), "a space is refused");
         assert!(with_interface("en0/1").is_err(), "a slash is refused");
+        assert!(with_interface("**").is_err(), "`**` is not the wildcard");
+        assert!(with_interface("*x").is_err(), "`*x` is not the wildcard");
+        assert!(with_interface("x*").is_err(), "`x*` is not the wildcard");
+        assert!(
+            with_interface(" *").is_err(),
+            "a padded `*` is not the wildcard"
+        );
+        let any = with_interface(ANY_INTERFACE).expect("`*` is the D9.5 wildcard");
+        assert_eq!(any.interface, ANY_INTERFACE);
 
         for ok in [
             "lo0",
@@ -529,6 +549,68 @@ mod tests {
             let entry = with_interface(ok).unwrap_or_else(|e| panic!("`{ok}` is accepted: {e}"));
             assert_eq!(entry.interface, ok);
         }
+    }
+
+    /// Scanner v2 D7/D9.5 (T7 security re-review): the inject entry the gate text
+    /// tells an operator to add (`interface "*", direction outbound, <ip>/32,
+    /// capability inject`) must be creatable over the bus, not only from the config
+    /// file. `l4.scope.add` on a trusted-control host with `interface: "*"` mints an
+    /// entry whose interface is the wildcard; `"**"` and `"*x"` are refused by the
+    /// same verb with the error naming the param and the rule.
+    #[test]
+    fn scope_add_accepts_the_any_interface_wildcard_over_the_bus() {
+        let guard = Arc::new(L4Guard::new(&L4Config {
+            enabled: true,
+            ..L4Config::default()
+        }));
+        let cmd = ScopeAdd::new(Arc::clone(&guard));
+        let mem = aitm_core::MemFlowStore::new();
+        let client = StubClient;
+        let core = aitm_core::StdGuard::default();
+        let host =
+            CommandHost::new(&mem, &client, &core, None).with_frontend(aitm_core::Frontend::Cli);
+        let args_for = |iface: &str| -> Params {
+            let mut p = ac5_params();
+            p.retain(|(k, _)| *k != "interface" && *k != "capability" && *k != "direction");
+            p.push(("interface", Value::Str(iface.to_string())));
+            p.push(("direction", Value::Str("outbound".into())));
+            p.push(("capability", Value::Str("inject".into())));
+            params(&p)
+        };
+
+        let id = cmd
+            .invoke(args_for(ANY_INTERFACE), &host)
+            .expect("`*` is accepted over the bus");
+        assert!(
+            matches!(id, Value::Str(_)),
+            "scope.add returns the minted id"
+        );
+        let added = guard
+            .list_scope()
+            .into_iter()
+            .find(|e| e.interface == ANY_INTERFACE)
+            .expect("the wildcard entry is in the guard's scope");
+        assert_eq!(added.direction, L4Direction::Outbound);
+
+        for bad in ["**", "*x"] {
+            let err = cmd
+                .invoke(args_for(bad), &host)
+                .expect_err("only the exact wildcard is accepted");
+            assert!(
+                err.to_string()
+                    .starts_with("param `interface` must be `*` (any interface)"),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(
+            guard
+                .list_scope()
+                .iter()
+                .filter(|e| e.interface.contains('*'))
+                .count(),
+            1,
+            "the refused names added nothing"
+        );
     }
 
     /// Spec §3 / plan A6: `confirm_prompt` is `Some` even with empty args, so

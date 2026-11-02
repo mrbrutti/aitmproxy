@@ -3,8 +3,9 @@
 """T1-6: `scan.checks` is the real catalogue.
 
   - Core A (stock): every entry carries full `CheckMeta` (the D2/D3 wire keys),
-    the interim HTTP lane's two native classes are present, and when the bundled
-    active scripts are loaded at least one entry declares `origin.kind` bundled.
+    the interim HTTP lane's two native classes are present, and -- only once T3
+    has converted the bundled active scripts to `reg.add_check` -- at least one
+    entry declares `origin.kind` bundled.
   - Core B: an operator-authored `e2e-custom.rhai` dropped in `rhai.scripts_dir`
     registers through `load(reg)` / `reg.add_check(...)` and appears in
     `scan.checks` after the core boots.
@@ -13,11 +14,15 @@
     (parent spec D4: "Missing or invalid meta is a load error naming the key").
 
 Observers: the live `scan.checks` result, `script.list` (what is actually
-loaded), and the core's own stderr on disk.
+loaded), the bundled active scripts on disk, and the core's own stderr.
 
-SKIPs 77 when the live core lacks `scan.checks`.
+SKIPs 77 when the live core lacks `scan.checks`. The bundled `origin.kind`
+sub-assertion alone is noted and skipped when no bundled active script declares
+`reg.add_check` (T3's conversion is not on this build); every other assertion,
+including the custom `add_check` half of T1-6, still runs.
 """
-import os
+# Integration-shared edit: this cell is re-pinned only by the track's integration
+# task (plan 2026-10-31-aitmproxy-scanner-v2-t1b, Task 19), never by a build task.
 import os
 import shutil
 import sys
@@ -27,7 +32,7 @@ from pathlib import Path
 E2E = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(E2E))
 
-from aitm_e2e import check, free_port, ok, section  # noqa: E402
+from aitm_e2e import check, free_port, ok, repo_root, section  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
@@ -42,8 +47,20 @@ REQUIRED_META_KEYS = (
     "id", "name", "class", "lanes", "kinds", "intensity", "cost",
     "technique", "severity", "confidence_max", "origin",
 )
-# The interim HTTP lane's two native payload classes (parent spec D5/D6).
+# The interim HTTP lane's two native payload classes (parent spec D5/D6). The
+# catalogue is asserted as a SUPERSET of these: a build with more lanes or more
+# converted scripts adds ids, and that is not a regression.
 NATIVE_IDS = {"xss-reflected", "open-redirect"}
+# Where the bundled active scripts live; a script only reaches the catalogue once
+# it declares `reg.add_check` (T3's conversion), so the cell reads the files on
+# disk rather than assuming the conversion has landed.
+ACTIVE_DIR = Path(repo_root()) / "scripts" / "bundled" / "active"
+
+
+def bundled_scripts_declaring_add_check() -> list[str]:
+    """Names of `scripts/bundled/active/*.rhai` that declare `reg.add_check`."""
+    return [f.name for f in sorted(ACTIVE_DIR.glob("*.rhai"))
+            if "reg.add_check" in f.read_text(encoding="utf-8", errors="replace")]
 
 # A human-readable operator check (Matt's rule: Rhai scripts are for people to
 # read). It never probes — the closure reports `clean` for every point — so the
@@ -131,12 +148,20 @@ def main() -> None:
                                       if isinstance(row, dict)
                                       and "bundled" in str(row.get("path", ""))
                                       and "active" in str(row.get("path", ""))]
-                if bundled_active:
+                registering = bundled_scripts_declaring_add_check()
+                if bundled_active and registering:
                     origins = [c.get("origin", {}).get("kind") for c in checks]
                     check("bundled" in origins,
-                          f"{len(bundled_active)} bundled active script(s) loaded, so at "
-                          f"least one check has origin.kind == bundled "
+                          f"{len(bundled_active)} bundled active script(s) loaded and "
+                          f"{len(registering)} declare reg.add_check, so at least one check "
+                          f"has origin.kind == bundled "
                           f"(origins seen: {sorted(set(origins))})")
+                elif bundled_active:
+                    ok(f"note: {len(bundled_active)} bundled active script(s) are loaded but "
+                       f"none of the {len(list(ACTIVE_DIR.glob('*.rhai')))} scripts in "
+                       f"{ACTIVE_DIR.name}/ declares reg.add_check, so none can reach the "
+                       "catalogue; T3's add_check conversion is not on this build and the "
+                       "origin.kind == bundled assertion is skipped")
                 else:
                     ok(f"note: script.list ({status}) shows no bundled active scripts on "
                        "this build; the origin.kind == bundled assertion is not applicable")

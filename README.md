@@ -495,35 +495,36 @@ source checkout.
 
 ### Attack-surface scanner
 
-`scan.discover` drives the embedded browser to crawl an authorized, in-scope
-target breadth-first, then reads the captured flows back to enumerate **injection
-points** — query and body parameters, headers, cookies, path segments. It is
-deterministic and AI-free, and every step is bounded by scope and by depth, page
-and time caps.
+The scanner crawls an authorized, in-scope target, enumerates its **injection
+points** — query and body parameters, headers, cookies, path segments — and runs
+a catalogue of checks over them. It is deterministic and AI-free, and every step
+is bounded by scope and by probe, page and time budgets.
 
 ```mermaid
 %%{init: {"theme": "neutral"}}%%
 flowchart LR
-    target["scan.discover<br/>target"] --> gate{"In scope?"}
+    target["scan.start<br/>target"] --> gate{"In scope?"}
     gate -- no --> refused["Refused before<br/>any page opens"]
     gate -- yes --> crawl["Crawl in obscura<br/>same-origin, capped"]
     crawl --> flows["Captured flows"]
     flows --> points["Endpoints and<br/>injection points"]
-    points -.-> active["Active fuzz and inject<br/>(roadmap)"]
+    points --> checks["Catalogue checks<br/>budgeted, paced"]
+    checks --> issues["Issues<br/>scan.issues"]
 ```
 
 ```text
-scan.discover({ target: "https://staging.example.com/", max_depth: 2, max_pages: 50 })
+scan.start({ target: "https://staging.example.com/" })
 ```
 
-Run it from the **Scan** view in any UI, or have an agent call it over MCP; it
-needs a running core with the embedded browser, so the one-shot CLI cannot crawl.
-It returns the endpoints found, the injection points, pages crawled and why the
-crawl stopped. Endpoint and injection-point rows link back to the flow they came
-from. **What shipped in v0.5.0 is discovery.** It reads and enumerates; it never
-injects or mutates. Active fuzzing, injection and campaigns build on the same
-seam and are roadmap, not present features. Details in
-[docs/scanner.md](docs/scanner.md).
+A scan is a **job**: `scan.start` accepts it against an in-scope target and
+returns a job id immediately. Poll `scan.status` for state, counters and why it
+stopped; read what it found with `scan.issues` and `scan.issue`, the crawled
+tree with `scan.sitemap`, and stop it with `scan.cancel`. `scan.map` crawls and
+runs the passive checks without sending a probe. `scan.checks` lists the
+catalogue, and `check.<id>` runs one check by hand against one parameter. Run
+these from the **Scan** view in any UI or over MCP; a crawl needs a running core
+with the embedded browser, so the one-shot CLI cannot crawl. Issues link back to
+the flows they came from. Details in [docs/scanner.md](docs/scanner.md).
 
 ### Scripting and PoCs
 
@@ -746,7 +747,9 @@ beside `target/debug` and `target/release`; `scripts/package.sh` builds a releas
   started, scripting and PoC references, demos, downloads.
 - [INSTALL.md](INSTALL.md) — install on macOS and Linux, build from source, point
   the app at an external core.
-- [docs/scanner.md](docs/scanner.md) — the automated scanner (`scan.discover`).
+- [docs/scanner.md](docs/scanner.md) — the scanner: scan jobs, the `scan.*`
+  and `check.<id>` verbs, profiles, the `scanner:` config section, issues,
+  and writing a check in Rhai.
 - [`aitmproxy-plugin/README.md`](aitmproxy-plugin/README.md) — the MCP plugin for
   ChatGPT, Claude Desktop / claude.ai and Claude Code.
 - [docs/design/languages/](docs/design/languages) — the canonical Rhai and
