@@ -135,20 +135,20 @@ Linux rate-limits ICMP errors per destination (`net.ipv4.icmp_ratelimit = 1000` 
 
 ### (v) Real-bus cells on the rig (Task 4b, follow-up PR off main 7f942f9f)
 
-**Result:** all three T5 cells PASS on the rig through the real engine (`run.py scan`, real `aitm` core with file caps, real `aitm-testtarget-serve`, `tcpdump` witness), both in the runner and each alone on a quiet `lo`, at the final code head `4bcd6c6f` (run 16, 2026-11-02 09:54 UTC, rig `~/t5-proof/20261102T095438Z/`, Mac copies `/tmp/claude/t5-proof-linux/cells-run16-{summary.txt,scan.log,t5-lines.txt,test_t5_*.log}`), after passing in the runner at `ef950434` (run 11), `c5c96d1e` (run 12), `346a1156` (run 13), `c8180905` (run 14) and `e9ff8566` (run 15, direct leg too):
+**Result:** all three T5 cells PASS on the rig through the real engine (`run.py scan`, real `aitm` core with file caps, real `aitm-testtarget-serve`, `tcpdump` witness), both in the runner and each alone on a quiet `lo`, at the PR head `b0965d64` (run 17, 2026-11-02 10:27 UTC, after the second main merge; rig `~/t5-proof/20261102T102749Z/`, Mac copies `/tmp/claude/t5-proof-linux/cells-run17-*`) and at the last code commit `4bcd6c6f` (run 16, `~/t5-proof/20261102T095438Z/`, `cells-run16-*`), after passing in the runner at `ef950434` (run 11), `c5c96d1e` (run 12), `346a1156` (run 13), `c8180905` (run 14) and `e9ff8566` (run 15, direct leg too). Run 17:
 
 ```
   PASS  scan/test_t5_bounded_clean.py  (5.9s)
-  PASS  scan/test_t5_pins_dryrun.py  (0.8s)
-  PASS  scan/test_t5_crash_oracle.py  (41.7s)
-e2e summary: 29 pass, 6 skip, 3 fail
+  PASS  scan/test_t5_pins_dryrun.py  (0.9s)
+  PASS  scan/test_t5_crash_oracle.py  (42.3s)
+e2e summary: 33 pass, 5 skip, 2 fail
   ledger: 18/18 scan verbs called by at least one cell
 direct test_t5_bounded_clean exit: 0 (19 ok lines, 0 FAIL lines)
 direct test_t5_pins_dryrun exit: 0 (14 ok lines, 0 FAIL lines)
 direct test_t5_crash_oracle exit: 0 (34 ok lines, 0 FAIL lines)
 ```
 
-The three FAILs in the runner leg are other tracks' cells (`test_t1_contract`, `test_t3_h2_observe`, `test_t2_session_reuse`, unchanged since run 14; not verified on plain main, reported to the coordinator). The independent witness on the closed-UDP oracle job and on the job-derived source ports:
+The FAILs in the runner leg are other tracks' cells (run 17: `test_t1_record_policy`, `test_t2_session_reuse`; runs 14-16 on the previous main: `test_t1_contract`, `test_t3_h2_observe`, `test_t2_session_reuse`; not verified on plain main, reported to the coordinator). The witness excerpt below is run 16's; run 17's reads the same with ports 32656 / 31938 / 34219. The independent witness on the closed-UDP oracle job and on the job-derived source ports:
 
 ```
 ICMP port-unreachable lines by quoted port:
