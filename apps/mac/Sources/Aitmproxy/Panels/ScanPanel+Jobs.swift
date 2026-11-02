@@ -108,7 +108,7 @@ struct ScanJobsTab: View {
     /// (queued or running; never cancelling or terminal, Jobs view D2) and the
     /// link's verb gate (Jobs view D6).
     private func mayCancel(_ job: String) -> Bool {
-        state.surface.mayCancel(job: job) && state.link.verbsEnabled
+        state.surface.mayCancel(job: job) && state.verbsEnabled
     }
 
     private func select(_ job: String) {
@@ -310,7 +310,7 @@ private struct ScanJobDetail: View {
                     PrimaryButton("Cancel Scan") { Task { await state.cancel(job: facts.job) } }
                         .keyboardShortcut(".", modifiers: [.command, .option])
                         .help(ScanFormat.cancelHelpText)
-                        .disabled(!state.link.verbsEnabled)
+                        .disabled(!state.verbsEnabled)
                 }
             case .cancelling:
                 cancellingButton

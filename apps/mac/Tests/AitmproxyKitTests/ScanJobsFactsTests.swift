@@ -223,6 +223,74 @@ import Testing
         #expect(model.cancelTarget == nil)
     }
 
+    /// Plan fix 1.5h: the Jobs-view mutations write only what changed, so the 250 ms
+    /// poll re-applying the same truth leaves the surface value-equal (observation is
+    /// the panel's; the Kit pins the no-change path). A repeating failure keeps its
+    /// first `at`, so the age clause and the link do not restart every beat.
+    @Test func jobsWritesAreGuardedByChange() throws {
+        var model = ScanSurfaceModel()
+        let list = try ScanListResult(json: Self.load("scan.list.json"))
+        model.applyList(list, now: 1_000)
+        let afterFirstList = model
+        #expect(model.jobsLoadedAt == 1_000)
+        #expect(model.selectedJob == "scan-1a2b3c4d")
+
+        // The same list two seconds later: only the freshness stamp moves.
+        model.applyList(list, now: 3_000)
+        var expected = afterFirstList
+        expected.jobsLoadedAt = 3_000
+        #expect(model == expected)
+
+        // The same status twice: equal after the second apply; a changed one is stored.
+        let running = try Self.status(state: .running, elapsedMs: 43_000)
+        model.applyStatus(running)
+        let afterStatus = model
+        #expect(model.statuses["scan-1a2b3c4d"] == running)
+        #expect(model.jobs.first?.elapsedMs == 43_000)
+        model.applyStatus(running)
+        #expect(model == afterStatus)
+        let later = try Self.status(state: .running, elapsedMs: 44_000)
+        model.applyStatus(later)
+        #expect(model != afterStatus)
+        #expect(model.jobs.first?.elapsedMs == 44_000)
+
+        // The same failure text twice keeps the first `at`; a new text restamps.
+        model.noteReadFailure(text: "Unable to list jobs: timed out", now: 5_000)
+        #expect(model.readFailedAt == 5_000)
+        let afterFailure = model
+        model.noteReadFailure(text: "Unable to list jobs: timed out", now: 7_000)
+        #expect(model.readFailedAt == 5_000)
+        #expect(model == afterFailure)
+        model.noteReadFailure(text: "Unable to read job scan-1a2b3c4d: timed out", now: 9_000)
+        #expect(model.readFailedAt == 9_000)
+        #expect(model.jobsError == "Unable to read job scan-1a2b3c4d: timed out")
+
+        // Selecting the selected job is a no-op; the list that lands clears the failure once.
+        let beforeSelect = model
+        model.select(job: "scan-1a2b3c4d")
+        #expect(model == beforeSelect)
+        model.applyList(list, now: 11_000)
+        #expect(model.readFailure == nil)
+        #expect(model.jobsLoadedAt == 11_000)
+    }
+
+    /// Plan fix 1.5h: the verb gate without a clock, so the rows, the context menu and
+    /// the header verb slot do not re-evaluate on the 1 Hz age clock; it agrees with
+    /// `make(...).verbsEnabled` for every kind.
+    @Test func verbsEnabledIsClockFree() {
+        #expect(ScanJobsLink.verbsEnabled(bus: .connected("…"), readFailedAt: nil) == true)
+        #expect(ScanJobsLink.verbsEnabled(bus: .connected("…"), readFailedAt: 5_000) == false)
+        #expect(ScanJobsLink.verbsEnabled(bus: .connecting("…"), readFailedAt: nil) == false)
+        #expect(ScanJobsLink.verbsEnabled(bus: .disconnected, readFailedAt: nil) == false)
+        #expect(ScanJobsLink.verbsEnabled(bus: .failed("…"), readFailedAt: nil) == false)
+        for bus in [BusState.connected("…"), .connecting("…"), .disconnected, .failed("…")] {
+            for failedAt in [nil, 5_000] {
+                #expect(ScanJobsLink.make(bus: bus, readFailedAt: failedAt, jobsLoadedAt: 1_000, now: 43_000).verbsEnabled
+                        == ScanJobsLink.verbsEnabled(bus: bus, readFailedAt: failedAt))
+            }
+        }
+    }
+
     /// AC12 (unit half) and D15's banner table: the link kind from the bus state
     /// and the last list failure, the values' age, the verb gate and the words.
     @Test func jobsLinkKindsAndAge() {

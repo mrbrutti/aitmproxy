@@ -555,7 +555,17 @@ public struct ScanJobsLink: Equatable, Sendable {
         }
         let age = jobsLoadedAt.map { max(0, now - $0) }
         return ScanJobsLink(
-            kind: kind, valuesAgeMs: age, bannerText: bannerText(kind: kind, ageMs: age), verbsEnabled: kind == .live)
+            kind: kind, valuesAgeMs: age, bannerText: bannerText(kind: kind, ageMs: age),
+            verbsEnabled: verbsEnabled(bus: bus, readFailedAt: readFailedAt))
+    }
+
+    /// The verb gate alone, without a clock: true only for the `.live` kind (a connected
+    /// bus whose last Jobs read landed). The rows, the context menu and the header's verb
+    /// slot read this, not `make(...).verbsEnabled`, so the 1 Hz age clock re-evaluates
+    /// only the inline error (plan fix 1.5h).
+    public static func verbsEnabled(bus: BusState, readFailedAt: Int?) -> Bool {
+        if case .connected = bus { return readFailedAt == nil }
+        return false
     }
 
     /// D15's table; the age clause is omitted while no list has arrived.
@@ -693,6 +703,8 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// Per job: the `clamped` and `lanes.skipped` notices of its `scan.start` result.
     public var launchNotices: [String: [String]] = [:]
     /// When the last `scan.list` landed (epoch ms, the caller's clock); nil before the first (Jobs view D6).
+    /// The freshness stamp: it changes on every list beat, so no view reads it directly; the
+    /// inline error reads the age through `ScanJobsLink.valuesAgeMs` (plan fix 1.5h).
     public var jobsLoadedAt: Int?
     /// The last failed Jobs read (`scan.list`, `scan.status` or `scan.cancel`): its own
     /// wording and when it failed; the one stored failure fact. Set by `noteReadFailure`,
@@ -921,25 +933,34 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// selection follows the list (Jobs view D3): nothing selected → the newest
     /// job; a selection the core dropped and this app is not waiting on → the
     /// first row; an existing selection is never replaced by a newer job.
+    ///
+    /// Every write but the stamp compares first (plan fix 1.5h): the poll re-applies the
+    /// same list every 2 s, and a value that did not change is not assigned.
     public mutating func applyList(_ result: ScanListResult, now: Int) {
         let listed = Set(result.jobs.map(\.job))
         // Only a job this app started and the core has not listed yet stays ahead of the
         // list; a job the core itself stopped listing (restart, history cap) goes with it.
         let pending = jobs.filter { !listed.contains($0.job) && locallyStarted.contains($0.job) }
-        locallyStarted.subtract(listed)
-        jobs = pending + result.jobs
+        if !locallyStarted.isDisjoint(with: listed) { locallyStarted.subtract(listed) }
+        let newJobs = pending + result.jobs
+        if jobs != newJobs { jobs = newJobs }
         // The per-job side tables follow the list: a job the core no longer lists
         // (and this app is not waiting on) takes its seq, status, notices and flag with it.
         let kept = listed.union(locallyStarted)
-        lastSeq = lastSeq.filter { kept.contains($0.key) }
-        statuses = statuses.filter { kept.contains($0.key) }
-        launchNotices = launchNotices.filter { kept.contains($0.key) }
-        refreshNeeded = refreshNeeded.intersection(kept)
+        let keptSeq = lastSeq.filter { kept.contains($0.key) }
+        if lastSeq != keptSeq { lastSeq = keptSeq }
+        let keptStatuses = statuses.filter { kept.contains($0.key) }
+        if statuses != keptStatuses { statuses = keptStatuses }
+        let keptNotices = launchNotices.filter { kept.contains($0.key) }
+        if launchNotices != keptNotices { launchNotices = keptNotices }
+        let keptRefresh = refreshNeeded.intersection(kept)
+        if refreshNeeded != keptRefresh { refreshNeeded = keptRefresh }
         jobsLoadedAt = now
-        readFailure = nil
+        if readFailure != nil { readFailure = nil }
         if let selected = selectedJob {
             if !jobs.contains(where: { $0.job == selected }), !locallyStarted.contains(selected) {
-                selectedJob = jobs.first?.job
+                let first = jobs.first?.job
+                if selectedJob != first { selectedJob = first }
             }
         } else if let first = jobs.first {
             selectedJob = first.job
@@ -953,8 +974,13 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// and only the next list that lands clears it. The rows and their counters stay.
     /// The text carries the core's words, so it is bounded like `ScanJobStatus.error`:
     /// control and format scalars dropped, then cut to `ScanWire.detailMax` scalars.
+    /// A failure repeating the stored text keeps the stored `at` and writes nothing, so
+    /// a core that keeps failing does not republish the surface every beat (plan fix 1.5h).
     public mutating func noteReadFailure(text: String, now: Int) {
-        readFailure = ScanReadFailure(text: ScanWire.cleaned(text, max: ScanWire.detailMax), at: now)
+        let cleaned = ScanWire.cleaned(text, max: ScanWire.detailMax)
+        if readFailure?.text != cleaned {
+            readFailure = ScanReadFailure(text: cleaned, at: now)
+        }
     }
 
     /// The text of the inline error above the rows: while a Jobs read has failed and no
@@ -966,10 +992,11 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         readFailure.map { $0.text + ScanFormat.ageClause(ageMs) }
     }
 
-    /// `scan.status`: stored, and the matching list row takes its summary.
+    /// `scan.status`: stored, and the matching list row takes its summary; neither is
+    /// written when it already holds the value (plan fix 1.5h).
     public mutating func applyStatus(_ status: ScanJobStatus) {
-        statuses[status.job] = status
-        if let index = jobs.firstIndex(where: { $0.job == status.job }) {
+        if statuses[status.job] != status { statuses[status.job] = status }
+        if let index = jobs.firstIndex(where: { $0.job == status.job }), jobs[index] != status.summary {
             jobs[index] = status.summary
         }
     }
@@ -1091,7 +1118,9 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 
     // MARK: Selection
 
-    public mutating func select(job: String?) { selectedJob = job }
+    public mutating func select(job: String?) {
+        if selectedJob != job { selectedJob = job }
+    }
 
     public mutating func select(issue: String?) {
         selectedIssue = issue

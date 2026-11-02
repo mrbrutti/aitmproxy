@@ -164,7 +164,7 @@ final class ScanPanelState {
     /// job; never a cancelling one and never a job other than the selected, Jobs
     /// view D2), and nothing at all while the verbs are gated off by the link
     /// (Jobs view D6).
-    var cancelTarget: String? { link.verbsEnabled ? surface.cancelTarget : nil }
+    var cancelTarget: String? { verbsEnabled ? surface.cancelTarget : nil }
 
     var canCancel: Bool { cancelTarget != nil }
 
@@ -172,10 +172,15 @@ final class ScanPanelState {
     /// link's age clause moves without a render-time clock (Jobs view D6).
     var nowMs = ScanPanelState.clockMs
 
+    /// The verb gate without the clock (plan fix 1.5h): the rows, the context menu,
+    /// the header's verb slot, `cancelTarget` and `cancel(job:)` read this, so the
+    /// 1 Hz `nowMs` re-evaluates only the inline error that reads `link`.
+    var verbsEnabled: Bool { ScanJobsLink.verbsEnabled(bus: session.bus, readFailedAt: surface.readFailedAt) }
+
     /// How the Jobs view is linked to the core right now: the bus state, the last
     /// Jobs read's outcome (list, status or cancel; D6 amendment) and the age of the
-    /// values on screen (Jobs view D6). Computed each render; the verbs follow
-    /// `verbsEnabled`.
+    /// values on screen (Jobs view D6). Computed each render; only the inline error
+    /// reads it (its age clause moves with `nowMs`); the verbs read `verbsEnabled`.
     var link: ScanJobsLink {
         ScanJobsLink.make(bus: session.bus, readFailedAt: surface.readFailedAt, jobsLoadedAt: surface.jobsLoadedAt, now: nowMs)
     }
@@ -584,7 +589,7 @@ final class ScanPanelState {
     /// the verbs gated off, or while its own cancel is still on the wire (Jobs view D2,
     /// D6): pressing Cancel twice, even within one round trip, is one cancel.
     func cancel(job: String) async {
-        guard surface.mayCancel(job: job), link.verbsEnabled, !cancelsInFlight.contains(job) else { return }
+        guard surface.mayCancel(job: job), verbsEnabled, !cancelsInFlight.contains(job) else { return }
         cancelsInFlight.insert(job)
         defer { cancelsInFlight.remove(job) }
         do {
