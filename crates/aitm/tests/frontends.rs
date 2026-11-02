@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 100] = [
+const EXPECTED_TOOLS: [&str; 103] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -111,10 +111,10 @@ const EXPECTED_TOOLS: [&str; 100] = [
     "scan.profile.delete",
     "scan.session.preview",
     // One manual verb per registered check (spec D3 `check.<id>`): the ten T3
-    // natives of `aitm-scan-checks-http` (PR 2a; `xss-reflected` and
-    // `open-redirect` took over the interim lane's two active ids) and the
-    // interim lane's three passive checks, whose ids go away with T2's
-    // integration.
+    // natives of `aitm-scan-checks-http` (PR 2a) and the three passive checks
+    // the scanner engine itself ships (`reflection`, `security-header`,
+    // `cookie-flag`), which stay on the surface whatever lane holds the http
+    // slot (spec amendment 24: "the passives stay").
     "check.xss-reflected",
     "check.open-redirect",
     "check.sqli-boolean",
@@ -140,6 +140,11 @@ const EXPECTED_TOOLS: [&str; 100] = [
     "check.ws-subprotocol-observe",
     "check.l4-packet-crash",
     "check.l4-packet-reaction",
+    // The T6 L4 stream lane's three checks (`aitm-scan-l4-stream`), one campaign
+    // per point shared by all three (spec S6.3).
+    "check.l4-crash",
+    "check.l4-parser-fault",
+    "check.l4-latency-outlier",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.

@@ -1175,15 +1175,15 @@ mod tests {
     }
 
     /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
-    /// a skeleton slot returning `None` is skipped rather than collected. Two lanes
-    /// have landed: T4 (`aitm-scan-ws`) and T5 (`aitm-scan-l4-packet`, which returns
-    /// `Some` even without the L4 handles, call A18); the remaining slots are still
-    /// skeletons, and with the L4 handles present the stream slot is still called
-    /// and still contributes nothing. Each lane track's landing bumps these
-    /// literals; that track re-pins this test.
+    /// a skeleton slot returning `None` is skipped rather than collected. Four
+    /// lanes have landed: T2 (`aitm-scan-http`), T4 (`aitm-scan-ws`), T5
+    /// (`aitm-scan-l4-packet`, which returns `Some` even without the L4 handles,
+    /// call A18) and T6 (`aitm-scan-l4-stream`, `Some` with or without the L4
+    /// handles; it refuses at discovery when they are absent). Each lane track's
+    /// landing bumps these literals; that track re-pins this test.
     #[test]
     fn lane_slots_count_the_landed_lanes() {
-        assert_eq!(collect_lanes(None).len(), 2);
+        assert_eq!(collect_lanes(None).len(), 4);
         // T3 (`aitm-scan-checks-http`): the ten D8.2 natives, built through the
         // gated constructor with an unbound guard (deny-by-default until the
         // proxy binds it).
@@ -1214,7 +1214,7 @@ mod tests {
             })),
             store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
         };
-        assert_eq!(collect_lanes(Some(&shared)).len(), 2);
+        assert_eq!(collect_lanes(Some(&shared)).len(), 4);
     }
 
     /// Task 19 (T4 hand-off): the operator's `ssl_insecure` reaches the WS
@@ -1356,10 +1356,11 @@ mod tests {
 
     /// Task 15 and call B7: an ordinary assembly carries the whole scanner v2
     /// verb surface plus one `check.<id>` command per catalogue entry. Which
-    /// entries exist depends on the lanes this build links (the interim HTTP
-    /// lane's five while no lane crate supplies `http`; T2's once it does), so
-    /// the manual verbs are checked against the engine's own catalogue, and the
-    /// interim ids only while the `http` lane is the interim one.
+    /// entries exist depends on the lanes this build links, so the manual
+    /// verbs are checked against the engine's own catalogue; the three shipped
+    /// passive checks are engine-native (spec amendment 24) and are asserted
+    /// unconditionally, the two legacy active ids only while the `http` lane
+    /// is the interim one.
     #[test]
     fn scan_verbs_and_manual_checks_are_registered() {
         let mut cfg = Config::default();
@@ -1384,18 +1385,25 @@ mod tests {
                 "check.{id} is registered for catalogue entry {id}"
             );
         }
+        // Spec amendment 24 ("the passives stay"): the engine ships the three
+        // passive checks whatever lane holds the http slot, so their manual
+        // verbs are on every build.
+        for id in ["reflection", "security-header", "cookie-flag"] {
+            assert!(
+                ids.iter().any(|have| have == id),
+                "shipped passive check {id} is in the catalogue"
+            );
+            assert!(
+                reg.command(&format!("check.{id}")).is_some(),
+                "check.{id} is registered"
+            );
+        }
         let http_is_interim = engine.lane_entries().iter().any(|e| {
             e.lane == aitm_scan_model::LaneKind::Http
                 && e.source == aitm_scan_model::LaneSource::Interim
         });
         if http_is_interim {
-            for id in [
-                "xss-reflected",
-                "open-redirect",
-                "reflection",
-                "security-header",
-                "cookie-flag",
-            ] {
+            for id in ["xss-reflected", "open-redirect"] {
                 assert!(
                     ids.iter().any(|have| have == id),
                     "interim check {id} is in the catalogue"

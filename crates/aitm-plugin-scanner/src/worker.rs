@@ -1602,8 +1602,12 @@ mod tests {
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.points.found, 2);
         assert_eq!(status.points.audited, 2);
-        assert_eq!(status.checks.scheduled, 2);
-        assert_eq!(status.checks.done, 2);
+        // Two points x (the lane's one check + the engine's three shipped
+        // passive checks, which run on every http point whatever lane holds
+        // the slot; spec amendment 24). The passives read the captured flow
+        // and send nothing, so the probe count is the fake check's alone.
+        assert_eq!(status.checks.scheduled, 8);
+        assert_eq!(status.checks.done, 8);
         assert!(status.checks.running.is_empty());
         assert_eq!(status.probes.sent, 2, "one probe per point");
         assert!(status.finished_at.is_some());
@@ -2764,10 +2768,11 @@ mod tests {
         assert_eq!(status.state, JobState::Done, "{:?}", status.error);
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.error, None);
-        // Two points x two checks: every item, the panicking ones included,
-        // counts as done, and the point count follows.
-        assert_eq!(status.checks.scheduled, 4);
-        assert_eq!(status.checks.done, 4);
+        // Two points x (two lane checks + the engine's three shipped passive
+        // checks): every item, the panicking ones included, counts as done,
+        // and the point count follows.
+        assert_eq!(status.checks.scheduled, 10);
+        assert_eq!(status.checks.done, 10);
         assert_eq!(status.points.audited, 2);
         assert!(status.checks.running.is_empty());
         // `fake.hit` still ran after `fake.boom` panicked on the same point.

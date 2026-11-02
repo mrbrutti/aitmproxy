@@ -14,8 +14,6 @@ pub mod l4;
 pub mod overlays;
 pub mod scan;
 pub mod sidebar;
-pub mod text;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -106,7 +104,17 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     bars::toolbar(app, theme, toolbar, buf);
     bars::chips(app, theme, chips, buf);
 
-    match app.mode {
+    // The wire-confirm overlay sits over the view the launch came from (fix
+    // round H, H18): its body is `wire_confirm_from`'s, the Scan view for a
+    // `scan.*` launch, the flow list and inspector for a guarded L4 verb.
+    // A prompt likewise draws the view it was opened from under its bar
+    // (H43): `prompt_from`, the mode `Esc` returns to.
+    let body_mode = match app.mode {
+        Mode::WireConfirm => app.wire_confirm_from,
+        Mode::Prompt(_) => app.prompt_from,
+        mode => mode,
+    };
+    match body_mode {
         Mode::Compose => overlays::compose(app, theme, body, buf),
         Mode::Scope => overlays::scope(app, theme, body, buf),
         Mode::Findings => overlays::findings(app, theme, body, buf),
@@ -132,7 +140,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     match app.mode {
         Mode::Help => overlays::help(app, theme, area, buf),
         Mode::QuickLook => overlays::quick_look(app, theme, area, buf),
-        Mode::L4Confirm => l4::confirm(app, theme, area, buf),
+        Mode::WireConfirm => scan::confirm::render(app, theme, area, buf),
         _ => {}
     }
 }
@@ -189,7 +197,7 @@ fn main_region(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut
 }
 
 /// Test-only: draw `app` into a fresh `cols`×`rows` buffer with the truecolor
-/// theme, through [`render`] — the path the live terminal takes.
+/// theme, through [`render`]: the path the live terminal takes.
 #[cfg(test)]
 pub(crate) fn render_buffer(app: &App, cols: u16, rows: u16) -> Buffer {
     let area = Rect::new(0, 0, cols, rows);
@@ -198,7 +206,7 @@ pub(crate) fn render_buffer(app: &App, cols: u16, rows: u16) -> Buffer {
     buf
 }
 
-/// Test-only: [`render_buffer`] as text, styles dropped — one symbol per
+/// Test-only: [`render_buffer`] as text, styles dropped: one symbol per
 /// cell, each line trimmed of trailing spaces, `\n`-joined, ending in `\n`.
 /// One line per row even at zero width (no cells, so every line is empty).
 /// The cells are row-major, so each `cols`-long chunk is one row.
@@ -324,9 +332,9 @@ mod tests {
         );
     }
 
-    /// Tester (D7): `render_text` is the text the terminal shows — one line
+    /// Tester (D7): `render_text` is the text the terminal shows (one line
     /// per row, trailing spaces trimmed, `\n`-joined and `\n`-terminated,
-    /// no line wider than the buffer — and `render_buffer` is exactly
+    /// no line wider than the buffer) and `render_buffer` is exactly
     /// `cols`×`rows`: at the design size, at the 40×4 minimum, below it, at
     /// a single cell and at the empty rectangle. The same text
     /// `tests/common/mod.rs::to_text` reads, so a 1×1 terminal shows the

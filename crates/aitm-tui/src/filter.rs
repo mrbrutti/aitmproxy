@@ -144,7 +144,7 @@ enum Tok {
     /// `~name`
     Atom(String),
     Word(String),
-    /// `/re/` — the source between the slashes.
+    /// `/re/`: the source between the slashes.
     Regex(String),
 }
 

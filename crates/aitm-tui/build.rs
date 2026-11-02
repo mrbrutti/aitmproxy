@@ -51,7 +51,7 @@ fn main() {
 
 /// Generates `languages.rs`: the Rhai keyword/literal sets for the tokenizer
 /// and the embedded completion catalogs, from the shared definition files.
-/// A missing or malformed file fails the build — the TUI is pinned to the
+/// A missing or malformed file fails the build: the TUI is pinned to the
 /// shared defs, so it cannot silently drift from the web and macOS surfaces.
 fn generate_languages(dir: &Path) -> String {
     let grammar = read_language_json(&dir.join("rhai.grammar.json"));

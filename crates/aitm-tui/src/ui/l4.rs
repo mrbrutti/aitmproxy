@@ -1,6 +1,7 @@
-//! The L4 operator surface's inspector and the inject confirm overlay
-//! (ui-ext §3.2–§3.4, L4OPS-AC8/AC10/AC12). The flow list renders L4 rows in
-//! `ui::flows`; this draws the selected L4 flow: a packet list, a packet's
+//! The L4 operator surface's inspector and the L4 panel (the wire-confirm
+//! overlay is `ui::scan::confirm`; ui-ext §3.2–§3.4, L4OPS-AC8/AC10/AC12).
+//! The flow list renders L4 rows in `ui::flows`; this draws the selected L4
+//! flow: a packet list, a packet's
 //! layer tree (honest indented **text** tree) + hex, the YAML craft editor with
 //! its `build()` hex preview, and the in-path intercept bar.
 
@@ -11,12 +12,12 @@ use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::l4::{inert, L4Flow, L4Pane};
+use crate::text::{cells, truncate};
 use crate::theme::Theme;
 use crate::tokens::glyph;
 use crate::ui::bars::{put, put_sides};
-use crate::ui::overlays::{boxed, lines_into};
+use crate::ui::overlays::lines_into;
 use crate::ui::selection_bg;
-use crate::ui::text::{cells, truncate};
 use crate::viewers;
 
 /// The L4 panel (`Mode::L4`, opened by `:l4` / `L`): the capture and
@@ -192,7 +193,7 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
         return;
     }
     // The packet list takes only the rows it has (at least one, at most 45 % of
-    // the pane), so the detail below — and its hex rows — gets the rest. A
+    // the pane), so the detail below (and its hex rows) gets the rest. A
     // fixed split left the hex view one row at 200×60 and none at 160×44.
     let cap = (area.height.saturating_mul(45) / 100).max(1);
     let list_h = cells(flow.packets.len().max(1))
@@ -205,7 +206,7 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
         buf.set_string(
             list_area.x + 1,
             list_area.y,
-            "no packets yet — craft and inject one, or start capture",
+            "no packets yet: craft and inject one, or start capture",
             theme.text_tertiary(),
         );
     } else {
@@ -299,7 +300,7 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
                         theme.accent().add_modifier(Modifier::BOLD),
                     ));
                     lines.push(Line::styled(
-                        "no bytes from this core — withheld for this caller (spec §2.2) or an older l4.flow.get",
+                        "no bytes from this core: withheld for this caller (spec §2.2) or an older l4.flow.get",
                         theme.text_tertiary(),
                     ));
                 }
@@ -318,7 +319,7 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     let [editor, preview] =
         Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
     // The YAML editor (read + highlighted; editing lands via the command bus
-    // and the palette today — the hook for in-pane Rhai craft is the
+    // and the palette today: the hook for in-pane Rhai craft is the
     // protocol-extensible seam, ui-ext §3.2).
     // The parked-packet keys (spec §4 / AC12) are offered only when they can
     // act: intercept available and a packet listed for this flow. Otherwise the
@@ -338,10 +339,10 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     };
     let header = match parked {
         Some(p) => format!(
-            "PacketSpec (YAML) — b build · {inject} · m apply to parked {} · u revert",
+            "PacketSpec (YAML): b build · {inject} · m apply to parked {} · u revert",
             inert(&p.id)
         ),
-        None => format!("PacketSpec (YAML) — b build · {inject}"),
+        None => format!("PacketSpec (YAML): b build · {inject}"),
     };
     buf.set_string(
         editor.x + 1,
@@ -416,7 +417,7 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     if !app.l4.inject_in_scope(flow) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "inject disabled — out of L4 scope (add an inject entry for this interface)",
+            "inject disabled: out of L4 scope (add an inject entry for this interface)",
             theme.text_tertiary(),
         ));
     }
@@ -497,7 +498,7 @@ fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut
             }
             if !app.l4.in_scope(flow) {
                 lines.push(Line::styled(
-                    "out of L4 scope — Forward/Drop disabled",
+                    "out of L4 scope: Forward/Drop disabled",
                     theme.text_tertiary(),
                 ));
             }
@@ -505,81 +506,10 @@ fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut
         }
         None => {
             lines.push(Line::styled(
-                "no parked packet on this flow — l4.intercept.list shows none for it",
+                "no parked packet on this flow: l4.intercept.list shows none for it",
                 theme.text_tertiary(),
             ));
             lines_into(buf, area, &lines, 0);
         }
     }
-}
-
-/// The inject confirm-over-the-wire overlay (ui-ext §3.4, L4OPS-AC10): the
-/// server's wire summary (destination, packet summary, count, scope entry,
-/// permit budget). `y` re-issues with `_confirm`; `n` / Esc cancels.
-pub fn confirm(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let Some(c) = &app.l4.confirm else {
-        return;
-    };
-    let area = crate::ui::centered(
-        screen,
-        screen.width.saturating_sub(10).clamp(40, 90),
-        screen.height.saturating_sub(8).clamp(7, 14),
-    );
-    let inner = boxed(
-        theme,
-        "Confirm over the wire — guarded L4 action",
-        area,
-        buf,
-    );
-    let mut lines = vec![
-        Line::styled(
-            format!(" {}", c.call),
-            theme.l4().add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-    ];
-    // Wrap the server's wire summary to the panel width.
-    for chunk in wrap(&c.prompt, usize::from(inner.width).saturating_sub(2)) {
-        lines.push(Line::styled(format!(" {chunk}"), theme.text_primary()));
-    }
-    lines.push(Line::raw(""));
-    // The footer is a fact about `l4.inject` (L4OPS-AC10); the same overlay
-    // also confirms an operator `l4.scope.add` (L4 parity spec §3), where
-    // that sentence would be false, so it is shown for the inject only.
-    if c.call == "l4.inject" {
-        lines.push(Line::styled(
-            " This reaches the wire only through l4.inject; the guard enforces scope.",
-            theme.text_tertiary(),
-        ));
-    }
-    lines.push(Line::styled(
-        " y confirm (re-issues with _confirm) · n / Esc cancel",
-        theme.accent().add_modifier(Modifier::BOLD),
-    ));
-    lines_into(buf, inner, &lines, 0);
-}
-
-/// Greedy word-wrap to `width` columns.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }
