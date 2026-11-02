@@ -3,8 +3,9 @@
 **Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 (Review log)
 **Spec:** `docs/superpowers/specs/2026-10-31-mac-app-icons-and-names-design.md`
 (approved 2026-10-31, revision 2, amended 2026-11-01; acceptance criteria AI-AC1 … AI-AC24)
-**Branch / worktree:** this worktree, `claude/apps-attribution-8ab619`
-(`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), base `main 8e19c2e3`
+**Branch / worktree:** `feat/mac-app-icons-and-names` in this worktree
+(`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), cut 2026-11-01 off `main 681dff57`
+(the traffic-route PR #265 merge; the original base was `main 8e19c2e3`)
 (PR #196 `5eac2a50` is the last owner of `Shell/SidebarView.swift` and `Bus/BusService.swift`; PR #197
 `9776a0e6` moved `Session.swift`'s navigation enums out).
 **PR shape:** two PRs from this branch — the traffic-route plan
@@ -18,7 +19,7 @@ traffic-route plan's Tasks 2/2b and run only after them, never concurrently.
    ClientInfo(sourceApp:)`, `ClientInfo.displayName(forSourceApp:)`). Merge SHA: **`3fe92f66`**
    (released in v0.5.9). Every Kit task below calls `ClientInfo(sourceApp:)`; without it nothing compiles.
 2. **The fixture-removal PR is on `main` and this branch has rebased once onto its SHA**
-   (record: `__________`). That PR deletes the mac app's fixture and sample-data modes
+   (record: **`c3a4fd37`**, PR #249; `main 681dff57` contains it). That PR deletes the mac app's fixture and sample-data modes
    (`Store.usesFixtures`, `APP_FIXTURES`/`APP_SNAPSHOT`, the Kit `Fixtures*.swift`,
    `Snapshot*.swift`, `SnapshotScenes`, the fixture `--selftest`, `snap.sh`/`selftest.sh`, the kit
    gallery). **This plan references none of them.** Coders who find a `Fixtures.` or
@@ -26,8 +27,9 @@ traffic-route plan's Tasks 2/2b and run only after them, never concurrently.
 3. **The orchestrator session has approved the file claim** for `Shell/SidebarView.swift`,
    `Bus/BusService.swift`, `Session.swift`, `FlowTable/FlowCellView.swift` (the files PR #196 and
    the fixture-removal PR touched last).
-4. **The traffic-route PR is merged** (record its merge SHA here: `__________`) and this branch's
-   second PR is cut on top of it. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
+4. **The traffic-route PR is merged** (record its merge SHA here: **`681dff57`**, PR #265, 2026-11-01) and this branch's
+   second PR is cut on top of it (`feat/mac-app-icons-and-names` off `681dff57`). Orchestrator ruling 2026-11-01: Tasks 5/6 also
+   wait for system-proxy PR 4 (it owns the `BusService` poll loop Task 6 enriches); the orchestrator says when it is in. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
    have landed** — they share `Session.swift` (traffic-route: `systemProxy`, `decrypt`) and
    `Bus/BusService.swift` (traffic-route: one `decrypt` line; PR D's `refreshCAStatus()` is also in
    that file by then) — and never concurrently with them; whichever lands second rebases onto the
@@ -121,6 +123,13 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
       public static func serviceLabel(_ name: String) -> String
       public static let knownUnbundled: [String: String]
       public static let ownerMap: [String: String]
+      /// Caps on what LaunchServices is asked about (stage-6 S-I1): over either, `candidates` is `[]`.
+      public static let maxIdentifierBytes: Int        // 256 UTF-8 bytes
+      public static let maxIdentifierComponents: Int   // 8 dotted parts
+      /// Most characters an identifier tooltip shows (stage-6 S-M3); the same figure by choice.
+      public static let maxTooltipCharacters: Int      // 256
+      /// The identifier for a tooltip: Cc/Cf removed, capped, no trimming (D10).
+      public static func tooltipText(_ identifier: String) -> String
   }
 
   public extension ClientInfo {
@@ -132,6 +141,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
   Rules, verbatim from D1:
   - `candidates`: split on `.`; fewer than three components → `[identifier]`; else the identifier
     then every prefix with ≥ 3 components, longest first.
+  - `candidates` cap (stage-6 S-I1): over `maxIdentifierBytes` (256) or `maxIdentifierComponents` (8) → `[]`, never asked of LaunchServices.
+  - `tooltipText` (stage-6 S-M3, D10): Cc/Cf removed via the one shared filter, capped at `maxTooltipCharacters` (256) characters, no trimming, no `.app` rule.
   - `trimmedAdHoc`: only when the identifier contains no `.`; regex `^(.+)-([0-9a-f]{16,})$`
     (lowercase hex only) → group 1; else unchanged.
   - `fallbackName`: `knownUnbundled[id] ?? ClientInfo.displayName(forSourceApp: trimmedAdHoc(id))`.
@@ -218,7 +229,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     }
     ```
 
-    - `clients(in:)`: today's `Session.clients` body (count per `ClientInfo` value) with the
+    - `clients(in:)`: grouped by `groupKey`, the entry's `ClientInfo` being the first row's with that key
+      (I-2 ruling 2026-11-01; replaces today's `Session.clients` body, which counted per `ClientInfo` value), with the
       order **count desc, then `name` asc, then `groupKey` asc** — the third key is added here
       (plan call) so two "(Service)" rows of one owner order deterministically; rows with
       `client == nil` are skipped.
@@ -227,7 +239,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     - `Pins.pin`: `.host(h)` and `.clientHost(_, h)` → `pinHost(h)`; `.client(k)` → `pinApp(k)`.
       `unpin` mirrors; `contains` mirrors (`.clientHost(_, h)` ⇔ `hosts.contains(h)`).
     - `BoundedCache`: a dictionary plus an insertion-order array; setting a new key past
-      `capacity` removes the oldest key first; overwriting an existing key keeps its age;
+      `capacity` removes the oldest key first; overwriting an existing key refreshes it to newest (ruling 2026-11-01, see Review log);
       setting `nil` removes the key and its order entry (plan call: a removal is a plain delete).
       `Sendable` when `Key` and `Value` are (conditional conformance), so the resolver can hold it
       on the main actor.
@@ -257,6 +269,9 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     `contains(.client("com.apple.Safari"))` all `true`; `contains(.client("Safari")) == false`;
     `unpin(.clientHost(client: "x", host: "example.com"))` → `hosts == []`; pinning
     `.client("com.apple.Safari")` again → `apps.count == 1`.
+  - `clientsWithOneIdentifierAndTwoNamesAreOneApp` (I-2 pin): rows `("Chrome", com.google.Chrome, example.com)`,
+    `("Google Chrome", com.google.Chrome, example.com)`, `("Google Chrome", com.google.Chrome, www.apple.com)` →
+    one entry, `groupKey == "com.google.Chrome"`, `name == "Chrome"`, count 3; `hosts(forClient:)` = `[example.com: 2, www.apple.com: 1]`.
   - `boundedCacheEvictsOldestInserted` (AI-AC12): `var c = BoundedCache<String, Int>(capacity: 3)`;
     `c["a"] = 1; c["b"] = 2; c["c"] = 3; c["d"] = 4` → `c.count == 3`, `c["a"] == nil`, `c["d"] == 4`;
     then `c["b"] = 20; c["e"] = 5` → `c["c"] == nil`, `c["b"] == 20`, `c["e"] == 5`;
@@ -277,7 +292,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 ### Task 3: Overview counts by group key
 
 - **Satisfies:** AI-AC11
-- **Depends on:** Task 1 for compilation (`groupKey`); coded in parallel.
+- **Depends on:** Tasks 1 and 2 for compilation (`groupKey`; `ClientTree.clients`, since the stage-6 Q-I1 fix); coded in parallel.
 - **Files:**
   - `apps/mac/Sources/AitmproxyKit/Panels/Overview.swift` (modify)
   - `apps/mac/Sources/AitmproxyKit/Panels/OverviewBreakdowns.swift` (modify)
@@ -292,7 +307,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     `clients` is grouped by `groupKey` with the name taken from the first row of that key, ordered
     count desc, then name asc, then key asc (the same order as `ClientTree.clients`).
   - App view `Panels/OverviewBreakdowns.swift` "Clients" section: `ForEach(breakdowns.clients, id: \.key)`,
-    label `entry.name`, `.help(entry.key)`, action `session.show(.apps, group: .client(entry.key))`,
+    label `entry.name`, `.help(AppIdentifier.tooltipText(entry.key))` (D10, stage-6 S-M3), action `session.show(.apps, group: .client(entry.key))`,
     accessibility label unchanged in shape.
 - **Test:** with the AI-AC7 rows built locally in each test file (same private helper as Task 2;
   do not share a file):
@@ -313,14 +328,20 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
   (Task 8) and by the diff review; gates AI-AC23 (`gen-tokens` leaves no diff; Rust gate).
 - **Depends on:** Task 1 (`AppIdentifier`, `withResolvedName`), Task 2 (`BoundedCache`).
 - **Files:**
-  - `docs/design/tokens.json` (modify: one row)
+  - `docs/design/tokens.json` (modify: three rows — `process`, plus `network` and `apps` for the folded-in PR #265 Q10 follow-up)
   - `apps/mac/Sources/Aitmproxy/UI/Tokens.swift` (regenerate only, via `swift apps/mac/tools/gen-tokens.swift` — Terminal; the Coder edits `tokens.json` and asks the orchestrator to regenerate, or regenerates if the sandbox permits running the script)
   - `apps/mac/Sources/Aitmproxy/UI/AppIdentity.swift` (create)
+  - `apps/mac/Sources/Aitmproxy/Shell/RouteBanner.swift` (modify: ONLY the two glyph string literals — PR #265 quality Q10 follow-up, folded in here by the orchestrator 2026-11-01)
 - **Change:**
   - `tokens.json` `icon.glyph` table gains `"process": { "mac": "terminal", "web": "terminal", "tui": "$" }`
     (D9). Consumers: mac `gen-tokens.swift` (→ `Tok.Glyph.process`), `crates/aitm-tui/build.rs`
     (→ `glyph::PROCESS = "$"`, no test pins the count), `apps/web/src/components/Icon.tsx` already
-    maps `terminal` to a Lucide icon. No other edit.
+    maps `terminal` to a Lucide icon. **Folded-in follow-up (PR #265 Q10):** two more rows,
+    `"network": { "mac": "network", "web": "network", "tui": "⇅" }` and
+    `"apps": { "mac": "app.badge", "web": "layout-grid", "tui": "▦" }`, and `Shell/RouteBanner.swift` swaps its two
+    string literals for `Tok.Glyph.network` and `Tok.Glyph.apps` (lines `Image(systemName: "network")` and the
+    `case .systemProxy: "network"` / `case .allApps: "app.badge"` glyph switch) — the rendered symbols are unchanged,
+    `check-connection-words.sh` / `check-capture-toggle.sh` must still PASS. No other edit.
   - `UI/AppIdentity.swift`, exactly spec D1's app API:
 
     ```swift
@@ -391,6 +412,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 
 ### Task 5: Session tree state and the sidebar Apps tree
 
+> Checklist additions (stage-6 on PR #268): (1) the context-menu noun at `SidebarView.swift:158` must say "Host" for `.clientHost` too (today every non-`.host` group reads "App"); (2) delete `AppMark` (NSRunningApplication path) — `ClientMark` replaces it; (3) `Session.clients` already delegates to `ClientTree.clients(in: rows)` (interim widening, Review log Q-M1) — Task 5 only confirms it; (4) every identifier tooltip is `AppIdentifier.tooltipText(id)` (security S-M3).
+
 - **Satisfies:** D4 (Session), D5, D7, D10 (sidebar rows); AI-AC13 (tripwires); proven live by
   AI-AC14, AI-AC15, AI-AC19, AI-AC20 (Task 8).
 - **Depends on:** Task 2 (`clientHost`, `ClientTree`, `Pins` mapping), Task 4 (`ClientMark`); **gate 4**
@@ -419,7 +442,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
       leading inset `12`, then the row `Button` (`ClientMark(client:)` at inset `28`, `Space.sm`,
       title `client.name`, spacer, count) whose action is `session.show(.apps, group: .client(key))`;
       height `Tok.Size.control`; fill `Tok.Ground.active` when `session.page == .apps && session.group == .client(key)`;
-      `.help(client.bundleID ?? client.name)`; `.contextMenu` Pin/Unpin App via
+      `.help(AppIdentifier.tooltipText(client.bundleID ?? client.name))` (D10); `.contextMenu` Pin/Unpin App via
       `session.pin/unpin(.client(key))`; accessibility label
       `"<name>, <count> flows[, pinned], expanded|collapsed"` plus `.accessibilityAction(named:)`
       "Expand"/"Collapse".
@@ -431,7 +454,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     - Pinned apps: `ForEach(session.pins.apps …)` keyed by the stored key; `current = session.clients.first { $0.0.groupKey == key }`;
       title `current?.0.name ?? key`, mark `ClientMark(client: current?.0 ?? ClientInfo(name: key, bundleID: key))`
       (plan call: a stale key still resolves through the one cache), count `current?.1`,
-      `.help(key)`; visible when the query matches the key or the current name; not expandable.
+      `.help(AppIdentifier.tooltipText(key))` (D10); visible when the query matches the key or the current name; not expandable.
     - `subItem` signature becomes
       `private func subItem<Mark: View>(_ group: FlowGroup, title: String, count: Int?, page: SidebarPage, leadingInset: CGFloat = 28, help: String? = nil, @ViewBuilder mark: () -> Mark) -> some View`;
       Domains rows and pinned hosts call it with `mark: { Monogram(text: "◎") }` and the default inset —
@@ -449,6 +472,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 ---
 
 ### Task 6: Poll-loop enrichment and the Client cell
+
+> Checklist addition (stage-6 on PR #268): the Client cell tooltip is `AppIdentifier.tooltipText(identifier)`, never the raw `bundleID` (D10, security S-M3).
 
 - **Satisfies:** D3, D6; AI-AC22 (diff shape); proven live by AI-AC17, AI-AC18, AI-AC21 (Task 8).
 - **Depends on:** Task 4 (`AppIdentityResolver`, `Tok.Glyph.process`); **gate 4** (the traffic-route PR
@@ -476,7 +501,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
       `clientIcon.contentTintColor = meta.nsColor`; pending → `clientIcon.image = nil` and
       `AppIdentityResolver.shared.onResolve(identifier) { [weak self] verdict in guard let self, self.shownIdentifier == identifier else { return }; <apply as above> }`.
       `client == nil` → `label.stringValue = Format.dash`, `clientIcon` hidden.
-    - `toolTip`: `.client` → `row.client.map { $0.bundleID ?? $0.name }`.
+    - `toolTip`: `.client` → `row.client.map { AppIdentifier.tooltipText($0.bundleID ?? $0.name) }` (D10, stage-6 S-M3: never the raw `bundleID`).
     - `describeDrawnViews`: `clientIcon.setAccessibilityElement(!clientIcon.isHidden && clientIcon.image != nil)`,
       role `.image`, label `row.client?.name`.
     - `backgroundStyle` override and `FlowRowView.isEmphasized` stay as they are (selection must
@@ -607,6 +632,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 | `docs/design/tokens.json` | | | | M | | | | |
 | `Aitmproxy/UI/Tokens.swift` (generated) | | | | G | | | | |
 | `Aitmproxy/UI/AppIdentity.swift` (new) | | | | C | | | | |
+| `Aitmproxy/Shell/RouteBanner.swift` (two glyph literals only; folded-in PR #265 Q10) | | | | M | | | | |
 | `Aitmproxy/Session.swift` | | | | | M | | | |
 | `Aitmproxy/Shell/SidebarView.swift` | | | | | M | | | |
 | `Aitmproxy/Bus/BusService.swift` | | | | | | M | | |
@@ -701,7 +727,59 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | docs #242 | quality (2nd pass) | Minor | icons spec AI-AC11 `Overview(rows:).clients` — the type is `OverviewStats` | fixed in b57840e3 |
 | docs #242 | quality (2nd pass) | Minor | `flowTable` overlay anchor "~258"/"~261" | fixed in b57840e3: `ShellView.swift:258` in spec D7 and plan Task 3 |
 | all | Spec (3rd pass) | Minor | `GettingStartedStep.Kind` listing showed `caTrusted` after `scopeSet`; PR D's enum is `coreRunning, busConnected, caTrusted, extensionOn, scopeSet, firstFlow` | fixed in ad83ab78: listings use PR D's source order; the steps order stays make's |
+| 2 | Coder (stop-and-report) | Important | spec D1 / plan Task 2 said an overwrite "does not change its age" while AI-AC12 and the plan's literal test expect `c["b"] = 20; c["e"] = 5` to evict `c`, not `b` | ruled 2026-11-01 (architect, self-approved): the AC is the oracle — overwrite refreshes to newest; D1 and Task 2 prose amended; `BoundedCache` setter moves the key to newest |
+| 2 | Coder (noticed) | Important | `FlowGroup.clientHost` makes `Session.swift:410-430` (`pin`/`unpin`/`isPinned`) non-exhaustive, so the app target (and thus `swift test`) cannot build before Task 5 | orchestrator GRANTED 2026-11-01 a narrow interim claim on `Session.swift` for exactly the three one-line functions `pin`/`unpin`/`isPinned` delegating to `Pins.pin/unpin/contains(_ group:)`, landed in the Kit-half PR (nothing near `systemProxy`/`decrypt`/`caTrust`/the poll loop; system-proxy PR 4 owns the rest of the file and whoever lands later re-merges); done by the orchestrating session in the Wave A commit |
+| 4 | Coder (deviations flagged) | Minor | (a) one storage member beyond the plan's four: `nonisolated private let iconSide: CGFloat`, read once from `Tok.Size.icon` on the main actor because the token is actor-isolated under the app target's default MainActor isolation and the `nonisolated` lookup cannot read it; (b) icon sharing per owner path happens in `store` on the main actor (a second helper's transient copy is discarded) so lookups stay off-main; (c) `onResolve` on a miss also schedules a lookup; (d) step 6 falls back to `AppIdentifier.fallbackName(for:)` when all three name sources sanitize to nil; (e) `resolve` is `nonisolated` (must run on the detached task); the pre-authorised `Handoff` wrapper was NOT needed — no `unchecked`/`unsafe` in the file | accepted 2026-11-01 (orchestrating session): none changes D2's order or a verdict; (c) and (d) close holes the spec left open (a caller using `onResolve` alone would never fire; an empty label); recorded for the spec reviewer |
+| 4 | Coder (noticed) | Minor | `apps/web/src/components/Icon.tsx` has no Lucide entry for `glyph.network.web = "network"`; nothing generates from `glyph.web`, so no gate breaks | follow-up (web), listed in Shipped |
+| 4 | Coder (noticed) | Minor | `Shell/SidebarView.swift` still holds `AppMark` (uses `NSRunningApplication`) | Task 5 replaces it with `ClientMark` as planned (waits for system-proxy PR 4) |
+| 7 | Coder (noticed) | Minor | two stale "gallery" words remain in KIT.md's token tables (`Tok.Ground.surface` "the gallery ground", section role "gallery section labels"), outside Task 7's three parts | follow-up docs sweep, listed in Shipped |
+| Kit half | Tester | Important | I-1 — `Shell/SidebarView.swift:35` and `:52` still build `.client(client.name)` while `FlowQuery` matches `.client(key)` against `groupKey`: in a build of this range an Apps row lists nothing and `isPinned(.client(name))` disagrees with key-stored pins | orchestrator GRANTED 2026-11-01 a two-token interim claim on `Shell/SidebarView.swift` (the `.client(client.name)` group at line 35 → `.client(client.groupKey)`; the pinned-app count lookup `$0.0.name == app` at the line-52 call site → `$0.0.groupKey == app`; nothing else in the file; observe-lane Task 13 re-merges over it); fixed in b45c3045 (orchestrating session); Task 5 still owns the rest of the file |
+| Kit half | Tester | Important | I-2 — `ClientTree.clients(in:)` grouped by the `ClientInfo` value while every other consumer groups by `groupKey` (two names under one identifier ⇒ two Apps rows, Overview 1) | ruled 2026-11-01 (architect): group by `groupKey`, first row's `ClientInfo`; spec D4 amended; fixed in b45c3045 (Task 2 coder) + pin test `clientsWithOneIdentifierAndTwoNamesAreOneApp` |
+| Kit half | Tester | Minor | M-1 — `sanitized` caps after trimming so a trailing space can survive the cap | accepted: spec-conformant; noted |
+| Kit half | Tester | Minor | M-2 — PR B's `ClientInfo.knownSourceApps` still names `com.apple.WebKit.Networking` "Safari" for one poll / imported rows (anti-goal 1); `Flow.swift` is do-not-touch | accepted for this PR; follow-up in Shipped (core/PR B table) |
+| Kit half | Tester | Minor | M-3 — glyph string literals remain in `ShellView.swift:367,406`, `SidebarPage.swift:38`, `SettingsView.swift:61`, `BrowserPanel.swift:108` (outside the Q10 fold) | accepted; follow-up in Shipped (token sweep) |
+| Kit half | Tester | Minor | M-4 — `ClientMark` / `AppIdentityResolver` unreferenced until Tasks 5/6 | by construction (plan waves); no action |
+| PR #268 | spec | Important | SP-I1 — plan Task 2 (`clients(in:)`: "count per `ClientInfo` value") and spec D1 ("today's `Session.clients` body … moved into the Kit") still described the pre-I-2 grouping | fixed in docs (this commit): both say grouped by `groupKey`, first row's `ClientInfo`; pin test named in Task 2's test list |
+| PR #268 | spec | Minor | SP-M1 — stale comment in `ClientTreeTests.swift:98` stated the pre-ruling "overwrite keeps age" rule above assertions that pin the refresh | fixed (this commit) |
+| PR #268 | spec | Minor | SP-M2 — I-1/I-2 Review-log rows carried no fix SHA | fixed in docs (this commit): `b45c3045` |
+| PR #268 | spec | Minor | SP-M3 — D2 step 6 had no rule for the all-nil name case the code handles (Task 4 deviation (d)) | fixed in docs (this commit): "if none sanitises, `AppIdentifier.fallbackName(for: id)`" |
+| PR #268 | spec | Minor | SP-M4 — AI-AC5 says "four true paths" but D1 listed three; the test's fourth (`.xpc/`) literal was the coder's | fixed in docs (this commit): fourth path added to D1 |
+| PR #268 | spec | Minor | SP-M5 — `Session.clients` (`Session.swift:360-364`) still groups by `ClientInfo` value until Task 5, so the Apps header can exceed the Overview tile in the I-2 scenario while the Kit half is on main alone | superseded: the one-line Session.swift widening (Q-M1 grant) lands `ClientTree.clients(in: rows)` in this PR, so the Apps header equals the Overview tile on main alone |
+| PR #268 | quality | Important | Q-I1 — `OverviewBreakdowns.clients` re-implemented `ClientTree.clients` (group by key, first-row name, count→name→key sort); the two copies drifted once already in this range (Tester I-2) | fixed (this commit): `clients = ClientTree.clients(in: http).map { ClientCount(key:name:count:) }`; `OverviewStats.clients` stays a one-liner |
+| PR #268 | quality | Minor | Q-M1 — `ClientTree.swift` doc comment says `Session.clients` calls it while `Session.swift:360-364` still carries the old `ClientInfo`-value loop (a third copy, the one running) | orchestrator GRANTED 2026-11-01 the one-line widening of the Session.swift interim claim: `var clients: [(ClientInfo, Int)] { ClientTree.clients(in: rows) }` (same return shape, no callers changed; nothing near `systemProxy`/`decrypt`/`caTrust`/the poll loop; PR 4 re-merges over it); fixed in the commit after a5e5ea86 |
+| PR #268 | quality | Minor | Q-M2 — stale "overwrite keeps age" test comment | = spec SP-M1, fixed (this commit) |
+| PR #268 | quality | Minor | Q-M3 — `AppIdentityResolver` had an internal `init()` beside `shared` (a second resolver with cold caches was constructible), `owner(of:)` internal among private siblings, step-7 comment described `store`'s job | fixed (this commit): `private init()`, `private static owner(of:)`, step-7 comment reworded |
+| PR #268 | quality | Minor | Q-M4 — tester suite: a runtime `#expect(shared is BoundedCache…)` that cannot fail stood in for a compile-time check; `boundedCacheOverwriteRefreshesTheOldest` re-proves a Coder property | fixed (this commit): `let _: any Sendable = …` with a comment; the overlapping test kept, overlap accepted in writing (it pins the refresh from the other key and the count) |
+| PR #268 | quality | Minor | Q-M5 — KIT.md documents Task 5/6 UI (app row anatomy, `FlowCellView.clientIcon`, pinned-app mark) that does not exist at this head; `SidebarView.swift:158` labels every non-`.host` group "App" so a `.clientHost` row would read "Pin App" | accepted in writing: a known forward state of the kit page (plan wave order), closed by the Task 5/6 PR; Task 5 checklist line added for the context-menu noun |
+| PR #268 | security | Important | S-I1 — identifier length unbounded off the wire (64 KiB `source_app` round-trips an import; a handoff identifier is signer-chosen, frame cap 1 MiB) and `candidates` materialised every dotted prefix eagerly, one `NSWorkspace` IPC per candidate: a 64 KiB all-dot id → ~2 GiB of strings + 65k IPCs in one detached task | fixed (this commit): `AppIdentifier.candidates` returns `[]` over `maxIdentifierBytes` 256 / `maxIdentifierComponents` 8 so the resolver goes straight to step 8; spec D1 + AI-AC1 literals; tester `candidatesRefuseOversizeIdentifiers` |
+| PR #268 | security | Minor | S-M1 — past 512 distinct identifiers the poll loop's `enriched` re-scheduled every evicted identifier each tick (eviction storm; `inFlight` unbounded) | fixed (this commit): `seen` (`BoundedCache`, 4096) marks identifiers resolved once; `enriched` never re-schedules them, only a visible `identity(for:)` read does |
+| PR #268 | security | Minor | S-M2 — the prefix walk lets an ad-hoc-signed local binary (`codesign -i com.apple.Safari.sync`) wear Safari's icon and "Safari (Service)"; the tooltip's raw id is the only tell | accepted as a design gap (the NE does not verify the signer); spec Open question 4; follow-up in Shipped: team-id beside `source_app` from the extension's audit token, resolver inherits only on a team match |
+| PR #268 | security | Minor | S-M3 — the Overview bar tooltip showed the raw `bundleID` (no Cc/Cf filter, no cap): a U+202E override makes the tail read as another vendor | fixed (this commit): `AppIdentifier.tooltipText(_:)` (Cc/Cf stripped, 256-char cap, no trimming) used by the bar `.help`; D10 rule; Task 5 uses it for the sidebar rows; tester `tooltipTextStripsFormatAndControlScalarsAndCaps` |
+| PR #268 | security | — | `unsafe` sign-off: none in range; no `@unchecked`/`nonisolated(unsafe)`; the `Handoff` wrapper was not needed | n/a |
+| PR #268 | security (delta re-verification of a5e5ea86) | — | S-I1/S-M1/S-M3 verified fixed, S-M2 accepted; residual recorded: past 4096 distinct LIVE identifiers the `seen` set rotates and the poll re-resolves (live − 4096) per tick, each now ≤ 6 IPCs of ≤ 256 bytes — bounded CPU, attacker-only shape; no `unsafe` in range | PASS, 0 open; residual accepted (hardening option: size `seen` from `max_flows`) |
+| PR #268 | quality (delta re-verification of a5e5ea86) | Minor | QD1 — the Cc/Cf scalar filter appeared twice in `AppIdentifier` (`sanitized`, `tooltipText`); the tooltip cap was documented as "`maxIdentifierBytes` characters" | fixed (this commit): one private `withoutControlAndFormat`; `maxTooltipCharacters = 256` named as the same figure by choice |
+| PR #268 | quality (delta re-verification of a5e5ea86) | Minor | QD2 — the two S-I1/S-M3 contract tests lived in the tester's edge-shape suite | fixed (this commit): moved into `AppIdentifierTests` |
+| PR #268 | quality (delta re-verification of a5e5ea86) | Minor | QD3 — `seen` comment gave the mechanism, not the visible cost (an evicted identifier's rows show the Kit name until a visible mark re-reads it) | fixed (this commit): one sentence added |
+| PR #268 | spec (delta re-verification of a5e5ea86) | Important | SPD-I1 — the identifier-tooltip rule was written two ways: D10 said `tooltipText`, while spec D4/D5 and plan Tasks 3/5/6 still wrote the raw `.help(key)` form and Task 6 had no instruction | fixed in docs (this commit): all six sites read `AppIdentifier.tooltipText(…)`; Task 6 checklist line |
+| PR #268 | spec (delta) | Minor | SPD-M1 — `maxIdentifierBytes`, `maxIdentifierComponents`, `tooltipText` (and `maxTooltipCharacters`) missing from D1's API block and plan Task 1's signature block / rules | fixed in docs (this commit) |
+| PR #268 | spec (delta) | Minor | SPD-M2 — tooltip cap stated in three units (bytes / scalars / characters) | fixed: code caps on `Character`s (`String.prefix`), constant `maxTooltipCharacters`, spec says characters; test adds a 300-flag literal → 256 characters / 512 scalars |
+| PR #268 | spec (delta) | Minor | SPD-M3 — AI-AC1 pointed at "the S-M3 literals above" with one literal in D1 | fixed in docs (this commit): four `tooltipText` literals listed |
+| PR #268 | spec (delta) | Minor | SPD-M4 — the resolver's `seen` set was only in the Amendments line; Constraints, D1 `enriched` doc, D1 storage comment and D3 still described two caches and "one poll" | fixed in docs (this commit) |
+| PR #268 | spec (delta) | Minor | SPD-M5 — plan Task 3 "Depends on: Task 1" while the Q-I1 fix made it call `ClientTree.clients` | fixed in docs (this commit): Tasks 1 and 2 |
+| PR #268 | spec (delta) | Minor | SPD-M6 — Open question 4 was inserted before item 3 | fixed in docs (this commit): reordered |
+| PR #268 | security (final, 99e5b3be) | — | note: `tooltipText` caps 256 `Character`s, so an identifier of combining marks (Mn, not stripped) can exceed 256 scalars in the tooltip; cosmetic, no regression over PR B's uncapped last component | accepted; tighten to `unicodeScalars.prefix` if ever wanted; PASS stands for `681dff57..99e5b3be` |
+| PR #268 | spec (final, 99e5b3be) | Minor | SPD2-M1 — two stale words after the reorder and the widening: OQ preamble "both" with three forks; D1 "(Task 5)" on the already-landed `Session.clients` one-liner | fixed in docs (this commit); PASS for `681dff57..99e5b3be` |
+| PR #268 | quality (final, 99e5b3be) | — | Q-M1, QD1–QD3 verified closed; nothing new | PASS, 0 open |
 
 ## Shipped
 
 What merged, what was cut, follow-ups. Filled at stage 7.
+
+Pre-filled 2026-11-01 — follow-ups accepted during implementation, each a small PR of its own:
+
+1. Web: add a Lucide mapping for `network` in `apps/web/src/components/Icon.tsx` (glyph.network.web; Task 4 noticed).
+2. KIT.md: drop the two stale "gallery" words in the token tables (Task 7 noticed).
+3. `Flow.swift` `knownSourceApps`: drop the `com.apple.WebKit.Networking → "Safari"` row so PR B's one-poll name matches `knownUnbundled` (Tester M-2; `Flow.swift` is do-not-touch here).
+4. Glyph-literal sweep: `ShellView.swift:367,406`, `SidebarPage.swift:38`, `SettingsView.swift:61`, `BrowserPanel.swift:108` → `Tok.Glyph.*` via gen-tokens (Tester M-3).
+5. Signer verification (security S-M2, spec Open question 4): the extension derives the team identifier from the flow's audit token and sends it beside `source_app`; the resolver inherits an owner's icon/name only on a team match — extension + core + Kit, its own spec.
+6. Sandbox typecheck recipe for app-target coders (memory `sandbox-swift-typecheck-in-process-plugins`) — fold into the plan TEMPLATE's Environment adaptation.
