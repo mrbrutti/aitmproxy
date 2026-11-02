@@ -19,6 +19,12 @@ rig and binary; its idle-window `t0=1793585702085` is 2026-11-02 02:15:02 UTC = 
 `62af37a8` = unit (c) fix 3, the commit that added every-token redaction, the no-auto-PASS step wrapper, the 05f privileged
 branch and step 07d; same rig; core on proxy 60010, web 60012, target 60009; its idle-window `t0=1793587936570` is
 2026-11-02 02:52:16 UTC = 18:52:16 PST, file written 18:53 PST).
+**Full redacted log (run 4, the fix-4 build):** `/tmp/claude/l4-rig/c-evidence/12-cua-l4-run4-after-fix4.log` (410 lines; built from
+`32d92a30` = unit (c) fix 4 — store recovery keyed by call identity, per-flow load-more guard, identity stale-cancel,
+`isPendingAvailability` identity-only, `formatPacketTime` placeholder for a malformed timestamp; the script itself changed
+only in a comment; same rig; its idle-window `t0=1793589127177` is 2026-11-02 03:12:07 UTC = 19:12:07 PST). Summary line
+`38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`; 07d read `rows=184; l4 rows=31; error rows=[]`; the five BLOCKED lines
+quote the same two core reasons as runs 1–3.
 
 **Summary line printed by the script, run 1:** `38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`.
 One of the 38 PASS lines was the step-09 wrapper line (`PASS 09 privileged real-packet click-drive …`) printed after the
