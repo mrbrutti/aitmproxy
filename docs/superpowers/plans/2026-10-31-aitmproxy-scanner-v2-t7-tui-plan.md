@@ -777,6 +777,7 @@ Kept by the main session during stage 6. One row per finding.
 | 17 | quality | FAIL | Important: `bound_summary` copies `bound_issue`'s shared-field list (next `IssueLocation` string lands in one bounder only); Minor: ` +n` built three ways, `forget_job` clones per issue, four stale doc comments and the README Testing bullet, legacy suite duplicates a robustness test and asserts loosely, H84 `+n` expectation restates the formula, three `screen` helpers | fix round I (I1, I2, I4-I8, I10, I11) |
 | 17 | spec | PASS | Minor: H40 `Findings · PoCs and runs` pin not re-homed; D11 literals and D3 shapes lag the `l4`/`job` lines and the Site map `job` head; spec still names `l4_surface.rs`/`scan_surface.rs`/`bus-fixture.json`; umbrella `scan.sitemap` verb row lacks `job` (coordinator) | I9; spec amended `60cbad9f`; umbrella row relayed |
 | I | fix round | dispatched | `docs/superpowers/plans/2026-11-01-aitmproxy-scanner-v2-t7-fix-round-i.md` I1-I11 | re-gate (crate + workspace) and re-run the cell on the final head |
+| 17 | gate | green | workspace gate on `955e84c8` from the Terminal (`/tmp/claude/t7-gate17.log`): `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test --no-fail-fast` 0 (every suite ok, `perf.rs` included) | repeat on the round I head |
 
 ## Shipped
 
