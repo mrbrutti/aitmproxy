@@ -522,3 +522,64 @@ fn an_l4_inject_shows_the_wire_confirm_and_reissues_with_the_token() {
         "the pending confirm is consumed"
     );
 }
+
+/// Fix round J, J1 (security Minor): the pending guarded L4 call is bound to
+/// the connection that carries it, like every other in-flight confirm state
+/// `forget_inflight()` drops. A `Disconnected` clears `App::l4.pending`, so
+/// after the reconnect the same control is not refused as "already waiting
+/// for the core" and a later call of that name cannot bind its handshake to
+/// the stale arguments: the next `s` sends exactly one fresh `l4.inject`.
+#[test]
+fn a_disconnect_clears_the_pending_l4_call_so_the_control_is_live_again() {
+    let mut tools: Vec<&str> = CORE_TOOLS.to_vec();
+    tools.extend(["l4.flow.list", "l4.flow.get", "l4.scope.list", "l4.inject"]);
+    let mut app = App::new(TermCaps::full(), "test");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &tools, None);
+    app.l4.pending = Some(("l4.inject".into(), json!({"flow": "f1"})));
+
+    let reqs = app.on_bus(BusEvent::Disconnected("x".into()));
+    assert!(reqs.is_empty(), "a disconnect sends nothing: {reqs:?}");
+    assert!(
+        app.l4.pending.is_none(),
+        "the pending L4 call is dropped with the connection: {:?}",
+        app.l4.pending
+    );
+
+    let _ = connect(&mut app, &tools, None);
+    let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
+        "interface": "lo0", "capability": "inject",
+        "cidr": {"addr": "127.0.0.0", "prefix": 8},
+        "ports": {"lo": 0, "hi": 65535}, "direction": "outbound"
+    })]));
+    let _ = app.on_bus(BusEvent::L4Flows(vec![json!({
+        "id": "l4-2", "kind": "craft", "interface": "lo0", "filter": null,
+        "queue": null, "packet_count": 0, "injected_count": 0, "packets": []
+    })]));
+    app.selected = Some("l4-2".into());
+    app.mode = Mode::Inspector;
+    app.l4.pane = aitm_tui::l4::L4Pane::Craft;
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: aitm_tui::l4::L4Availability::from_reply(
+            &json!({"available": true, "code": "available", "reason": null, "captures": []}),
+        ),
+        intercept: app.l4.intercept.clone(),
+        captures: vec![],
+    });
+
+    let reqs = app.update(Action::L4Inject);
+    let [BusRequest::Call { name, .. }] = reqs.as_slice() else {
+        panic!("exactly one fresh call after the reconnect: {reqs:?}");
+    };
+    assert_eq!(name, "l4.inject");
+    assert!(
+        !app.toasts
+            .iter()
+            .any(|t| t.text == "l4.inject is already waiting for the core"),
+        "no stale single-flight refusal: {:?}",
+        app.toasts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+    );
+}

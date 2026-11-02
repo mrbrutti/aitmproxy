@@ -2764,8 +2764,8 @@ impl App {
 
     /// The bus went away (or came back): no call sent before now will be
     /// answered, so nothing stays "in flight": the browser view's counters,
-    /// the CA pill's `· CA trusting…` (D17.6) and the sys-proxy pill's
-    /// `· sys-proxy setting…` (D14) alike.
+    /// the CA pill's `· CA trusting…` (D17.6), the sys-proxy pill's
+    /// `· sys-proxy setting…` (D14) and the pending guarded L4 call alike.
     fn forget_inflight(&mut self) {
         self.browser.inflight = 0;
         self.browser.busy = None;
@@ -2773,6 +2773,11 @@ impl App {
         // A `proxy.system.set|unset` reply that will never come must not
         // keep the guard refusing `s` / `:sysproxy on|off` (F-tui 6).
         self.sysproxy_setting = false;
+        // Nor may a guarded L4 call whose `needs_confirmation` reply is lost
+        // with the connection keep `l4_in_flight` refusing the same control,
+        // or bind a later call of that name to stale arguments (fix round J,
+        // J1).
+        self.l4.pending = None;
     }
 
     /// Ask `ca.status` when the bus offers it (D17.5: the pill word is the
