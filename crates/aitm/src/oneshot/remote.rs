@@ -16,6 +16,7 @@
 //! by the entry point in [`super::run`], which knows where the address came
 //! from; this module only says what happened ([`RemoteError`]).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -51,10 +52,10 @@ const CONFIRM_KEY: &str = "_confirm";
 const NEEDS_CONFIRMATION: &str = "needs_confirmation";
 /// The [`RemoteError::Lost`] detail for a connection the OS refused; the
 /// entry point maps it to R2/R2'/R3/R4 by the address's source.
-pub const REFUSED: &str = "refused";
+pub(crate) const REFUSED: &str = "refused";
 /// The `Str` arguments a live verb reads as paths on the core's machine; a
 /// relative value means the operator's directory (plan C11, research F24a).
-pub const PATH_ARGUMENTS: &[&str] = &["poc_path", "path"];
+pub(crate) const PATH_ARGUMENTS: &[&str] = &["poc_path", "path"];
 
 /// The verb a one-shot asked for, as the local registry understands it.
 pub enum Prepared {
@@ -144,8 +145,16 @@ pub fn prepare(registry: &Registry, argv: &[String]) -> anyhow::Result<Prepared>
             })
         }
         None if dotted.contains('.') => Ok(Prepared::Unresolved { dotted, flags, yes }),
-        None => anyhow::bail!("unknown command `{dotted}`; run with no arguments to list commands"),
+        None => Err(unknown_command(&dotted)),
     }
+}
+
+/// Today's `unknown command` usage error, byte for byte: W1 classifies it
+/// by this prefix (`USAGE_PREFIXES`, exit 2). The one literal, for a name
+/// the registry lacks ([`prepare`]) and one the core's `tools/list` lacks
+/// too (the entry point).
+pub(super) fn unknown_command(dotted: &str) -> anyhow::Error {
+    anyhow::anyhow!("unknown command `{dotted}`; run with no arguments to list commands")
 }
 
 /// `tok` is a flag: `--` and at least one more character (`--` alone and
@@ -202,7 +211,8 @@ pub fn absolutize_paths(args: &mut JsonValue, cwd: &Path) {
 }
 
 /// What went wrong on the remote path. Which spec D9 panel it is depends on
-/// where the address came from, which [`super::run`] knows.
+/// where the address came from, which [`super::run`] knows; the panels are
+/// its only rendering (it has no `Display`: nothing prints it as text).
 #[derive(Debug)]
 pub enum RemoteError {
     /// The budget elapsed before the answer.
@@ -224,22 +234,6 @@ pub enum RemoteError {
     Aborted(String),
     /// The question could not be asked (no terminal, no `--yes`).
     Confirm(anyhow::Error),
-}
-
-impl fmt::Display for RemoteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RemoteError::Timeout(d) => write!(f, "no answer within {} ms", d.as_millis()),
-            RemoteError::Refused => f.write_str("the core refused the operator token"),
-            RemoteError::Lost(detail) => write!(f, "connection lost: {detail}"),
-            RemoteError::Agent => f.write_str("the core would treat this connection as an agent"),
-            RemoteError::Tool(text) => f.write_str(text),
-            RemoteError::Rpc { code, message } => write!(f, "bus rpc error {code}: {message}"),
-            RemoteError::Protocol(text) => write!(f, "bus protocol error: {text}"),
-            RemoteError::Aborted(text) => f.write_str(text),
-            RemoteError::Confirm(err) => write!(f, "{err:#}"),
-        }
-    }
 }
 
 /// Every text the bus reports is sanitized here, once, on entry: the core's
@@ -408,26 +402,22 @@ fn confirmation_request(result: &JsonValue) -> Option<(&str, &str)> {
 /// [`render_cli_value`] prints it. The declared result schema guides the
 /// rebuild and never gates it: the core already validated its own answer,
 /// and an incomplete declaration must not print an error against a healthy
-/// core. Three steps ([`rebuild_value`]):
+/// core. Three steps ([`rebuild_value`]), and never a failure:
 ///
 /// 1. A declared `Object` with no fields means "some object" (fifteen
 ///    commands declare `result: TypeDesc::Object(Vec::new())`); the answer
 ///    is converted structurally, as `TypeDesc::Any`.
 /// 2. Otherwise the strict `from_json`, which is where the schema adds
-///    information (`Bytes` from base64). When it refuses, every `null`
-///    answered for a field the schema marks optional is set aside (through
-///    nested declared objects, and arrays and maps of them), the strict
-///    conversion runs once more, and the `null`s come back as `Value::Null`
-///    so the printed object keeps every key the core answered: the bytes
-///    stay identical to the local path's (G6).
-/// 3. When that still fails the answer is converted structurally so the
-///    operator sees it, with one `debug!` naming the strict refusal (the
-///    field path and the expectation, never what the core answered).
-///
-/// Never an `Err` today; the signature stays so the entry point's mapping is
-/// untouched.
-pub fn render(result: &JsonValue, ty: &TypeDesc) -> anyhow::Result<Vec<u8>> {
-    Ok(render_cli_value(&rebuild_value(result, ty)))
+///    information (`Bytes` from base64). When it refuses, [`lenient`] runs
+///    once: the same conversion, except that a `null` answered for a field
+///    the schema marks optional is kept as `Value::Null`, so the printed
+///    object keeps every key the core answered and the bytes stay identical
+///    to the local path's (G6).
+/// 3. When that refuses too the answer is converted structurally so the
+///    operator sees it, with one `debug!` naming the declared schema and the
+///    answer's JSON kind, never its content (security S5).
+pub fn render(result: &JsonValue, ty: &TypeDesc) -> Vec<u8> {
+    render_cli_value(&rebuild_value(result, ty))
 }
 
 /// The three steps [`render`] documents, as the `Value` to print.
@@ -435,19 +425,15 @@ fn rebuild_value(result: &JsonValue, ty: &TypeDesc) -> Value {
     if matches!(ty, TypeDesc::Object(defs) if defs.is_empty()) {
         return structural(result);
     }
-    let refusal = match from_json(result, ty) {
-        Ok(value) => return value,
-        Err(err) => err,
-    };
-    let (stripped, stripped_any) = without_optional_nulls(result, ty);
-    if stripped_any {
-        if let Ok(mut value) = from_json(&stripped, ty) {
-            restore_optional_nulls(&mut value, result, ty);
-            return value;
-        }
+    if let Ok(value) = from_json(result, ty) {
+        return value;
+    }
+    if let Ok(value) = lenient(result, ty) {
+        return value;
     }
     debug!(
-        refusal = %refusal_words(&refusal),
+        ?ty,
+        kind = json_kind(result),
         "the core's answer does not fit the verb's declared result schema; showing it as is"
     );
     structural(result)
@@ -458,105 +444,66 @@ fn structural(j: &JsonValue) -> Value {
     from_json(j, &TypeDesc::Any).unwrap_or(Value::Null)
 }
 
-/// Step 2's first half: `j` without the `null`s answered for fields `ty`
-/// marks optional, and whether any was removed. A key the schema does not
-/// name is kept, so the strict retry still refuses it.
-fn without_optional_nulls(j: &JsonValue, ty: &TypeDesc) -> (JsonValue, bool) {
-    let mut any = false;
-    let out = match (ty, j) {
+/// Step 2 of [`render`]: the strict conversion, except that a `null`
+/// answered for a field `ty` marks optional is [`Value::Null`], through
+/// nested declared objects and the arrays and maps of them; every leaf is
+/// `from_json`'s. What the strict conversion refuses for any other reason
+/// (a key the schema does not declare, a missing required field, a leaf of
+/// the wrong type) is refused here too, so step 3 decides it. The error
+/// carries nothing the core answered and is never logged.
+fn lenient(j: &JsonValue, ty: &TypeDesc) -> anyhow::Result<Value> {
+    match (ty, j) {
         (TypeDesc::Object(defs), JsonValue::Object(fields)) => {
-            let mut out = Map::new();
-            for (k, v) in fields {
-                match defs.iter().find(|d| &d.name == k) {
-                    Some(def) if v.is_null() && !def.required => any = true,
-                    Some(def) => {
-                        let (inner, removed) = without_optional_nulls(v, &def.ty);
-                        any |= removed;
-                        out.insert(k.clone(), inner);
+            let mut out = BTreeMap::new();
+            for def in defs {
+                match fields.get(&def.name) {
+                    Some(JsonValue::Null) if !def.required => {
+                        out.insert(def.name.clone(), Value::Null);
                     }
-                    None => {
-                        out.insert(k.clone(), v.clone());
+                    Some(v) => {
+                        out.insert(def.name.clone(), lenient(v, &def.ty)?);
                     }
+                    None if def.required => {
+                        anyhow::bail!("missing required field `{}`", def.name)
+                    }
+                    None => {}
                 }
             }
-            JsonValue::Object(out)
-        }
-        (TypeDesc::Array(item), JsonValue::Array(items)) => JsonValue::Array(
-            items
-                .iter()
-                .map(|v| {
-                    let (inner, removed) = without_optional_nulls(v, item);
-                    any |= removed;
-                    inner
-                })
-                .collect(),
-        ),
-        (TypeDesc::Map(item), JsonValue::Object(fields)) => JsonValue::Object(
-            fields
-                .iter()
-                .map(|(k, v)| {
-                    let (inner, removed) = without_optional_nulls(v, item);
-                    any |= removed;
-                    (k.clone(), inner)
-                })
-                .collect(),
-        ),
-        _ => j.clone(),
-    };
-    (out, any)
-}
-
-/// Step 2's second half: every `null` the first half removed comes back as
-/// `Value::Null` at its place in `value`, walking `j` and `ty` together.
-fn restore_optional_nulls(value: &mut Value, j: &JsonValue, ty: &TypeDesc) {
-    match (ty, j, value) {
-        (TypeDesc::Object(defs), JsonValue::Object(fields), Value::Object(out)) => {
-            for (k, v) in fields {
-                let Some(def) = defs.iter().find(|d| &d.name == k) else {
-                    continue;
-                };
-                if v.is_null() && !def.required {
-                    out.insert(k.clone(), Value::Null);
-                } else if let Some(inner) = out.get_mut(k) {
-                    restore_optional_nulls(inner, v, &def.ty);
-                }
+            if fields.keys().any(|k| !defs.iter().any(|d| &d.name == k)) {
+                anyhow::bail!("a key the schema does not declare");
             }
+            Ok(Value::Object(out))
         }
-        (TypeDesc::Array(item), JsonValue::Array(items), Value::Array(out)) => {
-            for (inner, v) in out.iter_mut().zip(items) {
-                restore_optional_nulls(inner, v, item);
-            }
-        }
-        (TypeDesc::Map(item), JsonValue::Object(fields), Value::Object(out)) => {
-            for (k, v) in fields {
-                if let Some(inner) = out.get_mut(k) {
-                    restore_optional_nulls(inner, v, item);
-                }
-            }
-        }
-        _ => {}
+        (TypeDesc::Array(item), JsonValue::Array(items)) => items
+            .iter()
+            .map(|v| lenient(v, item))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map(Value::Array),
+        (TypeDesc::Map(item), JsonValue::Object(fields)) => fields
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), lenient(v, item)?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()
+            .map(Value::Object),
+        _ => from_json(j, ty),
     }
 }
 
-/// The strict refusal's words up to the offending value: the field path and
-/// the expectation (`param `provider`: param `attached_at`: expected an
-/// integer`), never what the core answered.
-fn refusal_words(err: &anyhow::Error) -> String {
-    let mut text = format!("{err:#}");
-    if let Some(at) = text.find(", got ") {
-        text.truncate(at);
+/// The answer's JSON kind, for the one `debug!` step 3 writes: the word
+/// only, never the content.
+fn json_kind(j: &JsonValue) -> &'static str {
+    match j {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
     }
-    if let Some(at) = text.find("not a valid flow id:") {
-        text.truncate(at + "not a valid flow id".len());
-    }
-    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::collections::BTreeMap;
 
     use aitm_core::ParamDef;
 
@@ -786,56 +733,43 @@ mod tests {
     #[test]
     fn tester_render_empty_bytes_and_any_values() {
         assert_eq!(
-            render(&serde_json::json!(""), &TypeDesc::Bytes).expect("empty bytes"),
+            render(&serde_json::json!(""), &TypeDesc::Bytes),
             Vec::<u8>::new()
         );
         let nested = serde_json::json!({"b": [1, {"c": null, "d": 2.5}], "a": "x", "e": true});
         assert_eq!(
-            String::from_utf8(render(&nested, &TypeDesc::Any).expect("any")).unwrap(),
+            String::from_utf8(render(&nested, &TypeDesc::Any)).unwrap(),
             "{\n  \"a\": \"x\",\n  \"b\": [\n    1,\n    {\n      \"c\": null,\n      \"d\": 2.5\n    }\n  ],\n  \"e\": true\n}\n"
         );
         assert_eq!(
-            render(&serde_json::json!("plain"), &TypeDesc::Any).expect("str"),
+            render(&serde_json::json!("plain"), &TypeDesc::Any),
             b"plain\n"
         );
+        assert_eq!(render(&serde_json::json!([]), &TypeDesc::Any), b"[]\n");
+        assert_eq!(render(&serde_json::json!(null), &TypeDesc::Any), b"null\n");
         assert_eq!(
-            render(&serde_json::json!([]), &TypeDesc::Any).expect("empty array"),
-            b"[]\n"
-        );
-        assert_eq!(
-            render(&serde_json::json!(null), &TypeDesc::Any).expect("null"),
-            b"null\n"
-        );
-        assert_eq!(
-            render(&serde_json::json!("iVBORw=="), &TypeDesc::Any).expect("base64 as text"),
+            render(&serde_json::json!("iVBORw=="), &TypeDesc::Any),
             b"iVBORw==\n"
         );
         assert_eq!(
-            render(&serde_json::json!("iVBORw=="), &TypeDesc::Bytes).expect("bytes"),
+            render(&serde_json::json!("iVBORw=="), &TypeDesc::Bytes),
             [0x89, 0x50, 0x4e, 0x47]
         );
         // Step 3: an answer the declared schema cannot explain is still
         // shown, structurally, never as an error against a healthy core.
+        assert_eq!(render(&serde_json::json!(5), &TypeDesc::Bytes), b"5\n");
         assert_eq!(
-            render(&serde_json::json!(5), &TypeDesc::Bytes).expect("int as bytes"),
-            b"5\n"
-        );
-        assert_eq!(
-            render(&serde_json::json!("not base64!"), &TypeDesc::Bytes).expect("text as bytes"),
+            render(&serde_json::json!("not base64!"), &TypeDesc::Bytes),
             b"not base64!\n"
         );
         assert_eq!(
             render(
                 &serde_json::json!({}),
                 &TypeDesc::Array(Box::new(TypeDesc::Str))
-            )
-            .expect("object as array"),
+            ),
             b"{}\n"
         );
-        assert_eq!(
-            render(&serde_json::json!("x"), &TypeDesc::Int).expect("text as int"),
-            b"x\n"
-        );
+        assert_eq!(render(&serde_json::json!("x"), &TypeDesc::Int), b"x\n");
     }
 
     /// Tester — `prepare` edges: `--yes` anywhere is stripped from the flags
@@ -880,50 +814,6 @@ mod tests {
         );
     }
 
-    /// Tester — `RemoteError`'s `Display` and `Debug` carry what the bus
-    /// said and nothing of what the client sent: no variant has a token
-    /// field, and the connect error for a refused socket is the one word.
-    #[test]
-    fn tester_remote_error_texts_are_the_bus_words() {
-        let cases: Vec<(RemoteError, &str)> = vec![
-            (
-                RemoteError::Timeout(Duration::from_secs(2)),
-                "no answer within 2000 ms",
-            ),
-            (RemoteError::Refused, "the core refused the operator token"),
-            (
-                RemoteError::Lost(REFUSED.to_string()),
-                "connection lost: refused",
-            ),
-            (
-                RemoteError::Agent,
-                "the core would treat this connection as an agent",
-            ),
-            (RemoteError::Tool("x failed".into()), "x failed"),
-            (
-                RemoteError::Rpc {
-                    code: -32601,
-                    message: "no such method".into(),
-                },
-                "bus rpc error -32601: no such method",
-            ),
-            (
-                RemoteError::Protocol("odd".into()),
-                "bus protocol error: odd",
-            ),
-            (
-                RemoteError::Aborted("aborted: scope add not run".into()),
-                "aborted: scope add not run",
-            ),
-        ];
-        for (err, text) in cases {
-            assert_eq!(err.to_string(), text);
-            assert!(!format!("{err:?}").is_empty());
-        }
-        let confirm = RemoteError::Confirm(anyhow::anyhow!("inner").context("outer"));
-        assert_eq!(confirm.to_string(), "outer: inner");
-    }
-
     fn def(name: &str, ty: TypeDesc, required: bool) -> ParamDef {
         ParamDef {
             name: name.to_string(),
@@ -942,8 +832,7 @@ mod tests {
         let answer =
             serde_json::json!({"address": "127.0.0.1:8080", "flows": 0, "capturing": true});
         assert_eq!(
-            String::from_utf8(render(&answer, &TypeDesc::Object(Vec::new())).expect("render"))
-                .unwrap(),
+            String::from_utf8(render(&answer, &TypeDesc::Object(Vec::new()))).unwrap(),
             "{\n  \"address\": \"127.0.0.1:8080\",\n  \"capturing\": true,\n  \"flows\": 0\n}\n"
         );
     }
@@ -967,7 +856,7 @@ mod tests {
             ),
         ]);
         let answer = serde_json::json!({"provider": {"attached_at": null, "state": "detached"}, "state": "on"});
-        let remote = render(&answer, &schema).expect("render");
+        let remote = render(&answer, &schema);
         assert_eq!(
             String::from_utf8(remote.clone()).unwrap(),
             "{\n  \"provider\": {\n    \"attached_at\": null,\n    \"state\": \"detached\"\n  },\n  \"state\": \"on\"\n}\n"
@@ -985,6 +874,137 @@ mod tests {
         assert_eq!(remote, render_cli_value(&local));
     }
 
+    /// Quality Q4: the one walker keeps a declared-optional `null` at every
+    /// depth (an object field, a field of an array item, a field of a map
+    /// value), omits a missing optional field as the strict path does, and
+    /// refuses what the strict path refuses for any other reason, so step 3
+    /// decides those.
+    #[test]
+    fn lenient_keeps_optional_nulls_at_every_depth_and_refuses_the_rest() {
+        let item = TypeDesc::Object(vec![
+            def("n", TypeDesc::Int, false),
+            def("s", TypeDesc::Str, true),
+        ]);
+        let schema = TypeDesc::Object(vec![
+            def("one", item.clone(), true),
+            def("many", TypeDesc::Array(Box::new(item.clone())), true),
+            def("by_name", TypeDesc::Map(Box::new(item.clone())), false),
+            def("note", TypeDesc::Str, false),
+            def("absent", TypeDesc::Str, false),
+        ]);
+        let answer = serde_json::json!({
+            "one": {"n": null, "s": "a"},
+            "many": [{"n": 1, "s": "b"}, {"n": null, "s": "c"}],
+            "by_name": {"k": {"n": null, "s": "d"}},
+            "note": null
+        });
+        assert!(
+            from_json(&answer, &schema).is_err(),
+            "strict refuses a null"
+        );
+        let obj = |n: Value, s: &str| {
+            Value::Object(BTreeMap::from([
+                ("n".to_string(), n),
+                ("s".to_string(), Value::Str(s.to_string())),
+            ]))
+        };
+        let expected = Value::Object(BTreeMap::from([
+            (
+                "by_name".to_string(),
+                Value::Object(BTreeMap::from([("k".to_string(), obj(Value::Null, "d"))])),
+            ),
+            (
+                "many".to_string(),
+                Value::Array(vec![obj(Value::Int(1), "b"), obj(Value::Null, "c")]),
+            ),
+            ("note".to_string(), Value::Null),
+            ("one".to_string(), obj(Value::Null, "a")),
+        ]));
+        assert_eq!(lenient(&answer, &schema).expect("lenient"), expected);
+        assert_eq!(rebuild_value(&answer, &schema), expected);
+        for (label, refused) in [
+            (
+                "undeclared key",
+                serde_json::json!({"one": {"n": 1, "s": "a"}, "many": [], "extra": 1}),
+            ),
+            ("missing required", serde_json::json!({"many": []})),
+            (
+                "null for a required field",
+                serde_json::json!({"one": {"s": null}, "many": []}),
+            ),
+            (
+                "wrong leaf type",
+                serde_json::json!({"one": {"n": "x", "s": "a"}, "many": []}),
+            ),
+            (
+                "null for an array item",
+                serde_json::json!({"one": {"s": "a"}, "many": [null]}),
+            ),
+            ("not an object", serde_json::json!([1])),
+        ] {
+            assert!(lenient(&refused, &schema).is_err(), "{label}");
+            // Step 3 shows it anyway, structurally.
+            assert_eq!(
+                rebuild_value(&refused, &schema),
+                structural(&refused),
+                "{label}"
+            );
+        }
+        assert_eq!(json_kind(&serde_json::json!(null)), "null");
+        assert_eq!(json_kind(&serde_json::json!(true)), "boolean");
+        assert_eq!(json_kind(&serde_json::json!(1.5)), "number");
+        assert_eq!(json_kind(&serde_json::json!("x")), "string");
+        assert_eq!(json_kind(&serde_json::json!([])), "array");
+        assert_eq!(json_kind(&serde_json::json!({})), "object");
+    }
+
+    /// Security S5 / quality Q4: the structural-fallback `debug!` names the
+    /// declared schema and the answer's JSON kind, nothing else. A key the
+    /// core chose (here one carrying a terminal escape) and the value under
+    /// it never reach the log.
+    #[test]
+    fn fallback_debug_names_the_schema_and_kind_never_the_answer() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buf").extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let schema = TypeDesc::Object(vec![def("state", TypeDesc::Str, true)]);
+        let answer = serde_json::json!({"state": "on", "evil\u{1b}[2J": "secret-value"});
+        let bytes = tracing::subscriber::with_default(subscriber, || render(&answer, &schema));
+        // Step 3 showed the answer as is: both keys are printed (S6: stdout is data).
+        let shown = String::from_utf8(bytes).expect("utf8");
+        assert!(shown.contains("\"state\": \"on\""), "{shown}");
+        assert!(shown.contains("secret-value"), "{shown}");
+        let log = String::from_utf8(buf.0.lock().expect("buf").clone()).expect("utf8 log");
+        assert!(
+            log.contains("does not fit the verb's declared result schema"),
+            "{log}"
+        );
+        assert!(log.contains("kind=\"object\""), "{log}");
+        assert!(log.contains("ty=Object("), "{log}");
+        assert!(log.contains("name: \"state\""), "{log}");
+        assert!(!log.contains("evil"), "{log}");
+        assert!(!log.contains("secret-value"), "{log}");
+        assert!(!log.contains('\u{1b}'), "{log}");
+    }
+
     /// The strict path stays where it adds information: a `Bytes` result
     /// decodes from base64 to the raw bytes (the structural fallback would
     /// print the base64 text), and a `Bytes` field beside an optional `null`
@@ -992,7 +1012,7 @@ mod tests {
     #[test]
     fn render_bytes_still_decode_on_the_strict_path() {
         assert_eq!(
-            render(&serde_json::json!("iVBORw=="), &TypeDesc::Bytes).expect("bytes"),
+            render(&serde_json::json!("iVBORw=="), &TypeDesc::Bytes),
             [0x89, 0x50, 0x4e, 0x47]
         );
         let schema = TypeDesc::Object(vec![

@@ -89,12 +89,15 @@ fn client_over(server: Arc<McpServer>, role: Frontend) -> BusClient {
 /// built as the binary builds its operator bus.
 struct Rig {
     _proxy: aitm_core::Proxy,
+    /// The config the server was built from, for a local `Cli` that must
+    /// answer `config.get` as the server does.
+    cfg: Arc<aitm_core::Config>,
     services: tui::Services,
     client: BusClient,
 }
 
 fn rig(tag: &str, operator_token: Option<&str>, role: Frontend) -> Rig {
-    let cfg = config(tag);
+    let cfg = Arc::new(config(tag));
     let (proxy, services, _governance) = assemble_services(&cfg);
     let server = Arc::new(
         tui::server(&cfg, McpTransport::Stdio, &services)
@@ -103,6 +106,7 @@ fn rig(tag: &str, operator_token: Option<&str>, role: Frontend) -> Rig {
     let client = client_over(server, role);
     Rig {
         _proxy: proxy,
+        cfg,
         services,
         client,
     }
@@ -130,6 +134,7 @@ fn rig_with(tag: &str, commands: Vec<Arc<dyn Command>>) -> Rig {
     let client = client_over(server, Frontend::Operator);
     Rig {
         _proxy: proxy,
+        cfg: Arc::new(cfg),
         services,
         client,
     }
@@ -185,17 +190,13 @@ async fn scope_add_then_list_over_the_bus_renders_like_local() {
     .await
     .expect("scope.add");
     assert_eq!(added, JsonValue::String("example.com".into()));
-    assert_eq!(
-        remote::render(&added, &TypeDesc::Str).expect("render"),
-        b"example.com\n"
-    );
+    assert_eq!(remote::render(&added, &TypeDesc::Str), b"example.com\n");
 
     let listed = remote::call(&rig.client, "scope.list", json!({}), CALL, &yes, false)
         .await
         .expect("scope.list");
     assert_eq!(listed, json!(["example.com"]));
-    let remote_bytes =
-        remote::render(&listed, &TypeDesc::Array(Box::new(TypeDesc::Str))).expect("render");
+    let remote_bytes = remote::render(&listed, &TypeDesc::Array(Box::new(TypeDesc::Str)));
     assert_eq!(remote_bytes, b"[\n  \"example.com\"\n]\n");
 
     // The local `Cli` over the same registry and guard renders byte-identically
@@ -252,7 +253,7 @@ async fn bytes_round_trip_through_base64() {
     assert_eq!(result, JsonValue::String("iVBORw==".into()));
     // … and the one-shot prints the original bytes, raw.
     assert_eq!(
-        remote::render(&result, &TypeDesc::Bytes).expect("render"),
+        remote::render(&result, &TypeDesc::Bytes),
         [0x89, 0x50, 0x4e, 0x47]
     );
 }
@@ -1150,7 +1151,7 @@ async fn tester_unknown_verb_round_trips_through_the_generic_path() {
     .expect("custom.verb");
     assert_eq!(result, json!({"n": 3, "ok": true}));
     assert_eq!(
-        remote::render(&result, &TypeDesc::Any).expect("render"),
+        remote::render(&result, &TypeDesc::Any),
         b"{\n  \"n\": 3,\n  \"ok\": true\n}\n"
     );
 
@@ -1208,11 +1209,13 @@ const READ_ONLY_LIVE_VERBS: &[&str] = &[
 ];
 
 /// Tester — spec D8 step 10 across the verb table: every read-only live verb
-/// the registry declares must render through its *declared* result schema,
-/// because that is the schema the one-shot rebuilds the core's answer with
-/// (`from_json(&result, &schema.result)`). A verb whose declared result is
-/// narrower than what it returns (an `Object(Vec::new())` that returns keys)
-/// prints an error against a healthy core instead of its answer.
+/// a bare assembly registers renders through its *declared* result schema
+/// byte for byte as the local `Cli` prints the same registry's answer
+/// (decision (f), AC-R14-24). `render` cannot fail (quality Q3), so the only
+/// observable regression is a wrong rendering, and parity per verb is what
+/// catches it (quality Q9a): a `null` dropped from an optional field, a
+/// declared `Bytes` left as base64, a key the structural fallback orders or
+/// types differently.
 ///
 /// Recorded 2026-11-01 (tester, pass 1) against a bare assembly: `proxy.status`
 /// (`control.rs:105`, `result: Object(Vec::new())`) → `unknown param
@@ -1220,7 +1223,7 @@ const READ_ONLY_LIVE_VERBS: &[&str] = &[
 /// `unknown param `browser` for `object``; `capture.status` (its schema
 /// declares `provider.attached_at: Int, required: false`, the core answers
 /// `null`) → `param `provider`: param `attached_at`: expected an integer,
-/// got null`. Root cause: `remote::render` rebuilds with the strict
+/// got null`. Root cause: `remote::render` rebuilt with the strict
 /// `aitm_mcp::json::from_json` (`json.rs:117-131`), which refuses undeclared
 /// keys and `null` for an optional field, while thirteen commands declare
 /// `Object(Vec::new())` as "some object" and many optional fields are
@@ -1235,8 +1238,17 @@ async fn tester_every_read_only_live_verb_renders_through_its_declared_schema() 
         .await
         .expect("handshake");
     let yes = Always::new(true);
-    let mut unrenderable = Vec::new();
+    let cli = Cli::new(rig.services.registry.clone())
+        .with_config(rig.cfg.clone())
+        .with_services(
+            rig.services.store.clone(),
+            rig.services.client.clone(),
+            rig.services.guard.clone(),
+            None,
+        );
+    let mut mismatched = Vec::new();
     let mut skipped = Vec::new();
+    let mut compared = Vec::new();
     for dotted in READ_ONLY_LIVE_VERBS {
         // The bare assembly registers neither `script.*` nor `findings.*`
         // (those arrive with the script tier); they are recorded, not failed.
@@ -1251,23 +1263,43 @@ async fn tester_every_read_only_live_verb_renders_through_its_declared_schema() 
                 continue;
             }
             Err(err) => {
-                unrenderable.push(format!("{dotted}: the call failed: {err}"));
+                mismatched.push(format!("{dotted}: the call failed: {err:?}"));
                 continue;
             }
         };
-        if let Err(err) = remote::render(&answer, &cmd.schema().result) {
-            unrenderable.push(format!(
-                "{dotted}: declared result {:?}; answer {answer}; render error: {err:#}",
-                cmd.schema().result
+        let remote_bytes = remote::render(&answer, &cmd.schema().result);
+        let words: Vec<&str> = dotted.split('.').collect();
+        let local = cli
+            .dispatch(&args(&words))
+            .unwrap_or_else(|e| panic!("{dotted}: local dispatch: {e:#}"));
+        let local_bytes = render_cli_value(&local);
+        if remote_bytes != local_bytes {
+            let first_diff = remote_bytes
+                .iter()
+                .zip(&local_bytes)
+                .position(|(r, l)| r != l)
+                .unwrap_or(remote_bytes.len().min(local_bytes.len()));
+            mismatched.push(format!(
+                "{dotted}: declared result {:?}; remote {} bytes, local {} bytes, first \
+                 difference at byte {first_diff}",
+                cmd.schema().result,
+                remote_bytes.len(),
+                local_bytes.len()
             ));
         }
+        compared.push(*dotted);
     }
     assert!(
-        unrenderable.is_empty(),
-        "live verbs whose answer does not render through their declared result schema \
-         (skipped for a missing param: {skipped:?}):\n  {}",
-        unrenderable.join("\n  ")
+        mismatched.is_empty(),
+        "live verbs whose remote rendering differs from the local path's (skipped: \
+         {skipped:?}):\n  {}",
+        mismatched.join("\n  ")
     );
+    assert!(
+        compared.len() >= 6,
+        "too few verbs compared ({compared:?}); skipped: {skipped:?}"
+    );
+    assert!(yes.prompts().is_empty(), "read-only verbs ask nothing");
 }
 
 /// Tester — AC-R14-24 parity beyond the Scope list, on the read-only live
@@ -1303,9 +1335,8 @@ async fn tester_parity_holds_for_more_shapes() {
             .clone();
         let remote_json = remote::call(&rig.client, &dotted, json!({}), CALL, &yes, false)
             .await
-            .unwrap_or_else(|e| panic!("{dotted}: {e}"));
-        let remote_bytes = remote::render(&remote_json, &cmd.schema().result)
-            .unwrap_or_else(|e| panic!("{dotted}: render remote: {e:#}"));
+            .unwrap_or_else(|e| panic!("{dotted}: {e:?}"));
+        let remote_bytes = remote::render(&remote_json, &cmd.schema().result);
         let local = cli.dispatch(&args(verb)).expect("local dispatch");
         assert_eq!(
             String::from_utf8_lossy(&remote_bytes),

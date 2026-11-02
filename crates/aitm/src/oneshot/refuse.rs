@@ -17,13 +17,13 @@ use std::time::Duration;
 use aitm_term::error::ErrorReport;
 
 /// The closing sentence of every `why` whose outcome is known.
-pub const NOTHING_CHANGED: &str = "Nothing was changed.";
+pub(crate) const NOTHING_CHANGED: &str = "Nothing was changed.";
 /// The closing sentence when the call may have reached the core.
-pub const OUTCOME_UNKNOWN: &str = "Whether anything changed is unknown.";
+pub(crate) const OUTCOME_UNKNOWN: &str = "Whether anything changed is unknown.";
 /// The substring every `Frontend::Cli`-only gate sentence carries (research
 /// F14): `tls passthrough add|remove`, `map add|remove`, `session save|load`
 /// and `flow export|import` with a path, `script validate --path`.
-pub const GATE_MARK: &str = "from an agent frontend";
+pub(crate) const GATE_MARK: &str = "from an agent frontend";
 
 const START_OR_SCOPE_PAGE: &str = "Start aitm, or use the app's Scope page.";
 const CHECK_LOG_THEN_RETRY: &str = "Check the core's log, then retry.";
@@ -213,65 +213,86 @@ pub fn no_operator_token(addr: SocketAddr, config: &Path, config_exists: bool) -
 
 /// **R7** — the core answered `-32001`: it refused the token `source` named.
 pub fn token_refused(addr: SocketAddr, source: &TokenSource) -> ErrorReport {
-    let (location, why, fix) = match source {
-        TokenSource::Config(path) => (
-            path.display().to_string(),
+    let (why, fix) = match source {
+        TokenSource::Config(_) => (
             format!(
                 "The config changed after that core started; a rotated token only takes effect \
                  on restart. {NOTHING_CHANGED}"
             ),
             "Restart the core, or pass --config for the config it was started with.",
         ),
-        TokenSource::TokenFile(path) => (
-            path.display().to_string(),
-            explicit_token_mismatch(),
-            "Check the token, or drop --bus to let aitm find the core.",
-        ),
-        TokenSource::Env => (
-            "AITM_BUS_TOKEN".to_string(),
-            explicit_token_mismatch(),
+        TokenSource::TokenFile(_) | TokenSource::Env => (
+            format!(
+                "It matched neither the agent nor the operator token of that core. \
+                 {NOTHING_CHANGED}"
+            ),
             "Check the token, or drop --bus to let aitm find the core.",
         ),
     };
     ErrorReport::failure(format!(
-        "the core at {addr} refused the operator token in {location}"
+        "the core at {addr} refused the operator token in {}",
+        locator(source)
     ))
     .with_why(vec![why])
     .with_fix(fix)
 }
 
-fn explicit_token_mismatch() -> String {
-    format!("It matched neither the agent nor the operator token of that core. {NOTHING_CHANGED}")
+/// Where a token came from, as a panel names it: the file's path, or the
+/// variable's name. Never the token.
+fn locator(source: &TokenSource) -> String {
+    match source {
+        TokenSource::Config(path) | TokenSource::TokenFile(path) => path.display().to_string(),
+        TokenSource::Env => "AITM_BUS_TOKEN".to_string(),
+    }
 }
 
 /// **R8** — `initialize` answered a role other than `operator`: the token
-/// in `config` is that core's agent token.
-pub fn connected_as_agent(addr: SocketAddr, config: &Path) -> ErrorReport {
-    ErrorReport::failure(format!("the core at {addr} would treat this as an agent"))
+/// `source` named is that core's agent token. From a config, the fix and its
+/// command rotate that config's token. From `--token-file` or
+/// `AITM_BUS_TOKEN` (an explicit `--bus`/`AITM_BUS` core) the one-shot never
+/// read that core's config, so no command it could offer is known to be true
+/// (spec D9, 2026-11-01): the fix is prose and there is no command.
+pub fn connected_as_agent(addr: SocketAddr, source: &TokenSource) -> ErrorReport {
+    let report = ErrorReport::failure(format!("the core at {addr} would treat this as an agent"))
         .with_why(vec![format!(
             "The token in {} is that core's agent token, not its operator token, and an agent \
              may not change Scope. {NOTHING_CHANGED}",
-            config.display()
-        )])
-        .with_fix("Set mcp.operator_token to a different value and restart the core.")
-        .with_command("aitm operator-token generate --force")
+            locator(source)
+        )]);
+    match source {
+        TokenSource::Config(_) => report
+            .with_fix("Set mcp.operator_token to a different value and restart the core.")
+            .with_command("aitm operator-token generate --force"),
+        TokenSource::TokenFile(_) | TokenSource::Env => report
+            .with_fix("Pass that core's operator token, or drop --bus to let aitm find the core."),
+    }
 }
 
 /// **R9** — the core's `isError` text is a `Frontend::Cli`-only gate
 /// sentence ([`is_cli_only_gate`]). The headline is the core's sentence
 /// verbatim (T6); every operator surface is refused by the same gate, so the
-/// only true fix is the config key the sentence names.
-pub fn cli_only_gate(sentence: &str, addr: SocketAddr, config: &Path) -> ErrorReport {
+/// only true fix is the config key the sentence names, in `config` when the
+/// one-shot resolved the core from a config (a configured transport or a
+/// pointer), or in "the config that core was started with" when the core
+/// was named by `--bus`/`AITM_BUS` and no file was read (spec D9,
+/// 2026-11-01).
+pub fn cli_only_gate(sentence: &str, addr: SocketAddr, config: Option<&Path>) -> ErrorReport {
+    let fix = match config {
+        Some(path) => format!(
+            "Set the config key the sentence names in {} and restart the core.",
+            path.display()
+        ),
+        None => "Set the config key the sentence names in the config that core was started \
+                 with, and restart it."
+            .to_string(),
+    };
     ErrorReport::failure(sentence)
         .with_why(vec![format!(
             "This one-shot reached the core at {addr} as an operator; that verb admits only an \
              in-process CLI, which has no running core to change. The app and the TUI are \
              refused by the same gate. {NOTHING_CHANGED}"
         )])
-        .with_fix(format!(
-            "Set the config key the sentence names in {} and restart the core.",
-            config.display()
-        ))
+        .with_fix(fix)
 }
 
 /// **R10** — the connection was accepted but `budget` elapsed before the
@@ -728,8 +749,8 @@ error: no running core found
         assert_eq!(r7_env.why, r7_file.why);
         assert_eq!(r7_env.fix, r7_file.fix);
 
-        // R8 — `initialize.role` is not `operator`.
-        let r8 = connected_as_agent(lo(9090), Path::new(CFG));
+        // R8 — `initialize.role` is not `operator`; the token from a config.
+        let r8 = connected_as_agent(lo(9090), &TokenSource::Config(PathBuf::from(CFG)));
         assert_eq!(r8.kind, ErrorKind::Failure);
         assert_eq!(
             r8.what,
@@ -749,10 +770,34 @@ error: no running core found
                 "aitm operator-token generate --force".to_string()
             ))
         );
+        // R8 from `--token-file` / `AITM_BUS_TOKEN` (an explicit core): the
+        // locator is the token's own, the fix is prose, no command (the
+        // config command would rotate a token that core never read).
+        let r8_file =
+            connected_as_agent(lo(9090), &TokenSource::TokenFile(PathBuf::from("/t/tok")));
+        assert_eq!(r8_file.kind, ErrorKind::Failure);
+        assert_eq!(r8_file.what, r8.what);
+        assert_eq!(
+            r8_file.why,
+            vec!["The token in /t/tok is that core's agent token, not its operator token, and an agent may not change Scope. Nothing was changed.".to_string()]
+        );
+        assert_eq!(
+            r8_file.fix.as_deref(),
+            Some("Pass that core's operator token, or drop --bus to let aitm find the core.")
+        );
+        assert_eq!(r8_file.command, None);
+        let r8_env = connected_as_agent(lo(9090), &TokenSource::Env);
+        assert_eq!(r8_env.what, r8.what);
+        assert_eq!(
+            r8_env.why,
+            vec!["The token in AITM_BUS_TOKEN is that core's agent token, not its operator token, and an agent may not change Scope. Nothing was changed.".to_string()]
+        );
+        assert_eq!(r8_env.fix, r8_file.fix);
+        assert_eq!(r8_env.command, None);
 
-        // R9 — a Cli-only gate sentence from the core.
+        // R9 — a Cli-only gate sentence from the core; the config is known.
         let sentence = "tls.passthrough.add refused: changing the TLS passthrough list from an agent frontend is disabled. Set tls.allow_agent_passthrough = true in the aitmproxy config to allow it, or change the list from the human CLI.";
-        let r9 = cli_only_gate(sentence, lo(50512), Path::new(CFG));
+        let r9 = cli_only_gate(sentence, lo(50512), Some(Path::new(CFG)));
         assert_eq!(r9.kind, ErrorKind::Failure);
         assert_eq!(r9.what, sentence);
         assert_eq!(
@@ -766,6 +811,16 @@ error: no running core found
             ))
         );
         assert_eq!(r9.command, None);
+        // R9 for an explicit `--bus`/`AITM_BUS` core: no file was read, so
+        // the fix names none.
+        let r9_explicit = cli_only_gate(sentence, lo(50512), None);
+        assert_eq!(r9_explicit.what, sentence);
+        assert_eq!(r9_explicit.why, r9.why);
+        assert_eq!(
+            r9_explicit.fix.as_deref(),
+            Some("Set the config key the sentence names in the config that core was started with, and restart it.")
+        );
+        assert_eq!(r9_explicit.command, None);
 
         // R10 — the budget elapses.
         let r10 = no_answer(lo(50512), Some("scope.add"), Duration::from_secs(30));
@@ -965,13 +1020,29 @@ error: no running core found
                 "R7",
                 token_refused(lo(9090), &TokenSource::Config(cfg.to_path_buf())),
             ),
-            ("R8", connected_as_agent(lo(9090), cfg)),
+            (
+                "R8",
+                connected_as_agent(lo(9090), &TokenSource::Config(cfg.to_path_buf())),
+            ),
+            (
+                "R8 token file",
+                connected_as_agent(lo(9090), &TokenSource::TokenFile(PathBuf::from("/t/tok"))),
+            ),
+            ("R8 env", connected_as_agent(lo(9090), &TokenSource::Env)),
             (
                 "R9",
                 cli_only_gate(
                     "x refused: y from an agent frontend is disabled.",
                     lo(50512),
-                    cfg,
+                    Some(cfg),
+                ),
+            ),
+            (
+                "R9 explicit",
+                cli_only_gate(
+                    "x refused: y from an agent frontend is disabled.",
+                    lo(50512),
+                    None,
                 ),
             ),
             (
@@ -1138,7 +1209,8 @@ error: no running core found
             token_refused(lo(9090), &TokenSource::TokenFile(tok.clone())),
             token_refused(lo(9090), &TokenSource::Env),
             no_operator_token(lo(9090), &cfg, true),
-            connected_as_agent(lo(9090), &cfg),
+            connected_as_agent(lo(9090), &TokenSource::Config(cfg.clone())),
+            connected_as_agent(lo(9090), &TokenSource::TokenFile(tok.clone())),
             foreign_config(&cfg),
         ];
         for report in &reports {

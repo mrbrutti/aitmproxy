@@ -12,12 +12,13 @@
 //! records origin `operator`, that label and the command.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aitm_cli::{Cli, TtyConfirmer};
+use aitm_cli::{Cli, Confirmer};
 use aitm_core::{Config, Params, TypeDesc};
 use aitm_mcp::json::to_json;
-use aitm_mcp::pointer::{self, CorePointer};
+use aitm_mcp::pointer;
 use aitm_term::error::ErrorReport;
 use aitm_term::reporter::Reporter;
 use serde_json::Value as JsonValue;
@@ -49,6 +50,10 @@ pub struct Inputs<'a> {
     pub services: &'a Services,
     /// The in-process CLI a local verb runs through.
     pub cli: Cli,
+    /// Who answers a core's confirmation question on the live path: the
+    /// same confirmer `cli` was built with (`Cli::with_confirmer`), so a
+    /// local and a live verb ask the operator the same way.
+    pub confirmer: Arc<dyn Confirmer>,
     /// Where warnings and the call's phase go.
     pub reporter: &'a Reporter,
     /// The log file, for every panel's footer.
@@ -85,9 +90,10 @@ pub struct Site<'a> {
     pub dotted: &'a str,
     /// The core that was dialed.
     pub target: &'a Target,
-    /// The one-shot's own flags, for the token's locator (R7).
+    /// The one-shot's own flags, for the token's locator (R7, R8).
     pub bus_args: &'a BusArgs,
-    /// The effective config path, named when the target has no config.
+    /// The effective config path: what a configured transport (R2, R3) read.
+    /// Never named for an explicit address, whose target has no config.
     pub effective_path: &'a Path,
     /// Whether `--config`/`AITM_CONFIG` named the config.
     pub explicit_config: bool,
@@ -161,12 +167,13 @@ async fn run_live(
     // `tools/list` share one handshake budget (spec D8 step 6).
     let started = Instant::now();
     let remaining = || HANDSHAKE_BUDGET.saturating_sub(started.elapsed());
+    // Before the call: R2 for a configured port names the live cores it
+    // was not pointed at; every other source names none.
     let refuse_early = |err: RemoteError, stage: Stage| {
-        let others = match (stage, &target.source) {
-            (Stage::Call, _) => Vec::new(),
-            (_, Source::ConfigPort) => resolve::live_pointers(&resolver)
+        let others = match &target.source {
+            Source::ConfigPort => resolve::live_pointers(&resolver)
                 .iter()
-                .map(|found| core_ref(&found.pointer))
+                .map(resolve::core_ref)
                 .collect(),
             _ => Vec::new(),
         };
@@ -190,9 +197,7 @@ async fn run_live(
                     Err(err) => return Err(refuse_early(err, Stage::Handshake)),
                 };
             if !known_remotely {
-                return Err(OneShotError::Other(anyhow::anyhow!(
-                    "unknown command `{dotted}`; run with no arguments to list commands"
-                )));
+                return Err(OneShotError::Other(remote::unknown_command(&dotted)));
             }
             let map = remote::generic_arguments(&flags).map_err(OneShotError::Other)?;
             (JsonValue::Object(map), TypeDesc::Any)
@@ -204,13 +209,20 @@ async fn run_live(
 
     let words = verb_words(dotted);
     let addr = target.addr;
-    let confirmer = TtyConfirmer::from_stdin();
     let phase = i.reporter.phase(&format!("{words} · core {addr}"));
-    let result = remote::call(&client, dotted, args, call_budget, &confirmer, yes).await;
+    let result = remote::call(
+        &client,
+        dotted,
+        args,
+        call_budget,
+        i.confirmer.as_ref(),
+        yes,
+    )
+    .await;
     let result = phase
         .finish_with(result, |_| format!("{words} answered · core {addr}"))
         .map_err(|err| refusal(err, Stage::Call, &site, &[], log()))?;
-    remote::render(&result, &result_ty).map_err(OneShotError::Other)
+    Ok(remote::render(&result, &result_ty))
 }
 
 /// The spec D9 panel for `err` at `stage`, given where the address came from
@@ -226,7 +238,6 @@ pub fn refusal(
 ) -> OneShotError {
     let verb = site.dotted;
     let addr = site.target.addr;
-    let config = site.target.config.as_deref().unwrap_or(site.effective_path);
     let report = match err {
         RemoteError::Timeout(_) => match stage {
             Stage::Call => refuse::no_answer(addr, Some(verb), site.budget),
@@ -234,12 +245,14 @@ pub fn refusal(
         },
         RemoteError::Lost(detail) => match stage {
             Stage::Call => refuse::lost(addr, verb, &detail),
-            Stage::Connect | Stage::Handshake => not_listening(site, config, others),
+            Stage::Connect | Stage::Handshake => not_listening(site, others),
         },
-        RemoteError::Refused => refuse::token_refused(addr, &token_source(site, config)),
-        RemoteError::Agent => refuse::connected_as_agent(addr, config),
+        RemoteError::Refused => refuse::token_refused(addr, &token_source(site)),
+        RemoteError::Agent => refuse::connected_as_agent(addr, &token_source(site)),
         RemoteError::Tool(text) if refuse::is_cli_only_gate(&text) => {
-            refuse::cli_only_gate(&text, addr, config)
+            // `None` for an explicit `--bus`/`AITM_BUS` core: the one-shot
+            // read no config of that core, so R9 names no file (spec D9).
+            refuse::cli_only_gate(&text, addr, site.target.config.as_deref())
         }
         RemoteError::Tool(text) => refuse::tool_failure(&text),
         RemoteError::Rpc { message, .. } => ErrorReport::failure(message),
@@ -251,9 +264,10 @@ pub fn refusal(
 }
 
 /// R2, R2', R3 or R4 by the address's source (spec D7 step 5).
-fn not_listening(site: &Site<'_>, config: &Path, others: &[CoreRef]) -> ErrorReport {
+fn not_listening(site: &Site<'_>, others: &[CoreRef]) -> ErrorReport {
     let verb = site.dotted;
     let addr = site.target.addr;
+    let config = read_config(site);
     match &site.target.source {
         Source::ExplicitFlag => refuse::not_listening_explicit(verb, addr, false),
         Source::ExplicitEnv => refuse::not_listening_explicit(verb, addr, true),
@@ -272,22 +286,31 @@ fn not_listening(site: &Site<'_>, config: &Path, others: &[CoreRef]) -> ErrorRep
     }
 }
 
-/// Where the refused token came from (R7): `--token-file` or
-/// `AITM_BUS_TOKEN` for an explicit address, else the config it was read from.
-fn token_source(site: &Site<'_>, config: &Path) -> TokenSource {
+/// Where the token the core judged came from (R7, R8): `--token-file` or
+/// `AITM_BUS_TOKEN` for an explicit address, else the config it was read
+/// from. An explicit address never resolves to a config (spec D9, quality
+/// Q1): a panel for it must not name, or offer to rotate, the one-shot's own.
+fn token_source(site: &Site<'_>) -> TokenSource {
     match site.target.source {
         Source::ExplicitFlag | Source::ExplicitEnv => match &site.bus_args.token_file {
             Some(path) => TokenSource::TokenFile(path.clone()),
             None => TokenSource::Env,
         },
         Source::ConfigPort | Source::ConfigEndpointFile(_) | Source::Pointer { .. } => {
-            TokenSource::Config(config.to_path_buf())
+            TokenSource::Config(read_config(site).to_path_buf())
         }
     }
 }
 
+/// The config the token was read from, for a source that read one. The
+/// resolver records it on the target; a configured transport (R2, R3) read
+/// the effective config, which is the fallback for those arms only.
+fn read_config<'a>(site: &Site<'a>) -> &'a Path {
+    site.target.config.as_deref().unwrap_or(site.effective_path)
+}
+
 /// A resolver warning as the operator reads it (spec D7).
-pub fn warning_text(warning: &Warning) -> String {
+pub(crate) fn warning_text(warning: &Warning) -> String {
     match warning {
         Warning::WideConfig(path) => format!(
             "{} is readable by other users · chmod 600 {}",
@@ -308,16 +331,6 @@ fn params_json(params: &Params) -> JsonValue {
             .map(|(name, value)| (name.to_string(), to_json(value)))
             .collect(),
     )
-}
-
-/// A live pointer as a panel names it.
-fn core_ref(ptr: &CorePointer) -> CoreRef {
-    CoreRef {
-        addr: ptr.bus,
-        pid: Some(ptr.pid),
-        started_unix: Some(ptr.started_unix),
-        config: Some(ptr.config.clone()),
-    }
 }
 
 /// Epoch seconds now; `0` on a clock before 1970.
@@ -399,18 +412,126 @@ mod tests {
             }
             OneShotError::Report(r) => panic!("not a panel: {r:?}"),
         }
-        // An explicit address without a config names the effective config in R8.
-        match refusal(RemoteError::Agent, Stage::Handshake, &site, &[], None) {
-            OneShotError::Report(r) => assert_eq!(
-                r.why,
-                vec![
-                    "The token in /x/config.yaml is that core's agent token, not its operator \
-                      token, and an agent may not change Scope. Nothing was changed."
-                        .to_string()
-                ]
-            ),
+    }
+
+    /// Quality Q1 (spec D9 R8/R9, amended 2026-11-01): an explicit
+    /// `--bus`/`AITM_BUS` target has no config the one-shot read, so R8 names
+    /// the token's own locator (`--token-file` path or `AITM_BUS_TOKEN`) and
+    /// offers no command (the config command would rotate the one-shot's own
+    /// config, not that core's), and R9's fix names no file. A config source
+    /// keeps the config's text and command.
+    #[test]
+    fn explicit_source_r8_r9_name_the_token_locator_never_the_one_shots_config() {
+        const GATE: &str = "tls.passthrough.add refused: changing the TLS passthrough list from \
+                            an agent frontend is disabled. Set tls.allow_agent_passthrough = true \
+                            in the aitmproxy config to allow it, or change the list from the \
+                            human CLI.";
+        let report = |err, site: &Site<'_>| match refusal(err, Stage::Handshake, site, &[], None) {
+            OneShotError::Report(r) => r,
             OneShotError::Other(e) => panic!("expected a panel: {e:#}"),
+        };
+        for (source, from_env) in [(Source::ExplicitFlag, false), (Source::ExplicitEnv, true)] {
+            let target = Target {
+                addr: "127.0.0.1:1".parse().expect("addr"),
+                token: "optoken-test-x".to_string(),
+                source,
+                config: None,
+            };
+            let env_bus = BusArgs {
+                bus: (!from_env).then(|| "127.0.0.1:1".to_string()),
+                token_file: None,
+            };
+            let file_bus = BusArgs {
+                bus: env_bus.bus.clone(),
+                token_file: Some(PathBuf::from("/t/tok")),
+            };
+            for (bus, locator) in [(&env_bus, "AITM_BUS_TOKEN"), (&file_bus, "/t/tok")] {
+                let site = Site {
+                    dotted: "scope.add",
+                    target: &target,
+                    bus_args: bus,
+                    effective_path: Path::new("/x/config.yaml"),
+                    explicit_config: true,
+                    budget: Duration::from_secs(30),
+                    now_unix: 0,
+                };
+                let r8 = report(RemoteError::Agent, &site);
+                assert_eq!(
+                    r8.what, "the core at 127.0.0.1:1 would treat this as an agent",
+                    "{locator}"
+                );
+                assert_eq!(
+                    r8.why,
+                    vec![format!(
+                        "The token in {locator} is that core's agent token, not its operator \
+                         token, and an agent may not change Scope. Nothing was changed."
+                    )]
+                );
+                assert_eq!(
+                    r8.fix.as_deref(),
+                    Some(
+                        "Pass that core's operator token, or drop --bus to let aitm find the core."
+                    ),
+                    "{locator}"
+                );
+                assert_eq!(r8.command, None, "{locator}");
+                let r9 = report(RemoteError::Tool(GATE.to_string()), &site);
+                assert_eq!(r9.what, GATE);
+                assert_eq!(
+                    r9.fix.as_deref(),
+                    Some(
+                        "Set the config key the sentence names in the config that core was \
+                         started with, and restart it."
+                    ),
+                    "{locator}"
+                );
+                assert_eq!(r9.command, None);
+                for text in [&r8, &r9].map(|r| r.render_plain(&aitm_term::glyphs::RICH)) {
+                    assert!(!text.contains("/x/config.yaml"), "{locator}: {text}");
+                }
+            }
         }
+        // A config source still names the config it read and the true command.
+        let target = Target {
+            addr: "127.0.0.1:9090".parse().expect("addr"),
+            token: "optoken-test-x".to_string(),
+            source: Source::ConfigPort,
+            config: Some(PathBuf::from("/x/c.yaml")),
+        };
+        let bus = BusArgs::default();
+        let site = Site {
+            dotted: "scope.add",
+            target: &target,
+            bus_args: &bus,
+            effective_path: Path::new("/x/config.yaml"),
+            explicit_config: false,
+            budget: Duration::from_secs(30),
+            now_unix: 0,
+        };
+        let r8 = report(RemoteError::Agent, &site);
+        assert_eq!(
+            r8.why,
+            vec![
+                "The token in /x/c.yaml is that core's agent token, not its operator token, and \
+                 an agent may not change Scope. Nothing was changed."
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            r8.fix.as_deref(),
+            Some("Set mcp.operator_token to a different value and restart the core.")
+        );
+        assert_eq!(
+            r8.command,
+            Some(aitm_term::error::FixCommand(
+                "aitm operator-token generate --force".to_string()
+            ))
+        );
+        let r9 = report(RemoteError::Tool(GATE.to_string()), &site);
+        assert_eq!(
+            r9.fix.as_deref(),
+            Some("Set the config key the sentence names in /x/c.yaml and restart the core.")
+        );
     }
 
     // ---- tester additions (stage 5, R14 pass 1) ----

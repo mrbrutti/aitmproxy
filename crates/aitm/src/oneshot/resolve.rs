@@ -25,7 +25,7 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
 use aitm_core::{Config, McpTransport};
-use aitm_mcp::pointer::{self, CorePointer, Found, Liveness};
+use aitm_mcp::pointer::{self, Found, Liveness};
 use aitm_term::error::ErrorReport;
 use tracing::debug;
 
@@ -248,7 +248,7 @@ pub fn resolve(
                 .iter()
                 .map(|found| CoreRef {
                     config: Some(canonical(&found.pointer.config)),
-                    ..core_ref(&found.pointer)
+                    ..core_ref(found)
                 })
                 .collect();
             return Err(refuse::two_cores(dotted, &cores, &wanted, r.now_unix, argv));
@@ -363,8 +363,10 @@ fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// A pointer as a panel names it.
-fn core_ref(ptr: &CorePointer) -> CoreRef {
+/// A live pointer as a panel names it (R2's "a different core is running",
+/// R11's list): every field known, the config as the pointer records it.
+pub(crate) fn core_ref(found: &Found) -> CoreRef {
+    let ptr = &found.pointer;
     CoreRef {
         addr: ptr.bus,
         pid: Some(ptr.pid),
@@ -456,6 +458,7 @@ pub fn owner_uid(run_dir: &Path) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aitm_mcp::pointer::CorePointer;
     use aitm_term::error::{ErrorKind, FixCommand};
     use std::cell::Cell;
     use std::fs::{self, File, Permissions};
