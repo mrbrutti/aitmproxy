@@ -1720,6 +1720,62 @@ mod tests {
         assert_eq!(again.state, JobState::Cancelled);
     }
 
+    /// Amendment 39, full run: a lane whose crawl failed on every request
+    /// (three `h2_not_negotiated` reports, no page) ends `done` with
+    /// `stopped_reason: null` and `error: null` (D5 "degrade, do not fail"),
+    /// and the status says why: `crawl.errors == 3`,
+    /// `crawl.last_error == h2_not_negotiated`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_all_failing_crawl_surfaces_its_reason_and_the_job_still_finishes() {
+        let h = Harness::new().with_lane(FakeLane::http().with_crawl_errors(vec![
+            ("http://scan.test", "h2_not_negotiated"),
+            ("http://scan.test", "h2_not_negotiated"),
+            ("http://scan.test", "h2_not_negotiated"),
+        ]));
+        h.bind();
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        assert_eq!(status.error, None);
+        assert_eq!(status.crawl.errors, 3);
+        assert_eq!(status.crawl.pages, 0);
+        assert_eq!(
+            status.crawl.last_error,
+            Some(aitm_scan_model::CrawlErrorKind::H2NotNegotiated)
+        );
+    }
+
+    /// Amendment 39, full run: one failed request beside a fetched page is a
+    /// partial failure — counted in `crawl.errors`, no `last_error`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partially_failing_crawl_sets_no_reason_in_a_full_run() {
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_crawl_flows(1)
+                .with_crawl_errors(vec![("http://scan.test", "connect_refused")]),
+        );
+        h.bind();
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.crawl.errors, 1);
+        assert!(status.crawl.pages >= 1, "pages: {}", status.crawl.pages);
+        assert_eq!(status.crawl.last_error, None);
+    }
+
     /// Spec D5 / call B15: a host whose answers are all unusable trips the
     /// per-host error ladder, and the job ends `done` with
     /// `stopped_reason: errors`.
@@ -1734,7 +1790,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_all_erroring_host_stops_the_job_with_stopped_reason_errors() {
         let h = Harness::new()
-            .answering(500)
+            // Amendment 40: a 5xx is an answer; only a transport failure or a
+            // timeout counts on the ladder, so the host fails at the transport.
+            .failing("connect refused")
             .with_lane(FakeLane::http().with_check(FakeCheck::new(
                 "fake.probe",
                 "demo",
@@ -1743,8 +1801,8 @@ mod tests {
         h.bind();
 
         let mut profile = h.profile(&["http://scan.test"]);
-        // One unusable answer is enough; the ratio rule can never fire, so the
-        // only thing under test is the consecutive ladder and its key.
+        // One transport failure is enough; the ratio rule can never fire, so
+        // the only thing under test is the consecutive ladder and its key.
         profile.budget.per_host_errors = aitm_scan_model::PerHostErrors {
             consecutive: 1,
             ratio: 1.0,

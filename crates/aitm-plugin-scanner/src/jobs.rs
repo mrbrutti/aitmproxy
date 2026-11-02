@@ -1123,8 +1123,13 @@ pub(crate) mod test_support {
         /// otherwise the canned `200 ok`.
         page: Option<String>,
         /// The status every send is answered with (`200` unless a test asks
-        /// for another). A `5xx` is what the per-host error ladder counts.
+        /// for another). A `5xx` is an answer like any other since amendment
+        /// 40: the per-host error ladder counts transport errors and timeouts
+        /// only, which [`StubClient::failing`] models.
         status: u16,
+        /// When set, every send fails at the transport with this text instead
+        /// of answering — what the per-host error ladder counts.
+        failing: Option<&'static str>,
     }
 
     impl StubClient {
@@ -1136,6 +1141,7 @@ pub(crate) mod test_support {
                 requests: Mutex::new(Vec::new()),
                 page: None,
                 status: 200,
+                failing: None,
             })
         }
 
@@ -1149,20 +1155,22 @@ pub(crate) mod test_support {
                 requests: Mutex::new(Vec::new()),
                 page: Some(html.to_string()),
                 status: 200,
+                failing: None,
             })
         }
 
-        /// A client that answers every send with `status` — a `5xx` is the
-        /// unusable answer the per-host error ladder counts (`client.rs`
-        /// `ProbeMeter::record`).
-        pub(crate) fn answering(status: u16) -> Arc<Self> {
+        /// A client whose every send fails at the transport with `text` — the
+        /// outcome the per-host error ladder counts (`client.rs`
+        /// `ProbeMeter::record`). The call is still recorded.
+        pub(crate) fn failing(text: &'static str) -> Arc<Self> {
             Arc::new(Self {
                 calls: AtomicU64::new(0),
                 last_call_ms: AtomicU64::new(0),
                 seen: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
                 page: None,
-                status,
+                status: 200,
+                failing: Some(text),
             })
         }
 
@@ -1221,6 +1229,9 @@ pub(crate) mod test_support {
                     .push(req.clone());
                 self.last_call_ms
                     .store(crate::util::now_ms(), Ordering::SeqCst);
+                if let Some(text) = self.failing {
+                    anyhow::bail!("{text}");
+                }
                 let mut flow = stub_flow(req);
                 if let Some(response) = flow.response.as_mut() {
                     response.status = self.status;
@@ -1691,6 +1702,10 @@ pub(crate) mod test_support {
         /// job's `scan:<job>` mark and the `crawl` mark, as both crawl paths
         /// leave behind.
         crawl_flows: u32,
+        /// `(origin, reason)` pairs `discover` reports through
+        /// [`JobCtx::report_crawl_error`], one per failed crawl request, as the
+        /// interim lane does (amendment 39).
+        crawl_errors: Vec<(String, String)>,
     }
 
     impl FakeLane {
@@ -1711,6 +1726,7 @@ pub(crate) mod test_support {
                 discoveries: AtomicU64::new(0),
                 discover_charge: 0,
                 crawl_flows: 0,
+                crawl_errors: Vec::new(),
             }
         }
 
@@ -1743,6 +1759,17 @@ pub(crate) mod test_support {
 
         pub(crate) fn with_check(mut self, check: Arc<dyn Check>) -> Self {
             self.checks.push(check);
+            self
+        }
+
+        /// `discover` reports each `(origin, reason)` through
+        /// `JobCtx::report_crawl_error`, like a client crawl whose requests
+        /// failed; pair it with no crawl captures for an all-failing crawl.
+        pub(crate) fn with_crawl_errors(mut self, errors: Vec<(&str, &str)>) -> Self {
+            self.crawl_errors = errors
+                .into_iter()
+                .map(|(o, r)| (o.to_string(), r.to_string()))
+                .collect();
             self
         }
 
@@ -1802,6 +1829,9 @@ pub(crate) mod test_support {
                 }
                 for page in 0..self.crawl_flows {
                     job.store().insert(crawl_capture(job.job_id(), page));
+                }
+                for (origin, reason) in &self.crawl_errors {
+                    job.report_crawl_error(origin, reason);
                 }
                 if self.discover_panic {
                     panic!("{PANIC_TEXT}");
@@ -2008,10 +2038,10 @@ pub(crate) mod test_support {
             self
         }
 
-        /// Answer every send with `status`, so a test can make a host fail.
-        /// Call before [`Harness::bind`].
-        pub(crate) fn answering(mut self, status: u16) -> Self {
-            self.client = StubClient::answering(status);
+        /// Fail every send at the transport with `text`, so a test can make a
+        /// host trip the per-host error ladder. Call before [`Harness::bind`].
+        pub(crate) fn failing(mut self, text: &'static str) -> Self {
+            self.client = StubClient::failing(text);
             self
         }
 
