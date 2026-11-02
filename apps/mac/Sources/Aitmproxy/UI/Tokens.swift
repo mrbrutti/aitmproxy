@@ -1,5 +1,5 @@
 // Generated from docs/design/tokens.json by tools/gen-tokens.swift. Do not edit.
-// Version 0.1.0. The names mirror the JSON; see
+// Version 0.2.0. The names mirror the JSON; see
 // docs/design/operator-ui-foundation.md §2 for which token goes where.
 import AppKit
 import SwiftUI
@@ -47,6 +47,8 @@ enum Tok {
     enum Ground {
         /// Selected row in a list that drives a detail pane; selected sidebar item. A quiet accent tint, never the full accent.
         static let active = DynamicColor(light: 0xE8EEFB, dark: 0x2B3344)
+        /// The raised job card and the wells: one tone above surface and below raised in dark; white with a border and a shadow in light.
+        static let card = DynamicColor(light: 0xFFFFFF, dark: 0x232326)
         /// Row/item hover. Never moves a selection.
         static let hover = DynamicColor(light: 0xF3F4F6, dark: 0x2A2A2C)
         /// Near-black primary button fill (light) / inverted white (dark).
@@ -241,6 +243,8 @@ enum Tok {
         enum Size {
             /// Body in comfortable views, sidebar labels, form controls.
             static let base: CGFloat = 14
+            /// KPI numerals.
+            static let display: CGFloat = 28
             /// Pane titles (Request / Response), dialog titles.
             static let lg: CGFloat = 16
             /// Body in dense views: flow rows, header tables, code.
@@ -251,6 +255,8 @@ enum Tok {
             static let xl: CGFloat = 20
             /// Badges, pills, meta chips, line numbers. Floor.
             static let xs: CGFloat = 11
+            /// The job card's heading.
+            static let xxl: CGFloat = 24
         }
         enum Weight {
             /// Active tab, selected sidebar item, badge text.
@@ -314,12 +320,18 @@ enum Tok {
         /// Only the toolbar's 'Listening on host:port' status pill and chip filters.
         static let pill: CGFloat = 999
     }
-    /// Shadows only on what floats.
+    /// Shadows on what floats and on the Jobs tab's raised cards (float: the selected job's card; rest: the wells); other resting panels get none.
     enum Shadow {
+        /// The selected job's card.
+        static let float = FloatingShadow(y: 12, radius: 32 / 2, lightOpacity: 0.10, darkOpacity: 0.42)
         static let floating = FloatingShadow(y: 8, radius: 24 / 2, lightOpacity: 0.12, darkOpacity: 0.5)
+        /// A resting card: the Jobs wells.
+        static let rest = FloatingShadow(y: 4, radius: 14 / 2, lightOpacity: 0.08, darkOpacity: 0.28)
     }
-    /// Feedback only; nothing on screen performs an entrance.
+    /// Feedback only, plus one named entrance: the Jobs card's staggered rise when a job becomes selected (Jobs view spec D12).
     enum Motion {
+        /// Live counter digit ticks; opacity/translate of the digits only
+        static let counter: Double = 0.150
         static func easeInOut(_ duration: Double) -> Animation {
             Animation.timingCurve(0.77, 0.0, 0.175, 1.0, duration: duration)
         }
@@ -339,6 +351,8 @@ enum Tok {
         static let popover: Double = 0.160
         /// Button :active scale(0.97).
         static let press: Double = 0.120
+        /// A progress fill, mark or ring easing to a new value; never snaps
+        static let progress: Double = 0.250
         /// Breathing curve for the one allowed pulse (the armed-intercept dot): a gentle sine-like ease-in-out, never for travel.
         static func pulse(_ duration: Double) -> Animation {
             Animation.timingCurve(0.42, 0.0, 0.58, 1.0, duration: duration)
@@ -350,6 +364,8 @@ enum Tok {
         static let rowArrive: Double = 0.000
         /// Compose/PoC sheets, the browser drawer.
         static let sheet: Double = 0.220
+        /// The delay between the Jobs card's blocks in its one entrance
+        static let stagger: Double = 0.060
     }
     /// SF Symbol per icon role (`icon.glyph.*.mac`).
     enum Glyph {
