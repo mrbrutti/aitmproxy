@@ -31,11 +31,15 @@ struct ScopeSheet: View {
         .background(Tok.Ground.surface.color)
     }
 
-    /// `3 hosts · 13 flows in scope`, or nothing while empty (the panel says so).
+    /// `3 hosts · 13 flows in scope`, or nothing while empty (the panel says so);
+    /// ` · 3 L4 entries` follows when the core advertises L4 and lists any.
     private var summary: String {
         let hosts = session.scopeHosts.count
-        guard hosts > 0 else { return "" }
+        let l4 = session.l4Enabled ? session.l4Scope.count : 0
+        let l4Text = l4 > 0 ? "\(l4) L4 entr\(l4 == 1 ? "y" : "ies")" : ""
+        guard hosts > 0 else { return l4Text }
         let flows = session.rows.filter(\.inScope).count
-        return "\(hosts) host\(hosts == 1 ? "" : "s") · \(flows) flow\(flows == 1 ? "" : "s") in scope"
+        let base = "\(hosts) host\(hosts == 1 ? "" : "s") · \(flows) flow\(flows == 1 ? "" : "s") in scope"
+        return l4Text.isEmpty ? base : "\(base) · \(l4Text)"
     }
 }

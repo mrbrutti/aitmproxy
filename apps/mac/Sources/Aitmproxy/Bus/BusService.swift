@@ -15,6 +15,9 @@ final class BusService: FlowActions {
     var pollInterval: Duration = .milliseconds(500)
     /// `ca.status` is read on one poll tick in this many (spec D17.10: about every 5 s).
     static let caStatusEveryTicks = 10
+    /// The L4 status, scope and parked reads run on one poll tick in this many (l4-parity plan,
+    /// unit (d) amendment 6: the same ~5 s cadence as `ca.status`; spec §1 says re-read, never cache).
+    static let l4StatusEveryTicks = 10
 
     @ObservationIgnored private var client: BusClient?
     @ObservationIgnored private var runTask: Task<Void, Never>?
@@ -184,6 +187,13 @@ final class BusService: FlowActions {
             session.forgetCATrust()
             // Likewise the system-proxy facts: the route and the menu title must not keep a gone core's word.
             session.forgetSystemProxy()
+            // And the L4 facts (l4-parity spec §1: never cached for the session): a new core is
+            // re-read from `.pending`, and no stale scope or parked packet shows under a failed badge.
+            session.l4CaptureAvailability = .pending
+            session.l4InterceptAvailability = .pending
+            session.l4Scope = []
+            session.l4Parked = []
+            session.l4CanAddScope = false
         }
         var tick = 0
         while !Task.isCancelled && owns() {
@@ -207,6 +217,14 @@ final class BusService: FlowActions {
             // CA trust is the OS store's fact (spec D17.5, D17.10): read on the first tick and every
             // 10th (about every 5 s), because each read spawns `security` per store on the core side.
             if tick % Self.caStatusEveryTicks == 0 { await session.refreshCAStatus() }
+            // Same: the L4 reads below go through `self.client`.
+            guard owns() else { return }
+            // L4 availability, scope and parked packets are the core's facts (l4-parity spec §1): read on
+            // the first tick and every 10th, only from a core that advertises the L4 family. Each write
+            // inside is the owner's, guarded after every await. The same slow tick re-reads every listed
+            // L4 flow's fields below.
+            let l4SlowTick = tick % Self.l4StatusEveryTicks == 0
+            if l4SlowTick, session.l4Enabled { await refreshL4State(generation: generation) }
             // From here the iteration is the owner's: the stop() that retired a superseded run is
             // closing its socket, so whatever it still listed would only be dropped at the next guard.
             guard owns() else { return }
@@ -228,6 +246,40 @@ final class BusService: FlowActions {
                     refetch.didFetch(id, summary: summary)
                 }
             }
+            // Raw-L4 flows (l4-parity spec §2, AC25): a core that advertises both `l4.flow.list` and
+            // `l4.flow.get` is listed every tick like `flow.list`. A listed flow's fields are read with
+            // `limit: 0` when the core has the bounded window (never a packet in the list poll; only
+            // the inspector fetches a window) — on a normal tick only for an id not yet in
+            // `session.l4Details` (a new flow shows within one tick), and for every listed id on the
+            // slow tick, so counts and session state follow the core at the ~5 s cadence of the other
+            // L4 facts instead of one `l4.flow.get` per flow per 500 ms. Nothing is cached between
+            // ticks beyond `session.l4Details`, so a flow the core dropped leaves the list on the next
+            // tick. A new flow whose first read fails is skipped until the next tick, like the HTTP
+            // loop; a known flow whose slow-tick re-read fails keeps its cached fields, so a transient
+            // failure never drops a row or blanks the inspector. A failed `l4.flow.list`
+            // is an empty tick, deliberately not a thrown error: `pollLoop` throwing is how a lost
+            // connection is reported, and an L4 verb error (a gated verb on an older core, a guard
+            // refusal) must not reconnect the whole bus and drop the HTTP rows with it.
+            var l4Flows: [L4Flow] = []
+            if Self.pollsL4(tools) {
+                let l4IDs = (try? await client.call("l4.flow.list"))?.arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
+                guard owns() else { return }
+                let window = L4Wire.supportsWindow(tools)
+                let known = session.l4Details
+                for id in l4IDs {
+                    if !l4SlowTick, let cached = known[id] {
+                        l4Flows.append(cached)
+                        continue
+                    }
+                    let json = try? await client.call("l4.flow.get", L4Wire.flowGetArgs(id: id, inspect: false, window: window))
+                    guard owns() else { return }
+                    if let json, let flow = L4Flow(json: json) {
+                        l4Flows.append(flow)
+                    } else if let cached = known[id] {
+                        l4Flows.append(cached)
+                    }
+                }
+            }
             // Likewise the rows and rates this iteration publishes: no await from here to the sleep.
             guard owns() else { return }
             let known = Set(ids)
@@ -242,7 +294,22 @@ final class BusService: FlowActions {
                 row.client = row.client.map(AppIdentityResolver.shared.enriched)
                 return row
             }
-            let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
+            let httpRows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
+            // The L4 details are exactly what the core listed this tick (a duplicate id keeps its last
+            // reply; never a trap on wire data), change-guarded like every per-tick session write.
+            let l4Details = Dictionary(l4Flows.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+            if l4Details != session.l4Details { session.l4Details = l4Details }
+            // An L4 row is in scope iff a capture entry of the core's L4 scope covers its interface and
+            // destination (the HTTP host scope says nothing about it). L4 rows number after the HTTP rows.
+            let captureScope = session.l4Scope.filter { $0.capability == "capture" }
+            // `L4Flow` carries no direction today, so `covers` is asked without one (it then ignores the
+            // entry's); a flow without a known port (ICMP) is covered only by an `all`-ports entry.
+            let l4Rows = l4Flows.enumerated().map { index, flow in
+                flow.row(
+                    seq: ids.count + index + 1,
+                    inScope: captureScope.contains { $0.covers(interface: flow.interface, dst: flow.dst ?? "", port: flow.dstPort) })
+            }
+            let polled = httpRows + l4Rows
             // Rows an undone Clear put back stay ahead of the core's list and follow the live
             // scope like any other row; new flows number after them.
             let restored = session.restoredFlows.map(scoped)
@@ -317,6 +384,56 @@ final class BusService: FlowActions {
         } else if session.systemProxyFacts != nil {
             session.forgetSystemProxy()
         }
+    }
+
+    /// `l4.capture.status` / `l4.intercept.status` → the two availabilities, `l4.scope.list` → the
+    /// L4 scope, `l4.intercept.list` → the parked packets (only while intercept is available, spec §4:
+    /// the UI does not poll it otherwise), and `tools/list`'s `confirmable` on `l4.scope.add` → whether
+    /// the operator scope-add control renders. Each verb's reply is mapped through the Kit's pure
+    /// parsers; a status verb that fails degrades through its error text (an older core's gated verb
+    /// says `L4 unavailable: …`). Polls, not actions: nothing here is recorded in the activity log,
+    /// like `flow.list` and `proxy.status`. Every session write is the owner's (`generation` still
+    /// current after the await) and change-guarded like the other per-tick writes.
+    private func refreshL4State(generation: Int) async {
+        func owns() -> Bool { generation == runGeneration }
+        /// One poll read: the reply, or the error's text; never both.
+        func read(_ name: String) async -> (status: JSONValue?, error: String?) {
+            guard let client else { return (nil, BusError.disconnected.description) }
+            do { return (try await client.call(name), nil) } catch { return (nil, Self.describe(error)) }
+        }
+        let capture = await read("l4.capture.status")
+        guard owns() else { return }
+        let captureAvailability = L4Availability.resolve(status: capture.status, error: capture.error)
+        if session.l4CaptureAvailability != captureAvailability { session.l4CaptureAvailability = captureAvailability }
+
+        let intercept = await read("l4.intercept.status")
+        guard owns() else { return }
+        let interceptAvailability = L4Availability.resolve(status: intercept.status, error: intercept.error)
+        if session.l4InterceptAvailability != interceptAvailability { session.l4InterceptAvailability = interceptAvailability }
+
+        let scope = await read("l4.scope.list")
+        guard owns() else { return }
+        if let reply = scope.status {
+            let items = L4ScopeItem.list(reply)
+            if session.l4Scope != items { session.l4Scope = items }
+        }
+
+        var parked: [L4ParkedPacket] = []
+        if interceptAvailability == .available {
+            let list = await read("l4.intercept.list")
+            guard owns() else { return }
+            parked = list.status.map(L4ParkedPacket.list) ?? session.l4Parked
+        }
+        if session.l4Parked != parked { session.l4Parked = parked }
+
+        let canAddScope = L4Wire.supportsOperatorScopeAdd(tools)
+        if session.l4CanAddScope != canAddScope { session.l4CanAddScope = canAddScope }
+    }
+
+    /// True iff the core advertises both halves of the live L4 list poll, `l4.flow.list` and
+    /// `l4.flow.get` (feature-detected from `tools/list`; a core without the L4 family is never asked).
+    private static func pollsL4(_ tools: [ToolDescriptor]) -> Bool {
+        tools.contains { $0.name == "l4.flow.list" } && tools.contains { $0.name == "l4.flow.get" }
     }
 
     // MARK: FlowActions
