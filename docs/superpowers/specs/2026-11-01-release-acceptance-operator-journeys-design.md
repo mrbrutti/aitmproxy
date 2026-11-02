@@ -495,4 +495,8 @@ would have been inert on a real config) — fixed: one `_block_list(top, sub)` w
 `system_proxy.bypass`, tests rewritten to the core's shape incl. the inline form and the sibling key; Minors
 fixed in the same commit (CLI cell's `run()` uses the SIGINT-reset shim run.sh uses, since bash 3.2 cannot undo
 the async SIGINT-ignore with `trap - INT`; N1 SKIP text names the probe digit; `py_installed` no longer swallows
-stderr). Security verdict recorded on the PR.
+stderr). Security FAIL on one Important — the web cell's `.secrets` file outlived an interrupted run and every
+standalone run — fixed: destroyed on EXIT/INT/TERM, read and destroyed the moment the web cell returns, never
+written outside `run.sh` (APFS does not overwrite blocks, so the honest claim is "0600, deleted"); Minors fixed:
+the ERROR-path restore compares to the cell's own start reading and prints the diff before replaying; N1 sends
+nothing when the focus probe is not seen (a blind paste could reach Settings' persisting bypass field).
