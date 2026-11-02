@@ -20,6 +20,8 @@ import {
   l4SessionState,
   l4Target,
   listCmd,
+  OPERATOR_ONLY_REASON,
+  operatorOnlyReason,
   packetHeadline,
   parsePacketSpec,
   PENDING_AVAILABILITY,
@@ -403,5 +405,24 @@ describe('TCP / UDP / L4 chips (spec §7(c), AC21)', () => {
     expect(l4ChipMatches('tcp', { subLabel: null })).toBe(false);
     expect(l4ChipMatches('http', { subLabel: 'TCP' })).toBe(false);
     expect(l4ChipMatches('all', { subLabel: 'TCP' })).toBe(false);
+  });
+});
+
+describe('operatorOnlyReason (spec §7(c) D12, AC24)', () => {
+  it('an operator connection has no reason: every Sensitive L4 control stays live', () => {
+    expect(operatorOnlyReason('operator')).toBeNull();
+  });
+
+  it('an agent connection gets the one operator-only reason, verbatim', () => {
+    expect(operatorOnlyReason('agent')).toBe('Operator only: reconnect with the Operator URL the core printed');
+  });
+
+  it('an unknown role (no echo yet, or a disconnect) is gated like an agent, not like an operator', () => {
+    expect(operatorOnlyReason(null)).toBe('Operator only: reconnect with the Operator URL the core printed');
+  });
+
+  it('the exported literal is the reason the components render as title and text', () => {
+    expect(OPERATOR_ONLY_REASON).toBe('Operator only: reconnect with the Operator URL the core printed');
+    expect(operatorOnlyReason('agent')).toBe(OPERATOR_ONLY_REASON);
   });
 });

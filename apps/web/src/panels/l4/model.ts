@@ -661,6 +661,22 @@ export const L4_ARG_BUILDERS: readonly { tool: string; keys: readonly string[] }
   { tool: 'l4.flow.get', keys: ['id', 'offset', 'limit'] },
 ];
 
+// ---- operator-only gate (parity spec §7(c) D12, AC24) ---------------------------------------------
+//
+// Every Sensitive L4 action (capture start/stop, inject, scope add, the parked-packet verdicts, the
+// agent gate toggles) is operator-only on the core. On a connection that did not resolve to the
+// operator role — an agent token, or no role echo yet — each such control renders disabled with this
+// one reason and its handler returns before anything reaches the bus, so no enabled control can only
+// fail (AC33). The connection role comes from the bus client's `initialize` echo (`bus.role()`).
+
+/** The one operator-only reason, verbatim: shown as each gated control's `title` and reason line. */
+export const OPERATOR_ONLY_REASON = 'Operator only: reconnect with the Operator URL the core printed';
+
+/** `null` on an operator connection (nothing is gated); the reason for an agent or an unknown role. */
+export function operatorOnlyReason(role: 'operator' | 'agent' | null): string | null {
+  return role === 'operator' ? null : OPERATOR_ONLY_REASON;
+}
+
 // ---- poll plan (parity spec §7(c) "Polling", AC23) ------------------------------------------------
 //
 // The app's 1.5 s timer calls `store.refresh()`; the store asks this plan what is due and returns

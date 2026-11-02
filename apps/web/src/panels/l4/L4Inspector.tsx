@@ -3,15 +3,19 @@
 // and the in-path intercept bar driven by `interceptBarModel` (parity spec §4). Presentational: the
 // panel wires the bus. Mutate sends the craft editor's spec: the editor hands each spec it builds
 // through `onBuild`, the inspector keeps the last one, and Mutate is off with a reason until a
-// packet has been built.
+// packet has been built. Role (spec §7(c) D12, AC24): inject and the verdicts are operator-only. The
+// inspector reads the connection role (`useApp().bus.role()`), hands the intercept bar its reason,
+// and gates Inject itself — the craft editor's button is told `canInject={false}` and `onInject`
+// returns here before the confirm path, so a forced click sends nothing.
 import { createSignal, Show, type Component } from 'solid-js';
+import { useApp } from '~/state/context';
 import { CraftEditor } from './CraftEditor';
 import { LayerTree } from './LayerTree';
 import { PacketList } from './PacketList';
 import { L4InterceptBar } from './L4InterceptBar';
 import type { InjectArgs } from './inject';
 import type { L4Caps } from './store';
-import type { InterceptBarModel, L4CraftResult, L4FlowWire, PacketSpec, UnionRow } from './model';
+import { operatorOnlyReason, type InterceptBarModel, type L4CraftResult, type L4FlowWire, type PacketSpec, type UnionRow } from './model';
 import css from './l4.module.css';
 
 /** Mutate's tooltip until the craft editor has built a spec to send. */
@@ -35,6 +39,9 @@ export interface L4InspectorProps {
 }
 
 export const L4Inspector: Component<L4InspectorProps> = (props) => {
+  const bus = useApp().bus;
+  /** The D12 gate: `null` on an operator connection, else the reason inject and the verdicts show. */
+  const operatorOnly = () => operatorOnlyReason(bus.role());
   const [sel, setSel] = createSignal<number | null>(props.flow.packets.length ? 0 : null);
   /** The spec the craft editor last built successfully; what Mutate sends. */
   const [lastBuilt, setLastBuilt] = createSignal<PacketSpec | null>(null);
@@ -47,7 +54,12 @@ export const L4Inspector: Component<L4InspectorProps> = (props) => {
     setLastBuilt(spec);
     return result;
   };
+  const inject = (args: InjectArgs) => {
+    if (operatorOnly() !== null) return; // D12: an agent connection sends nothing
+    props.onInject(args);
+  };
   const mutate = (parkedId: string) => {
+    if (operatorOnly() !== null) return; // D12: an agent connection sends nothing
     const spec = lastBuilt();
     if (spec) props.onMutate(parkedId, spec);
   };
@@ -79,14 +91,21 @@ export const L4Inspector: Component<L4InspectorProps> = (props) => {
 
       <Show when={packet()}>{(p) => <LayerTree packet={p()} />}</Show>
 
+      <Show when={operatorOnly()}>
+        {(reason) => (
+          <p class={css.dimReason} role="status" data-testid="l4-inject-operator-only" data-operator-only="true">
+            Inject: {reason()}
+          </p>
+        )}
+      </Show>
       <CraftEditor
         interface={props.flow.interface}
         inScope={props.row.inScope}
         scopeReason={props.row.scopeReason}
         canCraft={props.caps.craft}
-        canInject={props.caps.inject}
+        canInject={operatorOnly() === null && props.caps.inject}
         onBuild={build}
-        onInject={props.onInject}
+        onInject={inject}
       />
 
       <L4InterceptBar
@@ -94,6 +113,7 @@ export const L4Inspector: Component<L4InspectorProps> = (props) => {
         inScope={props.row.inScope}
         scopeReason={props.row.scopeReason}
         mutateBlocked={lastBuilt() ? null : MUTATE_NEEDS_BUILD}
+        operatorOnly={operatorOnly()}
         onForward={props.onForward}
         onMutate={mutate}
         onDrop={props.onDrop}

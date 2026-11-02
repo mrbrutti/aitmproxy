@@ -3,9 +3,12 @@
 // governs the agent (MCP) L4 path (not a cosmetic switch). Where the core exposes `l4.agent.set`
 // the operator flips the gate live; where it does not, the switch is read-only with an honest note
 // (config + restart). An agent can never flip its own gate — the core refuses `l4.agent.set` from
-// an MCP caller; this panel is the operator's control.
+// an MCP caller; this panel is the operator's control. Role (parity spec §7(c) D12, AC24): on a
+// connection that is not the operator's (`useApp().bus.role()` is `agent` or unknown) every switch
+// renders disabled with `OPERATOR_ONLY_REASON` and its handler returns before `onSet`.
 import { For, Show, type Component } from 'solid-js';
-import { AGENT_CAPS, AGENT_CAP_LABEL, type AgentCap, type AgentGates } from '~/panels/l4/model';
+import { useApp } from '~/state/context';
+import { AGENT_CAPS, AGENT_CAP_LABEL, operatorOnlyReason, type AgentCap, type AgentGates } from '~/panels/l4/model';
 import css from '~/panels/l4/l4.module.css';
 
 export interface L4TogglesProps {
@@ -16,45 +19,75 @@ export interface L4TogglesProps {
   onSet: (capability: AgentCap, allowed: boolean) => void;
 }
 
-export const L4Toggles: Component<L4TogglesProps> = (props) => (
-  <section class={css.section} aria-label="L4 agent capabilities">
-    <div class={css.sectionHead}>L4 agent capabilities</div>
-    <Show
-      when={props.gates}
-      fallback={<p class={css.note}>L4 agent gates are unavailable — this core does not expose `l4.agent.status`.</p>}
-    >
-      {(gates) => (
-        <div class={css.toggles} role="group" aria-label="L4 capability toggles">
-          <For each={AGENT_CAPS}>
-            {(cap) => {
-              const on = () => gates()[cap];
-              return (
-                <div class={css.toggleRow}>
-                  <button
-                    type="button"
-                    role="switch"
-                    class={css.switch}
-                    data-cap={cap}
-                    aria-checked={on()}
-                    aria-label={`Agent ${AGENT_CAP_LABEL[cap]}`}
-                    disabled={!props.canSet}
-                    title={props.canSet ? undefined : 'Read-only: set `l4.allow_agent_*` in config and restart (this core has no live setter).'}
-                    onClick={() => props.canSet && props.onSet(cap, !on())}
-                  />
-                  <label>{AGENT_CAP_LABEL[cap]}</label>
-                  <Show when={!props.canSet}>
-                    <span class={css.reason}>config only</span>
-                  </Show>
-                </div>
-              );
-            }}
-          </For>
-        </div>
-      )}
-    </Show>
-    <p class={css.note}>
-      An agent cannot change its own L4 gates; only an operator sets them. Each gate is the second of
-      two dimensions — the agent policy must also allow the call.
-    </p>
-  </section>
-);
+/**
+ * The connection's role accessor, or `null` when this panel is mounted bare — outside `AppProvider`
+ * there is no bus connection at all (a unit mount of the switches), so there is nothing to gate and
+ * nothing a switch could send. The app always mounts the agent panel under the provider.
+ */
+function connectionRole(): (() => 'operator' | 'agent' | null) | null {
+  try {
+    const bus = useApp().bus;
+    return () => bus.role();
+  } catch {
+    return null;
+  }
+}
+
+export const L4Toggles: Component<L4TogglesProps> = (props) => {
+  const role = connectionRole();
+  /** The D12 gate: `null` on an operator connection (or a bare mount), else the reason every switch shows. */
+  const operatorOnly = () => (role ? operatorOnlyReason(role()) : null);
+
+  function set(cap: AgentCap, allowed: boolean): void {
+    if (operatorOnly() !== null) return; // D12: an agent connection sends nothing
+    if (!props.canSet) return;
+    props.onSet(cap, allowed);
+  }
+
+  return (
+    <section class={css.section} aria-label="L4 agent capabilities">
+      <div class={css.sectionHead}>L4 agent capabilities</div>
+      <Show
+        when={props.gates}
+        fallback={<p class={css.note}>L4 agent gates are unavailable — this core does not expose `l4.agent.status`.</p>}
+      >
+        {(gates) => (
+          <div class={css.toggles} role="group" aria-label="L4 capability toggles">
+            <For each={AGENT_CAPS}>
+              {(cap) => {
+                const on = () => gates()[cap];
+                return (
+                  <div class={css.toggleRow}>
+                    <button
+                      type="button"
+                      role="switch"
+                      class={css.switch}
+                      data-cap={cap}
+                      aria-checked={on()}
+                      aria-label={`Agent ${AGENT_CAP_LABEL[cap]}`}
+                      disabled={operatorOnly() !== null || !props.canSet}
+                      title={
+                        operatorOnly() ??
+                        (props.canSet ? undefined : 'Read-only: set `l4.allow_agent_*` in config and restart (this core has no live setter).')
+                      }
+                      data-operator-only={operatorOnly() !== null ? 'true' : undefined}
+                      onClick={() => set(cap, !on())}
+                    />
+                    <label>{AGENT_CAP_LABEL[cap]}</label>
+                    <Show when={operatorOnly()} fallback={<Show when={!props.canSet}><span class={css.reason}>config only</span></Show>}>
+                      <span class={css.reason}>operator only</span>
+                    </Show>
+                  </div>
+                );
+              }}
+            </For>
+          </div>
+        )}
+      </Show>
+      <p class={css.note}>
+        An agent cannot change its own L4 gates; only an operator sets them. Each gate is the second of
+        two dimensions — the agent policy must also allow the call.
+      </p>
+    </section>
+  );
+};

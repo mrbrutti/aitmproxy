@@ -8,12 +8,16 @@
 // `tools/list` offers `l4.scope.add` with `confirmable: true` (spec §3, AC39) — against a core
 // without the operator confirm there is no form, not a form that can only fail — and every add goes
 // through the same confirm-over-the-wire dialog as inject, showing the core's prompt. Validation
-// text is the core's; nothing here second-guesses the entry.
+// text is the core's; nothing here second-guesses the entry. Role (spec §7(c) D12, AC24): capture
+// start/stop and the scope add are operator-only, so on a connection that is not the operator's
+// (`useApp().bus.role()` is `agent` or unknown) each renders disabled with `OPERATOR_ONLY_REASON`
+// and its handler returns before calling out — nothing reaches the bus even from a forced click.
 import { createSignal, For, Show, type Component } from 'solid-js';
 import { Button } from '~/components/Button';
+import { useApp } from '~/state/context';
 import { ConfirmInject } from './ConfirmInject';
 import type { GuardedOutcome } from './inject';
-import { supportsOperatorScopeAdd, type L4Availability, type L4Direction, type L4ScopeDraft, type L4ScopeEntryWire } from './model';
+import { operatorOnlyReason, supportsOperatorScopeAdd, type L4Availability, type L4Direction, type L4ScopeDraft, type L4ScopeEntryWire } from './model';
 import css from './l4.module.css';
 
 export interface CaptureControlsProps {
@@ -49,8 +53,21 @@ interface PendingScopeAdd {
 }
 
 export const CaptureControls: Component<CaptureControlsProps> = (props) => {
+  const bus = useApp().bus;
+  /** The D12 gate: `null` on an operator connection, else the reason every Sensitive control shows. */
+  const operatorOnly = () => operatorOnlyReason(bus.role());
   const [iface, setIface] = createSignal('lo0');
   const [direction, setDirection] = createSignal<L4Direction>('inbound');
+
+  function start(): void {
+    if (operatorOnly() !== null) return; // D12: an agent connection sends nothing
+    props.onStart(iface().trim(), direction());
+  }
+
+  function stop(id: string): void {
+    if (operatorOnly() !== null) return; // D12: an agent connection sends nothing
+    props.onStop(id);
+  }
 
   // The add form's draft, one signal per `l4.scope.add` argument.
   const [scopeCidr, setScopeCidr] = createSignal('127.0.0.1/32');
@@ -73,6 +90,7 @@ export const CaptureControls: Component<CaptureControlsProps> = (props) => {
 
   async function submitScopeAdd(e: Event): Promise<void> {
     e.preventDefault();
+    if (operatorOnly() !== null) return; // D12: an agent connection sends nothing
     if (submitting() || pending()) return;
     setSubmitting(true);
     setAddRefusal(null);
@@ -88,6 +106,7 @@ export const CaptureControls: Component<CaptureControlsProps> = (props) => {
   }
 
   async function confirmScopeAdd(): Promise<void> {
+    if (operatorOnly() !== null) return; // D12: an agent connection sends nothing
     const p = pending();
     if (!p || p.busy) return;
     setPending({ ...p, busy: true, refusal: null });
@@ -124,17 +143,28 @@ export const CaptureControls: Component<CaptureControlsProps> = (props) => {
             <option value="outbound">outbound</option>
           </select>
         </label>
-        <Button
-          variant="outline"
-          data-testid="l4-capture-start"
-          disabled={!props.capture.available}
-          title={props.capture.available ? undefined : (props.capture.reason ?? undefined)}
-          onClick={() => props.onStart(iface().trim(), direction())}
+        <Show
+          when={operatorOnly()}
+          fallback={
+            <Button
+              variant="outline"
+              data-testid="l4-capture-start"
+              disabled={!props.capture.available}
+              title={props.capture.available ? undefined : (props.capture.reason ?? undefined)}
+              onClick={() => start()}
+            >
+              Start capture
+            </Button>
+          }
         >
-          Start capture
-        </Button>
+          {(reason) => (
+            <Button variant="outline" data-testid="l4-capture-start" data-operator-only="true" disabled title={reason()}>
+              Start capture
+            </Button>
+          )}
+        </Show>
       </div>
-      <Show when={!props.capture.available && props.capture.reason}>
+      <Show when={operatorOnly() ?? (props.capture.available ? null : props.capture.reason)}>
         {(reason) => (
           <p class={css.note} data-testid="l4-capture-reason">
             {reason()}
@@ -145,7 +175,14 @@ export const CaptureControls: Component<CaptureControlsProps> = (props) => {
         <div class={css.controls} role="group" aria-label="Running captures">
           <For each={props.running}>
             {(id) => (
-              <Button variant="outline" aria-label={`Stop capture ${id}`} onClick={() => props.onStop(id)}>
+              <Button
+                variant="outline"
+                aria-label={`Stop capture ${id}`}
+                disabled={operatorOnly() !== null}
+                title={operatorOnly() ?? undefined}
+                data-operator-only={operatorOnly() !== null ? 'true' : undefined}
+                onClick={() => stop(id)}
+              >
                 Stop {id}
               </Button>
             )}
@@ -211,7 +248,14 @@ export const CaptureControls: Component<CaptureControlsProps> = (props) => {
               <option value="intercept">intercept</option>
             </select>
           </label>
-          <Button variant="outline" type="submit" data-testid="l4-scope-add" disabled={submitting() || pending() !== null}>
+          <Button
+            variant="outline"
+            type="submit"
+            data-testid="l4-scope-add"
+            disabled={operatorOnly() !== null || submitting() || pending() !== null}
+            title={operatorOnly() ?? undefined}
+            data-operator-only={operatorOnly() !== null ? 'true' : undefined}
+          >
             Add L4 scope
           </Button>
         </form>
