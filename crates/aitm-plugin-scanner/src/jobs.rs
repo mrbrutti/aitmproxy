@@ -2850,6 +2850,73 @@ mod tests {
             .expect("a different l4 port, and a free origin, is admitted");
     }
 
+    /// The accepted side effect of amendment 73a (call C10): because an
+    /// entry's `origins` now also holds the job's L4 `ip:port` targets,
+    /// [`crate::jobs::JobRegistry::newest_for_target`] — `scan.sitemap`'s
+    /// target resolver — matches those strings too.
+    ///
+    /// Harmless, and pinned here with the reason: the verb normalizes its
+    /// `target` through [`crate::profiles::normalize_origin`] first, and a
+    /// bare `ip:port` is not an origin, so the resolver is never reached with
+    /// one from the bus. A caller that *does* reach it (an in-process caller,
+    /// or an origin spelled `http://127.0.0.1:9`) gets the L4 job and its
+    /// empty site map rather than a `not_found`, which is what C10 accepted.
+    #[test]
+    fn newest_for_target_also_answers_to_an_l4_ip_port() {
+        use aitm_scan_model::{JobState, JobStatus};
+
+        let registry = crate::jobs::JobRegistry::new(10);
+        let targets = vec!["http://a.test:80".to_string(), "127.0.0.1:9".to_string()];
+        assert!(registry.try_insert(crate::jobs::JobEntry {
+            status: Arc::new(std::sync::RwLock::new(JobStatus {
+                job: "scan-0000000a".to_string(),
+                state: JobState::Running,
+                started_at: 10,
+                targets: targets.clone(),
+                ..JobStatus::default()
+            })),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            confine: None,
+            started_by: Default::default(),
+            discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+            origins: targets.clone(),
+            is_agent: false,
+            terminal: tokio::sync::watch::channel(false).0,
+        }));
+
+        assert_eq!(
+            registry.newest_for_target("127.0.0.1:9"),
+            Some("scan-0000000a".to_string()),
+            "the L4 target the job is single-flight on resolves to it"
+        );
+        assert_eq!(
+            registry.newest_for_target("http://a.test:80"),
+            Some("scan-0000000a".to_string()),
+            "the HTTP origin resolves exactly as before"
+        );
+        assert_eq!(
+            registry.newest_for_target("127.0.0.1:10"),
+            None,
+            "another port is another target"
+        );
+        // The job it resolves to has an empty site map, not a wrong one.
+        let handles = registry
+            .entry_handles("scan-0000000a")
+            .expect("the entry is there");
+        let discovery = handles.discovery.read().expect("discovery");
+        assert!(discovery.points.is_empty() && discovery.nodes.is_empty());
+        drop(discovery);
+
+        // And `scan.sitemap`'s own front door refuses the spelling before the
+        // resolver sees it, so nothing on the bus changed shape.
+        let refused = crate::profiles::normalize_origin("127.0.0.1:9")
+            .expect_err("a bare ip:port is not an origin");
+        assert!(
+            refused.contains("is not an origin"),
+            "the sitemap verb's refusal names the shape: {refused}"
+        );
+    }
+
     /// AC T5-3 (spec D8.4): a lane refuses a profile it cannot run **before**
     /// the job is spawned, so the caller learns it from `scan.start` itself.
     #[tokio::test(flavor = "multi_thread")]

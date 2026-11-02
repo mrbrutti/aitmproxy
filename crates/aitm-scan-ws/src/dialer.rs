@@ -1724,7 +1724,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn into_flows_records_a_replay_conversation() {
         let (transport, _log) = ws_server(None, echo_handler);
-        let dialer = WsDialer::new(transport);
+        let dialer = WsDialer::new(transport.clone() as Arc<dyn crate::transport::WsTransport>);
         let (handshake, _) = captured_conversation();
         let guard = guard_in_scope();
         let mut conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
@@ -1749,6 +1749,20 @@ mod tests {
         let response_peer = http.response.as_ref().and_then(|r| r.peer);
         assert!(response_peer.is_some(), "the WS dialer knows its peer");
         assert_eq!(response_peer, http.server_conn.as_ref().map(|c| c.peer));
+        // And it is the address this dial actually connected to — the
+        // transport recorded it — not merely an address consistent with the
+        // flow's own `server_conn` (tester, PR 3b).
+        assert_eq!(
+            transport.connects().len(),
+            1,
+            "one dial: {:?}",
+            transport.connects()
+        );
+        assert_eq!(
+            response_peer,
+            transport.connects().first().map(|(addr, _, _)| *addr),
+            "the response names the address the dialer asked the transport for"
+        );
         assert!(http.metadata.is_replay);
         assert_eq!(http.metadata.marks, vec!["scan:job-1".to_string()]);
         assert_eq!(

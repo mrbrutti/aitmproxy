@@ -530,6 +530,279 @@ async fn nosqli_json_meta_declares_both_kinds_and_wants_json() {
     );
 }
 
+/// The document branch's **other** oracle (call C12): no status flip, but the
+/// operator widened the result set materially while a plain string at the same
+/// field left it where the baseline was. The status-flip arm above and this one
+/// are the only two ways the check reports a finding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_reports_a_widened_result_set_when_the_string_control_does_not() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let body_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/search",
+        Some(LOGIN_BODY),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    // A route that answers 200 to everything: one record for the baseline and
+    // for the string control, the whole table for the operator document.
+    let one_record = "b".repeat(100);
+    let whole_table = "b".repeat(400);
+    let widened = Replies::plain(200, &one_record)
+        .when("$ne", 200, &whole_table)
+        .when("aitm", 200, &one_record)
+        .build();
+    let verdict = run(&check, &body_point, &widened).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable);
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(
+        verdict.location,
+        Some(VerdictLocation {
+            path: None,
+            name: Some("password".to_string()),
+        })
+    );
+    assert_eq!(
+        verdict.evidence.matched.as_deref(),
+        Some(
+            "result set 100 -> 400 bytes with an operator at \"password\"; \
+             the string control answered 100 bytes"
+        ),
+        "the size rule names both the operator's answer and the control's"
+    );
+    assert_eq!(
+        widened
+            .payloads()
+            .iter()
+            .map(|sent| compact(sent))
+            .collect::<Vec<String>>(),
+        vec![
+            compact(r#"{"password":{"$ne":null},"username":"alice"}"#),
+            compact(&format!(
+                r#"{{"password":"aitm{MARKER}","username":"alice"}}"#
+            )),
+        ],
+        "one operator and its control; the second operator and the second \
+         field are not spent once the first field is a finding"
+    );
+}
+
+/// The control is what makes the size rule a finding rather than noise: a route
+/// whose answer grows for *any* value it has not seen grows for the string
+/// control too, and then nothing is reported. Every operator is still tried, at
+/// every string field, each with its own control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_reports_nothing_when_the_string_control_moved_too() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let body_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/search",
+        Some(LOGIN_BODY),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    let one_record = "b".repeat(100);
+    let whole_table = "b".repeat(400);
+    let noisy = Replies::plain(200, &one_record)
+        .when("$ne", 200, &whole_table)
+        .when("$gt", 200, &whole_table)
+        .when("aitm", 200, &whole_table)
+        .build();
+    let verdict = run(&check, &body_point, &noisy).await;
+
+    assert_eq!(
+        verdict.outcome,
+        Outcome::Clean,
+        "a route that answers anything unfamiliar the same way is not a finding"
+    );
+    assert_eq!(
+        verdict.detail,
+        "A query-operator document at any string field of this JSON body did not change the answer."
+    );
+    assert_eq!(
+        noisy
+            .payloads()
+            .iter()
+            .map(|sent| compact(sent))
+            .collect::<Vec<String>>(),
+        vec![
+            compact(r#"{"password":{"$ne":null},"username":"alice"}"#),
+            compact(&format!(
+                r#"{{"password":"aitm{MARKER}","username":"alice"}}"#
+            )),
+            compact(r#"{"password":{"$gt":""},"username":"alice"}"#),
+            compact(&format!(
+                r#"{{"password":"aitm{MARKER}","username":"alice"}}"#
+            )),
+            compact(r#"{"password":"[redacted]","username":{"$ne":null}}"#),
+            compact(&format!(
+                r#"{{"password":"[redacted]","username":"aitm{MARKER}"}}"#
+            )),
+            compact(r#"{"password":"[redacted]","username":{"$gt":""}}"#),
+            compact(&format!(
+                r#"{{"password":"[redacted]","username":"aitm{MARKER}"}}"#
+            )),
+        ],
+        "operator then control at each field in turn, and the field is put \
+         back before the next one — no document ever carries two operators"
+    );
+}
+
+/// The budget arm: a body wide enough that the operators and their controls
+/// outrun the probes the job has left stops where the budget stops and says so.
+/// A `clean` there would be a claim about fields that were never tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_is_inconclusive_when_the_budget_runs_out_mid_document() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    // Five string fields; every operator moves the answer and so costs a
+    // control as well — four probes a field, against the sixteen the host
+    // lends, so the fifth field is never reached.
+    let wide_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/search",
+        Some(r#"{"f1":"v","f2":"v","f3":"v","f4":"v","f5":"v"}"#),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    let one_record = "b".repeat(100);
+    let whole_table = "b".repeat(400);
+    let noisy = Replies::plain(200, &one_record)
+        .when("$", 200, &whole_table)
+        .when("aitm", 200, &whole_table)
+        .build();
+    let verdict = run(&check, &wide_point, &noisy).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert_eq!(verdict.confidence, Confidence::Tentative);
+    assert_eq!(
+        verdict.detail,
+        "the probe budget ran out before every string field of this JSON body had been tried"
+    );
+    assert_eq!(
+        noisy.payloads().len(),
+        16,
+        "it stops at the budget, it does not keep sending: {:?}",
+        noisy.payloads()
+    );
+    assert_eq!(
+        verdict.evidence.payload.as_deref().map(compact),
+        Some(compact(
+            r#"{"f1":"v","f2":"v","f3":"v","f4":{"$gt":""},"f5":"v"}"#
+        )),
+        "the evidence is the last document it managed to send"
+    );
+}
+
+/// The completeness guard reads the document, not its last character: a string
+/// value holding braces, brackets and escaped quotes is a *whole* document and
+/// the check proceeds to probe it (and, in doing so, keeps those escapes intact
+/// in the document it rebuilds).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_takes_a_document_whose_strings_hold_braces_and_escaped_quotes() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let tricky = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/search",
+        Some(r#"{"q":"he said \"hi\" } ] {","user":"alice"}"#),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    let host = Replies::plain(401, r#"{"ok":false}"#).build();
+    let verdict = run(&check, &tricky, &host).await;
+
+    assert_eq!(
+        verdict.outcome,
+        Outcome::Clean,
+        "the document is whole, so it is probed and decided, not refused"
+    );
+    assert_eq!(
+        host.payloads().len(),
+        4,
+        "two operators at each of the two string fields: {:?}",
+        host.payloads()
+    );
+    // Keys come back in a Rhai map's sorted order, so the operator visits `q`
+    // first; the tricky value is then the *other* field, and it must survive
+    // the rebuild byte for byte, escapes and all.
+    assert!(
+        host.payloads()[0].contains(r#""$ne""#) && host.payloads()[0].contains(r#""user":"alice""#),
+        "the first operator document sits at `q`: {:?}",
+        host.payloads()[0]
+    );
+    assert!(
+        host.payloads()[2].contains(r#""user":{"$ne":null}"#)
+            && host.payloads()[2].contains(r#"he said \"hi\" } ] {"#),
+        "the operator document keeps the other field's escapes: {:?}",
+        host.payloads()[2]
+    );
+}
+
+/// Everything the document branch refuses rather than guesses at, in one place:
+/// a top-level array, a bare scalar, a document with one brace too many, and a
+/// point with no example at all. Each is the `inconclusive` of
+/// [`nosqli_json_is_inconclusive_when_the_example_is_not_the_document`], and
+/// none of them spends a probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_refuses_a_body_that_is_not_one_whole_json_object() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let examples: Vec<Option<&str>> = vec![
+        Some(r#"[{"username":"alice"}]"#),
+        Some(r#""just a string""#),
+        Some("42"),
+        Some(r#"{"username":"alice"}}"#),
+        Some(""),
+        None,
+    ];
+
+    for example in examples {
+        let body_point = point(
+            InsertionKind::EntireBody,
+            "body",
+            "http://127.0.0.1:8080/api/login",
+            example,
+            &[PointTrait::Json, PointTrait::Structured],
+        );
+        let host = Replies::plain(401, r#"{"ok":false}"#).build();
+        let verdict = run(&check, &body_point, &host).await;
+
+        assert_eq!(
+            verdict.outcome,
+            Outcome::Inconclusive,
+            "{example:?} is not a whole JSON object: {verdict:?}"
+        );
+        assert_eq!(
+            verdict.detail,
+            "the JSON document is longer than the point's example; document-level operators need the whole body",
+            "{example:?}"
+        );
+        assert_eq!(
+            host.payloads(),
+            Vec::<String>::new(),
+            "{example:?} spent a probe"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_plain_string_return_is_read_as_inconclusive() {
     let check = Loaded::load_source(
@@ -571,5 +844,98 @@ fn the_retired_scripts_are_gone() {
     assert!(
         !active_path("check-open-redirect.rhai").exists(),
         "check-open-redirect.rhai is retired"
+    );
+}
+
+/// A JSON body whose fields are all numbers, booleans or nulls: the document
+/// branch has nowhere to put an operator, so it sends nothing at all — and
+/// still answers `clean` with `firm` confidence.
+///
+/// **Tester finding (PR 3b, document branch).** `Outcome::Clean` is "the check
+/// ran and found nothing" (`aitm-scan-model` vocab), and the detail says the
+/// operator "did not change the answer" when no operator was ever placed. The
+/// honest answer for a body with no string field is `inconclusive` (or a
+/// skip), as the cut example gets. This test pins what the shipped script does
+/// today so the fix is a deliberate edit here, not a silent change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_calls_a_body_with_no_string_field_clean_without_a_probe() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let body_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/search",
+        Some(r#"{"active":true,"id":7,"page":null}"#),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    let host = Replies::plain(401, r#"{"ok":false}"#).build();
+    let verdict = run(&check, &body_point, &host).await;
+
+    assert_eq!(
+        host.payloads(),
+        Vec::<String>::new(),
+        "no string field, so no operator document was ever built"
+    );
+    assert_eq!(
+        verdict.outcome,
+        Outcome::Clean,
+        "today's answer: {verdict:?}"
+    );
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(
+        verdict.detail,
+        "A query-operator document at any string field of this JSON body did not change the answer."
+    );
+    assert_eq!(verdict.evidence.payload, None);
+}
+
+/// The lane's `entire_body` example is **scrubbed** before the check sees it
+/// (`aitm-scan-http::redact::example`), and a secret-named field whose value is
+/// not quoted — a number, an object, `true`, `null` — is replaced value and
+/// quotes alike: `{"user":"a","api_key":12345}` reaches the script as
+/// `{"user":"a","api_key":[redacted]}`, pinned by
+/// `redact::tests::an_entire_body_example_with_an_unquoted_secret_value_is_no_longer_json`.
+///
+/// **Tester finding (PR 3b, document branch).** That text passes
+/// `is_whole_json_object` — its braces and brackets balance and no quote is
+/// left open — so the script hands it to `parse_json`, which fails, and the
+/// whole check ends as an `error` verdict on an ordinary JSON body. The guard
+/// the Task 11 review log accepted covers the *cut* example; this shape is not
+/// a cut and is not covered. The honest answer is the same `inconclusive` the
+/// cut gets. Pinned as it behaves today so the fix is a deliberate edit here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nosqli_json_errors_on_an_example_the_scrub_left_unparsable() {
+    let check = Loaded::load("check-nosqli-json.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+    let body_point = point(
+        InsertionKind::EntireBody,
+        "body",
+        "http://127.0.0.1:8080/api/login",
+        Some(r#"{"user":"a","api_key":[redacted]}"#),
+        &[PointTrait::Json, PointTrait::Structured],
+    );
+
+    let host = Replies::plain(401, r#"{"ok":false}"#).build();
+    let verdict = run(&check, &body_point, &host).await;
+
+    assert_eq!(
+        verdict.outcome,
+        Outcome::Error,
+        "today's answer on a scrubbed-unquoted-secret body: {verdict:?}"
+    );
+    assert!(
+        verdict.detail.contains("Variable not found: redacted"),
+        "the Rhai failure reaches the operator verbatim: {}",
+        verdict.detail
+    );
+    assert_eq!(
+        host.payloads(),
+        Vec::<String>::new(),
+        "the check dies before it probes"
     );
 }

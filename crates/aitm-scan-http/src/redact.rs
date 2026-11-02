@@ -387,6 +387,70 @@ mod tests {
         );
     }
 
+    /// Task 11b / call C13, the edges of the wider `entire_body` cap: the last
+    /// character that is kept, a multibyte document (the cut counts characters
+    /// and never splits one), and the scrub-before-cut order where it matters —
+    /// a credential sitting just inside the cap is masked, not shown.
+    #[test]
+    fn entire_body_examples_cut_at_exactly_the_wider_cap() {
+        // Exactly 1024 characters: the whole document survives, unchanged.
+        let exact = "y".repeat(MAX_ENTIRE_BODY_EXAMPLE_CHARS);
+        assert_eq!(example(InsertionKind::EntireBody, "body", &exact), exact);
+        // One more: the cut takes the last character and nothing else; no
+        // ellipsis is added.
+        let over = "y".repeat(MAX_ENTIRE_BODY_EXAMPLE_CHARS + 1);
+        let cut = example(InsertionKind::EntireBody, "body", &over);
+        assert_eq!(cut.chars().count(), MAX_ENTIRE_BODY_EXAMPLE_CHARS);
+        assert_eq!(cut, exact);
+
+        // A multibyte document: 2000 three-byte characters cut to 1024
+        // *characters* (3072 bytes), on a char boundary — a byte-wise cut
+        // would panic or emit a replacement character here.
+        let multibyte = "— ".repeat(1000); // em dash + space, 2000 chars
+        let cut = example(InsertionKind::EntireBody, "body", &multibyte);
+        assert_eq!(cut.chars().count(), MAX_ENTIRE_BODY_EXAMPLE_CHARS);
+        assert_eq!(cut.len(), 1024 + 512 * 2, "every em dash survives whole");
+        assert!(multibyte.starts_with(&cut));
+
+        // The scrub runs before the cut: a credential that sits inside the cap
+        // is masked in what the operator sees ...
+        let filler = "a".repeat(900);
+        let body = format!(r#"{{"note":"{filler}","password":"hunter2"}}"#);
+        let shown = example(InsertionKind::EntireBody, "body", &body);
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.ends_with(r#""password":"[redacted]"}"#), "{shown}");
+        // ... and one past the cap is cut away entirely, never half-shown.
+        let filler = "a".repeat(1100);
+        let body = format!(r#"{{"note":"{filler}","password":"hunter2"}}"#);
+        let shown = example(InsertionKind::EntireBody, "body", &body);
+        assert_eq!(shown.chars().count(), MAX_ENTIRE_BODY_EXAMPLE_CHARS);
+        assert!(!shown.contains("hunter"), "{shown}");
+    }
+
+    /// What the widened cap hands a document-level check when the body holds a
+    /// secret-named field whose value is **not** quoted: the scrub replaces the
+    /// whole value run, so the example is no longer parsable JSON. Pinned here
+    /// because `check-nosqli-json.rhai` rebuilds its probe from this string.
+    #[test]
+    fn an_entire_body_example_with_an_unquoted_secret_value_is_no_longer_json() {
+        assert_eq!(
+            example(
+                InsertionKind::EntireBody,
+                "body",
+                r#"{"user":"a","api_key":12345}"#
+            ),
+            r#"{"user":"a","api_key":[redacted]}"#
+        );
+        assert_eq!(
+            example(
+                InsertionKind::EntireBody,
+                "body",
+                r#"{"user":"a","auth":{"token":"t"}}"#
+            ),
+            r#"{"user":"a","auth":[redacted]"token":"[redacted]"}}"#
+        );
+    }
+
     #[test]
     fn safe_url_pins() {
         assert_eq!(
