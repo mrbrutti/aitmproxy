@@ -1356,10 +1356,11 @@ mod tests {
 
     /// Task 15 and call B7: an ordinary assembly carries the whole scanner v2
     /// verb surface plus one `check.<id>` command per catalogue entry. Which
-    /// entries exist depends on the lanes this build links (the interim HTTP
-    /// lane's five while no lane crate supplies `http`; T2's once it does), so
-    /// the manual verbs are checked against the engine's own catalogue, and the
-    /// interim ids only while the `http` lane is the interim one.
+    /// entries exist depends on the lanes this build links, so the manual
+    /// verbs are checked against the engine's own catalogue; the three shipped
+    /// passive checks are engine-native (spec amendment 24) and are asserted
+    /// unconditionally, the two legacy active ids only while the `http` lane
+    /// is the interim one.
     #[test]
     fn scan_verbs_and_manual_checks_are_registered() {
         let mut cfg = Config::default();
@@ -1384,18 +1385,25 @@ mod tests {
                 "check.{id} is registered for catalogue entry {id}"
             );
         }
+        // Spec amendment 24 ("the passives stay"): the engine ships the three
+        // passive checks whatever lane holds the http slot, so their manual
+        // verbs are on every build.
+        for id in ["reflection", "security-header", "cookie-flag"] {
+            assert!(
+                ids.iter().any(|have| have == id),
+                "shipped passive check {id} is in the catalogue"
+            );
+            assert!(
+                reg.command(&format!("check.{id}")).is_some(),
+                "check.{id} is registered"
+            );
+        }
         let http_is_interim = engine.lane_entries().iter().any(|e| {
             e.lane == aitm_scan_model::LaneKind::Http
                 && e.source == aitm_scan_model::LaneSource::Interim
         });
         if http_is_interim {
-            for id in [
-                "xss-reflected",
-                "open-redirect",
-                "reflection",
-                "security-header",
-                "cookie-flag",
-            ] {
+            for id in ["xss-reflected", "open-redirect"] {
                 assert!(
                     ids.iter().any(|have| have == id),
                     "interim check {id} is in the catalogue"
