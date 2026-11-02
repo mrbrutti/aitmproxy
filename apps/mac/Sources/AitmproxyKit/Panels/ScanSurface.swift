@@ -1532,41 +1532,40 @@ public enum ScanFormat {
     /// `yes` / `no`, for the session and L4 evidence flags.
     public static func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
 
-    /// The state word, or the phase word while running.
-    static func stateWord(_ summary: ScanJobSummary) -> String {
-        summary.state == .running ? summary.phase.word : summary.state.word
+    /// The hosts of the status's targets, `host[:port]` each; empty until a status lands.
+    static func hostList(_ facts: ScanJobFacts) -> [String] {
+        facts.status?.targets.map(hostOf(origin:)) ?? []
     }
 
-    static func hosts(_ status: ScanJobStatus?) -> String? {
-        guard let targets = status?.targets, !targets.isEmpty else { return nil }
-        return targets.map(hostOf(origin:)).joined(separator: ", ")
+    /// The hosts joined with `, `; nil when none are known.
+    static func hosts(_ facts: ScanJobFacts) -> String? {
+        let hosts = hostList(facts)
+        return hosts.isEmpty ? nil : hosts.joined(separator: ", ")
     }
 
     /// The status's profile name; nil when there is no status or it carries none (`""`).
-    private static func profileName(_ status: ScanJobStatus?) -> String? {
-        guard let name = status?.profileName, !name.isEmpty else { return nil }
+    static func profileName(_ facts: ScanJobFacts) -> String? {
+        guard let name = facts.status?.profileName, !name.isEmpty else { return nil }
         return name
     }
 
-    /// `Auditing · standard · 127.0.0.1:8080`; `—` for what `scan.status` has not told us yet.
+    /// PR 1's row line, `Auditing · standard · 127.0.0.1:8080`, spelled from the D10
+    /// cells. `ScanJobRow` reads it until Jobs view plan Task 2.7 lays the row out as
+    /// cells; it is not a home for words of its own.
     public static func jobRowLine1(_ summary: ScanJobSummary, status: ScanJobStatus?) -> String {
-        [stateWord(summary), profileName(status) ?? "—", hosts(status) ?? "—"].joined(separator: " · ")
+        let facts = ScanJobFacts(summary: summary, status: status)
+        return [stateWord(facts), profileText(facts), hostsText(facts)].joined(separator: " · ")
     }
 
-    /// `probes 418 / 2000 · points 80 / 120 audited · 0:42`.
+    /// `probes 418 / 2000 · points 80 / 120 audited · 0:42`: PR 1's second row line,
+    /// read by `ScanJobRow` until Task 2.7.
     public static func jobRowLine2(_ summary: ScanJobSummary) -> String {
         [probesText(summary.probes), pointsText(summary.points), elapsed(ms: summary.elapsedMs)].joined(separator: " · ")
     }
 
-    /// The row's words for VoiceOver (D13); the severity bar hides behind it.
+    /// PR 1's label signature over the D14 sentence; `ScanJobRow` reads it until Task 2.7.
     public static func jobAccessibilityLabel(_ summary: ScanJobSummary, status: ScanJobStatus?) -> String {
-        var parts = [summary.state.word, summary.phase.rawValue]
-        if let name = profileName(status) { parts.append(name) }
-        if let hosts = hosts(status) { parts.append(hosts) }
-        parts.append("\(summary.probes.sent) of \(summary.probes.budget) probes")
-        parts.append("\(summary.points.audited) of \(summary.points.found) points audited")
-        parts.append(severityCountsInWords(summary.issues.bySeverity))
-        return parts.joined(separator: ", ")
+        jobAccessibilityLabel(ScanJobFacts(summary: summary, status: status))
     }
 
     /// `3 issues: 1 high, 1 medium, 1 low` / `no issues`.
@@ -1684,5 +1683,437 @@ public enum ScanFormat {
     /// sentences, Jobs view D4). The one singular rule.
     public static func plural(_ n: Int, _ noun: String, grouped: Bool = false) -> String {
         "\(grouped ? Self.grouped(n) : String(n)) \(noun)\(n == 1 ? "" : "s")"
+    }
+}
+
+// MARK: - The Jobs table's and the card's words (Jobs view D10, D11, D14, D17)
+
+/// The job card's tone (Jobs view D11): one Kit value the app maps to its token
+/// pair once (`ScanToneColors`). Queued and running share the progress pair,
+/// cancelled is neutral (Architect's call).
+public enum ScanJobTone: Equatable, Sendable { case progress, pending, success, danger, neutral }
+
+/// The finding line under the card's heading (Jobs view D11). `parts` carry the
+/// roles the view inks differently; joined, they are `text`. `reason` is the
+/// stopped-reason sentence a terminal job shows above the line, nil when none.
+public struct ScanFindingLine: Equatable, Sendable {
+    public enum Role: Equatable, Sendable { case plain, figure, checkId, agent }
+
+    public struct Part: Equatable, Sendable {
+        public var text: String
+        public var role: Role
+
+        public init(text: String, role: Role) {
+            self.text = text
+            self.role = role
+        }
+    }
+
+    /// The stopped-reason sentence, terminal only; nil when there is none to say.
+    public var reason: String?
+    /// The line's pieces in order; joined, they are `text`.
+    public var parts: [Part]
+    /// The line as one string (the AX value, the tests' pin).
+    public var text: String
+    /// Whether an MCP or agent frontend started the job (the `an agent` part is inked).
+    public var agentOriginated: Bool
+
+    public init(reason: String?, parts: [Part], text: String, agentOriginated: Bool) {
+        self.reason = reason
+        self.parts = parts
+        self.text = text
+        self.agentOriginated = agentOriginated
+    }
+}
+
+/// One group of the card's issue ledger (Jobs view D11): the marks drawn, capped at
+/// `ScanFormat.ledgerMarkCap`, and the count word that carries the true count.
+public struct ScanLedgerGroup: Equatable, Sendable {
+    public var severity: ScanSeverity
+    public var count: Int
+    public var marks: Int
+    /// `4 low`.
+    public var word: String
+
+    public init(severity: ScanSeverity, count: Int, marks: Int, word: String) {
+        self.severity = severity
+        self.count = count
+        self.marks = marks
+        self.word = word
+    }
+}
+
+extension ScanFormat {
+    // MARK: Fixed words (D10, D11, D17)
+
+    /// The table's header labels, sentence case, in column order.
+    public static let tableHeaders = ["State", "Profile", "Target", "Progress", "Probes", "Points", "Issues", "Elapsed"]
+    /// The KPI strip's labels, in cell order.
+    public static let kpiLabels = ["Progress", "Checks", "Probes", "Points audited", "Issues"]
+    public static let gaugeLabel = "probe budget"
+    public static let laneCrawlLabel = "crawl"
+    public static let laneAuditLabel = "audit"
+    /// What a cell shows for a value the bus has not said.
+    public static let missingValue = "—"
+    public static let agentDotHelp = "started by an agent"
+    public static let wellCrawlTitle = "Crawl and points"
+    public static let wellCrawlSubtitle = "what the job found to test"
+    public static let wellIssuesTitle = "Issues"
+    public static let wellIssuesSubtitle = "by severity and confidence"
+    /// The most marks one ledger group draws; the word carries the true count.
+    public static let ledgerMarkCap = 12
+    /// The help strings of the UX section, verbatim. `Stop` here is the one allowed
+    /// use of the verb in a Jobs string (AC32).
+    public static let cancelScanHelp = "Stop this job; the issues and site map it found stay (⌥⌘.)"
+    public static let scanAgainHelpGeneric = "Start a new job with this job's profile and target"
+    public static let showIssuesHelp = "Open the Issues tab filtered to this job"
+    public static let showSiteMapHelp = "Open the Site map tab for this job"
+    /// The most characters of a `started_by.client_label` the finding line shows.
+    static let startedByLabelMax = 40
+
+    /// The keys of the card's two wells (Jobs view D11), one constant each.
+    public enum WellKey {
+        public static let pagesFetched = "Pages fetched"
+        public static let pagesWaiting = "Pages waiting"
+        public static let depth = "Depth"
+        public static let formsSubmitted = "Forms submitted"
+        public static let formsNotSubmitted = "Forms not submitted"
+        public static let crawlErrors = "Crawl errors"
+        public static let pointsFound = "Points found"
+        public static let waitingForAudit = "Waiting for audit"
+        public static let audited = "Audited"
+        public static let lanes = "Lanes"
+        public static let probesByLane = "Probes by lane"
+        public static let session = "Session"
+        public static let criticalHighMedium = "Critical · High · Medium"
+        public static let low = "Low"
+        public static let info = "Info"
+        public static let certainFirmTentative = "Certain · Firm · Tentative"
+        public static let probeErrors = "Probe errors · timeouts · rate waits"
+        public static let checks = "Checks scheduled · done · errors · skipped"
+
+        /// Every key, in the wells' order.
+        public static let all = [
+            pagesFetched, pagesWaiting, depth, formsSubmitted, formsNotSubmitted, crawlErrors, pointsFound,
+            waitingForAudit, audited, lanes, probesByLane, session, criticalHighMedium, low, info,
+            certainFirmTentative, probeErrors, checks,
+        ]
+    }
+
+    // MARK: The row's cells (D10)
+
+    /// The phase word while running, else the state word: `Auditing` / `Cancelling` /
+    /// `Done` (P23). The chip and the State cell both read it.
+    public static func stateWord(_ facts: ScanJobFacts) -> String {
+        let summary = facts.summary
+        return summary.state == .running ? summary.phase.word : summary.state.word
+    }
+
+    /// `standard`; `—` until the status lands or when it carries no name.
+    public static func profileText(_ facts: ScanJobFacts) -> String {
+        profileName(facts) ?? missingValue
+    }
+
+    /// `127.0.0.1:8117` / `a.test, b.test`; `—` until the status lands.
+    public static func hostsText(_ facts: ScanJobFacts) -> String {
+        hosts(facts) ?? missingValue
+    }
+
+    /// The Progress cell: `50 % · 3,236 of 6,468` while auditing with something
+    /// scheduled; the pages line while crawling; `Passive checks`; `Scheduling checks`;
+    /// `Writing results`; `—` while queued or before the status lands; the checks
+    /// `3,236 of 6,468` when terminal (`0 of 0` is the bus truth, shown as such).
+    public static func rowProgressText(_ facts: ScanJobFacts, _ progress: ScanJobProgress) -> String {
+        guard let status = facts.status else { return missingValue }
+        let checks = status.checks
+        switch facts.summary.state {
+        case .queued, .other:
+            return missingValue
+        case .running, .cancelling:
+            switch facts.summary.phase {
+            case .crawling:
+                return progress.phaseLine
+            case .passive:
+                return "Passive checks"
+            case .auditing:
+                guard checks.scheduled > 0, let percent = progress.percentText else { return ScanJobProgress.schedulingLine }
+                return "\(percent) · \(grouped(checks.done)) of \(grouped(checks.scheduled))"
+            case .reporting:
+                return ScanJobProgress.reportingLine
+            case .queued, .done, .other:
+                return progress.phaseLine
+            }
+        case .done, .cancelled, .failed:
+            return "\(grouped(checks.done)) of \(grouped(checks.scheduled))"
+        }
+    }
+
+    /// `4 low` / `1 high, 3 low`; `no issues yet` for a live job with none, `no issues` otherwise.
+    public static func severityWords(by: BySeverity, running: Bool) -> String {
+        let parts = severityWordParts(by: by)
+        guard !parts.isEmpty else { return running ? "no issues yet" : "no issues" }
+        return parts.map(\.1).joined(separator: ", ")
+    }
+
+    /// `[(.high, "1 high"), (.low, "3 low")]`, critical → info, zero counts omitted;
+    /// the view inks each in its severity's colour.
+    public static func severityWordParts(by: BySeverity) -> [(ScanSeverity, String)] {
+        severityCounts(by).map { ($0, "\(grouped($1)) \($0.rawValue)") }
+    }
+
+    /// The non-zero tallies, critical → info.
+    static func severityCounts(_ by: BySeverity) -> [(ScanSeverity, Int)] {
+        [ScanSeverity.critical, .high, .medium, .low, .info].compactMap { severity in
+            let count = by.count(severity)
+            return count > 0 ? (severity, count) : nil
+        }
+    }
+
+    /// `4 jobs · 1 running` / `1 job` / `3 jobs`: the table container's accessibility label.
+    public static func jobsCaption(total: Int, running: Int) -> String {
+        let jobs = plural(total, "job", grouped: true)
+        return running > 0 ? "\(jobs) · \(grouped(running)) running" : jobs
+    }
+
+    // MARK: The card's heading and finding line (D11)
+
+    /// The hosts: `127.0.0.1:8117` / `a.test, b.test` / `a.test and 2 more`; `—` until known.
+    public static func jobHeading(_ facts: ScanJobFacts) -> String {
+        let hosts = hostList(facts)
+        guard let first = hosts.first else { return missingValue }
+        return hosts.count >= 3 ? "\(first) and \(hosts.count - 1) more" : hosts.joined(separator: ", ")
+    }
+
+    /// The full host list for the heading's help when three or more are cut to `and n more`.
+    public static func jobHeadingHelp(_ facts: ScanJobFacts) -> String? {
+        let hosts = hostList(facts)
+        return hosts.count >= 3 ? hosts.joined(separator: ", ") : nil
+    }
+
+    /// Whether an MCP or agent frontend started the job.
+    public static func agentOriginated(_ by: ScanStartedBy) -> Bool {
+        by.frontend == "mcp" || by.frontend == "agent"
+    }
+
+    /// Who started the job: `this app` (the mac app's own client label), `the CLI`,
+    /// `an agent`, an operator client's label (control and format scalars stripped,
+    /// cut to 40 characters), else `the operator`.
+    public static func startedByWords(_ by: ScanStartedBy) -> String {
+        let label = by.clientLabel.map { ScanWire.cleaned($0, max: startedByLabelMax) } ?? ""
+        if label == "aitm-mac" { return "this app" }
+        if by.frontend == "cli" { return "the CLI" }
+        if agentOriginated(by) { return "an agent" }
+        if by.frontend == "operator", !label.isEmpty { return label }
+        return "the operator"
+    }
+
+    /// `HH:mm`, 24-hour, of an epoch-millisecond stamp in the given zone.
+    public static func clock(ms: Int, timeZone: TimeZone) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let parts = calendar.dateComponents([.hour, .minute], from: Date(timeIntervalSince1970: Double(ms) / 1000))
+        return String(format: "%02ld:%02ld", parts.hour ?? 0, parts.minute ?? 0)
+    }
+
+    /// `no issues so far` / `4 low issues so far` / `1 high issue so far` / `5 issues so far: 1 high, 4 low`.
+    public static func issuesSoFar(by: BySeverity) -> String {
+        issuesSoFarParts(by).map(\.text).joined()
+    }
+
+    static func issuesSoFarParts(_ by: BySeverity) -> [ScanFindingLine.Part] {
+        let counts = severityCounts(by)
+        guard !counts.isEmpty else { return [plain("no issues so far")] }
+        if counts.count == 1, let (severity, count) = counts.first {
+            return [figure(count), plain(" \(severity.rawValue) issue\(count == 1 ? "" : "s") so far")]
+        }
+        var parts = [figure(by.total), plain(" issues so far: ")]
+        for (index, (severity, count)) in counts.enumerated() {
+            if index > 0 { parts.append(plain(", ")) }
+            parts.append(figure(count))
+            parts.append(plain(" \(severity.rawValue)"))
+        }
+        return parts
+    }
+
+    /// `xss-reflected running now` / `xss-reflected and 3 more checks running now`; nil when nothing runs.
+    public static func nowClause(running: [String]) -> String? {
+        nowClauseParts(running)?.map(\.text).joined()
+    }
+
+    static func nowClauseParts(_ running: [String]) -> [ScanFindingLine.Part]? {
+        guard let first = running.first else { return nil }
+        let more = running.count - 1
+        guard more > 0 else { return [checkId(first), plain(" running now")] }
+        return [checkId(first), plain(" and \(more) more check\(more == 1 ? "" : "s") running now")]
+    }
+
+    private static func plain(_ text: String) -> ScanFindingLine.Part { .init(text: text, role: .plain) }
+    private static func figure(_ n: Int) -> ScanFindingLine.Part { .init(text: grouped(n), role: .figure) }
+    private static func checkId(_ id: String) -> ScanFindingLine.Part { .init(text: id, role: .checkId) }
+
+    /// The finding line (Jobs view D11). Live: `<issues so far> · <now clause> ·
+    /// <profile> · started <h:mm> by <who>`; terminal: `<profile> · started <h:mm> by
+    /// <who> · finished <h:mm>` with the stopped-reason sentence as `reason`. The
+    /// clauses the status carries wait for it: before it lands a live line is the
+    /// issues clause alone and a terminal line is empty. A status without
+    /// `started_at` reads `started by <who>`.
+    public static func findingLine(_ facts: ScanJobFacts, timeZone: TimeZone) -> ScanFindingLine {
+        let summary = facts.summary
+        let terminal = summary.state.isTerminal
+        var clauses: [[ScanFindingLine.Part]] = []
+        var agent = false
+        var reason: String?
+        if !terminal { clauses.append(issuesSoFarParts(summary.issues.bySeverity)) }
+        if let status = facts.status {
+            if !terminal, let now = nowClauseParts(status.checks.running) { clauses.append(now) }
+            clauses.append([plain(profileText(facts))])
+            agent = agentOriginated(status.startedBy)
+            let when = status.startedAt > 0 ? " \(clock(ms: status.startedAt, timeZone: timeZone))" : ""
+            clauses.append([
+                plain("started\(when) by "), .init(text: startedByWords(status.startedBy), role: agent ? .agent : .plain),
+            ])
+            if terminal {
+                if let finishedAt = status.finishedAt, finishedAt > 0 {
+                    clauses.append([plain("finished \(clock(ms: finishedAt, timeZone: timeZone))")])
+                }
+                if let stopped = status.stoppedReason {
+                    reason = ScanEndText.stoppedReason(
+                        stopped, state: summary.state, probesBudget: summary.probes.budget, error: status.error)
+                }
+            }
+        }
+        var parts: [ScanFindingLine.Part] = []
+        for (index, clause) in clauses.enumerated() {
+            if index > 0 { parts.append(plain(" · ")) }
+            parts += clause
+        }
+        return ScanFindingLine(
+            reason: reason, parts: parts, text: parts.map(\.text).joined(), agentOriginated: agent)
+    }
+
+    // MARK: Tone, ledger, gauge, lane and KPI words (D11)
+
+    /// Queued and running → `.progress`; cancelling → `.pending`; done → `.success`;
+    /// failed → `.danger`; cancelled and an unknown state → `.neutral`.
+    public static func tone(_ facts: ScanJobFacts) -> ScanJobTone {
+        switch facts.summary.state {
+        case .queued, .running: .progress
+        case .cancelling: .pending
+        case .done: .success
+        case .failed: .danger
+        case .cancelled, .other: .neutral
+        }
+    }
+
+    /// One group per non-zero severity, critical → info, `marks = min(count, 12)`, `word = "4 low"`.
+    public static func ledgerGroups(by: BySeverity) -> [ScanLedgerGroup] {
+        severityCounts(by).map { severity, count in
+            ScanLedgerGroup(
+                severity: severity, count: count, marks: min(count, ledgerMarkCap), word: "\(grouped(count)) \(severity.rawValue)")
+        }
+    }
+
+    /// The gauge turns amber past 80 % of a known budget.
+    public static func budgetWarning(sent: Int, budget: Int) -> Bool {
+        budget > 0 && Double(sent) > 0.8 * Double(budget)
+    }
+
+    /// `287 of 2,000`; `287 probes` when the budget is unknown (`0`).
+    public static func probeBudgetText(sent: Int, budget: Int) -> String {
+        budget > 0 ? "\(grouped(sent)) of \(grouped(budget))" : plural(sent, "probe", grouped: true)
+    }
+
+    /// `287 of 2,000 probes sent (the probe budget, not progress)`; `287 probes sent (…)` without a budget.
+    public static func probesTileHelp(sent: Int, budget: Int) -> String {
+        let count = budget > 0 ? "\(grouped(sent)) of \(grouped(budget)) probes" : plural(sent, "probe", grouped: true)
+        return "\(count) sent (the probe budget, not progress)"
+    }
+
+    /// `4 issues: 1 high, 3 low` / `no issues`: the ledger's and the Issues KPI cell's help.
+    public static func issuesTileHelp(by: BySeverity) -> String {
+        let parts = severityWordParts(by: by)
+        guard !parts.isEmpty else { return "no issues" }
+        return "\(plural(by.total, "issue", grouped: true)): \(parts.map(\.1).joined(separator: ", "))"
+    }
+
+    /// `of 6,468`: the unit after a KPI or cell numeral.
+    public static func ofText(_ n: Int) -> String { "of \(grouped(n))" }
+
+    /// `3,236 checks done`: the audit segment's lower label.
+    public static func laneChecksDone(_ done: Int) -> String { plural(done, "check", grouped: true) + " done" }
+
+    /// `46 pages` / `1 page`: the crawl segment's lower label.
+    public static func lanePages(_ pages: Int) -> String { plural(pages, "page", grouped: true) }
+
+    /// `started 11:32`: the scale row's first entry.
+    public static func scaleStarted(_ clock: String) -> String { "started \(clock)" }
+
+    /// `elapsed 1:04`: the scale row's second entry.
+    public static func scaleElapsed(ms: Int) -> String { "elapsed \(elapsed(ms: ms))" }
+
+    /// The Crawl well's skipped-points rows, one per reason, zeros included:
+    /// `722 skipped as repetitive`, `6 skipped by rule`, `0 skipped at the per-request cap`.
+    public static func pointSkipWords(_ skipped: ScanPointCounters.Skipped) -> [String] {
+        [
+            "\(grouped(skipped.frequent)) skipped as repetitive",
+            "\(grouped(skipped.ignored)) skipped by rule",
+            "\(grouped(skipped.limit)) skipped at the per-request cap",
+        ]
+    }
+
+    // MARK: Accessibility (D14)
+
+    /// `1 minute 4 seconds` / `42 seconds` / `1 hour 2 minutes 3 seconds`; zero
+    /// components are left out, `0 seconds` for nothing.
+    public static func elapsedWords(ms: Int) -> String {
+        let total = max(0, ms) / 1000
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        var parts: [String] = []
+        if hours > 0 { parts.append(plural(hours, "hour")) }
+        if minutes > 0 { parts.append(plural(minutes, "minute")) }
+        if seconds > 0 || parts.isEmpty { parts.append(plural(seconds, "second")) }
+        return parts.joined(separator: " ")
+    }
+
+    /// `50 percent` for a determinate progress (the lane's accessibility value); nil otherwise.
+    public static func progressAccessibilityValue(_ progress: ScanJobProgress) -> String? {
+        progress.percentText.map { $0.replacingOccurrences(of: "\u{00A0}%", with: " percent") }
+    }
+
+    /// The row as one sentence: `Auditing, standard, 127.0.0.1:8117, 50 percent, 3,236
+    /// of 6,468 checks, 4 issues: 4 low, 1 minute 4 seconds.` The percent and the
+    /// progress line only when the progress is determinate; the profile and hosts only
+    /// once the status has said them.
+    public static func jobAccessibilityLabel(_ facts: ScanJobFacts) -> String {
+        let summary = facts.summary
+        let progress = ScanJobProgress(facts)
+        var parts = [stateWord(facts)]
+        if let name = profileName(facts) { parts.append(name) }
+        if let hosts = hosts(facts) { parts.append(hosts) }
+        if let percent = progressAccessibilityValue(progress) {
+            parts.append(percent)
+            parts.append(progress.phaseLine)
+        }
+        let by = summary.issues.bySeverity
+        parts.append(by.total > 0 ? issuesTileHelp(by: by) : severityWords(by: by, running: !summary.state.isTerminal))
+        parts.append(elapsedWords(ms: summary.elapsedMs))
+        return parts.joined(separator: ", ") + "."
+    }
+
+    /// The one VoiceOver announcement when the selected job ends: `Scan of
+    /// 127.0.0.1:8117 done: 4 issues.` / `… cancelled: no issues.` / `… failed.`
+    /// The job id names the scan while no host is known.
+    public static func endAnnouncement(_ facts: ScanJobFacts) -> String {
+        let subject = hostList(facts).isEmpty ? "Scan \(facts.job)" : "Scan of \(jobHeading(facts))"
+        let by = facts.summary.issues.bySeverity
+        let issues = by.total > 0 ? plural(by.total, "issue", grouped: true) : "no issues"
+        switch facts.summary.state {
+        case .done: return "\(subject) done: \(issues)."
+        case .cancelled: return "\(subject) cancelled: \(issues)."
+        case .failed: return "\(subject) failed."
+        default: return "\(subject) \(facts.summary.state.rawValue)."
+        }
     }
 }

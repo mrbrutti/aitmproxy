@@ -409,12 +409,21 @@ import Testing
 
         #expect(ScanFormat.probesText(status.probes) == "probes 418 / 2000")
         #expect(ScanFormat.pointsText(status.points) == "points 80 / 120 audited")
-        #expect(ScanFormat.jobRowLine2(list.jobs[0]) == "probes 418 / 2000 · points 80 / 120 audited · 0:42")
-        #expect(ScanFormat.jobRowLine1(list.jobs[0], status: status) == "Auditing · standard · 127.0.0.1:8080")
-        #expect(ScanFormat.jobRowLine1(list.jobs[1], status: nil) == "Done · — · —")
-        #expect(ScanFormat.jobAccessibilityLabel(list.jobs[0], status: status)
-                == "Running, auditing, standard, 127.0.0.1:8080, 418 of 2000 probes, 80 of 120 points audited, "
-                + "3 issues: 1 high, 1 medium, 1 low")
+        // The row's cells (Jobs view D10): the phase word while running, `—` for what `scan.status` has not told us yet.
+        let auditing = ScanJobFacts.make(summary: list.jobs[0], status: status)
+        #expect(ScanFormat.stateWord(auditing) == "Auditing")
+        #expect(ScanFormat.profileText(auditing) == "standard")
+        #expect(ScanFormat.hostsText(auditing) == "127.0.0.1:8080")
+        #expect(ScanFormat.rowProgressText(auditing, ScanJobProgress(auditing)) == "75\u{00A0}% · 180 of 240")
+        #expect(ScanFormat.elapsed(ms: auditing.summary.elapsedMs) == "0:42")
+        let unread = ScanJobFacts(summary: list.jobs[1], status: nil)
+        #expect(ScanFormat.stateWord(unread) == "Done")
+        #expect(ScanFormat.profileText(unread) == "—")
+        #expect(ScanFormat.hostsText(unread) == "—")
+        #expect(ScanFormat.rowProgressText(unread, ScanJobProgress(unread)) == "—")
+        #expect(ScanFormat.jobAccessibilityLabel(auditing)
+                == "Auditing, standard, 127.0.0.1:8080, 75 percent, 180 of 240 checks, 3 issues: 1 high, 1 medium, 1 low, "
+                + "42 seconds.")
         #expect(ScanFormat.severityCountsInWords(list.jobs[0].issues.bySeverity) == "3 issues: 1 high, 1 medium, 1 low")
         #expect(ScanFormat.severityCountsInWords(list.jobs[1].issues.bySeverity) == "no issues")
         #expect(ScanFormat.severityCountsInWords(issues.bySeverity) == "2 issues: 1 high, 1 medium")
@@ -1161,31 +1170,42 @@ extension ScanSurfaceTests {
 
         // MS-AC1: an unknown state renders as it came, in the row and for VoiceOver.
         let paused = try ScanListResult(json: ScanPack.edited(Self.load("scan.list.json"), path: ["jobs", "0", "state"], to: "paused")).jobs[0]
-        #expect(ScanFormat.jobRowLine1(paused, status: nil) == "paused · — · —")
-        #expect(ScanFormat.jobAccessibilityLabel(paused, status: nil)
-                == "paused, auditing, 418 of 2000 probes, 80 of 120 points audited, 3 issues: 1 high, 1 medium, 1 low")
+        let pausedFacts = ScanJobFacts(summary: paused, status: nil)
+        #expect(ScanFormat.stateWord(pausedFacts) == "paused")
+        #expect(ScanFormat.profileText(pausedFacts) == "—")
+        #expect(ScanFormat.hostsText(pausedFacts) == "—")
+        #expect(ScanFormat.rowProgressText(pausedFacts, ScanJobProgress(pausedFacts)) == "—")
+        #expect(ScanFormat.jobAccessibilityLabel(pausedFacts) == "paused, 3 issues: 1 high, 1 medium, 1 low, 42 seconds.")
 
         // A queued or cancelling job shows its state word, not its phase; only a running job shows the phase.
         let queued = try ScanStartResult(json: Self.load("scan.start.json")).status
-        #expect(ScanFormat.jobRowLine1(queued.summary, status: queued) == "Queued · standard · 127.0.0.1:8080")
+        let queuedFacts = ScanJobFacts.make(summary: queued.summary, status: queued)
+        #expect(ScanFormat.stateWord(queuedFacts) == "Queued")
+        #expect(ScanFormat.profileText(queuedFacts) == "standard")
+        #expect(ScanFormat.hostsText(queuedFacts) == "127.0.0.1:8080")
+        #expect(ScanFormat.rowProgressText(queuedFacts, ScanJobProgress(queuedFacts)) == "—")
         let cancelling = try ScanJobStatus(json: Self.load("scan.cancel.json"))
-        #expect(ScanFormat.jobRowLine1(cancelling.summary, status: cancelling) == "Cancelling · standard · 127.0.0.1:8080")
+        #expect(ScanFormat.stateWord(ScanJobFacts.make(summary: cancelling.summary, status: cancelling)) == "Cancelling")
         let crawling = try ScanStartResult(json: Self.load("scan.map.json")).status
-        #expect(ScanFormat.jobRowLine1(crawling.summary, status: crawling) == "Crawling · standard · 127.0.0.1:8080")
-        #expect(ScanFormat.jobRowLine2(crawling.summary) == "probes 0 / 0 · points 0 / 0 audited · 0:01")
+        let crawlingFacts = ScanJobFacts.make(summary: crawling.summary, status: crawling)
+        #expect(ScanFormat.stateWord(crawlingFacts) == "Crawling")
+        #expect(ScanFormat.rowProgressText(crawlingFacts, ScanJobProgress(crawlingFacts)) == "0 pages, 0 queued")
+        #expect(ScanFormat.elapsed(ms: crawlingFacts.summary.elapsedMs) == "0:01")
+        #expect(ScanFormat.ofText(crawlingFacts.summary.probes.budget) == "of 0")
 
         // A finished job with no status read yet.
-        #expect(ScanFormat.jobAccessibilityLabel(list.jobs[1], status: nil)
-                == "Done, done, 0 of 0 probes, 0 of 0 points audited, no issues")
+        let unread = ScanJobFacts(summary: list.jobs[1], status: nil)
+        #expect(ScanFormat.jobAccessibilityLabel(unread) == "Done, no issues, 42 seconds.")
         #expect(ScanFormat.severityCountsInWords(BySeverity(critical: 1, high: 0, medium: 0, low: 0, info: 0)) == "1 issue: 1 critical")
         #expect(ScanFormat.severityCountsInWords(BySeverity(critical: 2, high: 0, medium: 0, low: 0, info: 3)) == "5 issues: 2 critical, 3 info")
 
         // Two targets join with a comma; a target with a path or scheme in capitals is reduced to its authority.
         let two = ScanPack.edited(try Self.load("scan.status.json"), path: ["targets"], to: ["http://127.0.0.1:8080", "HTTPS://api.shop-staging.test/"])
         let status = try ScanJobStatus(json: two)
-        #expect(ScanFormat.jobRowLine1(status.summary, status: status) == "Auditing · standard · 127.0.0.1:8080, api.shop-staging.test")
+        #expect(ScanFormat.hostsText(ScanJobFacts.make(summary: status.summary, status: status))
+                == "127.0.0.1:8080, api.shop-staging.test")
         let noTargets = try ScanJobStatus(json: ScanPack.edited(try Self.load("scan.status.json"), path: ["targets"], to: []))
-        #expect(ScanFormat.jobRowLine1(noTargets.summary, status: noTargets) == "Auditing · standard · —")
+        #expect(ScanFormat.hostsText(ScanJobFacts.make(summary: noTargets.summary, status: noTargets)) == "—")
 
         // An issue row without a method (a WS or L4 lane) shows the path alone.
         var issue = try ScanIssuesResult(json: Self.load("scan.issues.json")).issues[0]
@@ -1645,17 +1665,22 @@ extension ScanSurfaceTests {
         let list = try ScanListResult(json: Self.load("scan.list.json"))
         let nameless = try ScanJobStatus(json: ScanPack.edited(Self.load("scan.status.json"), path: ["profile_name"], to: ""))
         #expect(nameless.profileName == "")
-        #expect(ScanFormat.jobRowLine1(list.jobs[0], status: nameless) == "Auditing · — · 127.0.0.1:8080")
-        #expect(ScanFormat.jobAccessibilityLabel(list.jobs[0], status: nameless)
-                == "Running, auditing, 127.0.0.1:8080, 418 of 2000 probes, 80 of 120 points audited, "
-                + "3 issues: 1 high, 1 medium, 1 low")
+        let namelessFacts = ScanJobFacts.make(summary: list.jobs[0], status: nameless)
+        #expect(ScanFormat.stateWord(namelessFacts) == "Auditing")
+        #expect(ScanFormat.profileText(namelessFacts) == "—")
+        #expect(ScanFormat.hostsText(namelessFacts) == "127.0.0.1:8080")
+        #expect(ScanFormat.jobAccessibilityLabel(namelessFacts)
+                == "Auditing, 127.0.0.1:8080, 75 percent, 180 of 240 checks, 3 issues: 1 high, 1 medium, 1 low, 42 seconds.")
         let absent = try ScanJobStatus(json: ScanPack.removing(Self.load("scan.status.json"), path: ["profile_name"]))
-        #expect(ScanFormat.jobRowLine1(list.jobs[0], status: absent) == "Auditing · — · 127.0.0.1:8080")
+        #expect(ScanFormat.profileText(ScanJobFacts.make(summary: list.jobs[0], status: absent)) == "—")
         let bare = try ScanJobStatus(json: ScanPack.edited(
             ScanPack.edited(Self.load("scan.status.json"), path: ["profile_name"], to: ""), path: ["targets"], to: []))
-        #expect(ScanFormat.jobRowLine1(list.jobs[0], status: bare) == "Auditing · — · —")
-        #expect(ScanFormat.jobAccessibilityLabel(list.jobs[0], status: bare)
-                == "Running, auditing, 418 of 2000 probes, 80 of 120 points audited, 3 issues: 1 high, 1 medium, 1 low")
+        let bareFacts = ScanJobFacts.make(summary: list.jobs[0], status: bare)
+        #expect(ScanFormat.profileText(bareFacts) == "—")
+        #expect(ScanFormat.hostsText(bareFacts) == "—")
+        #expect(ScanFormat.jobHeading(bareFacts) == "—")
+        #expect(ScanFormat.jobAccessibilityLabel(bareFacts)
+                == "Auditing, 75 percent, 180 of 240 checks, 3 issues: 1 high, 1 medium, 1 low, 42 seconds.")
     }
 
     /// P4: the Site map tab picks the newest job once, the first time there is one;
@@ -2523,5 +2548,438 @@ extension ScanSurfaceTests {
         #expect(ScanEndText.notices(quiet, launchNotices: []) == [])
         #expect(ScanEndText.notices(quiet, launchNotices: ["Clamped budget.probes 50000 → 20000"])
                 == ["Clamped budget.probes 50000 → 20000"])
+    }
+}
+
+// MARK: - Jobs view plan Task 2.3: the table's and the card's words (D10, D11, D14, D17)
+
+extension ScanSurfaceTests {
+    static let lisbon = TimeZone(identifier: "Europe/Lisbon")!
+    /// 2026-07-01T10:32:00Z: `11:32` in Lisbon (WEST, UTC+1), so the zone is exercised, not assumed.
+    static let startedAt1132 = 1_782_901_920_000
+    /// One minute later: `11:33`.
+    static let finishedAt1133 = 1_782_901_980_000
+
+    /// The `issues` edits for a tally.
+    static func issues(critical: Int = 0, high: Int = 0, medium: Int = 0, low: Int = 0, info: Int = 0)
+        -> [([String], JSONValue)]
+    {
+        [
+            (["issues", "total"], .number(Double(critical + high + medium + low + info))),
+            (["issues", "by_severity"], [
+                "critical": .number(Double(critical)), "high": .number(Double(high)), "medium": .number(Double(medium)),
+                "low": .number(Double(low)), "info": .number(Double(info)),
+            ]),
+        ]
+    }
+
+    /// The `started_by` edit.
+    static func startedBy(_ frontend: String, label: String? = nil) -> [([String], JSONValue)] {
+        [(["started_by"], ["frontend": .string(frontend), "client_label": label.map { .string($0) } ?? .null])]
+    }
+
+    /// The comp's job: one target on 8117, started at 11:32 Lisbon by this app.
+    static let compJob: [([String], JSONValue)] = [
+        (["targets"], ["http://127.0.0.1:8117"]), (["started_at"], .number(Double(startedAt1132))),
+    ] + startedBy("operator", label: "aitm-mac")
+
+    static func tally(critical: Int = 0, high: Int = 0, medium: Int = 0, low: Int = 0, info: Int = 0) -> BySeverity {
+        BySeverity(critical: critical, high: high, medium: medium, low: low, info: info)
+    }
+
+    /// AC17, P23 (Jobs view D10): the row's cells are facts-based words with `—` for
+    /// what the bus has not said; the caption counts; the headers are sentence case.
+    @Test func rowWordsAndCaption() throws {
+        let fourIds = ["xss-reflected", "sqli-error", "open-redirect", "ssrf"]
+        let auditing = try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 3236, scheduled: 6468, running: fourIds) + Self.compJob)
+        #expect(ScanFormat.stateWord(auditing) == "Auditing")
+        #expect(ScanFormat.stateWord(try Self.progressFacts(state: .cancelling, phase: .auditing)) == "Cancelling")
+        #expect(ScanFormat.stateWord(try Self.progressFacts(state: .done, phase: .done)) == "Done")
+        #expect(ScanFormat.stateWord(try Self.progressFacts(state: .queued, phase: .queued)) == "Queued")
+        #expect(ScanFormat.stateWord(try Self.progressFacts(state: .running, phase: .passive)) == "Passive")
+        #expect(ScanFormat.stateWord(try Self.progressFacts(state: .cancelled, phase: .done)) == "Cancelled")
+        #expect(ScanFormat.stateWord(try Self.progressFacts(state: .failed, phase: .done)) == "Failed")
+        let unread = ScanJobFacts(summary: try Self.progressRow(state: .running, phase: .crawling), status: nil)
+        #expect(ScanFormat.stateWord(unread) == "Crawling", "the list row alone carries the state and phase")
+
+        #expect(ScanFormat.profileText(auditing) == "standard")
+        #expect(ScanFormat.profileText(unread) == "—")
+        #expect(ScanFormat.hostsText(auditing) == "127.0.0.1:8117")
+        #expect(ScanFormat.hostsText(unread) == "—")
+        let two = try Self.progressFacts(state: .running, phase: .auditing, edits: [(["targets"], ["https://a.test", "http://b.test:8080/x"])])
+        #expect(ScanFormat.hostsText(two) == "a.test, b.test:8080")
+
+        // The progress cell's seven forms.
+        #expect(ScanFormat.rowProgressText(auditing, ScanJobProgress(auditing)) == "50\u{00A0}% · 3,236 of 6,468")
+        let crawling = try Self.progressFacts(
+            state: .running, phase: .crawling, edits: [(["crawl", "pages"], 46), (["crawl", "queued"], 12)])
+        #expect(ScanFormat.rowProgressText(crawling, ScanJobProgress(crawling)) == "46 pages, 12 queued")
+        let passive = try Self.progressFacts(state: .running, phase: .passive)
+        #expect(ScanFormat.rowProgressText(passive, ScanJobProgress(passive)) == "Passive checks")
+        let scheduling = try Self.progressFacts(state: .running, phase: .auditing, edits: Self.checks(done: 0, scheduled: 0))
+        #expect(ScanFormat.rowProgressText(scheduling, ScanJobProgress(scheduling)) == "Scheduling checks")
+        let reporting = try Self.progressFacts(state: .running, phase: .reporting, edits: Self.checks(done: 6468, scheduled: 6468))
+        #expect(ScanFormat.rowProgressText(reporting, ScanJobProgress(reporting)) == "Writing results")
+        let queued = try Self.progressFacts(state: .queued, phase: .queued)
+        #expect(ScanFormat.rowProgressText(queued, ScanJobProgress(queued)) == "—")
+        let done = try Self.progressFacts(state: .done, phase: .done, edits: Self.checks(done: 6468, scheduled: 6468))
+        #expect(ScanFormat.rowProgressText(done, ScanJobProgress(done)) == "6,468 of 6,468")
+        let cancelled = try Self.progressFacts(state: .cancelled, phase: .done, edits: Self.checks(done: 3236, scheduled: 6468))
+        #expect(ScanFormat.rowProgressText(cancelled, ScanJobProgress(cancelled)) == "3,236 of 6,468")
+        let emptyDone = try Self.progressFacts(state: .done, phase: .done, edits: Self.checks(done: 0, scheduled: 0))
+        #expect(ScanFormat.rowProgressText(emptyDone, ScanJobProgress(emptyDone)) == "0 of 0", "the bus truth, shown as such")
+        let cancellingRow = try Self.progressFacts(state: .cancelling, phase: .auditing, edits: Self.checks(done: 3236, scheduled: 6468))
+        #expect(ScanFormat.rowProgressText(cancellingRow, ScanJobProgress(cancellingRow)) == "50\u{00A0}% · 3,236 of 6,468",
+                "cancelling freezes the last read")
+        let unreadDone = ScanJobFacts(summary: try Self.progressRow(state: .done, phase: .done), status: nil)
+        #expect(ScanFormat.rowProgressText(unreadDone, ScanJobProgress(unreadDone)) == "—", "no status, no checks")
+        #expect(ScanFormat.rowProgressText(unread, ScanJobProgress(unread)) == "—")
+
+        // Issues cell words.
+        #expect(ScanFormat.severityWords(by: Self.tally(low: 4), running: true) == "4 low")
+        #expect(ScanFormat.severityWords(by: Self.tally(high: 1, low: 3), running: false) == "1 high, 3 low")
+        #expect(ScanFormat.severityWords(by: .zero, running: true) == "no issues yet")
+        #expect(ScanFormat.severityWords(by: .zero, running: false) == "no issues")
+        #expect(ScanFormat.severityWords(by: Self.tally(critical: 2, medium: 1, info: 5), running: true) == "2 critical, 1 medium, 5 info")
+        let parts = ScanFormat.severityWordParts(by: Self.tally(high: 1, low: 3))
+        #expect(parts.map(\.0) == [.high, .low])
+        #expect(parts.map(\.1) == ["1 high", "3 low"])
+        #expect(ScanFormat.severityWordParts(by: .zero).isEmpty)
+
+        #expect(ScanFormat.jobsCaption(total: 4, running: 1) == "4 jobs · 1 running")
+        #expect(ScanFormat.jobsCaption(total: 1, running: 0) == "1 job")
+        #expect(ScanFormat.jobsCaption(total: 3, running: 0) == "3 jobs")
+        #expect(ScanFormat.jobsCaption(total: 2, running: 2) == "2 jobs · 2 running")
+        #expect(ScanFormat.tableHeaders == ["State", "Profile", "Target", "Progress", "Probes", "Points", "Issues", "Elapsed"])
+    }
+
+    /// AC20 (Jobs view D11): the heading is the hosts; the finding line's clauses and
+    /// their roles; `started <h:mm> by <who>` from the status's `started_by`.
+    @Test func headingAndFindingLine() throws {
+        let fourIds = ["xss-reflected", "sqli-error", "open-redirect", "ssrf"]
+        let live = try Self.progressFacts(
+            state: .running, phase: .auditing,
+            edits: Self.checks(done: 3236, scheduled: 6468, running: fourIds) + Self.compJob + Self.issues(low: 4))
+        #expect(ScanFormat.jobHeading(live) == "127.0.0.1:8117")
+        #expect(ScanFormat.jobHeadingHelp(live) == nil)
+        let two = try Self.progressFacts(state: .running, phase: .auditing, edits: [(["targets"], ["http://a.test", "http://b.test"])])
+        #expect(ScanFormat.jobHeading(two) == "a.test, b.test")
+        #expect(ScanFormat.jobHeadingHelp(two) == nil)
+        let three = try Self.progressFacts(
+            state: .running, phase: .auditing, edits: [(["targets"], ["http://a.test", "http://b.test", "https://c.test:8443"])])
+        #expect(ScanFormat.jobHeading(three) == "a.test and 2 more")
+        #expect(ScanFormat.jobHeadingHelp(three) == "a.test, b.test, c.test:8443")
+        let none = try Self.progressFacts(state: .running, phase: .auditing, edits: [(["targets"], [])])
+        #expect(ScanFormat.jobHeading(none) == "—")
+        #expect(ScanFormat.jobHeading(ScanJobFacts(summary: try Self.progressRow(state: .running, phase: .auditing), status: nil)) == "—")
+
+        // Live, by this app.
+        let line = ScanFormat.findingLine(live, timeZone: Self.lisbon)
+        #expect(line.text == "4 low issues so far · xss-reflected and 3 more checks running now · standard · started 11:32 by this app")
+        #expect(line.reason == nil)
+        #expect(line.agentOriginated == false)
+        #expect(line.parts.map(\.text).joined() == line.text, "joined, the parts are the text")
+        #expect(line.parts.contains(ScanFindingLine.Part(text: "4", role: .figure)))
+        #expect(line.parts.contains(ScanFindingLine.Part(text: "xss-reflected", role: .checkId)))
+        #expect(!line.parts.contains { $0.role == .agent })
+
+        // By an agent: the MCP frontend.
+        let agent = try Self.progressFacts(
+            state: .running, phase: .auditing,
+            edits: Self.checks(done: 3236, scheduled: 6468, running: fourIds) + Self.compJob + Self.issues(low: 4)
+                + Self.startedBy("mcp", label: "claude-desktop"))
+        let agentLine = ScanFormat.findingLine(agent, timeZone: Self.lisbon)
+        #expect(agentLine.text.hasSuffix(" · started 11:32 by an agent"))
+        #expect(agentLine.agentOriginated == true)
+        #expect(agentLine.parts.contains(ScanFindingLine.Part(text: "an agent", role: .agent)))
+
+        // By the CLI, one id, no issues.
+        let cli = try Self.progressFacts(
+            state: .running, phase: .auditing,
+            edits: Self.checks(done: 10, scheduled: 6468, running: ["xss-reflected"]) + Self.compJob + Self.issues() + Self.startedBy("cli"))
+        #expect(ScanFormat.findingLine(cli, timeZone: Self.lisbon).text
+                == "no issues so far · xss-reflected running now · standard · started 11:32 by the CLI")
+
+        // Nothing running: the now clause is omitted, not left empty.
+        let idle = try Self.progressFacts(
+            state: .queued, phase: .queued, edits: Self.checks(done: 0, scheduled: 0) + Self.compJob + Self.issues())
+        #expect(ScanFormat.findingLine(idle, timeZone: Self.lisbon).text == "no issues so far · standard · started 11:32 by this app")
+
+        // Terminal: the reason above, then profile · started · finished.
+        let stopped = try Self.progressFacts(
+            state: .done, phase: .done,
+            edits: Self.checks(done: 240, scheduled: 240) + Self.compJob + Self.issues(low: 4)
+                + [(["stopped_reason"], "errors"), (["finished_at"], .number(Double(Self.finishedAt1133)))])
+        let stoppedLine = ScanFormat.findingLine(stopped, timeZone: Self.lisbon)
+        #expect(stoppedLine.reason == "Stopped early: too many errors from the target.")
+        #expect(stoppedLine.text == "standard · started 11:32 by this app · finished 11:33")
+        #expect(stoppedLine.agentOriginated == false)
+        #expect(stoppedLine.parts.map(\.text).joined() == stoppedLine.text)
+        let plainDone = try Self.progressFacts(
+            state: .done, phase: .done, edits: Self.compJob + [(["finished_at"], .number(Double(Self.finishedAt1133)))])
+        #expect(ScanFormat.findingLine(plainDone, timeZone: Self.lisbon).reason == nil)
+        let noFinish = try Self.progressFacts(state: .failed, phase: .done, edits: Self.compJob + [(["error"], "boom")])
+        #expect(ScanFormat.findingLine(noFinish, timeZone: Self.lisbon).text == "standard · started 11:32 by this app",
+                "no finished_at, no finished clause")
+        // Cancelled by the operator: the reason the state already says is not repeated.
+        let cancelled = try Self.progressFacts(
+            state: .cancelled, phase: .done, edits: Self.compJob + [(["stopped_reason"], "cancelled")])
+        #expect(ScanFormat.findingLine(cancelled, timeZone: Self.lisbon).reason == nil)
+
+        // No status yet: only what the list row says.
+        let unread = ScanJobFacts(summary: try Self.progressRow(state: .running, phase: .auditing), status: nil)
+        #expect(ScanFormat.findingLine(unread, timeZone: Self.lisbon).text == "3 issues so far: 1 high, 1 medium, 1 low")
+        let unreadDone = ScanJobFacts(summary: try Self.progressRow(state: .done, phase: .done), status: nil)
+        #expect(ScanFormat.findingLine(unreadDone, timeZone: Self.lisbon) == ScanFindingLine(reason: nil, parts: [], text: "", agentOriginated: false))
+
+        // The clauses on their own.
+        #expect(ScanFormat.issuesSoFar(by: Self.tally(high: 1, low: 4)) == "5 issues so far: 1 high, 4 low")
+        #expect(ScanFormat.issuesSoFar(by: Self.tally(high: 1)) == "1 high issue so far")
+        #expect(ScanFormat.issuesSoFar(by: Self.tally(low: 4)) == "4 low issues so far")
+        #expect(ScanFormat.issuesSoFar(by: .zero) == "no issues so far")
+        #expect(ScanFormat.nowClause(running: []) == nil)
+        #expect(ScanFormat.nowClause(running: ["xss-reflected"]) == "xss-reflected running now")
+        #expect(ScanFormat.nowClause(running: fourIds) == "xss-reflected and 3 more checks running now")
+        #expect(ScanFormat.nowClause(running: ["a", "b"]) == "a and 1 more check running now")
+
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "operator", clientLabel: "aitm-tui")) == "aitm-tui")
+        #expect(ScanFormat.findingLine(
+            try Self.progressFacts(state: .running, phase: .auditing, edits: Self.compJob + Self.startedBy("operator", label: "aitm-tui")),
+            timeZone: Self.lisbon).text.hasSuffix(" by aitm-tui"))
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "operator", clientLabel: "aitm-mac")) == "this app")
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "cli", clientLabel: nil)) == "the CLI")
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "mcp", clientLabel: nil)) == "an agent")
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "agent", clientLabel: "x")) == "an agent")
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "operator", clientLabel: nil)) == "the operator")
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "operator", clientLabel: "")) == "the operator")
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "", clientLabel: nil)) == "the operator")
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "operator", clientLabel: "web\u{0}-ui\u{202E}")) == "web-ui",
+                "control and format scalars never reach the line")
+        #expect(ScanFormat.startedByWords(ScanStartedBy(frontend: "operator", clientLabel: String(repeating: "a", count: 50)))
+                == String(repeating: "a", count: 40))
+        #expect(ScanFormat.agentOriginated(ScanStartedBy(frontend: "mcp", clientLabel: nil)))
+        #expect(ScanFormat.agentOriginated(ScanStartedBy(frontend: "agent", clientLabel: nil)))
+        #expect(!ScanFormat.agentOriginated(ScanStartedBy(frontend: "cli", clientLabel: nil)))
+        #expect(!ScanFormat.agentOriginated(ScanStartedBy(frontend: "operator", clientLabel: "aitm-mac")))
+
+        // The clock is 24-hour `HH:mm` in the given zone.
+        #expect(ScanFormat.clock(ms: Self.startedAt1132, timeZone: Self.lisbon) == "11:32")
+        #expect(ScanFormat.clock(ms: Self.startedAt1132, timeZone: TimeZone(identifier: "UTC")!) == "10:32")
+        #expect(ScanFormat.clock(ms: 1_768_467_900_000, timeZone: Self.lisbon) == "09:05", "2026-01-15T09:05Z, WET")
+        #expect(ScanFormat.clock(ms: 1_768_467_900_000 + 14 * 3_600_000, timeZone: Self.lisbon) == "23:05")
+        #expect(ScanFormat.scaleStarted("11:32") == "started 11:32")
+        #expect(ScanFormat.scaleElapsed(ms: 64_000) == "elapsed 1:04")
+    }
+
+    /// AC45 (Jobs view D10, D11): the ledger's groups, the card's tone, the gauge's
+    /// warning and text, the lane and KPI words, and the fixed labels.
+    @Test func ledgerTonesAndGauge() throws {
+        #expect(ScanFormat.ledgerGroups(by: Self.tally(low: 4))
+                == [ScanLedgerGroup(severity: .low, count: 4, marks: 4, word: "4 low")])
+        #expect(ScanFormat.ledgerGroups(by: Self.tally(high: 1, low: 4)).map(\.severity) == [.high, .low])
+        #expect(ScanFormat.ledgerGroups(by: Self.tally(high: 1, low: 4)).map(\.word) == ["1 high", "4 low"])
+        let many = ScanFormat.ledgerGroups(by: Self.tally(low: 30))
+        #expect(many.count == 1)
+        #expect(many[0].marks == 12)
+        #expect(many[0].count == 30)
+        #expect(many[0].word == "30 low")
+        #expect(ScanFormat.ledgerGroups(by: .zero) == [])
+        #expect(ScanFormat.ledgerGroups(by: Self.tally(critical: 1, high: 2, medium: 3, low: 4, info: 5)).map(\.severity)
+                == [.critical, .high, .medium, .low, .info])
+        #expect(ScanFormat.ledgerMarkCap == 12)
+
+        #expect(ScanFormat.tone(try Self.progressFacts(state: .running, phase: .auditing)) == .progress)
+        #expect(ScanFormat.tone(try Self.progressFacts(state: .queued, phase: .queued)) == .progress)
+        #expect(ScanFormat.tone(try Self.progressFacts(state: .cancelling, phase: .auditing)) == .pending)
+        #expect(ScanFormat.tone(try Self.progressFacts(state: .done, phase: .done)) == .success)
+        #expect(ScanFormat.tone(try Self.progressFacts(state: .failed, phase: .done)) == .danger)
+        #expect(ScanFormat.tone(try Self.progressFacts(state: .cancelled, phase: .done)) == .neutral)
+        #expect(ScanFormat.tone(try Self.progressFacts(state: .other("paused"), phase: .auditing)) == .neutral)
+
+        #expect(ScanFormat.budgetWarning(sent: 1601, budget: 2000) == true)
+        #expect(ScanFormat.budgetWarning(sent: 1600, budget: 2000) == false)
+        #expect(ScanFormat.budgetWarning(sent: 5, budget: 0) == false)
+        #expect(ScanFormat.probeBudgetText(sent: 287, budget: 2000) == "287 of 2,000")
+        #expect(ScanFormat.probeBudgetText(sent: 287, budget: 0) == "287 probes")
+        #expect(ScanFormat.probeBudgetText(sent: 1, budget: 0) == "1 probe")
+        #expect(ScanFormat.probesTileHelp(sent: 287, budget: 2000) == "287 of 2,000 probes sent (the probe budget, not progress)")
+        #expect(ScanFormat.probesTileHelp(sent: 287, budget: 0) == "287 probes sent (the probe budget, not progress)")
+        #expect(ScanFormat.issuesTileHelp(by: Self.tally(high: 1, low: 3)) == "4 issues: 1 high, 3 low")
+        #expect(ScanFormat.issuesTileHelp(by: Self.tally(low: 4)) == "4 issues: 4 low")
+        #expect(ScanFormat.issuesTileHelp(by: Self.tally(high: 1)) == "1 issue: 1 high")
+        #expect(ScanFormat.issuesTileHelp(by: .zero) == "no issues")
+
+        #expect(ScanFormat.kpiLabels == ["Progress", "Checks", "Probes", "Points audited", "Issues"])
+        #expect(ScanFormat.ofText(6468) == "of 6,468")
+        #expect(ScanFormat.laneChecksDone(3236) == "3,236 checks done")
+        #expect(ScanFormat.laneChecksDone(1) == "1 check done")
+        #expect(ScanFormat.lanePages(46) == "46 pages")
+        #expect(ScanFormat.lanePages(1) == "1 page")
+        #expect(ScanFormat.gaugeLabel == "probe budget")
+        #expect(ScanFormat.laneCrawlLabel == "crawl")
+        #expect(ScanFormat.laneAuditLabel == "audit")
+        #expect(ScanFormat.missingValue == "—")
+        #expect(ScanFormat.agentDotHelp == "started by an agent")
+        #expect(ScanFormat.wellCrawlTitle == "Crawl and points")
+        #expect(ScanFormat.wellCrawlSubtitle == "what the job found to test")
+        #expect(ScanFormat.wellIssuesTitle == "Issues")
+        #expect(ScanFormat.wellIssuesSubtitle == "by severity and confidence")
+        #expect(ScanFormat.WellKey.pagesFetched == "Pages fetched")
+        #expect(ScanFormat.WellKey.pagesWaiting == "Pages waiting")
+        #expect(ScanFormat.WellKey.depth == "Depth")
+        #expect(ScanFormat.WellKey.formsSubmitted == "Forms submitted")
+        #expect(ScanFormat.WellKey.formsNotSubmitted == "Forms not submitted")
+        #expect(ScanFormat.WellKey.crawlErrors == "Crawl errors")
+        #expect(ScanFormat.WellKey.pointsFound == "Points found")
+        #expect(ScanFormat.WellKey.waitingForAudit == "Waiting for audit")
+        #expect(ScanFormat.WellKey.audited == "Audited")
+        #expect(ScanFormat.WellKey.lanes == "Lanes")
+        #expect(ScanFormat.WellKey.probesByLane == "Probes by lane")
+        #expect(ScanFormat.WellKey.session == "Session")
+        #expect(ScanFormat.WellKey.criticalHighMedium == "Critical · High · Medium")
+        #expect(ScanFormat.WellKey.low == "Low")
+        #expect(ScanFormat.WellKey.info == "Info")
+        #expect(ScanFormat.WellKey.certainFirmTentative == "Certain · Firm · Tentative")
+        #expect(ScanFormat.WellKey.probeErrors == "Probe errors · timeouts · rate waits")
+        #expect(ScanFormat.WellKey.checks == "Checks scheduled · done · errors · skipped")
+        #expect(ScanFormat.WellKey.all.count == 18)
+        #expect(Set(ScanFormat.WellKey.all).count == 18, "every key is distinct")
+        #expect(ScanFormat.pointSkipWords(ScanPointCounters.Skipped(ignored: 6, frequent: 722, limit: 0))
+                == ["722 skipped as repetitive", "6 skipped by rule", "0 skipped at the per-request cap"])
+        #expect(ScanFormat.pointSkipWords(ScanPointCounters.Skipped(ignored: 1200, frequent: 0, limit: 3))
+                == ["0 skipped as repetitive", "1,200 skipped by rule", "3 skipped at the per-request cap"])
+
+        // The help strings, verbatim from the UX section.
+        #expect(ScanFormat.cancelScanHelp == "Stop this job; the issues and site map it found stay (⌥⌘.)")
+        #expect(ScanFormat.scanAgainHelpGeneric == "Start a new job with this job's profile and target")
+        #expect(ScanFormat.showIssuesHelp == "Open the Issues tab filtered to this job")
+        #expect(ScanFormat.showSiteMapHelp == "Open the Site map tab for this job")
+    }
+
+    /// AC28 (Jobs view D14): the row's one-sentence label, the lane's value, the
+    /// elapsed words and the end announcement.
+    @Test func accessibilitySentenceAndAnnouncement() throws {
+        let auditing = try Self.progressFacts(
+            state: .running, phase: .auditing, elapsedMs: 64_000,
+            edits: Self.checks(done: 3236, scheduled: 6468) + Self.compJob + Self.issues(low: 4))
+        #expect(ScanFormat.jobAccessibilityLabel(auditing)
+                == "Auditing, standard, 127.0.0.1:8117, 50 percent, 3,236 of 6,468 checks, 4 issues: 4 low, 1 minute 4 seconds.")
+        // Indeterminate: no percent, no checks clause; a live job with nothing found reads `no issues yet`.
+        let passive = try Self.progressFacts(state: .running, phase: .passive, elapsedMs: 42_000, edits: Self.compJob + Self.issues())
+        #expect(ScanFormat.jobAccessibilityLabel(passive) == "Passive, standard, 127.0.0.1:8117, no issues yet, 42 seconds.")
+        let queued = try Self.progressFacts(state: .queued, phase: .queued, elapsedMs: 0, edits: Self.compJob + Self.issues())
+        #expect(ScanFormat.jobAccessibilityLabel(queued) == "Queued, standard, 127.0.0.1:8117, no issues yet, 0 seconds.")
+        // Crawling is determinate from the pages.
+        let crawling = try Self.progressFacts(
+            state: .running, phase: .crawling, elapsedMs: 9_000,
+            edits: [(["crawl", "pages"], 46), (["crawl", "queued"], 12)] + Self.compJob + Self.issues())
+        #expect(ScanFormat.jobAccessibilityLabel(crawling)
+                == "Crawling, standard, 127.0.0.1:8117, 79 percent, 46 pages, 12 queued, no issues yet, 9 seconds.")
+        // Terminal: `no issues`, the final fraction is not a percent.
+        let done = try Self.progressFacts(
+            state: .done, phase: .done, elapsedMs: 69_000, edits: Self.checks(done: 6468, scheduled: 6468) + Self.compJob + Self.issues())
+        #expect(ScanFormat.jobAccessibilityLabel(done) == "Done, standard, 127.0.0.1:8117, no issues, 1 minute 9 seconds.")
+        let twoHosts = try Self.progressFacts(
+            state: .cancelled, phase: .done, elapsedMs: 3_723_000,
+            edits: Self.checks(done: 3236, scheduled: 6468) + [(["targets"], ["http://a.test", "http://b.test"])] + Self.issues(high: 1, low: 3))
+        #expect(ScanFormat.jobAccessibilityLabel(twoHosts)
+                == "Cancelled, standard, a.test, b.test, 4 issues: 1 high, 3 low, 1 hour 2 minutes 3 seconds.")
+
+        #expect(ScanFormat.elapsedWords(ms: 64_000) == "1 minute 4 seconds")
+        #expect(ScanFormat.elapsedWords(ms: 42_000) == "42 seconds")
+        #expect(ScanFormat.elapsedWords(ms: 3_723_000) == "1 hour 2 minutes 3 seconds")
+        #expect(ScanFormat.elapsedWords(ms: 0) == "0 seconds")
+        #expect(ScanFormat.elapsedWords(ms: 999) == "0 seconds")
+        #expect(ScanFormat.elapsedWords(ms: 1_000) == "1 second")
+        #expect(ScanFormat.elapsedWords(ms: 60_000) == "1 minute")
+        #expect(ScanFormat.elapsedWords(ms: 3_600_000) == "1 hour")
+        #expect(ScanFormat.elapsedWords(ms: 7_205_000) == "2 hours 5 seconds")
+        #expect(ScanFormat.elapsedWords(ms: -5_000) == "0 seconds")
+
+        #expect(ScanFormat.progressAccessibilityValue(ScanJobProgress(auditing)) == "50 percent")
+        #expect(ScanFormat.progressAccessibilityValue(ScanJobProgress(crawling)) == "79 percent")
+        #expect(ScanFormat.progressAccessibilityValue(ScanJobProgress(passive)) == nil)
+        #expect(ScanFormat.progressAccessibilityValue(ScanJobProgress(done)) == nil)
+
+        let doneFour = try Self.progressFacts(state: .done, phase: .done, edits: Self.compJob + Self.issues(low: 4))
+        #expect(ScanFormat.endAnnouncement(doneFour) == "Scan of 127.0.0.1:8117 done: 4 issues.")
+        let cancelledNone = try Self.progressFacts(state: .cancelled, phase: .done, edits: Self.compJob + Self.issues())
+        #expect(ScanFormat.endAnnouncement(cancelledNone) == "Scan of 127.0.0.1:8117 cancelled: no issues.")
+        let failed = try Self.progressFacts(state: .failed, phase: .done, edits: Self.compJob + Self.issues(low: 4))
+        #expect(ScanFormat.endAnnouncement(failed) == "Scan of 127.0.0.1:8117 failed.")
+        let doneOne = try Self.progressFacts(state: .done, phase: .done, edits: Self.compJob + Self.issues(high: 1))
+        #expect(ScanFormat.endAnnouncement(doneOne) == "Scan of 127.0.0.1:8117 done: 1 issue.")
+        let threeHosts = try Self.progressFacts(
+            state: .done, phase: .done,
+            edits: [(["targets"], ["http://a.test", "http://b.test", "http://c.test"])] + Self.issues())
+        #expect(ScanFormat.endAnnouncement(threeHosts) == "Scan of a.test and 2 more done: no issues.")
+        let unreadDone = ScanJobFacts(summary: try Self.progressRow(state: .done, phase: .done), status: nil)
+        #expect(ScanFormat.endAnnouncement(unreadDone) == "Scan scan-1a2b3c4d done: 3 issues.",
+                "no hosts known yet: the job id names the scan")
+    }
+
+    /// AC32 (Jobs view D17): none of `stop`, `abort`, `finding`, `task` as a whole word
+    /// in any Jobs string, in-process over a sample facts set; the Cancel Scan help's
+    /// `Stop this job` is the one allowed verb use (and PR 1's `cancelHelpText` the same).
+    @Test func jobsWordsAvoidTheBannedTerms() throws {
+        let fourIds = ["xss-reflected", "sqli-error", "open-redirect", "ssrf"]
+        var facts: [ScanJobFacts] = []
+        for state in [ScanJobState.queued, .running, .cancelling, .done, .cancelled, .failed, .other("paused")] {
+            for phase in [ScanPhase.queued, .crawling, .passive, .auditing, .reporting, .done] {
+                facts.append(try Self.progressFacts(
+                    state: state, phase: phase,
+                    edits: Self.checks(done: 3236, scheduled: 6468, running: fourIds) + Self.compJob + Self.issues(high: 1, low: 4)
+                        + [(["checks", "errors"], 7), (["checks", "skipped"], 3), (["crawl", "errors"], 1), (["error"], "boom")]))
+            }
+        }
+        facts.append(ScanJobFacts(summary: try Self.progressRow(state: .running, phase: .auditing), status: nil))
+
+        var strings: [String] = ScanFormat.tableHeaders + ScanFormat.kpiLabels + ScanFormat.WellKey.all + [
+            ScanFormat.gaugeLabel, ScanFormat.laneCrawlLabel, ScanFormat.laneAuditLabel, ScanFormat.missingValue,
+            ScanFormat.agentDotHelp, ScanFormat.wellCrawlTitle, ScanFormat.wellCrawlSubtitle, ScanFormat.wellIssuesTitle,
+            ScanFormat.wellIssuesSubtitle, ScanFormat.scanAgainHelpGeneric, ScanFormat.showIssuesHelp,
+            ScanFormat.showSiteMapHelp, ScanFormat.cancellingTitle, ScanFormat.jobsCaption(total: 4, running: 1),
+            ScanFormat.probesTileHelp(sent: 287, budget: 2000), ScanFormat.probeBudgetText(sent: 287, budget: 0),
+            ScanFormat.issuesTileHelp(by: Self.tally(high: 1, low: 3)), ScanFormat.ofText(6468),
+            ScanFormat.laneChecksDone(3236), ScanFormat.lanePages(46), ScanFormat.scaleStarted("11:32"),
+            ScanFormat.scaleElapsed(ms: 64_000), ScanFormat.elapsedWords(ms: 3_723_000),
+            ScanFormat.severityWords(by: .zero, running: true), ScanFormat.severityWords(by: .zero, running: false),
+            ScanFormat.issuesSoFar(by: .zero), scanNoJobsText, scanSelectJobText,
+        ] + ScanFormat.pointSkipWords(ScanPointCounters.Skipped(ignored: 6, frequent: 722, limit: 0))
+        for reason in [ScanStoppedReason.budget, .time, .cancelled, .sessionLost, .errors, .policy, .guardRefused, .failed, .other("paused")] {
+            strings.append(ScanEndText.stoppedReason(reason, state: .done, probesBudget: 2000, error: nil) ?? "")
+        }
+        for kind in [ScanCrawlErrorKind.connectRefused, .tls, .timeout, .h2NotNegotiated, .transport, .other, .unknown("x")] {
+            strings.append(ScanEndText.crawlErrorWords(kind))
+        }
+        for f in facts {
+            let progress = ScanJobProgress(f)
+            strings += [
+                ScanFormat.stateWord(f), ScanFormat.profileText(f), ScanFormat.hostsText(f),
+                ScanFormat.rowProgressText(f, progress), ScanFormat.jobHeading(f), ScanFormat.jobHeadingHelp(f) ?? "",
+                ScanFormat.jobAccessibilityLabel(f), ScanFormat.endAnnouncement(f),
+                ScanFormat.severityWords(by: f.summary.issues.bySeverity, running: !f.summary.state.isTerminal),
+                ScanEndText.sentence(f) ?? "", progress.phaseLine, progress.helpText, progress.nowLine ?? "",
+                progress.nowTag ?? "", progress.checksToGoText ?? "", progress.estimateText ?? "", progress.estimateHelp ?? "",
+                ScanFormat.progressAccessibilityValue(progress) ?? "",
+            ]
+            let line = ScanFormat.findingLine(f, timeZone: Self.lisbon)
+            strings += [line.text, line.reason ?? ""] + line.parts.map(\.text)
+            strings += ScanEndText.attention(f).map(\.text)
+            if let status = f.status { strings += ScanEndText.notices(status, launchNotices: []) }
+        }
+        let banned = try Regex("(?i)\\b(stop|abort|finding|task)\\b")
+        // D4's session-lost sentence is pinned by the spec with the verb in it ("the profile
+        // says stop when that happens"), which AC32 forbids: a spec contradiction reported
+        // with Task 2.3, excepted here by name so the test neither hides nor rewords it.
+        let sessionLost = try #require(ScanEndText.stoppedReason(.sessionLost, state: .done, probesBudget: 0, error: nil))
+        #expect(sessionLost.contains(banned), "the exception is live; drop it when the spec settles the wording")
+        let offenders = strings.filter { $0 != sessionLost && $0.contains(banned) }
+        #expect(offenders.isEmpty, "\(offenders)")
+        // The negative control: the matcher does catch the one allowed verb use.
+        #expect(ScanFormat.cancelScanHelp.contains(banned))
+        #expect(ScanFormat.cancelHelpText.contains(banned))
+        #expect("Stopped early: the time budget ran out.".contains(banned) == false, "`Stopped` is not the whole word `stop`")
     }
 }
