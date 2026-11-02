@@ -234,6 +234,8 @@ Variants, one per failure mode (the `what` line carries the discriminating fact)
 9. **What the published v0.5.9 GitHub body says.** Only the local notes file was read (no network); the premise "0.5.10 recommends `aitm scope add --host <host>`" was not reproduced in any shipped text (F25).
 10. **Exit code for "no core".** Every prior-art tool uses `1` for this; gh reserves `4` for auth. Project convention today is `0/1/2`. Whether scripts need to tell "no core" from other failures is unanswered.
 
+11. **Mac-side follow-up (orchestrator, 2026-11-01).** The per-launch dir of F4/F6 is also why the app's fixture self-test picked a *stale* embedded core earlier today (card task_6b977012): with three `aitm-embedded-core/<UUID>/` dirs on disk, nothing says which one is live. The pointer file of direction D would close that trap too if the app's `EmbeddedCore` read it (liveness by connect, not by directory age) instead of its own newest-dir rule. That is a Swift change for the mac lane, not this PR; the spec should list it as a follow-up and keep the pointer's content a contract the app can rely on.
+
 ## 6. Sources
 
 Repository (read 2026-11-01, worktree `.wt/r14`):
