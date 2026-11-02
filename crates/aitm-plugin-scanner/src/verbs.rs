@@ -1225,9 +1225,10 @@ mod tests {
 
     /// A registry loaded with a real [`ScannerPlugin`], its [`crate::jobs::ScanLate`]
     /// bound to in-memory services. The plugin carries **no** lane crate, so the
-    /// interim HTTP lane is what `lanes_for_run` picks (call B2) and the five
-    /// interim checks are in the catalogue; a `FakeCheck` rides in beside them
-    /// through the native-check slot the binary fills.
+    /// interim HTTP lane is what `lanes_for_run` picks (call B2); the catalogue
+    /// holds the engine's three shipped passive checks (spec amendment 24) and
+    /// the two legacy actives in the native slot; a `FakeCheck` rides in beside
+    /// them through the native-check slot the binary fills.
     struct Harness {
         reg: Registry,
         engine: Arc<Engine>,
@@ -1447,7 +1448,7 @@ mod tests {
 
     /// Spec D3: the verb table is the contract. The registry holds exactly the
     /// eighteen `scan.*` names (fifteen new, three shipped) and one uniform
-    /// `check.<id>` per catalogue entry — here the interim lane's three passive
+    /// `check.<id>` per catalogue entry — here the engine's three shipped passive
     /// checks plus the two legacy actives in the harness's native slot (call B8).
     #[tokio::test(flavor = "multi_thread")]
     async fn registry_exposes_every_d3_verb_and_the_manual_checks() {
