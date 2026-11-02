@@ -201,6 +201,7 @@ impl Command for ManualCheck {
             guard: Arc::clone(&services.guard),
             budget,
             markers: AtomicU64::new(0),
+            marker_seed: util::marker_seed(),
         });
 
         // The interim HTTP lane owns the only shape a manual run has: a query
@@ -390,6 +391,9 @@ struct ManualJob {
     guard: Arc<dyn aitm_core::ScopeRateGuard>,
     budget: Arc<JobBudget>,
     markers: AtomicU64,
+    /// Minted per invocation (amendment 55): a manual run's markers are as
+    /// unguessable up front as a job's.
+    marker_seed: u32,
 }
 
 impl JobCtx for ManualJob {
@@ -437,8 +441,10 @@ impl JobCtx for ManualJob {
         self.budget.cancel.is_cancelled()
     }
 
+    /// Fresh per call (amendment 57), seeded per invocation (amendment 55).
     fn marker(&self) -> String {
-        util::marker(self.markers.fetch_add(1, Ordering::SeqCst))
+        let counter = self.markers.fetch_add(1, Ordering::SeqCst) as u32;
+        util::marker(self.marker_seed, counter)
     }
 }
 

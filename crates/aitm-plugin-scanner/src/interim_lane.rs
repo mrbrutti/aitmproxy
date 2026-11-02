@@ -1729,7 +1729,7 @@ mod tests {
             self.cancelled.load(Ordering::SeqCst)
         }
         fn marker(&self) -> String {
-            "aitm7f3a".to_string()
+            "aitm7f3a0000".to_string()
         }
         fn report_crawl_error(&self, origin: &str, reason: &str) {
             self.crawl_errors

@@ -235,6 +235,9 @@ pub struct JobRuntime {
     budget: Arc<JobBudget>,
     status: Arc<RwLock<JobStatus>>,
     markers: AtomicU64,
+    /// Per-job marker seed (amendment 55): minted once when the runtime is
+    /// built, mixed into every marker so two jobs' first markers differ.
+    marker_seed: u32,
     /// Set by [`JobCtx::report_session_lost`] or by the `scan: session_lost: `
     /// error prefix; the worker reads it between items.
     session_lost: AtomicBool,
@@ -470,9 +473,12 @@ impl JobCtx for JobRuntime {
     }
 
     /// A new token on every call (amendment 57): the per-job counter steps,
-    /// so no two calls on one job agree. Not a key — `job_id()` is.
+    /// so no two calls on one job agree. Not a key — `job_id()` is. The
+    /// counter is mixed with this job's seed (amendment 55), so no two jobs
+    /// share a first marker either.
     fn marker(&self) -> String {
-        crate::util::marker(self.markers.fetch_add(1, Ordering::SeqCst))
+        let counter = self.markers.fetch_add(1, Ordering::SeqCst) as u32;
+        crate::util::marker(self.marker_seed, counter)
     }
 
     /// Fold the lane's counters in by **per-field maximum** (call B27), so a
@@ -682,6 +688,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         budget: Arc::clone(&budget),
         status: Arc::clone(&status),
         markers: AtomicU64::new(0),
+        marker_seed: crate::util::marker_seed(),
         session_lost: AtomicBool::new(false),
         lane_charges: AtomicU64::new(0),
         charges_by_lane: Mutex::new(BTreeMap::new()),
@@ -2665,6 +2672,7 @@ mod tests {
             )),
             status: Arc::clone(&status),
             markers: AtomicU64::new(0),
+            marker_seed: crate::util::marker_seed(),
             session_lost: AtomicBool::new(false),
             lane_charges: AtomicU64::new(0),
             charges_by_lane: Mutex::new(BTreeMap::new()),
@@ -2703,6 +2711,41 @@ mod tests {
             id,
             "job_id() is the status's job"
         );
+    }
+
+    /// Amendment 55 (T3's 2b panel, security Minor): every job mints its own
+    /// marker seed, so two jobs' first markers differ — a target cannot forge
+    /// a verdict by echoing `aitm00000000` before it has seen a probe — while
+    /// one job's markers still step (the second differs from the first).
+    #[test]
+    fn two_jobs_first_markers_differ() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (job_a, _) = bare_runtime(&h, "scan-0000aaaa", 1);
+        let (job_b, _) = bare_runtime(&h, "scan-0000bbbb", 1);
+
+        let first_a = job_a.marker();
+        let first_b = job_b.marker();
+        assert_ne!(
+            first_a, first_b,
+            "two jobs on one engine never share a first marker"
+        );
+        assert_ne!(
+            first_a, "aitm00000000",
+            "a job's first marker is not the bare counter"
+        );
+        let second_a = job_a.marker();
+        assert_ne!(first_a, second_a, "a job's markers keep stepping");
+        for m in [&first_a, &first_b, &second_a] {
+            assert_eq!(m.len(), 12, "{m:?} is not aitm+8 hex");
+            assert!(m.starts_with("aitm"), "{m:?} is not aitm+8 hex");
+            assert!(
+                m[4..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "{m:?} is not aitm+8 lowercase hex"
+            );
+        }
     }
 
     /// T7/T2 live runs (2026-11-01): a crawl error a lane reports through
