@@ -78,14 +78,41 @@ impl CaptureInjectBackend for PcapBackend {
         read_timeout: Duration,
     ) -> Result<Box<dyn CaptureSource>, L4Error> {
         let timeout_ms = i32::try_from(read_timeout.as_millis()).unwrap_or(i32::MAX);
-        let mut cap = ::pcap::Capture::from_device(iface)
-            .and_then(|c| c.promisc(true).timeout(timeout_ms).open())
+        // The handle is opened in immediate mode and then switched to
+        // non-blocking reads, and `read_timeout` is enforced by
+        // [`PcapCaptureSource::next_frame`] itself. libpcap's own read timeout is
+        // not a bound: on Linux 6.8 with libpcap 1.10.4 a blocking `pcap_next_ex`
+        // on an interface where no frame passes the filter never returns, in
+        // plain and in immediate mode alike (the T5 rig probe `quiet-stages`,
+        // 2026-11-02), so `await_reply`'s deadline and the capture thread's stop
+        // flag were never consulted again once an interface went quiet: every
+        // silent fuzz case hung until the engine's 60 s check timeout and
+        // `l4.capture.stop` hung on the join. A non-blocking read returns
+        // `TimeoutExpired` at once when nothing is queued; `next_frame` naps
+        // between reads and gives up at the deadline. Immediate mode stays so a
+        // BSD/macOS BPF device hands a frame over as it arrives instead of
+        // holding it until its store buffer fills. Pinned by
+        // `linux_quiet_interface_read_returns_within_the_timeout`.
+        let cap = ::pcap::Capture::from_device(iface)
+            .and_then(|c| {
+                c.promisc(true)
+                    .immediate_mode(true)
+                    .timeout(timeout_ms)
+                    .open()
+            })
             .map_err(|e| unavailable("open", &e))?;
+        let mut cap = cap
+            .setnonblock()
+            .map_err(|e| unavailable("setnonblock", &e))?;
         if let Some(bpf) = filter {
             cap.filter(bpf, true)
                 .map_err(|e| unavailable("filter", &e))?;
         }
-        Ok(Box::new(PcapCaptureSource { cap }))
+        Ok(Box::new(PcapCaptureSource {
+            cap,
+            read_timeout,
+            idle_nap: IDLE_NAP_MIN,
+        }))
     }
 
     /// Put one already-authorized frame on `iface`.
@@ -396,19 +423,52 @@ fn inject_ip_packet(iface: &str, frame: &[u8]) -> Result<(), L4Error> {
     Ok(())
 }
 
+/// The shortest and the longest nap [`PcapCaptureSource::next_frame`] takes
+/// between two empty non-blocking reads. The nap starts short so a reply that
+/// lands right after an empty read is seen within a millisecond, and doubles
+/// while the interface stays quiet so an idle background capture wakes about
+/// fifty times a second instead of a thousand.
+const IDLE_NAP_MIN: Duration = Duration::from_millis(1);
+const IDLE_NAP_MAX: Duration = Duration::from_millis(20);
+
+/// The nap after one more empty read: double, capped at [`IDLE_NAP_MAX`].
+fn grow_idle_nap(nap: Duration) -> Duration {
+    (nap * 2).min(IDLE_NAP_MAX)
+}
+
 /// A live pcap capture, adapting `next_packet` to [`CaptureSource`].
+///
+/// The handle is non-blocking (see `open_capture`); `next_frame` polls it until
+/// a frame is queued or `read_timeout` has elapsed, napping between empty reads.
 struct PcapCaptureSource {
     cap: ::pcap::Capture<::pcap::Active>,
+    read_timeout: Duration,
+    idle_nap: Duration,
 }
 
 impl CaptureSource for PcapCaptureSource {
     fn next_frame(&mut self) -> Result<Option<Vec<u8>>, L4Error> {
-        match self.cap.next_packet() {
-            Ok(packet) => Ok(Some(packet.data.to_vec())),
-            // A timed-out poll is "no frame yet", not an error — the capture task
-            // loops on it to stay responsive to shutdown.
-            Err(::pcap::Error::TimeoutExpired) => Ok(None),
-            Err(e) => Err(L4Error::Unavailable(format!("pcap next_packet: {e}"))),
+        let deadline = std::time::Instant::now() + self.read_timeout;
+        loop {
+            match self.cap.next_packet() {
+                Ok(packet) => {
+                    self.idle_nap = IDLE_NAP_MIN;
+                    return Ok(Some(packet.data.to_vec()));
+                }
+                // Nothing queued: nap and read again until the timeout, then
+                // report "no frame yet" so the caller re-checks its own deadline
+                // or stop flag. Never a blocking read, which libpcap may not
+                // return from on a quiet interface (see `open_capture`).
+                Err(::pcap::Error::TimeoutExpired) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(self.idle_nap.min(deadline - now));
+                    self.idle_nap = grow_idle_nap(self.idle_nap);
+                }
+                Err(e) => return Err(L4Error::Unavailable(format!("pcap next_packet: {e}"))),
+            }
         }
     }
 }
@@ -1179,5 +1239,75 @@ mod tests {
                 "linux loopback inject: destination is not a loopback address".to_string()
             ))
         );
+    }
+    /// The idle nap doubles from 1 ms and stops at 20 ms, so a quiet capture
+    /// settles at about fifty wake-ups a second.
+    #[test]
+    fn idle_nap_doubles_to_its_cap() {
+        let mut nap = IDLE_NAP_MIN;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            seen.push(nap.as_millis());
+            nap = grow_idle_nap(nap);
+        }
+        assert_eq!(seen, [1, 2, 4, 8, 16, 20, 20, 20]);
+    }
+
+    /// A quiet interface must not hang a bounded read. libpcap on Linux with
+    /// `TPACKET_V3` polls with no timeout of its own and relies on the kernel
+    /// retiring a ring block when the read timeout expires, but the kernel only
+    /// retires a block that holds a packet (`prb_retire_rx_blk_timer_expired`
+    /// re-arms the timer on an empty block), so on an interface where no frame
+    /// passes the kernel filter `next_frame` never returns: neither
+    /// `await_reply`'s deadline nor the capture thread's stop flag is consulted
+    /// again. Found by the T5 real-bus cells run one at a time on the rig: every
+    /// silent case hung until the engine's 60 s check timeout, and
+    /// `l4.capture.stop` hung on the join; the runner's concurrent cells had
+    /// kept frames flowing and masked it. Needs `CAP_NET_RAW`/`CAP_NET_ADMIN`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires capture privilege (CAP_NET_RAW); run with AITM_L4_TESTS=1 and -- --ignored"]
+    fn linux_quiet_interface_read_returns_within_the_timeout() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        if std::env::var("AITM_L4_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let backend = PcapBackend::new();
+            // A filter no frame on the box can match: nothing ever wakes the read.
+            let opened = backend.open_capture(
+                "lo",
+                Some("udp port 1 and udp port 2"),
+                Duration::from_millis(50),
+            );
+            let mut source = match opened {
+                Ok(source) => source,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            let start = Instant::now();
+            let first = source.next_frame();
+            let _ = tx.send(Ok((start.elapsed(), first.map(|frame| frame.is_some()))));
+        });
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok((elapsed, Ok(frame)))) => {
+                assert!(!frame, "a frame matched a filter nothing on the box sends to");
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "the poll took {elapsed:?} for a 50 ms read timeout"
+                );
+            }
+            Ok(Ok((_, Err(e)))) => panic!("read error: {e}"),
+            Ok(Err(L4Error::Unavailable(msg))) => eprintln!("skip: {msg}"),
+            Ok(Err(e)) => panic!("open: {e}"),
+            Err(_) => panic!(
+                "next_frame did not return within 3 s on a quiet interface: the 50 ms read timeout is not honoured"
+            ),
+        }
     }
 }
