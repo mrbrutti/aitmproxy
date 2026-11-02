@@ -237,6 +237,10 @@ impl Lane for PacketLane {
             let target_owned = target.clone();
             let profile_owned = profile.clone();
             let marker = job.marker();
+            // The engine's stable job id (not `marker`, which is minted fresh
+            // per call) seeds each target's source port, so two concurrent jobs
+            // against one target never share a reply five-tuple (amendment 73 b).
+            let job_id = job.job_id().to_string();
             let planned = tokio::task::spawn_blocking(move || {
                 discover_all(
                     guard.as_ref(),
@@ -246,6 +250,7 @@ impl Lane for PacketLane {
                     &profile_owned,
                     &requested,
                     &marker,
+                    &job_id,
                 )
             })
             .await;

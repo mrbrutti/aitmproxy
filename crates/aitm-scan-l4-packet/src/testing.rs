@@ -907,6 +907,7 @@ pub mod harness {
             &profile,
             requested,
             &job.marker(),
+            job.job_id(),
         )
         .expect("the loopback profile discovers");
         let state = Arc::new(LaneState::new());

@@ -370,18 +370,29 @@ pub fn resolve_target(
     })
 }
 
-/// The source port the lane claims for the target at `target_index`: the first
-/// of `40000 + index`, `+1`, `+2`, ... that is neither one of the core's own
-/// listener ports — so the reply capture's self-exclusion never drops the
-/// lane's own replies (call C25) — nor the target's own port `target_port`, so
-/// a stimulus's direction is never ambiguous: `send_recv` recognises its own
-/// looped-back frame by `src:src_port -> dst:dst_port`, and on loopback, where
-/// both addresses are the same host, equal ports would make the echo service's
-/// reply indistinguishable from the stimulus (T5 live proof).
+/// The source port the lane claims for `job_id`'s target at `target_index`:
+/// [`crate::plan::src_port_for`]'s job-id-derived port, then the first of that
+/// port, `+1`, `+2`, ... that is neither one of the core's own listener ports —
+/// so the reply capture's self-exclusion never drops the lane's own replies
+/// (call C25) — nor the target's own port `target_port`, so a stimulus's
+/// direction is never ambiguous: `send_recv` recognises its own looped-back
+/// frame by `src:src_port -> dst:dst_port`, and on loopback, where both
+/// addresses are the same host, equal ports would make the echo service's reply
+/// indistinguishable from the stimulus (T5 live proof).
+///
+/// Deriving the starting port from the job id (amendment 73 b) keeps two
+/// concurrent jobs against one target off the same five-tuple, so one job's
+/// `send_recv` can never consume the other's reply — a reply is the reversed
+/// five-tuple since amendment 66.
 #[must_use]
-pub fn choose_src_port(guard: &L4Guard, target_index: usize, target_port: u16) -> u16 {
+pub fn choose_src_port(
+    guard: &L4Guard,
+    job_id: &str,
+    target_index: usize,
+    target_port: u16,
+) -> u16 {
     let self_ports = guard.self_ports();
-    let mut port = src_port_for(target_index);
+    let mut port = src_port_for(job_id, target_index);
     while self_ports.contains(&port) || port == target_port {
         let Some(next) = port.checked_add(1) else {
             break;
@@ -787,12 +798,21 @@ pub fn probe_privilege(
 /// here, so this function stays pure of the profile type. An empty list is
 /// the target's default field table.
 ///
+/// `job_id` is the engine's stable job identifier (never `JobCtx::marker`,
+/// which mints a fresh token per call); the source port each target claims is
+/// derived from it so two concurrent jobs against one target never share a
+/// reply five-tuple (amendment 73 b, [`choose_src_port`]).
+///
 /// # Errors
 ///
 /// The first [`DiscoverError`] any target raises: resolution, field
 /// validation, seeds, or the per-interface privilege probe — which runs
 /// **before** any point is minted, so a privilege-less host refuses the job
 /// rather than half-planning it.
+// The lane's whole input — guard, backend, two stores, the profile and its two
+// identity tokens (marker and job id) — is passed explicitly rather than boxed
+// into a context struct, so each caller sees exactly what discovery reads.
+#[allow(clippy::too_many_arguments)]
 pub fn discover_all(
     guard: &L4Guard,
     backend: &dyn CaptureInjectBackend,
@@ -801,6 +821,7 @@ pub fn discover_all(
     profile: &ScanProfile,
     requested: &[String],
     marker: &str,
+    job_id: &str,
 ) -> Result<(Vec<TargetPlan>, Discovery), DiscoverError> {
     let mut plans: Vec<TargetPlan> = Vec::with_capacity(target.l4.len());
     let mut points: Vec<InsertionPoint> = Vec::new();
@@ -813,7 +834,7 @@ pub fn discover_all(
         let fields = validate_fields(ip_version(resolved.ip), resolved.proto, requested)
             .map_err(|message| DiscoverError::InvalidProfile(bare_invalid_profile(message)))?;
         let seeds = seed_payloads(&resolved, &profile.l4, seed_store, marker)?;
-        let src_port = choose_src_port(guard, index, resolved.port);
+        let src_port = choose_src_port(guard, job_id, index, resolved.port);
 
         if !probed.contains(&resolved.interface) {
             probe_privilege(guard, backend, &resolved.interface)?;
@@ -895,7 +916,10 @@ mod tests {
         MAX_SEED_BYTES,
     };
     use crate::fields::{default_fields, FieldPath, IpVersion};
-    use crate::plan::{link_framing, PlanError, SeedOrigin, SeedPayload, TargetPlan};
+    use crate::plan::{
+        link_framing, src_port_for, PlanError, SeedOrigin, SeedPayload, TargetPlan, SRC_PORT_BASE,
+        SRC_PORT_RANGE,
+    };
     use crate::testing::{
         fields, l4_profile, loopback_guard, tcp_target, udp_target, MockBackend, MockReply,
     };
@@ -1358,13 +1382,24 @@ mod tests {
             &profile,
             &[],
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("both targets resolve");
 
         assert_eq!(plans.len(), 2);
         assert_eq!(discovery.points.len(), 14 + 19);
         assert_eq!(discovery.nodes.len(), 2);
-        assert_eq!(plans[1].src_port, 40_001);
+        // Each target's source port is the job-id-derived port for its index
+        // (amendment 73 b); the two targets therefore differ.
+        assert_eq!(
+            plans[0].src_port,
+            choose_src_port(&guard, "scan-0000test", 0, 9)
+        );
+        assert_eq!(
+            plans[1].src_port,
+            choose_src_port(&guard, "scan-0000test", 1, 80)
+        );
+        assert_ne!(plans[0].src_port, plans[1].src_port);
         assert_eq!(guard.in_flight(), 0);
     }
 
@@ -1387,6 +1422,7 @@ mod tests {
             &profile,
             &[],
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("both targets resolve");
 
@@ -1460,6 +1496,7 @@ mod tests {
             &profile,
             &[],
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("both targets resolve");
 
@@ -1491,6 +1528,7 @@ mod tests {
             &profile,
             &[],
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("the target resolves");
 
@@ -1512,6 +1550,7 @@ mod tests {
                 &profile,
                 &fields(&[pin]),
                 "aitm7f3a",
+                "scan-0000test",
             )
             .expect_err("a pinned field is refused");
             let DiscoverError::InvalidProfile(message) = &err else {
@@ -1537,6 +1576,7 @@ mod tests {
             &profile,
             &fields(&["raw"]),
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("raw is fuzzable");
         assert_eq!(plans.len(), 2);
@@ -1545,8 +1585,10 @@ mod tests {
 
     #[test]
     fn self_port_target_is_refused_and_src_port_skips_self_ports() {
+        let job = "scan-0000test";
         let guard = loopback_guard("*", 100);
-        guard.set_self_ports([9, 40_000]);
+        let derived = src_port_for(job, 0);
+        guard.set_self_ports([9, derived]);
 
         let err = resolve_target(&guard, &udp_target(9)).expect_err("port 9 is a self port");
         let DiscoverError::InvalidProfile(message) = &err else {
@@ -1554,41 +1596,56 @@ mod tests {
         };
         assert!(message.contains("own listener ports"), "{message}");
 
-        assert_eq!(choose_src_port(&guard, 0, 9), 40_001);
+        // The job's derived source port is a self port, so it is walked past.
+        assert_eq!(choose_src_port(&guard, job, 0, 9), derived + 1);
     }
 
     /// T5 live proof: the source port never equals the target's own port, so
     /// the stimulus's direction (`src:src_port -> dst:dst_port`) is never
     /// symmetric and `send_recv` can tell its looped-back frame from the
-    /// echo service's reply on loopback. Target port 40000 moves the source to
-    /// 40001; a self port and the target port are both skipped; an unrelated
-    /// target port leaves the default alone.
+    /// echo service's reply on loopback. A target on the job's derived source
+    /// port moves the source one past it; a self port and the target port are
+    /// both skipped; an unrelated target port leaves the derived port alone.
     #[test]
     fn src_port_skips_the_targets_own_port() {
+        let job = "scan-0000test";
         let guard = loopback_guard("*", 100);
-        assert_eq!(choose_src_port(&guard, 0, 40_000), 40_001);
-        assert_eq!(choose_src_port(&guard, 0, 9), 40_000);
-        assert_eq!(choose_src_port(&guard, 1, 40_001), 40_002);
+        let derived0 = src_port_for(job, 0);
+        let derived1 = src_port_for(job, 1);
 
-        guard.set_self_ports([40_000]);
-        assert_eq!(choose_src_port(&guard, 0, 40_001), 40_002);
+        // Target on the derived port: source walks one forward.
+        assert_eq!(choose_src_port(&guard, job, 0, derived0), derived0 + 1);
+        // Target elsewhere: the derived port stands.
+        assert_eq!(choose_src_port(&guard, job, 0, 9), derived0);
+        // A second target index gets its own derived port, past its own port.
+        assert_eq!(choose_src_port(&guard, job, 1, derived1), derived1 + 1);
 
-        // Through discovery: a target on the lane's default source port is
+        // The derived port is a self port and the target is the next one: both
+        // are walked past.
+        guard.set_self_ports([derived0]);
+        let chosen = choose_src_port(&guard, job, 0, derived0 + 1);
+        assert_ne!(chosen, derived0);
+        assert_ne!(chosen, derived0 + 1);
+
+        // Through discovery: a target on the job's derived source port is
         // planned with the next one.
-        let profile = l4_profile(vec![udp_target(40_000)], 10);
+        let disco_guard = loopback_guard("*", 100);
+        let target_port = src_port_for(job, 0);
+        let profile = l4_profile(vec![udp_target(target_port)], 10);
         let backend = MockBackend::new(MockReply::Echo);
         let (plans, _) = discover_all(
-            &loopback_guard("*", 100),
+            &disco_guard,
             backend.as_ref(),
             None,
             &profile.target,
             &profile,
             &fields(&["raw"]),
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("a loopback udp target discovers");
-        assert_eq!(plans[0].src_port, 40_001);
-        assert_eq!(plans[0].target.port, 40_000);
+        assert_eq!(plans[0].src_port, target_port + 1);
+        assert_eq!(plans[0].target.port, target_port);
     }
 
     /// Tester (T5 stage 5): the search walks past a run of excluded ports and
@@ -1598,22 +1655,26 @@ mod tests {
     /// own listeners (call C25), both rules at once.
     #[test]
     fn src_port_walks_past_a_run_of_excluded_ports() {
+        let job = "scan-0000test";
         let guard = loopback_guard("*", 100);
-        guard.set_self_ports([40_000, 40_001, 40_002]);
+        let base = src_port_for(job, 0);
+        guard.set_self_ports([base, base + 1, base + 2]);
 
         assert_eq!(
-            choose_src_port(&guard, 0, 40_003),
-            40_004,
+            choose_src_port(&guard, job, 0, base + 3),
+            base + 4,
             "three self ports and the target's own are all skipped"
         );
         assert_eq!(
-            choose_src_port(&guard, 0, 9),
-            40_003,
+            choose_src_port(&guard, job, 0, 9),
+            base + 3,
             "without the target in the way the first free port wins"
         );
         for index in 0..8usize {
-            let target_port = 40_000 + u16::try_from(index).expect("a small index");
-            let port = choose_src_port(&guard, index, target_port);
+            // The target sits on the index's own derived port, so the walk must
+            // move the source off it as well as off every self port.
+            let target_port = src_port_for(job, index);
+            let port = choose_src_port(&guard, job, index, target_port);
             assert_ne!(port, target_port, "index {index}");
             assert!(
                 !guard.self_ports().contains(&port),
@@ -1643,6 +1704,7 @@ mod tests {
             &profile,
             &[],
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect_err("no pcap privilege");
         assert_eq!(through, direct);
@@ -1738,6 +1800,7 @@ mod tests {
                 &profile,
                 &fields(&["raw"]),
                 "aitm7f3a",
+                "scan-0000test",
             )
             .expect("an empty seed plans");
             assert_eq!(plans[0].seeds.len(), 1, "{hex:?}");
@@ -1907,6 +1970,7 @@ mod tests {
             &profile,
             &[],
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("::1 resolves against a v6 entry");
 
@@ -2208,6 +2272,7 @@ mod tests {
                 &profile,
                 &fields(&["raw"]),
                 "aitm7f3a",
+                "scan-0000test",
             );
             if fits {
                 let (plans, discovery) = planned.expect("the largest frame plans");
@@ -2262,6 +2327,7 @@ mod tests {
             &profile,
             &fields(&["raw"]),
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect_err("seed 1 does not build");
 
@@ -2452,6 +2518,7 @@ mod tests {
                 profile,
                 &fields(&["raw"]),
                 "aitm7f3a",
+                "scan-0000test",
             )
         };
 
@@ -2501,5 +2568,102 @@ mod tests {
             "invalid_profile: seed 127.0.0.1:9/udp#2 cannot be crafted: crafted packet exceeds 65535 bytes"
         );
         assert_eq!(backend.inject_count(), 0);
+    }
+
+    /// Amendment 73 (b): two jobs against one target must not share a source
+    /// port. Since amendment 66 a reply is the reversed five-tuple, so a shared
+    /// tuple lets job A's `send_recv` consume job B's reply and mask A's
+    /// silence. The port is derived from the job id, so two distinct ids on one
+    /// target get distinct ports. The derivation is a hash, so a collision is
+    /// possible but rare: over ten distinct ids at least nine ports are
+    /// distinct (the forward walk only ever coincides when the hash itself
+    /// collides).
+    #[test]
+    fn two_jobs_on_one_target_get_different_source_ports() {
+        let guard = loopback_guard("*", 100);
+        let a = choose_src_port(&guard, "scan-0000aaaa", 0, 9);
+        let b = choose_src_port(&guard, "scan-0000bbbb", 0, 9);
+        assert_ne!(a, b, "two jobs on one target share a source port");
+
+        let ids = [
+            "scan-00000000",
+            "scan-00000001",
+            "scan-00000002",
+            "scan-00000003",
+            "scan-00000004",
+            "scan-00000005",
+            "scan-00000006",
+            "scan-00000007",
+            "scan-00000008",
+            "scan-00000009",
+        ];
+        let ports: std::collections::BTreeSet<u16> = ids
+            .iter()
+            .map(|id| choose_src_port(&guard, id, 0, 9))
+            .collect();
+        assert!(
+            ports.len() >= 9,
+            "at least nine of ten job ids get a distinct source port, got {}",
+            ports.len()
+        );
+    }
+
+    /// The derivation is deterministic: the same job id and target index always
+    /// yield the same source port, because a replay and `send_recv`'s reply
+    /// correlation both recompute it (amendment 73 b).
+    #[test]
+    fn the_source_port_is_stable_for_a_job() {
+        let guard = loopback_guard("*", 100);
+        assert_eq!(
+            choose_src_port(&guard, "scan-0000aaaa", 0, 9),
+            choose_src_port(&guard, "scan-0000aaaa", 0, 9)
+        );
+        assert_eq!(
+            choose_src_port(&guard, "scan-0000aaaa", 3, 9),
+            choose_src_port(&guard, "scan-0000aaaa", 3, 9)
+        );
+    }
+
+    /// The job-id-derived port still keeps task 7's exclusions: it is walked
+    /// forward past the target's own port and past a core self port, so the
+    /// reply capture never drops the lane's own replies (call C25) and the
+    /// stimulus direction stays unambiguous.
+    #[test]
+    fn the_derived_port_never_equals_the_target_or_a_self_port() {
+        let job = "scan-0000aaaa";
+        let derived = src_port_for(job, 0);
+
+        // Target on the derived port: the source is walked one past it.
+        let guard = loopback_guard("*", 100);
+        let chosen = choose_src_port(&guard, job, 0, derived);
+        assert_ne!(
+            chosen, derived,
+            "source must not equal the target's own port"
+        );
+        assert_eq!(chosen, derived + 1);
+
+        // A core self port equal to the derived port: also walked past.
+        let guard = loopback_guard("*", 100);
+        guard.set_self_ports([derived]);
+        let chosen = choose_src_port(&guard, job, 0, 9);
+        assert_ne!(chosen, derived, "source must not be a core listener");
+        assert!(!guard.self_ports().contains(&chosen));
+    }
+
+    /// Every job id in a sample derives a source port inside the lane's window
+    /// `SRC_PORT_BASE..SRC_PORT_BASE + SRC_PORT_RANGE`, before the exclusion
+    /// walk — the range stays below the 60000 ephemeral floor (amendment 73 b).
+    #[test]
+    fn the_derived_port_stays_in_range() {
+        for n in 0..256u32 {
+            let id = format!("scan-{n:08x}");
+            for index in 0..4usize {
+                let port = src_port_for(&id, index);
+                assert!(
+                    (SRC_PORT_BASE..SRC_PORT_BASE + SRC_PORT_RANGE).contains(&port),
+                    "id {id} index {index}: {port} out of range"
+                );
+            }
+        }
     }
 }

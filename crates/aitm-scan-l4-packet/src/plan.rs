@@ -84,15 +84,51 @@ pub fn link_framing(interface: &str) -> LinkFraming {
 /// The first source port the lane claims.
 pub const SRC_PORT_BASE: u16 = 40000;
 
-/// The source port for the target at `target_index`, so two targets of one job
-/// never share a five-tuple and `send_recv`'s reply correlation stays unique.
+/// How many ports above [`SRC_PORT_BASE`] the lane's derived source ports span.
 ///
-/// The guard's self-port exclusion (task 7) rejects a port that is one of the
-/// core's own listeners, so this is a starting point, not a guarantee.
+/// 16000 keeps every derived port in `40000..56000`, below the 60000 floor of
+/// the ephemeral range the core and a loopback test target draw from, so a
+/// derived port is less likely to collide with one already in use (amendment
+/// 73 b).
+pub const SRC_PORT_RANGE: u16 = 16000;
+
+/// FNV-1a 64-bit offset basis.
+const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+/// FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+/// A stable, dependency-free FNV-1a 64 hash of `job_id`'s bytes.
+///
+/// The source port a job claims is derived from this, so it is deterministic
+/// across runs: a replay and `send_recv`'s reply correlation both recompute the
+/// same port (amendment 73 b).
 #[must_use]
-pub fn src_port_for(target_index: usize) -> u16 {
-    // `target_index % 1000 < 1000`, so the conversion is exact.
-    let offset = (target_index % 1000) as u16;
+fn hash_job_id(job_id: &str) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in job_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The source port for `job_id`'s target at `target_index`, derived from the
+/// job id so two **jobs** against one target never share the five-tuple
+/// `send_recv` correlates a reply by: since amendment 66 a reply is the
+/// reversed five-tuple, so a shared tuple lets one job's `send_recv` consume
+/// another's reply and mask its silence (amendment 73 b). `target_index` is
+/// folded in so two **targets** of one job also differ.
+///
+/// The result is `SRC_PORT_BASE + (hash(job_id) + target_index) % SRC_PORT_RANGE`.
+/// The guard's self-port exclusion and the target-port exclusion (task 7,
+/// applied by [`crate::discover::choose_src_port`]) reject a port that is one of
+/// the core's own listeners or the target's own, so this is a starting point,
+/// not a guarantee.
+#[must_use]
+pub fn src_port_for(job_id: &str, target_index: usize) -> u16 {
+    let index = u64::try_from(target_index).unwrap_or(u64::MAX);
+    // The modulo is `< SRC_PORT_RANGE` (16000), so the conversion is exact.
+    let offset = (hash_job_id(job_id).wrapping_add(index) % u64::from(SRC_PORT_RANGE)) as u16;
     SRC_PORT_BASE + offset
 }
 
