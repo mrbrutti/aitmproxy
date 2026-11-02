@@ -328,6 +328,58 @@ impl fmt::Display for StopReason {
     }
 }
 
+/// The closed reason token the lane hands `JobCtx::report_crawl_error` for one
+/// failed request or page (amendment 39b).
+///
+/// Exactly one of `h2_not_negotiated`, `connect_refused`, `tls`, `timeout`,
+/// `transport`, `other` — a closed set, so the engine's `crawl.errors` log and
+/// any frontend reading it never see a foreign error string. The chain is
+/// walked from the outermost context inwards and the first link that reads as
+/// one of the tokens wins; a link is classified by its concrete type where the
+/// crate can see it (`std::io::Error`, `tokio::time::error::Elapsed`) and by
+/// its text otherwise. The text rules exist because this crate depends on
+/// `aitm-core` only: `h2_not_negotiated:` is the literal
+/// `aitm-proto-http/src/sender.rs` writes, and a browser driver's error has
+/// already been flattened to a scrubbed string by the time it arrives.
+pub(crate) fn crawl_error_token(err: &anyhow::Error) -> &'static str {
+    for link in err.chain() {
+        let text = link.to_string();
+        if text.starts_with("h2_not_negotiated:") {
+            return "h2_not_negotiated";
+        }
+        let lower = text.to_ascii_lowercase();
+        let io = link.downcast_ref::<std::io::Error>();
+        if io.map(std::io::Error::kind) == Some(std::io::ErrorKind::ConnectionRefused)
+            || lower.contains("refused")
+        {
+            return "connect_refused";
+        }
+        if link.downcast_ref::<tokio::time::error::Elapsed>().is_some()
+            || lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("deadline")
+        {
+            return "timeout";
+        }
+        if lower.contains("tls")
+            || lower.contains("certificate")
+            || lower.contains("handshake")
+            || lower.contains("alpn")
+        {
+            return "tls";
+        }
+        if io.is_some()
+            || lower.contains("reset")
+            || lower.contains("broken pipe")
+            || lower.contains("eof")
+            || lower.contains("connection")
+        {
+            return "transport";
+        }
+    }
+    "other"
+}
+
 /// What one crawl run did.
 ///
 /// `stopped_reason` is `None` when the crawl ran out of frontier on its own.
@@ -555,6 +607,81 @@ mod tests {
             assert_eq!(reason.as_str(), literal);
             assert_eq!(reason.to_string(), literal);
         }
+    }
+
+    /// Amendment 39b: every crawl failure the lane reports carries one of the
+    /// closed reason tokens, chosen from the error chain.
+    #[test]
+    fn crawl_error_tokens_are_the_closed_set() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        let h2 = anyhow::anyhow!("h2_not_negotiated: t:8080: the peer offered http/1.1")
+            .context("crawl: fetch failed");
+        assert_eq!(crawl_error_token(&h2), "h2_not_negotiated");
+
+        let refused = anyhow::Error::new(IoError::new(ErrorKind::ConnectionRefused, "nope"));
+        assert_eq!(crawl_error_token(&refused), "connect_refused");
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("connection refused")),
+            "connect_refused"
+        );
+
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("the request timed out")),
+            "timeout"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!(
+                "scan: the job deadline passed before the browser answered"
+            )),
+            "timeout"
+        );
+
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("TLS handshake failed")),
+            "tls"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("the certificate is not valid")),
+            "tls"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("no ALPN protocol")),
+            "tls"
+        );
+
+        assert_eq!(
+            crawl_error_token(&anyhow::Error::new(IoError::new(
+                ErrorKind::UnexpectedEof,
+                "short read"
+            ))),
+            "transport"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("connection reset by peer")),
+            "transport"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("broken pipe")),
+            "transport"
+        );
+
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("the browser swallowed it")),
+            "other"
+        );
+    }
+
+    /// Amendment 39b: a `tokio` timeout is a `timeout` token through its own
+    /// error type, with no text to read.
+    #[tokio::test]
+    async fn crawl_error_token_reads_an_elapsed_timeout() {
+        let elapsed = tokio::time::timeout(Duration::from_millis(1), async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        })
+        .await
+        .expect_err("the sleep outlasts the timeout");
+        assert_eq!(crawl_error_token(&anyhow::Error::new(elapsed)), "timeout");
     }
 
     /// S-M3: a frontier holds queued and visited URLs, and a stored seed

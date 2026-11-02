@@ -42,7 +42,8 @@ use aitm_scan_model::JobCtx;
 
 use crate::crawl::extract::{extract, FieldKind, FormSpec};
 use crate::crawl::frontier::{
-    fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits, StopReason,
+    crawl_error_token, fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits,
+    StopReason,
 };
 use crate::crawl::values::{form_action, form_pairs_for};
 use crate::limits::{job_mark, MARK_CRAWL, MAX_DOM_BYTES, USER_AGENT};
@@ -193,18 +194,25 @@ impl<'a> Run<'a> {
             session::apply_session(&mut request, &material);
         }
         let client = self.job.client();
-        match tokio::time::timeout(left, client.send_opts(request, self.send.clone())).await {
-            Ok(Ok(flow)) => Some(flow),
-            Ok(Err(_)) | Err(_) => {
-                self.failures = self.failures.saturating_add(1);
-                tracing::debug!(
-                    job = %self.job.job_id(),
-                    page = %redact::safe_url(url.as_str()),
-                    "scan: crawl: fetch failed"
-                );
-                None
-            }
-        }
+        let failure =
+            match tokio::time::timeout(left, client.send_opts(request, self.send.clone())).await {
+                Ok(Ok(flow)) => return Some(flow),
+                Ok(Err(err)) => err,
+                // A timeout is its own error here; `crawl_error_token` reads it as
+                // `timeout` off the type, with no text to parse.
+                Err(elapsed) => anyhow::Error::new(elapsed),
+            };
+        self.failures = self.failures.saturating_add(1);
+        // Amendment 39b: the job counts this page into `crawl.errors` with a
+        // closed reason token. The error text itself never crosses the seam.
+        self.job
+            .report_crawl_error(self.origin.as_str(), crawl_error_token(&failure));
+        tracing::debug!(
+            job = %self.job.job_id(),
+            page = %redact::safe_url(url.as_str()),
+            "scan: crawl: fetch failed"
+        );
+        None
     }
 
     /// Read everything the crawl wants out of one response and queue the work
@@ -854,7 +862,7 @@ mod tests {
                     &[("content-type", "text/html")],
                     br#"<a href="/a">a</a><a href="/b">b</a>"#,
                 )),
-                "/a" => Err(anyhow::anyhow!("connection reset")),
+                "/a" => Err(anyhow::anyhow!("connection refused")),
                 _ => Ok(crate::testutil::response(
                     200,
                     &[("content-type", "text/html")],
@@ -871,6 +879,12 @@ mod tests {
         assert_eq!(report.attempts, 3);
         assert_eq!(report.flows.len(), 2);
         assert_eq!(report.stopped_reason, None);
+        // Amendment 39b: the one failed fetch is reported to the job with a
+        // closed reason token, so `crawl.errors` is not 0 on a failing crawl.
+        assert_eq!(
+            *job.crawl_errors.lock().unwrap(),
+            vec![(ORIGIN.to_string(), "connect_refused".to_string())]
+        );
 
         let dead = Arc::new(crate::testutil::ScriptedClient::new(|_: &HttpRequest| {
             Err(anyhow::anyhow!("refused"))
@@ -882,6 +896,10 @@ mod tests {
         assert_eq!(report.pages, 0);
         assert_eq!(report.attempts, 1);
         assert_eq!(report.stopped_reason, Some(StopReason::NavigationFailed));
+        assert_eq!(
+            *job.crawl_errors.lock().unwrap(),
+            vec![(ORIGIN.to_string(), "connect_refused".to_string())]
+        );
     }
 
     // --- N2: a `multipart/form-data` form is posted as multipart ------------

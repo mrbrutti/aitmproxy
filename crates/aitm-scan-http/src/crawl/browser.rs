@@ -60,7 +60,8 @@ use url::Url;
 
 use crate::crawl::extract::{extract, Extracted, FieldKind, FormSpec};
 use crate::crawl::frontier::{
-    fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits, StopReason,
+    crawl_error_token, fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits,
+    StopReason,
 };
 use crate::crawl::values::{chosen_fields, form_action, value_for};
 use crate::limits::{
@@ -621,6 +622,11 @@ impl<'a> Run<'a> {
             Err(err) => {
                 self.guard.record_error(&authority);
                 self.collect();
+                // Amendment 39b: the job counts this page into `crawl.errors`
+                // with a closed reason token; the driver's own text stays in
+                // the (scrubbed) log line below.
+                self.job
+                    .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -652,6 +658,8 @@ impl<'a> Run<'a> {
             Ok(dom) => dom,
             Err(err) => {
                 self.collect();
+                self.job
+                    .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -1022,6 +1030,8 @@ impl<'a> Run<'a> {
             Ok(_) => Ok(Step::Continue),
             Err(err) => {
                 self.guard.record_error(&guard_authority(page));
+                self.job
+                    .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -2399,6 +2409,9 @@ mod tests {
         fn marker(&self) -> String {
             self.inner.marker()
         }
+        fn report_crawl_error(&self, origin: &str, reason: &str) {
+            self.inner.report_crawl_error(origin, reason);
+        }
     }
 
     /// The crawler's "could not load this page" line carries the driver's error
@@ -2430,6 +2443,61 @@ mod tests {
         for line in lines.all() {
             assert!(!line.contains("abc") && !line.contains("S3"), "{line}");
         }
+    }
+
+    /// A driver whose every navigation fails with a TLS error.
+    struct TlsFailBrowser;
+
+    impl BrowserDriver for TlsFailBrowser {
+        fn navigate(&self, _url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            Box::pin(async { Err(anyhow::anyhow!("tls handshake failed")) })
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// Amendment 39b: a page the browser cannot load is reported to the job
+    /// with the crawl origin and one closed reason token, so an all-failing
+    /// browser crawl does not end with `crawl.errors 0`.
+    #[tokio::test]
+    async fn failed_navigation_is_reported_to_the_job() {
+        let job = JobWithDriver {
+            inner: FakeJob::new(
+                ScanProfile::default(),
+                Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+            ),
+            driver: Arc::new(TlsFailBrowser),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a page the browser cannot load is skipped, not fatal");
+        assert_eq!(report.pages, 0);
+
+        assert_eq!(
+            *job.inner.crawl_errors.lock().unwrap(),
+            vec![(ROOT.to_string(), "tls".to_string())]
+        );
     }
 
     /// `prime_session` propagates a failed navigation as an error whose text is
