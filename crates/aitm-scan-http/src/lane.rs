@@ -50,7 +50,7 @@ use crate::crawl::client::ClientCrawler;
 use crate::crawl::frontier::{held_copy, limits_for, Crawler, StopReason};
 use crate::crawl::seeds::fetch_seeds;
 use crate::host::{HttpProbeHost, SessionMonitors};
-use crate::limits::{is_crawl_mark, job_mark, MARK_CRAWL, MAX_SEED_URLS, MAX_STORED_FLOWS};
+use crate::limits::{is_crawl_mark, job_mark, MAX_SEED_URLS, MAX_STORED_FLOWS};
 use crate::points::{enumerate_v2, CompiledIgnore, EnumerateOptions};
 use crate::redact;
 use crate::sitemap::{is_authenticated, SiteMapBuilder};
