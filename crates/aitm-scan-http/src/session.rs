@@ -255,7 +255,7 @@ fn is_scanner_capture(flow: &Flow) -> bool {
     http.metadata
         .marks
         .iter()
-        .any(|mark| mark == limits::MARK_CRAWL || mark.starts_with(limits::JOB_MARK_PREFIX))
+        .any(|mark| limits::is_crawl_mark(mark) || limits::is_job_mark(mark))
 }
 
 /// The canary `flow` would make, or `None` when it does not qualify.

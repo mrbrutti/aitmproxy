@@ -113,6 +113,16 @@ pub(crate) fn job_mark(job_id: &str) -> String {
     format!("{JOB_MARK_PREFIX}{job_id}")
 }
 
+/// Whether `mark` is the crawl mark [`MARK_CRAWL`].
+pub(crate) fn is_crawl_mark(mark: &str) -> bool {
+    mark == MARK_CRAWL
+}
+
+/// Whether `mark` is a job mark, `scan:<job id>` for any job.
+pub(crate) fn is_job_mark(mark: &str) -> bool {
+    mark.starts_with(JOB_MARK_PREFIX)
+}
+
 /// The `User-Agent` every request the lane makes itself carries — a crawl page
 /// fetch, a form submission, a `robots.txt` or `sitemap.xml` read.
 ///
@@ -125,8 +135,9 @@ pub(crate) const USER_AGENT: &str = "aitm-scan";
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        job_mark, CANARY_EVERY, JOB_MARK_PREFIX, MAX_AWAIT, MAX_DOM_BYTES, MAX_FRONTIER,
-        MAX_HELD_FLOWS, MAX_LINKS_PER_PAGE, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS,
+        is_crawl_mark, is_job_mark, job_mark, CANARY_EVERY, JOB_MARK_PREFIX, MAX_AWAIT,
+        MAX_DOM_BYTES, MAX_FRONTIER, MAX_HELD_FLOWS, MAX_LINKS_PER_PAGE, MAX_LOST_MONITOR_IDS,
+        MAX_SESSION_MONITORS,
     };
     use std::time::Duration;
 
@@ -149,5 +160,27 @@ mod tests {
         assert_eq!(JOB_MARK_PREFIX, "scan:");
         assert_eq!(job_mark("scan-1a2b3c4d"), "scan:scan-1a2b3c4d");
         assert_eq!(job_mark(""), "scan:");
+    }
+
+    /// The crawl mark is the one literal `crawl`: not a job mark, not the
+    /// unrelated `scanner` word, not a prefix match.
+    #[test]
+    fn is_crawl_mark_pins() {
+        assert!(is_crawl_mark("crawl"));
+        assert!(!is_crawl_mark(&job_mark("scan-1a2b3c4d")));
+        assert!(!is_crawl_mark("scanner"));
+        assert!(!is_crawl_mark("crawler"));
+        assert!(!is_crawl_mark(""));
+    }
+
+    /// A job mark is anything `job_mark` builds, whatever the job id; the
+    /// crawl mark and the unrelated `scanner` word are not.
+    #[test]
+    fn is_job_mark_pins() {
+        assert!(is_job_mark(&job_mark("scan-1a2b3c4d")));
+        assert!(is_job_mark("scan:"));
+        assert!(!is_job_mark("crawl"));
+        assert!(!is_job_mark("scanner"));
+        assert!(!is_job_mark("scan-1a2b3c4d"));
     }
 }
