@@ -129,8 +129,15 @@ fn default_budget_keeps_nesting_within_the_worker_stack() {
 }
 
 /// The wall-clock budget belongs to the run the caller opened, not to the
-/// thread: a second run on the same thread starts its clock afresh, and the
-/// deadline it opened is what host calls read back.
+/// thread: a run whose budget is already spent is terminated, the next run on
+/// the same thread starts its clock afresh and succeeds, and the deadline a
+/// run opened is what host calls read back.
+///
+/// Deterministic by construction: the spent budget is `Duration::ZERO` (its
+/// deadline has passed by the first `on_progress` tick, whatever the host is
+/// doing), the live budget is 30 s against a few milliseconds of work, and
+/// there is no sleep. The earlier form (a 60 ms loop under a 1.5 s budget)
+/// flaked on a saturated host.
 #[test]
 fn each_run_gets_a_fresh_budget_and_exposes_its_deadline() {
     let limits = RhaiLimits {
@@ -139,26 +146,37 @@ fn each_run_gets_a_fresh_budget_and_exposes_its_deadline() {
     };
     // The engine-level budget is generous; the run's own budget is what counts.
     let engine = build_engine(&limits, Duration::from_secs(30));
-    // ~60ms of busy work per run.
-    let busy = "let t = 0; for i in 0..400000 { t += i; } t";
+    // Real work the optimizer cannot fold away: the sum 0 + 1 + … + 1999.
+    let busy = "let t = 0; for i in 0..2000 { t += i; } t";
+    const BUSY_RESULT: i64 = 1_999_000;
+    let generous = budget(Duration::from_secs(30));
 
-    for _ in 0..2 {
-        let _run = begin_run(RunKind::Hook, budget(Duration::from_millis(1500)));
-        let started = Instant::now();
-        engine
+    // A run inside its budget completes with the right answer.
+    {
+        let _run = begin_run(RunKind::Hook, generous);
+        let value = engine
             .eval::<i64>(busy)
             .unwrap_or_else(|err| panic!("a run inside its budget must succeed: {err}"));
-        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(value, BUSY_RESULT);
     }
 
     // A run whose budget is already spent is aborted with the Timeout token.
     {
-        let _run = begin_run(RunKind::Hook, budget(Duration::from_millis(20)));
-        std::thread::sleep(Duration::from_millis(40));
+        let _run = begin_run(RunKind::Hook, budget(Duration::ZERO));
         let err = engine
             .eval::<i64>(busy)
             .expect_err("an expired run must abort");
         assert_eq!(abort_kind(&err), Some(AbortKind::Timeout), "{err}");
+    }
+
+    // The next run on the same thread is not tainted by the spent one: its
+    // budget is its own, opened afresh.
+    {
+        let _run = begin_run(RunKind::Hook, generous);
+        let value = engine
+            .eval::<i64>(busy)
+            .unwrap_or_else(|err| panic!("a fresh run after a spent one must succeed: {err}"));
+        assert_eq!(value, BUSY_RESULT);
     }
 
     // Outside a run nothing is active; inside, the kind and the remaining

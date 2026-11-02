@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::FlowRef;
 use crate::vocab::{
-    CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, PointTrait,
-    Technique,
+    CheckCost, CheckOrigin, CheckScope, Confidence, InsertionKind, Intensity, LaneKind, Outcome,
+    PointTrait, Technique,
 };
 
 /// The largest excerpt [`Evidence::excerpt`] will produce, in bytes (spec D2).
@@ -56,6 +56,12 @@ pub struct CheckMeta {
     /// Whether the check may mutate `session`-trait points. No v2 check does.
     #[serde(default)]
     pub targets_session: bool,
+    /// How often the scheduler runs the check: per point, per node, per origin.
+    ///
+    /// Absent from a pre-T1b catalogue entry, which reads as
+    /// [`CheckScope::Point`] — once per insertion point.
+    #[serde(default)]
+    pub scope: CheckScope,
     /// The CWE this class maps to.
     #[serde(default)]
     pub cwe: Option<u32>,
@@ -69,6 +75,16 @@ pub struct CheckMeta {
 }
 
 /// A check's result for one insertion point (spec D2).
+///
+/// **One verdict, or one per exposed path.** A check returns one root verdict
+/// and may attach sibling verdicts in [`Verdict::more`] (coordinator item (g),
+/// 2026-11-01). Each verdict's [`Verdict::location`], when present, overrides
+/// the issue location's `path` (and `name`), so an origin-scoped check such as
+/// an exposed-path probe produces one issue per entry — the dedupe key hashes
+/// class + location, which is what keeps `/.git/` and `/.env` apart. The
+/// engine flattens `more` **one level**: a `more` inside a `more` entry is
+/// ignored. Both fields are additive; a verdict written before them reads as
+/// "no override, no siblings".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Verdict {
@@ -83,6 +99,29 @@ pub struct Verdict {
     /// In-process instruction to the PoC builder; never serialised (call 23).
     #[serde(skip)]
     pub poc_hint: Option<PocHint>,
+    /// Where this verdict's issue lives when that differs from the point: the
+    /// engine takes `path` (and `name`) from here over the point's own.
+    #[serde(default)]
+    pub location: Option<VerdictLocation>,
+    /// Sibling verdicts from the same run, each becoming its own issue;
+    /// flattened one level by the engine.
+    #[serde(default)]
+    pub more: Vec<Verdict>,
+}
+
+/// The part of an issue location a verdict may override (coordinator item (g)).
+///
+/// An absent field keeps the point's value; a check that found `/.git/` sets
+/// `path` and leaves `name` to the point.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct VerdictLocation {
+    /// The request path the issue is at, overriding the point's.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The parameter or element name, overriding the point's.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// What a check tells the engine to assert when it reproduces the finding.
@@ -168,6 +207,13 @@ pub struct Timing {
     pub slope: f32,
     /// Pearson correlation coefficient of the fit.
     pub r: f32,
+    /// Whether the check judged the fit a correlation (spec D8.2: a blind timing
+    /// technique may claim `firm` only after a correlated repeat).
+    ///
+    /// The check decides, not the reader of the evidence: it knows how many
+    /// repeats it ran and against which threshold. Absent means `false`.
+    #[serde(default)]
+    pub correlated: bool,
 }
 
 /// Response-length evidence for a boolean-blind technique.
@@ -247,6 +293,8 @@ mod tests {
                 assertions: vec![aitm_poc::Assertion::Status(200)],
                 control: None,
             }),
+            location: None,
+            more: Vec::new(),
         };
 
         let json = serde_json::to_string(&verdict).expect("serializes");
@@ -274,6 +322,7 @@ mod tests {
             needs_baseline: false,
             wants_traits: None,
             targets_session: false,
+            scope: CheckScope::Point,
             cwe: Some(89),
             description: "A database error signature reveals the injected quote.".into(),
             remediation: Some("Use parameterised queries.".into()),
@@ -349,6 +398,89 @@ mod tests {
         }
     }
 
+    /// Coordinator decision 4 (spec D4): `scope` is additive. A catalogue entry
+    /// written before T1b carries no `scope` key and reads as the per-point
+    /// default, so the scheduler keeps scheduling it once per insertion point.
+    #[test]
+    fn check_scope_defaults_to_point() {
+        let json = r#"{
+            "id": "sqli-error",
+            "name": "SQL injection (error-based)",
+            "class": "sqli",
+            "lanes": ["http"],
+            "kinds": ["query"],
+            "intensity": "medium",
+            "cost": "light",
+            "technique": "error",
+            "severity": "high",
+            "confidence_max": "firm",
+            "description": "A database error signature reveals the injected quote.",
+            "origin": {"kind": "native"}
+        }"#;
+
+        let meta: CheckMeta = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(meta.scope, CheckScope::Point);
+        assert_eq!(CheckScope::default(), CheckScope::Point);
+
+        assert_eq!(
+            serde_json::to_string(&CheckScope::Origin).expect("serializes"),
+            "\"origin\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CheckScope::Node).expect("serializes"),
+            "\"node\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CheckMeta>(
+                &serde_json::to_string(&CheckMeta {
+                    scope: CheckScope::Origin,
+                    ..meta.clone()
+                })
+                .expect("serializes")
+            )
+            .expect("deserializes")
+            .scope,
+            CheckScope::Origin
+        );
+    }
+
+    /// Coordinator decision 3 (spec D8.2, AC T3-4): a timing check records
+    /// whether the fit actually correlated, and evidence written before T1b
+    /// reads as "not correlated" rather than claiming a correlation it never had.
+    #[test]
+    fn timing_correlated_defaults_false() {
+        const WITHOUT: &str = r#"{
+            "requested_s": [1.0, 3.0],
+            "observed_ms": [1020, 3030],
+            "baseline_ms": [18, 19],
+            "slope": 1005.0,
+            "r": 0.999
+        }"#;
+
+        let timing: Timing = serde_json::from_str(WITHOUT).expect("deserializes");
+        assert!(!timing.correlated);
+
+        let with: Timing = serde_json::from_str(
+            r#"{
+            "requested_s": [1.0, 3.0],
+            "observed_ms": [1020, 3030],
+            "baseline_ms": [18, 19],
+            "slope": 1005.0,
+            "r": 0.999,
+            "correlated": true
+        }"#,
+        )
+        .expect("deserializes");
+        assert!(with.correlated);
+
+        let json = serde_json::to_string(&with).expect("serializes");
+        assert!(json.contains(r#""correlated":true"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<Timing>(&json).expect("round trips"),
+            with
+        );
+    }
+
     #[test]
     fn l4_oracle_icmp_wire_shape() {
         assert_eq!(
@@ -390,5 +522,89 @@ mod tests {
 
         let back: L4Evidence = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, evidence);
+    }
+
+    /// Tester: an unknown `scope` token on a catalogue entry is a parse error,
+    /// not a silent fall-back to `point` — the scheduler must never run a check
+    /// at the wrong cadence because a script misspelt its scope.
+    #[test]
+    fn check_meta_with_an_unknown_scope_token_is_an_error() {
+        let json = r#"{
+            "id": "x", "name": "x", "class": "x",
+            "lanes": ["http"], "kinds": ["query"],
+            "intensity": "passive", "cost": "light", "technique": "passive",
+            "severity": "info", "confidence_max": "tentative",
+            "description": "x", "origin": {"kind": "native"},
+            "scope": "everywhere"
+        }"#;
+        let err = serde_json::from_str::<CheckMeta>(json).expect_err("an unknown scope is refused");
+        assert!(err.to_string().contains("everywhere"), "{err}");
+    }
+
+    /// Coordinator item (g) (2026-11-01): the multi-verdict contract is
+    /// additive. A verdict written before it carries neither `location` nor
+    /// `more` and reads as "no override, no siblings"; a `VerdictLocation`
+    /// round-trips its `path` so the engine can place one issue per exposed path.
+    #[test]
+    fn verdict_more_and_location_default_empty() {
+        let json = r#"{
+            "outcome": "vulnerable",
+            "confidence": "firm",
+            "evidence": {},
+            "detail": "exposed"
+        }"#;
+        let verdict: Verdict = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(verdict.location, None);
+        assert!(verdict.more.is_empty());
+
+        let located = Verdict {
+            outcome: Outcome::Vulnerable,
+            confidence: Confidence::Firm,
+            evidence: Evidence::default(),
+            detail: "git metadata exposed".into(),
+            poc_hint: None,
+            location: Some(VerdictLocation {
+                path: Some("/.git/".into()),
+                name: None,
+            }),
+            more: vec![Verdict {
+                outcome: Outcome::Vulnerable,
+                confidence: Confidence::Firm,
+                evidence: Evidence::default(),
+                detail: "env file exposed".into(),
+                poc_hint: None,
+                location: Some(VerdictLocation {
+                    path: Some("/.env".into()),
+                    name: Some("env".into()),
+                }),
+                more: Vec::new(),
+            }],
+        };
+        let json = serde_json::to_string(&located).expect("serializes");
+        assert!(
+            json.contains(r#""location":{"path":"/.git/","name":null}"#),
+            "{json}"
+        );
+        let back: Verdict = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, located);
+        assert_eq!(
+            back.location.as_ref().and_then(|l| l.path.as_deref()),
+            Some("/.git/")
+        );
+        assert_eq!(back.more.len(), 1);
+        assert_eq!(
+            back.more[0]
+                .location
+                .as_ref()
+                .and_then(|l| l.path.as_deref()),
+            Some("/.env")
+        );
+        assert_eq!(
+            VerdictLocation::default(),
+            VerdictLocation {
+                path: None,
+                name: None
+            }
+        );
     }
 }
