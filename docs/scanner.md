@@ -226,6 +226,7 @@ l4:
   liveness_every: 25
   consecutive_timeouts: 20
   max_bytes_per_s: 65536
+  icmp_pace_ms: 1100          # ICMP-paced points; raised to ceilings.l4_icmp_pace_ms_min
   seeds: []                   # - { hex: "0001" } | { base64: "AAE=" } | { flow: <flow id> }
   fields: []                  # empty = the lane's own default table
   dry_run: false              # build and report every case, send nothing
@@ -264,8 +265,9 @@ profile figure above its ceiling is **clamped, not refused**: the job runs,
 bounded, and every cut is reported in `scan.start`'s `clamped` list as
 `{ field, requested, applied }` and kept on `JobStatus.clamped`. The clamped
 fields are `budget.probes`, `budget.time_s`, `budget.max_issues`,
-`budget.check_timeout_s`, `l4.cases`, `l4.max_bytes_per_s` and
-`ws.max_frame_bytes`. `budget.check_timeout_s` is clamped by the lower of
+`budget.check_timeout_s`, `l4.cases`, `l4.max_bytes_per_s`, `l4.icmp_pace_ms`
+(the one field raised **up**, to the `l4_icmp_pace_ms_min` floor; amendment 46)
+and `ws.max_frame_bytes`. `budget.check_timeout_s` is clamped by the lower of
 `scanner.check_timeout_s` and `scanner.ceilings.time_s`: one check may never
 outlast the whole job.
 
@@ -546,8 +548,9 @@ every origin a surviving point belongs to, each scheduled as a synthesized
 that request. An origin is not a point, so no point gate applies to it —
 `audit.kinds`, `wants_traits`, the frequent-point rule and the session rule are
 not consulted and only the check's `intensity` can leave it out. A
-script may **not** declare `origin`: aitm records where the script came from
-(`native`, `bundled` or `custom`). A missing or mistyped meta key is a **load
+script may **not** declare the catalogue's `origin` field (not to be confused
+with `scope: origin`): aitm records where the script came from (`native`,
+`bundled` or `custom`). A missing or mistyped meta key is a **load
 error naming the key**, not a default — the catalogue cannot schedule what it
 cannot classify. An id a script already registered is a load error naming the
 source that holds it; an id that clashes across sources (lane checks, then the
