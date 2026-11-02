@@ -69,7 +69,6 @@ final class Session {
     /// The L4 commands are advertised by the current core (feature-detected).
     var l4Enabled: Bool { tools.contains { $0.name == "l4.flow.list" } }
     var l4HasSetter: Bool { tools.contains { $0.name == "l4.agent.set" } }
-    var l4HasIntercept: Bool { tools.contains { $0.name == "l4.intercept.start" } }
     /// `scan.discover` is advertised by the current core (feature-detected): the Scan page is offered, else hidden.
     var scanEnabled: Bool { ScanForm.isOffered(in: tools) }
     var selection: Set<FlowID> = []

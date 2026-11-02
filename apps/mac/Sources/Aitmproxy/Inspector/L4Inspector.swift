@@ -27,24 +27,29 @@ struct L4Inspector: View {
     @State private var injectResult: String?
     /// The inspect window for the selected flow (`l4.flow.get` with `inspect: true`).
     @State private var window: L4Flow?
+    /// Why the last window read failed (`BusService.describe`), shown where the packets
+    /// would be; cleared by the next successful read.
+    @State private var windowError: String?
 
     private var gate: L4ActionGate { L4ActionGate(inScope: row.inScope) }
+    /// Inject, Forward and Drop are the operator's (spec §3): an agent-role session would only
+    /// get a policy refusal, so the buttons are disabled with the reason instead of offered to
+    /// fail — the same gate as the Scope page's add form (`l4IsOperator`). Read from the role the
+    /// server echoed at `initialize`; nil (unconfirmed) is not the operator.
+    private var isOperator: Bool { session.resolvedRole == "operator" }
+    /// The help text on a verb the role gate disabled.
+    static let operatorOnlyReason = "Needs the operator token (Settings ▸ Bus)"
     /// The oldest parked packet of this flow, the one the intercept bar acts on (spec §4).
     private var parkedPacket: L4ParkedPacket? { L4ParkedPacket.first(for: row.id, in: session.l4Parked) }
 
     var body: some View {
         VStack(spacing: 0) {
-            switch session.l4CaptureAvailability {
-            case .degraded(let reason):
-                L4DegradedBanner(reason: reason)
+            if session.l4CaptureAvailability != .available {
+                L4DegradedBanner(availability: session.l4CaptureAvailability)
                 Rule()
-            case .pending:
-                L4DegradedBanner(reason: L4Availability.pendingText, pending: true)
-                Rule()
-            case .available:
-                EmptyView()
             }
             L4InterceptBar(availability: session.l4InterceptAvailability, parked: parkedPacket, gate: gate,
+                           isOperator: isOperator,
                            onForward: { verdict("l4.intercept.forward") },
                            onDrop: { verdict("l4.intercept.drop") })
             if let detail {
@@ -73,9 +78,25 @@ struct L4Inspector: View {
         .sheet(item: $confirm) { request in
             L4ConfirmSheet(request: request, onConfirm: { confirmed(request) }, onCancel: { confirm = nil })
         }
-        .task(id: detail?.id) {
-            guard let id = detail?.id else { window = nil; return }
+        .task(id: detail.map(WindowKey.init)) {
+            guard let id = detail?.id else { window = nil; windowError = nil; return }
             await fetchWindow(id)
+        }
+    }
+
+    /// What the window follows: the flow, and the two list-poll fields that change when
+    /// the core recorded more packets or the session moved on. A new key re-reads the
+    /// window; `fetchWindow` keeps the old one while the id matches, so the list never
+    /// blanks between the reads.
+    private struct WindowKey: Hashable {
+        let id: FlowID
+        let packetCount: Int
+        let sessionState: L4SessionState
+
+        init(_ flow: L4Flow) {
+            id = flow.id
+            packetCount = flow.packetCount
+            sessionState = flow.sessionState
         }
     }
 
@@ -95,8 +116,9 @@ struct L4Inspector: View {
             case .packet:
                 let shown = packets(detail)
                 if shown.isEmpty {
-                    Hint(text: "No packets").padding(.leading, Space.md)
+                    Hint(text: windowError.map { "Packets unavailable: \($0)" } ?? "No packets").padding(.leading, Space.md)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .accessibilityIdentifier(windowError == nil ? "l4-no-packets" : "l4-window-error")
                 } else {
                     L4PacketDetail(packet: shown[min(selected, shown.count - 1)])
                 }
@@ -127,7 +149,7 @@ struct L4Inspector: View {
                     .help(gate.disabledReason ?? "Parse the YAML and preview the on-wire bytes")
                 Button("Inject…") { beginInject() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!gate.injectEnabled || preview == nil || !session.l4CaptureAvailability.canDriveWire)
+                    .disabled(!isOperator || !gate.injectEnabled || preview == nil || !session.l4CaptureAvailability.canDriveWire)
                     .help(injectHelp)
                 Spacer()
                 if let preview {
@@ -156,10 +178,11 @@ struct L4Inspector: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    /// Inject's tooltip: the scope reason, else the core's availability text (its
-    /// reason when degraded, the pending literal before the first status reply),
-    /// else what is left to do.
+    /// Inject's tooltip: the operator-only reason, else the scope reason, else the core's
+    /// availability text (its reason when degraded, the pending literal before the first
+    /// status reply), else what is left to do.
     private var injectHelp: String {
+        if !isOperator { return Self.operatorOnlyReason }
         if !gate.injectEnabled { return gate.disabledReason ?? "" }
         if let text = session.l4CaptureAvailability.displayText { return text }
         if preview == nil { return "Build the packet first" }
@@ -245,16 +268,24 @@ struct L4Inspector: View {
 
     /// One `l4.flow.get` window for the selected flow: the first 256 packets with
     /// their bytes when this core has the bounded window, every packet otherwise.
+    /// Re-run for every `WindowKey` change; the previous window stays up while the id
+    /// matches, and a failed read keeps it too and records why, so a transient bus
+    /// error never blanks the packets the operator is reading.
     private func fetchWindow(_ id: FlowID) async {
-        if window?.id != id { window = nil }
+        if window?.id != id { window = nil; windowError = nil }
         let args = L4Wire.flowGetArgs(id: id, inspect: true, window: L4Wire.supportsWindow(session.tools))
         do {
             let result = try await session.runCommand("l4.flow.get", args)
             guard !Task.isCancelled else { return }
-            window = L4Flow(json: result)
+            if let flow = L4Flow(json: result) {
+                window = flow
+                windowError = nil
+            } else {
+                windowError = "l4.flow.get returned no flow"
+            }
         } catch {
             guard !Task.isCancelled else { return }
-            window = nil
+            windowError = BusService.describe(error)
         }
     }
 }
@@ -262,20 +293,6 @@ struct L4Inspector: View {
 enum L4Tab: String, CaseIterable, CustomStringConvertible {
     case packet = "Layers", craft = "Craft"
     var description: String { rawValue }
-}
-
-/// `src:srcPort → dst:dstPort` for a packet, from whatever §2 fields the core sent;
-/// nil when it sent neither address.
-private func endpointsLine(_ packet: L4Packet) -> String? {
-    func side(_ host: String?, _ port: Int?) -> String? {
-        guard let host, !host.isEmpty else { return nil }
-        if let port { return "\(host):\(port)" }
-        return host
-    }
-    let src = side(packet.src, packet.srcPort)
-    let dst = side(packet.dst, packet.dstPort)
-    if src == nil && dst == nil { return nil }
-    return "\(src ?? "?") → \(dst ?? "?")"
 }
 
 // MARK: - Packet list (mirrors the WebSocket frame list)
@@ -323,6 +340,7 @@ private struct L4PacketRow: View {
     private var outbound: Bool { packet.dir == .outbound }
 
     var body: some View {
+        let endpoints = packet.endpoints
         HStack(spacing: Space.md) {
             Image(systemName: outbound ? "arrow.up" : "arrow.down")
                 .font(.system(size: 11, weight: .medium))
@@ -337,7 +355,7 @@ private struct L4PacketRow: View {
             if packet.injected {
                 Badge(text: "injected", pair: ColorPair(fg: Tok.L4.deep, bg: Tok.L4.tint), uppercase: false)
             }
-            if let endpoints = endpointsLine(packet) {
+            if let endpoints {
                 Text(endpoints)
                     .font(Tok.Face.data(Tok.Typography.Size.md))
                     .foregroundStyle(Tok.Ink.primary.color)
@@ -345,7 +363,7 @@ private struct L4PacketRow: View {
             }
             Text(packet.summary)
                 .font(Tok.Face.data(Tok.Typography.Size.md))
-                .foregroundStyle(endpointsLine(packet) == nil ? Tok.Ink.primary.color : Tok.Ink.secondary.color)
+                .foregroundStyle(endpoints == nil ? Tok.Ink.primary.color : Tok.Ink.secondary.color)
                 .lineLimit(1).truncationMode(.tail)
             Spacer(minLength: Space.sm)
             Text(Format.bytes(Int64(packet.length)))
@@ -391,9 +409,11 @@ private struct L4PacketDetail: View {
                 if let bytes = packet.bytes {
                     // Every row is one `Text`; `L4Hex` has already replaced every byte
                     // outside 0x20–0x7e with `.`, so nothing a packet carried can act on
-                    // the screen (spec §2.3).
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(L4Hex.rows(bytes).enumerated()), id: \.offset) { _, line in
+                    // the screen (spec §2.3). The rows are built once per packet, here,
+                    // and laid out lazily: a 256-packet window of full frames is 25,000 rows.
+                    let rows = L4Hex.rows(bytes)
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(rows.enumerated()), id: \.offset) { _, line in
                             Text(line)
                                 .font(Tok.Face.data(Tok.Typography.Size.md)).monospaced()
                                 .foregroundStyle(Tok.Ink.primary.color)
@@ -415,50 +435,12 @@ private struct L4PacketDetail: View {
     private var metaLine: String {
         var parts: [String] = []
         if let timestamp = packet.timestamp { parts.append(Format.time(timestamp)) }
-        if let endpoints = endpointsLine(packet) { parts.append(endpoints) }
+        if let endpoints = packet.endpoints { parts.append(endpoints) }
         if let proto = packet.proto, !proto.isEmpty { parts.append(proto) }
         parts.append("Direction: \(packet.dir.rawValue)")
         parts.append("\(packet.length) B")
         if packet.injected { parts.append("injected") }
         return parts.joined(separator: " · ")
-    }
-}
-
-// MARK: - Confirm dialog (confirm-over-the-wire, AC10)
-
-private struct L4ConfirmSheet: View {
-    var request: L4ConfirmRequest
-    var onConfirm: () -> Void
-    var onCancel: () -> Void
-
-    /// The title and the action word follow the call the prompt is bound to.
-    private var words: (title: String, action: String) {
-        switch request.call?.command {
-        case "l4.inject": ("Confirm injection", "Inject")
-        case "l4.intercept.forward": ("Confirm forward", "Forward")
-        case "l4.intercept.drop": ("Confirm drop", "Drop")
-        default: ("Confirm", "Confirm")
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.md) {
-            HStack(spacing: Space.sm) {
-                Image(systemName: "exclamationmark.shield").foregroundStyle(Tok.L4.base.color)
-                Text(words.title).font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold)).foregroundStyle(Tok.Ink.primary.color)
-            }
-            Text(request.prompt)
-                .font(Tok.Face.data(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.secondary.color)
-                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { onCancel() }
-                Button(words.action) { onConfirm() }.buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("l4-confirm-inject")
-            }
-        }
-        .padding(Space.lg)
-        .frame(width: 480)
     }
 }
 
@@ -468,13 +450,21 @@ private struct L4ConfirmSheet: View {
 /// with the core's own reason and no buttons; pending ⇒ the pending literal; available
 /// with a parked packet for this flow ⇒ `Packet parked · <id>` with Forward / Drop,
 /// which send the parked id (never the flow id) through the confirm handshake;
-/// available with nothing parked ⇒ nothing. Never a control that silently fails.
+/// available with nothing parked ⇒ nothing. Never a control that silently fails: an
+/// agent-role session sees Forward / Drop disabled with the operator-only reason.
 struct L4InterceptBar: View {
     var availability: L4Availability
     var parked: L4ParkedPacket?
     var gate: L4ActionGate
+    var isOperator: Bool
     var onForward: () -> Void
     var onDrop: () -> Void
+
+    /// The reason a verdict is disabled, or nil when it is offered.
+    private func disabledReason(_ action: L4MutatingAction) -> String? {
+        if !isOperator { return L4Inspector.operatorOnlyReason }
+        return gate.isEnabled(action) ? nil : gate.disabledReason
+    }
 
     var body: some View {
         switch availability {
@@ -489,8 +479,12 @@ struct L4InterceptBar: View {
                         .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium)).foregroundStyle(Tok.Intercept.onBase.color)
                         .lineLimit(1)
                     Spacer(minLength: 0)
-                    GhostButton("Forward") { onForward() }.disabled(!gate.isEnabled(.forward))
-                    GhostButton("Drop") { onDrop() }.disabled(!gate.isEnabled(.drop))
+                    GhostButton("Forward") { onForward() }
+                        .disabled(disabledReason(.forward) != nil)
+                        .help(disabledReason(.forward) ?? "Forward the parked packet — the core confirms over the wire first")
+                    GhostButton("Drop") { onDrop() }
+                        .disabled(disabledReason(.drop) != nil)
+                        .help(disabledReason(.drop) ?? "Drop the parked packet — the core confirms over the wire first")
                 }
                 .padding(.horizontal, Space.md)
                 .frame(height: Tok.Size.interceptBar).frame(maxWidth: .infinity)
@@ -520,16 +514,27 @@ struct L4InterceptBar: View {
     }
 }
 
-/// The capture/inject degradation banner: the core's own reason (spec §1), or the
-/// shared pending literal before the first status reply.
+/// The capture/inject degradation banner: the core's own reason (spec §1) when
+/// degraded, the shared pending literal before the first status reply, nothing when
+/// available.
 struct L4DegradedBanner: View {
-    var reason: String
-    var pending = false
+    var availability: L4Availability
 
     var body: some View {
+        switch availability {
+        case .degraded(let reason):
+            line(text: "Capture and inject unavailable: \(reason)", value: reason, glyph: "exclamationmark.triangle")
+        case .pending:
+            line(text: L4Availability.pendingText, value: L4Availability.pendingText, glyph: "clock")
+        case .available:
+            EmptyView()
+        }
+    }
+
+    private func line(text: String, value: String, glyph: String) -> some View {
         HStack(spacing: Space.sm) {
-            Image(systemName: pending ? "clock" : "exclamationmark.triangle").foregroundStyle(Tok.Intercept.deep.color)
-            Text(pending ? reason : "Capture and inject unavailable: \(reason)")
+            Image(systemName: glyph).foregroundStyle(Tok.Intercept.deep.color)
+            Text(text)
                 .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
                 .lineLimit(1).truncationMode(.tail)
             Spacer(minLength: 0)
@@ -537,8 +542,8 @@ struct L4DegradedBanner: View {
         .padding(.horizontal, Space.md).padding(.vertical, Space.sm)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Tok.Intercept.tint.color)
-        .help(reason)
+        .help(value)
         .accessibilityIdentifier("l4-degraded-banner")
-        .accessibilityValue(reason)
+        .accessibilityValue(value)
     }
 }

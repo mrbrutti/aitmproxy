@@ -308,7 +308,9 @@ struct ScopePanel: View {
         .padding(.bottom, Space.lg)
         .gridArea("scope-l4", inset: 0)
         .sheet(item: $l4Confirm) { request in
-            ScopeL4ConfirmSheet(request: request, onConfirm: { confirmL4Scope(request) }, onCancel: { l4Confirm = nil })
+            // The shared L4 confirm sheet (Inspector/L4ConfirmSheet.swift): its words follow the
+            // bound `l4.scope.add` call — "Confirm L4 scope entry" / Add / `l4-scope-confirm`.
+            L4ConfirmSheet(request: request, onConfirm: { confirmL4Scope(request) }, onCancel: { l4Confirm = nil })
         }
     }
 
@@ -474,48 +476,27 @@ struct ScopePanel: View {
         }
     }
 
-    /// Re-read `l4.scope.list` into the session and clear the form.
+    /// Re-read `l4.scope.list` so the new entry shows at once, and clear the form.
+    ///
+    /// The read goes through `session.runCommand` like the add itself (the Scope page has no
+    /// `FlowActions` verb for L4 scope, and this fix may not widen that protocol), so the
+    /// write into `session.l4Scope` has no run-ownership guard of its own: it is taken only
+    /// while the bus still reports connected after the await, which is as close as a view can
+    /// get to `BusService`'s owner check. A reconnect that lands inside the round trip loses
+    /// nothing — `BusService.pollLoop` clears the L4 facts on disconnect and its slow tick
+    /// re-reads `l4.scope.list` (about every 5 s), so the list converges on the core's either way.
     private func refreshL4ScopeAfterAdd() async {
         do {
             let list = try await session.runCommand("l4.scope.list", [:])
-            session.l4Scope = L4ScopeItem.list(list)
+            guard case .connected = session.bus else { return }
+            let items = L4ScopeItem.list(list)
+            if session.l4Scope != items { session.l4Scope = items }
             l4Cidr = ""
             l4Ports = ""
             l4Interface = "lo0"
         } catch {
             l4AddError = BusService.describe(error)
         }
-    }
-}
-
-/// The operator confirm dialog for an L4 scope add (spec §3): the core's own
-/// prompt — cidr, ports, interface, direction, capability, inject rate and any
-/// wide-range warning — selectable in full, with Cancel and one Add. A sheet, like
-/// the inspector's inject confirm, because the prompt is multi-line text an alert
-/// would clip and could not be selected from.
-private struct ScopeL4ConfirmSheet: View {
-    var request: L4ConfirmRequest
-    var onConfirm: () -> Void
-    var onCancel: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.md) {
-            Text("Confirm L4 scope entry")
-                .font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold)).foregroundStyle(Tok.Ink.primary.color)
-            Text(request.prompt)
-                .font(Tok.Face.data(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.secondary.color)
-                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { onCancel() }
-                    .accessibilityIdentifier("l4-scope-confirm-cancel")
-                Button("Add") { onConfirm() }.buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("l4-scope-confirm")
-            }
-        }
-        .padding(Space.lg)
-        .frame(width: 480)
-        .noInitialFocus()
     }
 }
 

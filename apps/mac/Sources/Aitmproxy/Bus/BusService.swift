@@ -206,8 +206,10 @@ final class BusService: FlowActions {
             guard owns() else { return }
             // L4 availability, scope and parked packets are the core's facts (l4-parity spec §1): read on
             // the first tick and every 10th, only from a core that advertises the L4 family. Each write
-            // inside is the owner's, guarded after every await.
-            if tick % Self.l4StatusEveryTicks == 0, session.l4Enabled { await refreshL4State(generation: generation) }
+            // inside is the owner's, guarded after every await. The same slow tick re-reads every listed
+            // L4 flow's fields below.
+            let l4SlowTick = tick % Self.l4StatusEveryTicks == 0
+            if l4SlowTick, session.l4Enabled { await refreshL4State(generation: generation) }
             // From here the iteration is the owner's: the stop() that retired a superseded run is
             // closing its socket, so whatever it still listed would only be dropped at the next guard.
             guard owns() else { return }
@@ -230,17 +232,28 @@ final class BusService: FlowActions {
                 }
             }
             // Raw-L4 flows (l4-parity spec §2, AC25): a core that advertises both `l4.flow.list` and
-            // `l4.flow.get` is listed every tick like `flow.list`, and each listed flow's fields are
-            // read with `limit: 0` when the core has the bounded window (never a packet in the list
-            // poll; only the inspector fetches a window). Nothing is cached between ticks beyond
-            // `session.l4Details`, so a flow the core dropped leaves the list on the next tick. One
-            // flow's failed read skips that flow, like the HTTP loop; a failed list is an empty list.
+            // `l4.flow.get` is listed every tick like `flow.list`. A listed flow's fields are read with
+            // `limit: 0` when the core has the bounded window (never a packet in the list poll; only
+            // the inspector fetches a window) — on a normal tick only for an id not yet in
+            // `session.l4Details` (a new flow shows within one tick), and for every listed id on the
+            // slow tick, so counts and session state follow the core at the ~5 s cadence of the other
+            // L4 facts instead of one `l4.flow.get` per flow per 500 ms. Nothing is cached between
+            // ticks beyond `session.l4Details`, so a flow the core dropped leaves the list on the next
+            // tick. One flow's failed read skips that flow, like the HTTP loop. A failed `l4.flow.list`
+            // is an empty tick, deliberately not a thrown error: `pollLoop` throwing is how a lost
+            // connection is reported, and an L4 verb error (a gated verb on an older core, a guard
+            // refusal) must not reconnect the whole bus and drop the HTTP rows with it.
             var l4Flows: [L4Flow] = []
             if Self.pollsL4(tools) {
                 let l4IDs = (try? await client.call("l4.flow.list"))?.arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
                 guard owns() else { return }
                 let window = L4Wire.supportsWindow(tools)
+                let known = session.l4Details
                 for id in l4IDs {
+                    if !l4SlowTick, let cached = known[id] {
+                        l4Flows.append(cached)
+                        continue
+                    }
                     let json = try? await client.call("l4.flow.get", L4Wire.flowGetArgs(id: id, inspect: false, window: window))
                     guard owns() else { return }
                     if let json, let flow = L4Flow(json: json) { l4Flows.append(flow) }
@@ -265,6 +278,8 @@ final class BusService: FlowActions {
             // An L4 row is in scope iff a capture entry of the core's L4 scope covers its interface and
             // destination (the HTTP host scope says nothing about it). L4 rows number after the HTTP rows.
             let captureScope = session.l4Scope.filter { $0.capability == "capture" }
+            // `L4Flow` carries no direction today, so `covers` is asked without one (it then ignores the
+            // entry's); a flow without a known port (ICMP) is covered only by an `all`-ports entry.
             let l4Rows = l4Flows.enumerated().map { index, flow in
                 flow.row(
                     seq: ids.count + index + 1,

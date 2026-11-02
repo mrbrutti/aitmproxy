@@ -163,6 +163,23 @@ public struct L4Packet: Hashable, Sendable, Identifiable {
     }
 }
 
+extension L4Packet {
+    /// `src:srcPort → dst:dstPort` from whatever §2 fields the core sent: a side
+    /// without a port is the bare host, a missing side is `?`, and a packet with
+    /// neither address has no line at all (an older core's reply).
+    public var endpoints: String? {
+        func side(_ host: String?, _ port: Int?) -> String? {
+            guard let host, !host.isEmpty else { return nil }
+            if let port { return "\(host):\(port)" }
+            return host
+        }
+        let from = side(src, srcPort)
+        let to = side(dst, dstPort)
+        if from == nil && to == nil { return nil }
+        return "\(from ?? "?") → \(to ?? "?")"
+    }
+}
+
 /// An L4 flow's detail (`l4.flow.get`): the bind, the session kind, the packet log,
 /// the counts, and the l4-parity §2 flow-level fields (`started_at` and the first
 /// decodable packet's protocol / addresses / ports, so a list row shows its target
@@ -410,28 +427,23 @@ public struct L4ConfirmRequest: Hashable, Sendable, Identifiable {
         self.token = token
         self.call = call
     }
-
-    /// The same prompt and token bound to `call`.
-    public func bound(to call: L4PendingCall) -> L4ConfirmRequest {
-        L4ConfirmRequest(prompt: prompt, token: token, call: call)
-    }
 }
 
-/// The outcome of issuing `l4.inject` without `_confirm`: a confirm handshake, a
-/// guard refusal (surfaced verbatim), or a plain result.
-public struct L4InjectOutcome: Sendable {
-    public let confirm: L4ConfirmRequest?
-    public let error: String?
-
-    public init(confirm: L4ConfirmRequest?, error: String?) {
-        self.confirm = confirm
-        self.error = error
+/// The words the one confirm sheet shows for a bound call (spec §3 last rule: every
+/// confirmable L4 verb goes through the same confirm-over-the-wire dialog): the title,
+/// the action button's label and the button's accessibility identifier the live check
+/// presses. Derived from the call's command so the dialog can never say "Inject" over a
+/// drop; an unknown or absent command gets the neutral words.
+public enum L4ConfirmWords {
+    public static func `for`(command: String?) -> (title: String, action: String, identifier: String) {
+        switch command {
+        case "l4.inject": ("Confirm injection", "Inject", "l4-confirm-inject")
+        case "l4.intercept.forward": ("Confirm forward", "Forward", "l4-confirm-forward")
+        case "l4.intercept.drop": ("Confirm drop", "Drop", "l4-confirm-drop")
+        case "l4.scope.add": ("Confirm L4 scope entry", "Add", "l4-scope-confirm")
+        default: ("Confirm", "Confirm", "l4-confirm")
+        }
     }
-
-    public var needsConfirmation: Bool { confirm != nil }
-    /// A guard refusal (out-of-scope, rate, denylist, oversize, count) — never a dialog.
-    public var isRefusal: Bool { confirm == nil && error != nil }
-    public var refusalText: String? { isRefusal ? error : nil }
 }
 
 // MARK: - Availability from the core (L4PAR-AC26; spec §1, Decision 9)
@@ -534,7 +546,7 @@ public struct L4ParkedPacket: Hashable, Sendable, Identifiable {
         self.state = json["state"]?.stringValue ?? ""
         self.length = json["length"]?.intValue ?? 0
         self.layers = json["layers"]?.arrayValue?.compactMap { $0.stringValue } ?? []
-        self.parkedAt = json["parked_at"]?.doubleValue.map { Date(timeIntervalSince1970: $0 / 1000) }
+        self.parkedAt = L4Wire.date(epochMillis: json["parked_at"])
     }
 
     /// Parse an `l4.intercept.list` reply (a bare array, or `{structuredContent: [...]}`)
@@ -690,13 +702,17 @@ public struct L4ScopeItem: Hashable, Sendable, Identifiable {
     }
 
     /// Whether this entry covers a destination: the same interface, `dst` inside
-    /// `cidr`, and `port` inside `ports` (or `ports` is all, or no port is known).
-    /// The CIDR check is an IPv4 prefix match over the four octets; an IPv6 or
-    /// unparsable `dst` matches only when the entry is literally `<dst>/32`.
-    public func covers(interface: String, dst: String, port: Int?) -> Bool {
+    /// `cidr`, `port` inside `ports`, and — when the flow carries a `direction` —
+    /// the same direction. A flow without a known port (ICMP, an undecodable
+    /// packet) is covered only by an entry whose `ports` is all: a port range
+    /// cannot claim a flow whose port it cannot check. The CIDR check is an IPv4
+    /// prefix match over the four octets; an IPv6 or unparsable `dst` matches only
+    /// when the entry is literally `<dst>/32`.
+    public func covers(interface: String, dst: String, port: Int?, direction: String? = nil) -> Bool {
         guard interface == self.interface else { return false }
+        if let direction, direction != self.direction { return false }
         guard Self.cidrContains(cidr, address: dst) else { return false }
-        guard let port else { return true }
+        guard let port else { return Self.portsAreAll(ports) }
         return Self.portsContain(ports, port: port)
     }
 
@@ -726,9 +742,15 @@ public struct L4ScopeItem: Hashable, Sendable, Identifiable {
         return value
     }
 
-    static func portsContain(_ ports: String, port: Int) -> Bool {
+    /// `all` in any case, or blank (which `list` already normalises to `all`).
+    static func portsAreAll(_ ports: String) -> Bool {
         let text = ports.trimmingCharacters(in: .whitespaces)
-        if text.isEmpty || text.lowercased() == "all" { return true }
+        return text.isEmpty || text.lowercased() == "all"
+    }
+
+    static func portsContain(_ ports: String, port: Int) -> Bool {
+        if portsAreAll(ports) { return true }
+        let text = ports.trimmingCharacters(in: .whitespaces)
         let bounds = text.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
         guard let lo = Int(bounds[0].trimmingCharacters(in: .whitespaces)) else { return false }
         if bounds.count == 1 { return port == lo }

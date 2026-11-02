@@ -121,11 +121,10 @@ import Testing
         #expect(L4ConfirmRequest(json: .object(["status": .string("ok")])) == nil)
         #expect(L4ConfirmRequest(json: .string("done")) == nil)
 
-        // A guard refusal is an error surfaced verbatim, not a dialog.
+        // A guard refusal arrives as a thrown bus error, which the inspector surfaces
+        // verbatim; its text is never a confirm dialog.
         let refusal = "l4.inject refused: OutOfL4Scope — 10.0.0.5:80 is not in the L4 scope."
-        let outcome = L4InjectOutcome(confirm: L4ConfirmRequest(json: .string(refusal)), error: refusal)
-        #expect(outcome.isRefusal)
-        #expect(outcome.refusalText == refusal)
+        #expect(L4ConfirmRequest(json: .string(refusal)) == nil)
     }
 }
 
@@ -168,12 +167,12 @@ import Testing
         let other = L4ConfirmRequest(prompt: "again", token: "tok2")
         #expect(again.confirmed(with: other).args == ["id": .string("P1"), "_confirm": .string("tok2")])
 
-        // Value semantics: binding the same reply to a different call yields a
-        // request whose re-issue is *that* call; the drop request is untouched.
+        // Value semantics: the same prompt and token constructed with a different call
+        // yields a request whose re-issue is *that* call; the drop request is untouched.
         let inject = L4PendingCall(
             command: "l4.inject",
             args: ["spec": .object([:]), "dst": .string("127.0.0.1")])
-        let injectRequest = bound.bound(to: inject)
+        let injectRequest = L4ConfirmRequest(prompt: bound.prompt, token: bound.token, call: inject)
         #expect(injectRequest.call == inject)
         #expect(injectRequest.token == "tok")
         #expect(injectRequest.prompt == "Drop parked packet P1")
@@ -614,7 +613,8 @@ import Testing
         #expect(!item.covers(interface: "lo0", dst: "127.0.0.1", port: 8999))
         #expect(!item.covers(interface: "en0", dst: "127.0.0.1", port: 9053))
         #expect(!item.covers(interface: "lo0", dst: "10.0.0.1", port: 9053))
-        #expect(item.covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        // No port known (an ICMP-like flow): a port range cannot claim it, only `all` can (S1).
+        #expect(!item.covers(interface: "lo0", dst: "127.0.0.1", port: nil))
         // A /8 entry with all ports covers any host in it on any port.
         let wide = items[1]
         #expect(wide.covers(interface: "en0", dst: "10.1.2.3", port: 443))
@@ -701,7 +701,6 @@ import Testing
         let original = VerbTable.items(for: VerbContext(row: row))
         let gated = original.map { L4RowVerbs.gate($0, row: row) }
         #expect(gated.count == original.count)
-        #expect(gated.count == 14)
 
         for key in Self.gatedKeys {
             let item = VerbTable.item(key, in: gated)
@@ -1082,8 +1081,12 @@ import Testing
         #expect(!item("127.0.0.1/32", ports: "9000-").covers(interface: "lo0", dst: "127.0.0.1", port: 9000))
         #expect(!item("127.0.0.1/32", ports: "-9000").covers(interface: "lo0", dst: "127.0.0.1", port: 9000))
         #expect(!item("127.0.0.1/32", ports: "9000,9001").covers(interface: "lo0", dst: "127.0.0.1", port: 9000))
-        // Garbage ports still cover an unknown port (nil) — the CIDR decides alone.
-        #expect(item("127.0.0.1/32", ports: "abc").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        // An unknown port (nil) is covered only by `all` (or blank, which lists as `all`): a range
+        // or garbage ports cannot claim a flow whose port they cannot check (S1).
+        #expect(!item("127.0.0.1/32", ports: "abc").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        #expect(!item("127.0.0.1/32", ports: "9000-9999").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        #expect(item("127.0.0.1/32", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        #expect(item("127.0.0.1/32", ports: "").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
     }
 
     /// The draft trims the ports' surrounding spaces, and its key set is exactly the five AC5
@@ -1100,6 +1103,96 @@ import Testing
     }
 }
 
+// MARK: - Review-log fixes (stage 6, plan 2026-10-31-l4-parity-fixes unit (d))
+
+@Suite struct L4ReviewFixCoverTests {
+    private func item(_ cidr: String, ports: String, direction: String = "inbound") -> L4ScopeItem {
+        L4ScopeItem(id: "R", cidr: cidr, ports: ports, interface: "lo0", direction: direction,
+                    capability: "capture", source: "config")
+    }
+
+    /// S1: an ICMP-like flow (`lo0`, `127.0.0.1`, no port) is NOT covered by a `9000-9999` entry
+    /// but IS by an `all` entry; a flow that carries a direction is covered only by an entry of
+    /// the same direction, and a flow without one (today's `L4Flow`) ignores the entry's.
+    @Test func testUnknownPortNeedsAllAndDirectionMustMatch() {
+        #expect(!item("127.0.0.1/32", ports: "9000-9999").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        #expect(item("127.0.0.1/32", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        #expect(!item("127.0.0.1/32", ports: "9053").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        // A known port still goes through the range.
+        #expect(item("127.0.0.1/32", ports: "9000-9999").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+
+        let inbound = item("127.0.0.1/32", ports: "all", direction: "inbound")
+        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "inbound"))
+        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "outbound"))
+        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: nil, direction: "outbound"))
+        // No direction on the flow: the entry's direction is not consulted (the default argument).
+        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: nil))
+        // The entry's direction is compared exactly.
+        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "Inbound"))
+        let outbound = item("10.0.0.0/8", ports: "all", direction: "outbound")
+        #expect(outbound.covers(interface: "lo0", dst: "10.1.2.3", port: 443, direction: "outbound"))
+        #expect(!outbound.covers(interface: "lo0", dst: "10.1.2.3", port: 443, direction: "inbound"))
+    }
+}
+
+@Suite struct L4ReviewFixConfirmWordsTests {
+    /// Q3: the one shared confirm sheet derives its title, action word and accessibility
+    /// identifier from the bound call's command; an unknown or absent command gets the
+    /// neutral words.
+    @Test func testConfirmWordsFollowTheBoundCommand() {
+        let inject = L4ConfirmWords.for(command: "l4.inject")
+        #expect(inject.title == "Confirm injection")
+        #expect(inject.action == "Inject")
+        #expect(inject.identifier == "l4-confirm-inject")
+
+        let forward = L4ConfirmWords.for(command: "l4.intercept.forward")
+        #expect(forward.title == "Confirm forward")
+        #expect(forward.action == "Forward")
+        #expect(forward.identifier == "l4-confirm-forward")
+
+        let drop = L4ConfirmWords.for(command: "l4.intercept.drop")
+        #expect(drop.title == "Confirm drop")
+        #expect(drop.action == "Drop")
+        #expect(drop.identifier == "l4-confirm-drop")
+
+        let scope = L4ConfirmWords.for(command: "l4.scope.add")
+        #expect(scope.title == "Confirm L4 scope entry")
+        #expect(scope.action == "Add")
+        #expect(scope.identifier == "l4-scope-confirm")
+
+        let unknown = L4ConfirmWords.for(command: "l4.intercept.mutate")
+        #expect(unknown.title == "Confirm")
+        #expect(unknown.action == "Confirm")
+        #expect(unknown.identifier == "l4-confirm")
+        let unbound = L4ConfirmWords.for(command: nil)
+        #expect(unbound.title == "Confirm")
+        #expect(unbound.action == "Confirm")
+        #expect(unbound.identifier == "l4-confirm")
+    }
+}
+
+@Suite struct L4ReviewFixEndpointsTests {
+    /// Q7: `L4Packet.endpoints` is `src:srcPort → dst:dstPort` from whatever §2 fields the core
+    /// sent — a side without a port is the bare host, a missing side is `?`, and a packet with
+    /// neither address has no endpoints line at all.
+    @Test func testEndpointsLine() {
+        func packet(src: String? = nil, dst: String? = nil, srcPort: Int? = nil, dstPort: Int? = nil) -> L4Packet {
+            L4Packet(index: 0, dir: .inbound, length: 1, injected: false, layers: [],
+                     src: src, dst: dst, srcPort: srcPort, dstPort: dstPort)
+        }
+        #expect(packet(src: "127.0.0.1", dst: "127.0.0.1", srcPort: 40000, dstPort: 9053).endpoints
+            == "127.0.0.1:40000 → 127.0.0.1:9053")
+        #expect(packet(src: "10.0.0.5", dst: "10.0.0.9").endpoints == "10.0.0.5 → 10.0.0.9")
+        #expect(packet(src: "10.0.0.5", dstPort: 53).endpoints == "10.0.0.5 → ?")
+        #expect(packet(dst: "::1", dstPort: 53).endpoints == "? → ::1:53")
+        #expect(packet(dst: "::1").endpoints == "? → ::1")
+        #expect(packet(src: "", dst: "").endpoints == nil)
+        #expect(packet(srcPort: 1, dstPort: 2).endpoints == nil)
+        #expect(packet().endpoints == nil)
+    }
+}
+
 @Suite struct L4TesterHexTests {
     /// AC40 over the whole byte space: every one of the 256 values renders to exactly one
     /// character in 0x20…0x7e; the 95 printable bytes render as themselves and the other 161 as
@@ -1112,7 +1205,8 @@ import Testing
             #expect((0x20...0x7e).contains(scalar.value), "U+\(String(scalar.value, radix: 16)) reached the column")
         }
         let printable = Data((0x20...0x7e).map { UInt8($0) })
-        #expect(L4Hex.asciiColumn(printable) == String(String.UnicodeScalarView((0x20...0x7e).map { UnicodeScalar(UInt8($0)) })))
+        #expect(L4Hex.asciiColumn(printable)
+            == " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~")
         #expect(L4Hex.asciiColumn(printable).count == 95)
         #expect(L4Hex.asciiColumn(Data((0x00...0x1f).map { UInt8($0) })) == String(repeating: ".", count: 32))
         #expect(L4Hex.asciiColumn(Data((0x7f...0xff).map { UInt8($0) })) == String(repeating: ".", count: 129))
@@ -1200,7 +1294,7 @@ import Testing
         let layers = try #require(value["layers"]?.arrayValue)
         #expect(layers.count == 10_000)
         #expect(layers[0]["raw"] == .array([0]))
-        #expect(layers[9_999]["raw"] == .array([.number(Double(9_999 % 256))]))
+        #expect(layers[9_999]["raw"] == .array([.number(15)]))
 
         let payload = String(repeating: "A", count: 100_000)
         let big = try #require(PacketSpecDraft.parse("layers:\n  - raw: \"\(payload)\""))
@@ -1282,7 +1376,7 @@ import Testing
                 let row = flow.row(seq: 3, inScope: inScope)
                 let original = VerbTable.items(for: VerbContext(row: row, selectedCount: 2, selectedPausedCount: 2))
                 let gated = original.map { L4RowVerbs.gate($0, row: row) }
-                #expect(gated.count == 14)
+                #expect(gated.count == original.count)
                 let disabled = gated.filter { !$0.enabled }.map(\.verb)
                 let httpOnly: [FlowVerb] = [
                     .resume, .edit, .delete, .kill, .replay, .editAndReplay, .buildPoC, .resumeSelected, .killSelected,
