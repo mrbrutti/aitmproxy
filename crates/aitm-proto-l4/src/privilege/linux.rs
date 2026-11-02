@@ -322,7 +322,7 @@ fn probe_reports_net_raw(helper: &Path) -> bool {
         return false;
     }
     let mut stdout = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
+    if let Some(pipe) = child.stdout.take() {
         let _ = pipe.take(4096).read_to_end(&mut stdout);
     }
     serde_json::from_slice::<serde_json::Value>(&stdout)
