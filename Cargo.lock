@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-peer-process"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "aitm-core",
  "core-foundation",
