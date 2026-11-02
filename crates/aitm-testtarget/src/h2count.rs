@@ -13,8 +13,10 @@
 //! cancels (`RST_STREAM`) counts exactly like a served one.
 //!
 //! This is an observer, never a gate: a byte that does not match the preface
-//! or a frame that cannot be walked stops the counting (the count is left as
-//! is) and nothing else happens to the connection.
+//! stops the counting (the count is left as is) and nothing else happens to
+//! the connection. Once the preface matches, every 9-byte header is walkable
+//! and its payload is skipped by count whatever its 24-bit length says, so a
+//! preface mismatch is the only stop.
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -31,15 +33,11 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_HEADER_LEN: usize = 9;
 /// HEADERS frame type (RFC 9113 §6.2): the only frame that opens a client stream.
 const TYPE_HEADERS: u8 = 0x1;
-/// The largest payload a 24-bit length can carry (2^24 - 1); anything the
-/// decoder returns above it is impossible by construction, so a value there
-/// means the walk lost sync and counting stops.
-const MAX_FRAME_LEN: usize = 0x00FF_FFFF;
 
 /// Where the observer is in the inbound byte stream. Carried across
 /// `poll_read` calls so partial reads at any boundary are handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FrameState {
+enum FrameState {
     /// Inside the 24-byte connection preface; `seen` bytes matched so far.
     Preface { seen: usize },
     /// Collecting a 9-byte frame header; `have` bytes of `buf` are filled.
@@ -49,7 +47,7 @@ pub(crate) enum FrameState {
     },
     /// Skipping a frame payload; `remaining` bytes left before the next header.
     Payload { remaining: usize },
-    /// The bytes stopped looking like HTTP/2 framing; count nothing further.
+    /// A byte did not match the connection preface; count nothing further.
     Stopped,
 }
 
@@ -65,33 +63,55 @@ fn decode_header(h: &[u8; FRAME_HEADER_LEN]) -> (usize, u8, u32) {
 
 impl FrameState {
     /// The start state: expecting the connection preface.
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         FrameState::Preface { seen: 0 }
     }
 
+    /// An empty frame header, about to collect its first byte.
+    fn header() -> Self {
+        FrameState::Header {
+            buf: [0; FRAME_HEADER_LEN],
+            have: 0,
+        }
+    }
+}
+
+/// A [`FrameState`] plus the highest client stream id counted so far: the
+/// whole observer, pure and socket-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observer {
+    state: FrameState,
+    last_stream: u32,
+}
+
+impl Observer {
+    fn new() -> Self {
+        Observer {
+            state: FrameState::new(),
+            last_stream: 0,
+        }
+    }
+
     /// Walk `bytes` (the next slice of the inbound stream) and return how many
-    /// NEW client streams opened in it. `last_stream` is the highest odd id
-    /// counted so far, kept by the caller so the pure walk stays testable.
-    fn step(&mut self, bytes: &[u8], last_stream: &mut u32) -> u32 {
+    /// NEW client streams (HEADERS on an odd id above every id seen before)
+    /// opened in it.
+    fn observe(&mut self, bytes: &[u8]) -> u32 {
         let mut opened = 0;
         let mut rest = bytes;
         while !rest.is_empty() {
-            match self {
+            match &mut self.state {
                 FrameState::Stopped => return opened,
                 FrameState::Preface { seen } => {
                     let want = &PREFACE[*seen..];
                     let n = rest.len().min(want.len());
                     if rest[..n] != want[..n] {
-                        *self = FrameState::Stopped;
+                        self.state = FrameState::Stopped;
                         return opened;
                     }
                     *seen += n;
                     rest = &rest[n..];
                     if *seen == PREFACE.len() {
-                        *self = FrameState::Header {
-                            buf: [0; FRAME_HEADER_LEN],
-                            have: 0,
-                        };
+                        self.state = FrameState::header();
                     }
                 }
                 FrameState::Header { buf, have } => {
@@ -103,19 +123,12 @@ impl FrameState {
                         continue;
                     }
                     let (len, kind, id) = decode_header(buf);
-                    if len > MAX_FRAME_LEN {
-                        *self = FrameState::Stopped;
-                        return opened;
-                    }
-                    if kind == TYPE_HEADERS && id % 2 == 1 && id > *last_stream {
-                        *last_stream = id;
+                    if kind == TYPE_HEADERS && id % 2 == 1 && id > self.last_stream {
+                        self.last_stream = id;
                         opened += 1;
                     }
-                    *self = if len == 0 {
-                        FrameState::Header {
-                            buf: [0; FRAME_HEADER_LEN],
-                            have: 0,
-                        }
+                    self.state = if len == 0 {
+                        FrameState::header()
                     } else {
                         FrameState::Payload { remaining: len }
                     };
@@ -125,43 +138,17 @@ impl FrameState {
                     *remaining -= n;
                     rest = &rest[n..];
                     if *remaining == 0 {
-                        *self = FrameState::Header {
-                            buf: [0; FRAME_HEADER_LEN],
-                            have: 0,
-                        };
+                        self.state = FrameState::header();
                     }
                 }
             }
         }
         opened
     }
-}
-
-/// A [`FrameState`] plus the highest client stream id counted so far: the
-/// whole observer, pure and socket-free.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Observer {
-    state: FrameState,
-    last_stream: u32,
-}
-
-impl Observer {
-    pub(crate) fn new() -> Self {
-        Observer {
-            state: FrameState::new(),
-            last_stream: 0,
-        }
-    }
-
-    /// Feed the next inbound slice; returns the number of NEW client streams
-    /// (HEADERS on an odd id above every id seen before) it opened.
-    pub(crate) fn observe(&mut self, bytes: &[u8]) -> u32 {
-        self.state.step(bytes, &mut self.last_stream)
-    }
 
     /// The current framing position (asserted by the unit tests).
     #[cfg(test)]
-    pub(crate) fn state(&self) -> &FrameState {
+    fn state(&self) -> &FrameState {
         &self.state
     }
 }
@@ -196,7 +183,9 @@ impl<IO: AsyncRead + Unpin> AsyncRead for H2StreamCounter<IO> {
         let before = buf.filled().len();
         let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &poll {
-            let fresh = &buf.filled()[before..];
+            // `get` rather than indexing: total even over an inner reader
+            // that shrinks the filled region (nothing fresh to observe then).
+            let fresh = buf.filled().get(before..).unwrap_or(&[]);
             if !fresh.is_empty() {
                 let opened = this.observer.observe(fresh);
                 if opened > 0 {
@@ -241,8 +230,6 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for H2StreamCounter<IO> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
     /// One h2 frame: 9-byte header followed by `payload`.
     fn frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
@@ -296,13 +283,15 @@ mod tests {
 
     #[test]
     fn per_chunk_sums_are_the_total_and_land_on_the_headers_frames() {
-        // With 9-byte chunks the HEADERS headers land in distinct slices, so
-        // the per-slice results are a sequence of zeros and ones summing to 3.
+        // The 99-byte sequence in 9-byte chunks: the HEADERS headers for
+        // streams 1, 3 and 5 end at offsets 41, 55 and 79 (chunks 4, 6, 8),
+        // and a stream counts in the slice carrying its header's ninth byte,
+        // not one slice later on the first payload byte.
         let bytes = plan_sequence();
+        assert_eq!(bytes.len(), 99);
         let mut state = Observer::new();
         let per_chunk: Vec<u32> = bytes.chunks(9).map(|c| state.observe(c)).collect();
-        assert_eq!(per_chunk.iter().sum::<u32>(), 3);
-        assert!(per_chunk.iter().all(|&n| n <= 1), "{per_chunk:?}");
+        assert_eq!(per_chunk, vec![0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0]);
     }
 
     #[test]
@@ -430,28 +419,27 @@ mod tests {
     // --- Tester additions (stage 5): max-length payload, header-boundary
     // splits, sticky stop, write-path delegation, read errors, the JSON row ---
 
-    /// Spec D2: "skips ... payload by count" and "stops counting on a frame
-    /// length past 16 MiB". The largest length a 24-bit field can carry is
-    /// 16_777_215 (one byte short of 16 MiB), so the maximum frame is SKIPPED,
-    /// never a stop: its payload, stuffed with bytes that spell HEADERS
-    /// headers on huge odd ids, counts nothing in any chunking, the walk does
-    /// not stall or lose sync, and the real HEADERS(1) right after it counts.
+    /// Spec D2: "every payload is skipped by count, so no length stops the
+    /// walk". The largest length a 24-bit field can carry is 16_777_215 (one
+    /// byte short of 16 MiB), so the maximum frame is SKIPPED, never a stop:
+    /// its payload, stuffed with bytes that spell HEADERS headers on huge odd
+    /// ids, counts nothing in any chunking, the walk does not stall or lose
+    /// sync, and the real HEADERS(1) right after it counts.
     #[test]
     fn a_maximum_length_payload_is_skipped_by_count_across_many_chunks() {
-        // The decoder's ceiling is exactly MAX_FRAME_LEN, so the `>` stop is
-        // unreachable from the wire; documented here on purpose.
+        // 2^24 - 1: the decoder's ceiling, straight from `ff ff ff`.
+        const MAX_PAYLOAD: usize = 16_777_215;
         let max_header = [0xff, 0xff, 0xff, 0x0, 0x0, 0, 0, 0, 1];
-        assert_eq!(decode_header(&max_header), (MAX_FRAME_LEN, 0x0, 1));
-        assert_eq!(MAX_FRAME_LEN, 16 * 1024 * 1024 - 1);
+        assert_eq!(decode_header(&max_header), (MAX_PAYLOAD, 0x0, 1));
 
         // Payload: HEADERS headers on id 0x7fff_fffd (odd, enormous) back to
         // back; if any of them were read as a frame the high-water mark
         // would jump and the trailing HEADERS(1) could never count.
-        let mut payload = Vec::with_capacity(MAX_FRAME_LEN);
-        while payload.len() < MAX_FRAME_LEN {
+        let mut payload = Vec::with_capacity(MAX_PAYLOAD);
+        while payload.len() < MAX_PAYLOAD {
             payload.extend(frame(0x1, 0x5, 0x7fff_fffd, &[]));
         }
-        payload.truncate(MAX_FRAME_LEN);
+        payload.truncate(MAX_PAYLOAD);
         let mut bytes = PREFACE.to_vec();
         bytes.extend_from_slice(&max_header);
         bytes.extend_from_slice(&payload);
@@ -471,7 +459,7 @@ mod tests {
         // short of the payload is still Payload { 1 }, the next byte is the
         // header boundary.
         let mut state = Observer::new();
-        let edge = PREFACE.len() + FRAME_HEADER_LEN + MAX_FRAME_LEN - 1;
+        let edge = PREFACE.len() + FRAME_HEADER_LEN + MAX_PAYLOAD - 1;
         assert_eq!(state.observe(&bytes[..edge]), 0);
         assert_eq!(state.state(), &FrameState::Payload { remaining: 1 });
         assert_eq!(state.observe(&bytes[edge..edge + 1]), 0);
@@ -760,6 +748,41 @@ mod tests {
         let n = counted.read(&mut buf).await.expect("eof");
         assert_eq!(n, 0);
         assert_eq!(conn.streams.load(Ordering::SeqCst), 1);
+    }
+
+    /// An inner reader that breaks the `ReadBuf` contract and SHRINKS the
+    /// filled region (here: `clear()` on a buffer that already held 5 bytes)
+    /// then reports `Ready(Ok(()))`. The wrapper is total over any
+    /// `AsyncRead`: it hands the poll back unchanged, counts nothing and
+    /// does not panic on `filled()[before..]`.
+    struct ShrinkingIo;
+
+    impl AsyncRead for ShrinkingIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            buf.clear();
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn an_inner_reader_that_shrinks_the_filled_region_cannot_panic_the_wrapper() {
+        let conn = test_conn();
+        let mut counted = H2StreamCounter::new(ShrinkingIo, conn.clone());
+        let mut storage = [0u8; 32];
+        let mut buf = ReadBuf::new(&mut storage);
+        buf.put_slice(b"PRI *");
+        assert_eq!(buf.filled().len(), 5);
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let poll = Pin::new(&mut counted).poll_read(&mut cx, &mut buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))), "{poll:?}");
+        assert_eq!(buf.filled().len(), 0, "the inner's clear() is passed on");
+        assert_eq!(conn.streams.load(Ordering::SeqCst), 0);
+        assert_eq!(counted.observer.state(), &FrameState::Preface { seen: 0 });
     }
 
     /// One `poll_read` that delivers several HEADERS frames adds ALL of them
