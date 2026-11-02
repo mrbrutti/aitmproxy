@@ -991,6 +991,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cmdi_echo_edges() {
+        // The amendment-64 clauses `cmdi_echo_prints_the_words` leaves
+        // implicit: every separator (the substitution shapes too, when
+        // closed), whitespace around `echo`, words that carry shell syntax or
+        // a second separator (literal, never interpreted: no marker, no sleep),
+        // non-ASCII, oversized words, and P untouched through every shape.
+        const BASE: &str = "<pre>PING 1: 56 data bytes";
+
+        // The closed substitution shapes and whitespace around the command.
+        for target in [
+            "/ping?host=1%60echo%20AAABBB%60",  // 1`echo AAABBB`
+            "/ping?host=1$(echo%20AAABBB)",     // 1$(echo AAABBB)
+            "/ping?host=1;%20echo%20AAABBB",    // 1; echo AAABBB
+            "/ping?host=1;echo%09AAABBB",       // tab after echo
+            "/ping?host=1;echo%20AAABBB%20%20", // trailing blanks trimmed
+            "/ping?host=1;echo+AAABBB",         // `+` is a space in a query
+            "/ping?host=1;eChO%20AAABBB",       // mixed case
+        ] {
+            let (status, _, body) = get(V, target).await;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert_eq!(body, format!("{BASE}\nAAABBB</pre>"), "{target}");
+        }
+        // `&&` with spaces on both sides: the host keeps its trailing blank.
+        let (_, _, body) = get(V, "/ping?host=1%20%26%26%20echo%20AAABBB").await;
+        assert_eq!(body, "<pre>PING 1 : 56 data bytes\nAAABBB</pre>");
+        // An empty host still runs the command.
+        let (_, _, body) = get(V, "/ping?host=;echo%20AAABBB").await;
+        assert_eq!(body, "<pre>PING : 56 data bytes\nAAABBB</pre>");
+
+        // `echo` followed by nothing but whitespace is a bare `echo`.
+        for target in [
+            "/ping?host=1;echo%20",
+            "/ping?host=1;echo%20%20%09",
+            "/ping?host=1;echo%09",
+        ] {
+            let (_, _, body) = get(V, target).await;
+            assert_eq!(body, format!("{BASE}\n</pre>"), "{target}");
+        }
+        assert_eq!(echo_words("echo \t "), Some(""));
+        assert_eq!(echo_words("echo\tx"), Some("x"));
+        assert_eq!(echo_words("ECHO x"), Some("x"));
+
+        // Nothing is interpreted: a second separator, `id`, `sleep`, `$VAR`
+        // and quotes all stay literal words (escaped), run nothing and never sleep.
+        for (target, line) in [
+            ("/ping?host=1;echo%20a;id", "a;id"),
+            ("/ping?host=1;echo%20AAA%26%26id", "AAA&amp;&amp;id"),
+            ("/ping?host=1|echo%20x|sleep%203", "x|sleep 3"),
+            ("/ping?host=1;echo%20id", "id"),
+            ("/ping?host=1;echo%20sleep%203", "sleep 3"),
+            (
+                "/ping?host=1;echo%20$HOME%20%22q%22%20%27s%27",
+                "$HOME &quot;q&quot; &#x27;s&#x27;",
+            ),
+            ("/ping?host=1;echo%20$(id)", "$(id)"),
+            ("/ping?host=1;echo%20%60id%60", "`id`"),
+        ] {
+            let (status, _, body) = get(V, target).await;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert_eq!(body, format!("{BASE}\n{line}</pre>"), "{target}");
+            assert!(!body.contains(seed::CMDI_MARKER), "{target}: {body}");
+        }
+        for host in [
+            "1;echo a;id",
+            "1|echo x|sleep 3",
+            "1;echo sleep 3",
+            "1;echo $(sleep 3)",
+        ] {
+            assert_eq!(cmdi(V, host).1, None, "{host}: echo never sleeps");
+        }
+
+        // Non-ASCII: words are echoed as-is; a non-ASCII command head is no
+        // `echo` (and, like the `sleep` case, must not panic on a byte slice);
+        // a non-ASCII blank after `echo` is no word boundary.
+        let (_, _, body) = get(V, "/ping?host=1;echo%20h%C3%A9%20%E2%9C%93").await;
+        assert_eq!(body, format!("{BASE}\nh\u{e9} \u{2713}</pre>"));
+        for (target, cmd) in [
+            ("/ping?host=1;%C3%A9cho%20x", "\u{e9}cho x"),
+            ("/ping?host=1;ech%C3%B6%20x", "ech\u{f6} x"),
+            ("/ping?host=1;ech%C3%B6", "ech\u{f6}"),
+            ("/ping?host=1;echo%C2%A0x", "echo\u{a0}x"),
+        ] {
+            let (status, _, body) = get(V, target).await;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert_eq!(
+                body,
+                format!("{BASE}\nsh: {cmd}: command not found</pre>"),
+                "{target}"
+            );
+        }
+        assert_eq!(echo_words("ech\u{e9}"), None);
+        assert_eq!(echo_words("echo\u{a0}x"), None);
+        assert_eq!(echo_words("\u{e9}cho x"), None);
+
+        // Oversized words come back whole.
+        let long = "A".repeat(4096);
+        let (status, _, body) = get(V, &format!("/ping?host=1;echo%20{long}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("{BASE}\n{long}</pre>"));
+
+        // `echo` as the host itself is just a host: no separator, no command,
+        // in both modes (P's allowlist admits the word).
+        for mode in [V, P] {
+            for host in ["echo", "echoAAABBB", "echo.example"] {
+                let (status, _, body) = get(mode, &format!("/ping?host={host}")).await;
+                assert_eq!(status, StatusCode::OK, "{mode:?} {host}");
+                assert_eq!(
+                    body,
+                    format!("<pre>PING {host}: 56 data bytes</pre>"),
+                    "{mode:?} {host}"
+                );
+            }
+        }
+
+        // P: every shape that reaches `echo` in V is refused by the allowlist
+        // before any shell is emulated, with the same 400 body.
+        for target in [
+            "/ping?host=1|echo%20AAABBB",
+            "/ping?host=1%26%26echo%20AAABBB",
+            "/ping?host=1%60echo%20AAABBB%60",
+            "/ping?host=1$(echo%20AAABBB)",
+            "/ping?host=1;echo",
+            "/ping?host=1%20%26%26%20echo%20AAABBB",
+            "/ping?host=;echo%20AAABBB",
+            "/ping?host=1;echo%20h%C3%A9",
+        ] {
+            let (status, _, body) = get(P, target).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{target}");
+            assert_eq!(body, "invalid host", "{target}");
+            assert_eq!(
+                cmdi(
+                    P,
+                    &crate::app::percent_decode(&target["/ping?host=".len()..])
+                )
+                .1,
+                None
+            );
+        }
+
+        // The bundled probe, replayed: `check-command-injection.rhai` sends
+        // six payloads and confirms when the body holds the reassembled marker
+        // and not the raw `echo <r1>`. V confirms on each of the three plain
+        // separators; P confirms on none.
+        let probes = [
+            "1;echo AAABBB",
+            "1|echo AAABBB",
+            "1&&echo AAABBB",
+            "1$(echo AAA)BBB",
+            "1`echo AAA`BBB",
+            "1&echo AAABBB",
+        ];
+        let confirms = |body: &str| body.contains("AAABBB") && !body.contains("echo AAA");
+        for (i, probe) in probes.iter().enumerate() {
+            let target = format!(
+                "/ping?host={}",
+                probe.replace('&', "%26").replace('`', "%60")
+            );
+            let (v_status, _, v_body) = get(V, &target).await;
+            assert_eq!(v_status, StatusCode::OK, "{probe}");
+            if i < 3 {
+                assert!(confirms(&v_body), "V must confirm {probe}: {v_body}");
+            }
+            let (p_status, _, p_body) = get(P, &target).await;
+            assert_eq!(p_status, StatusCode::BAD_REQUEST, "{probe}");
+            assert!(!confirms(&p_body), "P must not confirm {probe}: {p_body}");
+        }
+
+        // The manifest advertises the new verb to the operator.
+        let row = crate::manifest::manifest()
+            .iter()
+            .find(|v| v.id == "cmdi-ping-host")
+            .expect("cmdi-ping-host in the manifest");
+        assert!(
+            row.trigger_hint.contains("echo w appends w"),
+            "{}",
+            row.trigger_hint
+        );
+        assert_eq!(row.success_signal, seed::CMDI_MARKER);
+    }
+
+    #[tokio::test]
     async fn cmdi_marker_and_sleep() {
         let (status, _, body) = get(V, "/ping?host=localhost;id").await;
         assert_eq!(status, StatusCode::OK);
