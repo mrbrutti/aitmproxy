@@ -115,6 +115,10 @@ final class Session {
     }
     var interceptArmed = false
     var capturing = true
+    /// The core's own account of the All Apps capture path (`capture.status`, read by `BusService`
+    /// on its slow tick from an embedded core that lists the verb). Nil = no fact: an external core,
+    /// an older core, or no connection — the lane then falls back to the app's tunnel status.
+    var captureStatus: CaptureStatus?
     var autoSelect = Store.isOverridden ? false : UserDefaults.standard.bool(forKey: "autoSelect") {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(autoSelect, forKey: "autoSelect") } }
     }

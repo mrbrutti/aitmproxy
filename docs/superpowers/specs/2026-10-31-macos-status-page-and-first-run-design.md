@@ -561,3 +561,13 @@ capturing the proxy."
 | R3-1 | "Capture" as the switch label reads as the proxy's recording; "Extension" (Proxyman's word) rejected too | FIXED — Matt chose *All Apps* from three proposals (All Apps / System-wide / Transparent): toolbar switch, lane title ("All Apps: all apps off"), Status card actions (Capture All Apps / Stop Capturing All Apps / Uninstall Extension…), Proxy menu (⌃⌘A), Settings tab (toggle "Capture traffic from all apps"), GLOSSARY. Kit identifiers (`CaptureSwitch`, `captureLane`, `turnCaptureOn`) keep their names; the tripwires follow the new labels |
 | R3-2 | Apps sidebar empty with the extension on | ROUTED to its own session (`mac-attribution`): the extension sends `source_app`, the core maps it to `peer_identity` and then drops it (`detail.rs` writes `"process": null`), and the app never decodes a client — core → app end to end, separate PR |
 
+Fold of the core's `capture.status` verb (2026-11-02, the "Facts from the other sessions folded in"
+item, PR #200's verb shipped in v0.5.5; last unit in the mac order after attribution and system proxy):
+
+| # | Point | Disposition |
+|---|---|---|
+| F-1 | The All Apps lane read only the app's tunnel status; the core's attach state and handoff count (`capture.status`) were decoded by `AitmproxyKit/CaptureStatus.swift` but never polled or shown | FIXED — `BusService.refreshCaptureStatus` reads the verb on the first tick and every 4th (~2 s), only from an embedded core that lists it, change-guarded into `Session.captureStatus` (nil on an external/older core, a failed read, or no connection); `Session+Connection` passes `CoreCaptureStatus(status)` as `make(coreCapture:)` |
+| F-2 | `CoreCaptureStatus` had no mapping from the verb's reply and no room for the core's reason | FIXED — `init(_ status: CaptureStatus)`: `provider.state == attached`, TCP + UDP handoffs, `reason = capability_reason ?? feeder.reason`; the "on, core not attached" detail appends the reason ("… · core not attached · macos_capture.enabled is false"); the attached detail is unchanged ("attached · n hosts in scope · m flows handed off"). Kit test pins the four shapes (attached, gate off, bind failed, awaiting) with literal JSON |
+| F-3 | `FlowSummary.swift` still said `source_app` is "nil for a proxied flow" after PR #283 taught the core to name proxied clients | FIXED — three comments |
+| F-4 | Live proof of the attached row needs the installed notarized app (a dev bundle embeds no extension, so its core answers `feeder off · "macos_capture.enabled is false"`) | The dev-bundle proof shows the verb polled on the bus and that reply folded into the lane; the attached/handed-off row is proven by the acceptance runner's MAC journeys on the next installed build |
+

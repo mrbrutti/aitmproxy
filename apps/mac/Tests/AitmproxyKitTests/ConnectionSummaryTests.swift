@@ -154,6 +154,45 @@ import Testing
         #expect(detached.actions.first == .restartCore)
     }
 
+    /// The fold of the `capture.status` reply (PR #200's shape) into the lane's input: attached +
+    /// TCP and UDP handoffs summed, and the core's own reason carried onto the detail when the
+    /// provider is not attached.
+    @Test func coreCaptureStatusComesFromTheVerbsReply() throws {
+        let attachedJSON = """
+        {"enabled":true,"feeder":{"state":"listening"},"provider":{"state":"attached","attached_at":1761900000000,
+         "team_id":"995PCLM9KH"},"scope_tokens":["www.example.com"],"flows_handed_off":{"tcp":4,"udp":3},
+         "last_handoff_at":1761900001000,"capability":"capturing"}
+        """
+        let attached = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(attachedJSON))))
+        #expect(attached == CoreCaptureStatus(providerAttached: true, flowsHandedOff: 7))
+        #expect(make(capability: .capturing, hosts: 1, coreCapture: attached).capture.detail
+                == "attached · 1 host in scope · 7 flows handed off")
+
+        let gateOffJSON = """
+        {"enabled":false,"feeder":{"state":"off","reason":"macos_capture.enabled is false"},
+         "provider":{"state":"detached"},"flows_handed_off":{"tcp":0,"udp":0},"last_handoff_at":null,
+         "capability":"feeder_off","capability_reason":"macos_capture.enabled is false"}
+        """
+        let gateOff = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(gateOffJSON))))
+        #expect(gateOff.providerAttached == false)
+        #expect(gateOff.reason == "macos_capture.enabled is false")
+        let lane = make(capability: .capturing, hosts: 1, coreCapture: gateOff).capture
+        #expect(lane.state == .warning)
+        #expect(lane.word == "on, core not attached")
+        #expect(lane.detail == "extension on · 1 host in scope · core not attached · macos_capture.enabled is false")
+
+        // A bind failure with no capability_reason falls back to the feeder's reason; a listening
+        // feeder that is simply not yet attached has no reason and the detail stays bare.
+        let bindFailed = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(
+            #"{"enabled":true,"feeder":{"state":"bind_failed","reason":"cannot bind the capture sockets (address in use)"},"capability":"degraded"}"#))))
+        #expect(bindFailed.reason == "cannot bind the capture sockets (address in use)")
+        let awaiting = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(
+            #"{"enabled":true,"feeder":{"state":"listening"},"capability":"awaiting_provider"}"#))))
+        #expect(awaiting == CoreCaptureStatus(providerAttached: false, flowsHandedOff: 0, reason: nil))
+        #expect(make(capability: .capturing, hosts: 1, coreCapture: awaiting).capture.detail
+                == "extension on · 1 host in scope · core not attached")
+    }
+
     // MARK: Overall + steps
 
     @Test func overallIsTheWorstLane() {

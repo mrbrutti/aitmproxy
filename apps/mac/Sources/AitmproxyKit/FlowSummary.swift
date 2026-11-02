@@ -27,13 +27,16 @@ public struct FlowSummary: Hashable, Sendable {
     /// even as `null`): an older core omits them, and then a nil size is unknown for
     /// good rather than still streaming.
     public var reportsBodySizes: Bool
-    /// The signing identifier of the app that opened the connection, as the capture
-    /// backend observed it (`source_app`, e.g. `com.apple.Safari`). Nil for a proxied flow
-    /// (`null`), an older core that sends no key, and a provider that sent nothing (`""`):
-    /// none of those is an app, so none makes an Apps group.
+    /// The signing identifier of the app that opened the connection (`source_app`, e.g.
+    /// `com.apple.Safari`): from the All Apps extension for a handed-off flow, and since PR #283
+    /// from the core's own peer-port → process lookup for a flow that reached the listener
+    /// directly. Nil when the core could not name the client (`null`: a process it may not read),
+    /// an older core that sends no key, and a backend that sent nothing (`""`): none of those is
+    /// an app, so none makes an Apps group.
     public var sourceApp: String?
     /// The capture backend that delivered the connection (`capture_interface`, `macos-ne`).
-    /// Nil for a proxied flow. Decoded as the wire's mirror; the row does not carry it.
+    /// Nil for a flow that reached the listener directly. Decoded as the wire's mirror; the row
+    /// does not carry it.
     public var captureInterface: String?
     /// When the core created the flow (`started_at`, milliseconds since the Unix
     /// epoch): the request head for HTTP, the upgrade for WebSocket. Nil from an
@@ -126,7 +129,7 @@ public struct FlowSummary: Hashable, Sendable {
         self.responseBytes = Self.size(json["response_bytes"])
         self.reportsBodySizes = json["request_bytes"] != nil || json["response_bytes"] != nil
         // Who opened the connection and which backend saw it. Absent, null and "" all
-        // read as nil: a proxied flow is no app, and the UI never shows a fake group.
+        // read as nil: an unnamed client is no app, and the UI never shows a fake group.
         self.sourceApp = Self.identifier(json["source_app"])
         self.captureInterface = Self.identifier(json["capture_interface"])
         // Timing is a count of milliseconds: a negative or fractional value from the

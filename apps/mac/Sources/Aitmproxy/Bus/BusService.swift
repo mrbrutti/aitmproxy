@@ -18,6 +18,10 @@ final class BusService: FlowActions {
     /// The L4 status, scope and parked reads run on one poll tick in this many (l4-parity plan,
     /// unit (d) amendment 6: the same ~5 s cadence as `ca.status`; spec §1 says re-read, never cache).
     static let l4StatusEveryTicks = 10
+    /// `capture.status` is read on one poll tick in this many (about every 2 s): the extension's
+    /// attach state and handoff count are the core's facts and the lane shows them, so they follow
+    /// the core at the cadence the status-page spec asked for, not this client's memory.
+    static let captureStatusEveryTicks = 4
 
     @ObservationIgnored private var client: BusClient?
     @ObservationIgnored private var runTask: Task<Void, Never>?
@@ -187,6 +191,8 @@ final class BusService: FlowActions {
             session.forgetCATrust()
             // Likewise the system-proxy facts: the route and the menu title must not keep a gone core's word.
             session.forgetSystemProxy()
+            // And the core's capture account: with no core there is no attach state to show.
+            session.captureStatus = nil
             // And the L4 facts (l4-parity spec §1: never cached for the session): a new core is
             // re-read from `.pending`, and no stale scope or parked packet shows under a failed badge.
             session.l4CaptureAvailability = .pending
@@ -212,6 +218,13 @@ final class BusService: FlowActions {
             // from any other client (agent, TUI, web) reaches the toolbar's Proxy switch within
             // one poll, and a relaunch against an already-paused core starts out saying so.
             await refreshProxyStatus()
+            // Same: the capture read below goes through `self.client`.
+            guard owns() else { return }
+            // The extension's attach state and handoff count are the core's facts (`capture.status`,
+            // PR #200): read on the first tick and every 4th (about every 2 s), only from an embedded
+            // core that lists the verb — an external core runs no extension, and an older core has
+            // no verb; both leave the lane on the app's own tunnel status.
+            if tick % Self.captureStatusEveryTicks == 0 { await refreshCaptureStatus() }
             // Same: `refreshCAStatus` reaches the bus through `session.commandRunner`, which reads `self.client`.
             guard owns() else { return }
             // CA trust is the OS store's fact (spec D17.5, D17.10): read on the first tick and every
@@ -384,6 +397,21 @@ final class BusService: FlowActions {
         } else if session.systemProxyFacts != nil {
             session.forgetSystemProxy()
         }
+    }
+
+    /// `capture.status` → `Session.captureStatus`, the core's account of the All Apps path: whether a
+    /// provider is attached and how many flows it handed off (the All Apps lane's detail and its
+    /// "on, core not attached" warning read it). Only an embedded core that lists the verb is asked;
+    /// anything else — an external core, an older core, a failed read — publishes nil, so the lane
+    /// falls back to the app's tunnel status rather than showing a stale attach state.
+    private func refreshCaptureStatus() async {
+        guard let client, session.embeddedCoreActive, tools.contains(where: { $0.name == "capture.status" }) else {
+            if session.captureStatus != nil { session.captureStatus = nil }
+            return
+        }
+        let status = (try? await client.call("capture.status")).flatMap(CaptureStatus.init)
+        // Change-guarded like every other per-tick write here.
+        if session.captureStatus != status { session.captureStatus = status }
     }
 
     /// `l4.capture.status` / `l4.intercept.status` → the two availabilities, `l4.scope.list` → the
