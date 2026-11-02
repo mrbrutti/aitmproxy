@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 94] = [
+const EXPECTED_TOOLS: [&str; 102] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -116,11 +116,21 @@ const EXPECTED_TOOLS: [&str; 94] = [
     "scan.profile.save",
     "scan.profile.delete",
     "scan.session.preview",
-    // One manual verb per registered check (spec D3 `check.<id>`): the interim HTTP
-    // lane's two active checks and three passive checks. The three interim passive
-    // ids go away with T2's integration.
+    // One manual verb per registered check (spec D3 `check.<id>`): the ten T3
+    // natives of `aitm-scan-checks-http` (PR 2a; `xss-reflected` and
+    // `open-redirect` took over the interim lane's two active ids) and the
+    // interim lane's three passive checks, whose ids go away with T2's
+    // integration.
     "check.xss-reflected",
     "check.open-redirect",
+    "check.sqli-boolean",
+    "check.sqli-time",
+    "check.cmdi-time",
+    "check.h2-settings-observe",
+    "check.h2-pseudo-header-validation",
+    "check.h2-header-crlf-tolerance",
+    "check.h2-cl-te-downgrade-indicator",
+    "check.h2-rapid-reset-mitigation",
     "check.reflection",
     "check.security-header",
     "check.cookie-flag",

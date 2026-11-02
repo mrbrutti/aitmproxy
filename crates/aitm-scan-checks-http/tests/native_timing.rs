@@ -75,6 +75,10 @@ async fn sqli_time_is_firm_when_the_delays_correlate() {
     assert_eq!(t.observed_ms, vec![1040, 3060, 1040, 3060]);
     assert!(t.r >= 0.85, "r was {}", t.r);
     assert!((950.0..=1050.0).contains(&t.slope), "slope was {}", t.slope);
+    assert!(
+        t.correlated,
+        "the check judged the fit correlated and the evidence says so (AC T3-4)"
+    );
 
     // The payload an operator re-sends by hand is the longest delay of the
     // family that fired, and the detail names the family and the fit.
@@ -609,4 +613,43 @@ async fn a_budget_for_exactly_one_family_runs_that_family_and_stops() {
     );
     assert_eq!(host.sent().len(), 4);
     assert_eq!(host.budget_left(), 0);
+}
+
+/// A family whose first delay probe is answered 5xx is abandoned at once: the
+/// payload breaks the query rather than delaying it (the error-based check's
+/// finding), and the remaining probes of that family would be three more
+/// server errors on the host's error ladder. With every family answering 5xx
+/// the point is Inconclusive and the detail says why (live run 2026-11-01).
+#[tokio::test]
+async fn a_family_answered_5xx_is_abandoned_on_its_first_probe() {
+    let host = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .with_fallback(html(500, "<pre>SQL syntax error</pre>"));
+
+    let verdict = sqli_check().run(&q(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert_eq!(
+        verdict.detail,
+        "2 of 2 payload families were abandoned after a 5xx answer (the last on probe 1 of 4): \
+         the payload breaks the query rather than delaying it, which is the error-based check's \
+         territory, so no delay was measured for them"
+    );
+    // One probe per family and not one more: the sqli check ships two families.
+    assert_eq!(host.sent().len(), 2, "{:?}", host.sent());
+}
+
+/// One erroring family among measured ones still makes the point Inconclusive:
+/// a family that was never measured cannot be counted as a quiet target.
+#[tokio::test]
+async fn one_erroring_family_keeps_the_point_inconclusive() {
+    let host = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .on("SLEEP(", html(500, "<pre>SQL syntax error</pre>"))
+        .with_fallback(timed(45));
+
+    let verdict = sqli_check().run(&q(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert!(verdict.detail.starts_with("1 of "), "{}", verdict.detail);
 }

@@ -1,0 +1,45 @@
+ ›•‹ aitmproxy  ● rec  ✎ compose  ⌫ clear                            ● aitmproxy · bus disconnected                            [⚙ Agent · n/a (F1)]  : palette  ▄▄ below  b sidebar
+  All 1 │ HTTP2 HTTPS3 WebSocket4 │ h15 h26 │ JSON7 Form8 XML9 JS0 CSS GraphQL Document Media Other                                                                      ⌕ / filter
+ ›•‹ aitmproxy             │        # URL                                                             Client   Method  Status Time         Duration  Request Response SSL Ed Origin
+                           │
+ Working                   │
+  Pinned                   │
+  Saved                 F10│
+                           │
+ All                       │
+  All flows               0│
+  Apps                    0│
+  Domains                 0│
+                           │
+ aitmproxy                 │
+  Scope                   0│
+  Findings              F13│
+  Browser                 —│  No flows yet — point a client at the proxy or open the browser.
+  Scripts                M3│
+  Agent                  F1│
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+ [ ] move  b hide          │
+ ? help  i intercept  e edit  bus: bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)  — ↑ — ↓ — (F4)  ● bus down · retrying

@@ -21,7 +21,7 @@ use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
 use aitm_core::{
     ActionPermit, AgentState, AuditRing, Config, GuardError, JobBus, Plugin, ProtocolModule, Proxy,
-    Registry, ScopeEntry, ScopeRateGuard,
+    Registry, ScopeEntry, ScopeRateGuard, SsrfPolicy,
 };
 use aitm_plugin_maprules::MapRulesPlugin;
 use aitm_plugin_passthrough::{PassthroughList, PassthroughModule, PassthroughPlugin};
@@ -226,12 +226,22 @@ pub fn ws_tls_policy(cfg: &Config) -> TlsPolicy {
 /// The native (compiled-in) scanner v2 checks this build ships (spec D1).
 ///
 /// `aitm-scan-checks-http` contributes checks to the HTTP lane's catalogue rather
-/// than a second lane, so its slot is `checks()`, not `lane()`. It answers the
-/// checks track T3 has landed, which is none while that crate ships an empty
-/// catalogue.
+/// than a second lane, so its slot is `checks_with`, not `lane()`: the ten T3
+/// natives (spec D8.2) — `sqli-boolean`, `sqli-time`, `cmdi-time`,
+/// `xss-reflected`, `open-redirect` and the five observe-only `h2-*` checks.
+/// The five h2 checks open one raw HTTP/2 connection per origin, outside the
+/// job client, so they take the egress posture explicitly: `ssrf` is the
+/// operator's `browser.ssrf` policy (the one [`SsrfPolicy`] in `Config`, the
+/// same one the browser engine and `aitm browser confine` read) and `guard` is
+/// the proxy's live scope guard, handed in as a [`LateGuard`] and bound right
+/// after `Proxy::build` like Map Remote's. It is the crate's only slot: no
+/// constructor omits the gate.
 #[must_use]
-pub fn collect_native_checks() -> Vec<Arc<dyn aitm_scan_model::Check>> {
-    aitm_scan_checks_http::checks()
+pub fn collect_native_checks(
+    ssrf: SsrfPolicy,
+    guard: Arc<dyn ScopeRateGuard>,
+) -> Vec<Arc<dyn aitm_scan_model::Check>> {
+    aitm_scan_checks_http::checks_with(ssrf, guard)
 }
 
 /// A built proxy and the CA it serves with.
@@ -519,6 +529,9 @@ pub fn assemble_with_scripts(
     // served. Until bound it reports nothing in scope, so the module would tunnel
     // everything (deny-by-default) rather than decrypt it.
     let tunnel_guard = Arc::new(LateGuard::default());
+    // The scope guard the T3 raw-h2 observe checks gate their one connection per
+    // origin on; bound to the proxy's guard right after build, beside the others.
+    let native_guard = Arc::new(LateGuard::default());
 
     // The one job bus (spec D9.2). Every long-running command publishes on it
     // and every server is handed this exact `Arc`, so progress from a job
@@ -535,7 +548,7 @@ pub fn assemble_with_scripts(
     scanner_cfg.l4_allow_agent_inject = features.l4.allow_agent_inject;
     // Scanner v2 registration slots (spec D1, "Registration without shared
     // files"): the lanes each lane crate's `lane()` handed back, the native
-    // checks from `aitm_scan_checks_http::checks()`, and the scripting tier's
+    // checks from `aitm_scan_checks_http::checks_with(..)`, and the scripting tier's
     // check registry (call B9). `late` and `engine_cell` are taken before the
     // registry takes the plugin by value: `main.rs` binds the proxy's handles
     // into the first once the proxy exists, and the second is how the assembled
@@ -545,7 +558,10 @@ pub fn assemble_with_scripts(
             features.l4_shared.as_ref(),
             ws_tls_policy(cfg),
         ))
-        .with_native_checks(collect_native_checks())
+        .with_native_checks(collect_native_checks(
+            cfg.browser.ssrf.clone(),
+            native_guard.clone(),
+        ))
         .with_script_checks(scripts.script_checks.clone().unwrap_or_default());
     let scan_late = scanner.late();
     let scanner_engine = scanner.engine_cell();
@@ -717,6 +733,7 @@ pub fn assemble_with_scripts(
     // same scope/rate guard the client path and every other command enforce.
     map_guard.bind(proxy.guard());
     tunnel_guard.bind(proxy.guard());
+    native_guard.bind(proxy.guard());
 
     // The protocol-general capture ingress (L4OPS-AC17). Its stream/TCP half is wired
     // for **every** build, from the live proxy's shared module list, flow store, event
@@ -1227,7 +1244,28 @@ mod tests {
     #[test]
     fn lane_slots_count_the_landed_lanes() {
         assert_eq!(collect_lanes(None).len(), 2);
-        assert_eq!(collect_native_checks().len(), 0);
+        // T3 (`aitm-scan-checks-http`): the ten D8.2 natives, built through the
+        // gated constructor with an unbound guard (deny-by-default until the
+        // proxy binds it).
+        let natives = collect_native_checks(SsrfPolicy::default(), Arc::new(LateGuard::default()));
+        assert_eq!(natives.len(), 10);
+        let mut ids: Vec<&str> = natives.iter().map(|c| c.meta().id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "cmdi-time",
+                "h2-cl-te-downgrade-indicator",
+                "h2-header-crlf-tolerance",
+                "h2-pseudo-header-validation",
+                "h2-rapid-reset-mitigation",
+                "h2-settings-observe",
+                "open-redirect",
+                "sqli-boolean",
+                "sqli-time",
+                "xss-reflected",
+            ]
+        );
 
         let shared = L4Shared {
             guard: Arc::new(L4Guard::new(&L4Config {

@@ -17,8 +17,9 @@ Assert:
     `evidence.timing.correlated == True` and `evidence.timing.r >= 0.85`;
   - class `cmdi` on `/ping` with correlated timing evidence;
   - on P none of the three;
-  - per point (counted per path over the target's own request log) at most 8
-    requests carry a delay payload -- the timing checks are bounded, not a flood;
+  - per point (counted per path over the target's own request log) at most 16
+    requests carry a delay payload, 8 per timing check -- the timing checks are
+    bounded, not a flood;
   - no bundled active Rhai script calls `sleep(`: the host measures `elapsed_ms`,
     a check never waits itself (parent spec D8.2 "Timing without `sleep`").
 
@@ -61,7 +62,17 @@ ACTIVE_DIR = Path(repo_root()) / "scripts" / "bundled" / "active"
 # case-insensitively, so `SLEEP`, `pg_sleep` and `sleep` are one token here.
 DELAY_TOKENS = ("sleep", "waitfor")
 TIMED_PATHS = ("/items", "/orders", "/ping")
-MAX_DELAY_PROBES_PER_POINT = 8
+# The seeded points, as (path, parameter).
+TIMED_POINTS = (("/items", "id"), ("/orders", "id"), ("/ping", "host"))
+# Spec D2 caps a timing check at 8 delay probes per point; two timing checks run
+# here (`sqli-time`, `cmdi-time`) and both apply to every query point, so one
+# point may see up to 16 delay-bearing requests, 8 from each (live run
+# 2026-11-01: /items?id saw exactly 16, 8 per check). A point is a (path,
+# parameter) pair read from the target's own log: `path` plus the name before
+# the first `=` of `query`. Body points are outside this oracle: a form field's
+# probe is logged without a query, so its delay token is never seen here and
+# the bound is proven for query points only.
+MAX_DELAY_PROBES_PER_POINT = 16
 MIN_TIMING_R = 0.85
 JOB_TIMEOUT = 600.0
 
@@ -82,19 +93,29 @@ def timing_of(op, issue_summary: dict) -> dict:
     return ((full.get("evidence") or {}).get("timing") or {})
 
 
-def delay_probes_per_path(target, seq0: int) -> dict:
-    """{path -> number of requests whose query carried a delay payload}, read from
-    the target's own log: the independent count of what the timing checks sent."""
+def delay_probes_per_point(target, seq0: int) -> dict:
+    """{(path, parameter) -> number of requests whose query carried a delay
+    payload}, read from the target's own log: the independent count of what the
+    timing checks sent to each insertion point."""
     counts: dict = {}
     for e in target.logs.scanner_requests(seq0):
-        query = (e.get("query") or "").lower()
-        if any(tok in query for tok in DELAY_TOKENS):
-            counts[e.get("path")] = counts.get(e.get("path"), 0) + 1
+        query = e.get("query") or ""
+        # The parameter whose *value* carries the delay token, so a probe aimed
+        # at the second parameter of a two-parameter query is counted under it
+        # and not under the first name.
+        for pair in query.split("&"):
+            name, _, value = pair.partition("=")
+            if any(tok in value.lower() for tok in DELAY_TOKENS):
+                key = (e.get("path"), name)
+                counts[key] = counts.get(key, 0) + 1
     return counts
 
 
-def run_blind(op, target) -> tuple[list, int]:
-    """The three blind checks against `target`'s plain origin; (issues, seq0)."""
+def run_blind(op, target) -> tuple[list, int, dict]:
+    """The three blind checks against `target`'s plain origin; (issues, seq0, the
+    number of insertion points the job discovered per (path, parameter), read from
+    `scan.sitemap` -- a path can carry the same parameter on more than one node,
+    the `/search` link and the search form both carry `q`)."""
     seq0 = target.logs.reset()
     job = start_job(op, "operator", profile_name="standard",
                     overrides={"target": {"origins": [target.base]},
@@ -103,7 +124,22 @@ def run_blind(op, target) -> tuple[list, int]:
     ok(f"{target.mode}: job ended state={status.get('state')!r} "
        f"probes={(status.get('probes') or {}).get('sent')!r} "
        f"issues={(status.get('issues') or {}).get('total')!r}")
-    return issues(op, "operator", job=job), seq0
+    sitemap = scan_call(op, "operator", "scan.sitemap", {"job": job})
+    points_per_key: dict = {}
+    for node in (sitemap.get("nodes") or []):
+        params = node.get("params") or []
+        # A node lists each parameter name once but may carry several points
+        # for it (`/search` has `q` from its link and from its form: two captured
+        # flows, `points: 2`), so the node's point count is shared evenly among
+        # its names. That is a ceiling for the non-seeded points (a node with
+        # an uneven split lets one name borrow another's allowance); the three
+        # seeded points are held to the literal bound above.
+        each = max(1, round(int(node.get("points") or 0) / max(1, len(params))))
+        for param in params:
+            name = param.get("name") if isinstance(param, dict) else str(param)
+            key = (node.get("path_template"), name)
+            points_per_key[key] = points_per_key.get(key, 0) + each
+    return issues(op, "operator", job=job), seq0, points_per_key
 
 
 def main() -> None:
@@ -125,7 +161,7 @@ def main() -> None:
             require_checks(op, *NEEDED_CHECKS)
 
             section("the blind checks find the seeded vulns on V")
-            iss_v, seq_v = run_blind(op, v)
+            iss_v, seq_v, points_v = run_blind(op, v)
 
             boolean = by_check(iss_v, "sqli-boolean", "/items")
             check(len(boolean) == 1,
@@ -156,21 +192,27 @@ def main() -> None:
                   f"(check_id={cmdi[0].get('check_id')!r}, timing={t_cmdi or None})")
 
             section("the timing checks are bounded (the target's own request count)")
-            counts_v = delay_probes_per_path(v, seq_v)
-            for path in TIMED_PATHS:
-                n = counts_v.get(path, 0)
+            counts_v = delay_probes_per_point(v, seq_v)
+            shown = {f"{path}?{param}": n for (path, param), n in sorted(counts_v.items())}
+            for point in TIMED_POINTS:
+                n = counts_v.get(point, 0)
                 check(n <= MAX_DELAY_PROBES_PER_POINT,
-                      f"V: {n} delay-payload request(s) on {path} (<= {MAX_DELAY_PROBES_PER_POINT})")
-            extra = {k: n for k, n in counts_v.items()
-                     if k not in TIMED_PATHS and n > MAX_DELAY_PROBES_PER_POINT}
+                      f"V: {n} delay-payload request(s) on {point[0]}?{point[1]} "
+                      f"(<= {MAX_DELAY_PROBES_PER_POINT}, 8 per timing check)")
+            # A (path, parameter) the job discovered on more than one node is that
+            # many points (the engine's own count), each allowed its 16.
+            extra = {f"{k[0]}?{k[1]}": (n, points_v.get(k, 1)) for k, n in counts_v.items()
+                     if k not in TIMED_POINTS
+                     and n > MAX_DELAY_PROBES_PER_POINT * max(1, points_v.get(k, 1))}
             check(not extra,
                   f"V: no other point got more than {MAX_DELAY_PROBES_PER_POINT} delay payloads "
-                  f"(observed {extra or 'none'}; all paths {counts_v or 'none'})")
-            check(sum(counts_v.get(p, 0) for p in ("/orders", "/ping")) > 0,
-                  f"V: the delay payloads really reached the target (per-path {counts_v or 'none'})")
+                  f"per discovered point (observed {extra or 'none'}; all points {shown or 'none'}; "
+                  f"points per (path, param) {dict((f'{k[0]}?{k[1]}', c) for k, c in points_v.items() if c > 1) or 'all single'})")
+            check(sum(counts_v.get(p, 0) for p in TIMED_POINTS[1:]) > 0,
+                  f"V: the delay payloads really reached the target (per point {shown or 'none'})")
 
             section("the patched twin yields none of the three")
-            iss_p, seq_p = run_blind(op, p)
+            iss_p, seq_p, _points_p = run_blind(op, p)
             leaked = [i for i in iss_p
                       if i.get("check_id") in ("sqli-boolean", "sqli-time")
                       or i.get("class") == "cmdi"]
