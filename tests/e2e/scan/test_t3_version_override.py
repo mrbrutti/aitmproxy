@@ -128,16 +128,8 @@ def main() -> None:
             check(int(crawl2.get("errors") or 0) > 0 and int(crawl2.get("pages") or 0) == 0,
                   f"crawl.errors counted every failed request and no page was fetched "
                   f"(observed errors={crawl2.get('errors')!r}, pages={crawl2.get('pages')!r})")
-            if lane_source(op, "http") == "crate" and crawl2.get("last_error") != "h2_not_negotiated":
-                # The lane crate's `crawl_error_token` reads the typed io kind and a
-                # `starts_with("h2_not_negotiated:")` link before falling back to
-                # text, and the sender's forced-h2 failure reaches it as a
-                # "refused" text first, so the token comes out `connect_refused`
-                # (amendment 68 family: classifier ordering in aitm-scan-http;
-                # the interim lane answers h2_not_negotiated here). Loud, never green.
-                skip(f"http lane crate names the forced-h2 failure {crawl2.get('last_error')!r}, not "
-                     f"h2_not_negotiated (amendment 68 classifier ordering in aitm-scan-http; "
-                     f"crawl={crawl2}); the T3 half of AC T3-2 passed above")
+            # Amendment 78 (T2 follow-up): the lane crate classifies an h2 negotiation
+            # failure before any refusal, so this is a hard check on both lane sources.
             check(crawl2.get("last_error") == "h2_not_negotiated",
                   f"crawl.last_error names h2_not_negotiated (observed {crawl2.get('last_error')!r})")
             check(probes2.get("errors", 0) > 0,

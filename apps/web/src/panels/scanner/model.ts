@@ -77,7 +77,7 @@ export const INSERTION_KINDS = [
 ] as const;
 export type InsertionKind = (typeof INSERTION_KINDS)[number];
 
-export const POINT_TRAITS = ['url', 'filename', 'number', 'email', 'base64', 'json', 'id', 'session'] as const;
+export const POINT_TRAITS = ['url', 'filename', 'number', 'email', 'base64', 'json', 'id', 'session', 'structured'] as const;
 export type PointTrait = (typeof POINT_TRAITS)[number];
 
 export const CONFIDENCES = ['tentative', 'firm', 'certain'] as const;

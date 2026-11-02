@@ -958,6 +958,52 @@ mod tests {
         assert_eq!(out.headers.get("content-length"), Some("3"));
     }
 
+    /// Amendment 65 makes `entire_body` a point of recognised JSON and XML
+    /// documents too, so the document-level checks (`xxe`'s DOCTYPE
+    /// injection, `nosqli-json`'s operator objects) replace a whole body that
+    /// `build_request` had only ever been asked to replace for an
+    /// unrecognised one. The replacement is verbatim — the document is *not*
+    /// re-serialised — `Content-Length` follows the new body, and
+    /// `Content-Type` is left exactly as captured, so the server still parses
+    /// the payload as the document type the check wrote.
+    #[test]
+    fn entire_body_replaces_a_json_or_xml_document_verbatim() {
+        let body = point(InsertionKind::EntireBody, "body", None);
+
+        let json = json_request(r#"{"user":"amy"}"#);
+        let injected = r#"{"user":{"$ne":null}}"#;
+        let out = build_request(&json, &body, &replace(injected)).unwrap();
+        assert_eq!(body_text(&out), injected);
+        assert_eq!(out.headers.get("content-type"), Some("application/json"));
+        assert_eq!(
+            out.headers.get("content-length"),
+            Some(injected.len().to_string().as_str())
+        );
+
+        let xml = xml_request("<order><item>W</item></order>");
+        let doctype = "<!DOCTYPE o [<!ENTITY x SYSTEM \"file:///etc/hostname\">]><order><item>&x;</item></order>";
+        let out = build_request(&xml, &body, &replace(doctype)).unwrap();
+        assert_eq!(body_text(&out), doctype);
+        assert_eq!(out.headers.get("content-type"), Some("text/xml"));
+        assert_eq!(
+            out.headers.get("content-length"),
+            Some(doctype.len().to_string().as_str())
+        );
+
+        // Prefix mode prepends to the captured document and re-lengths it.
+        let out = build_request(
+            &xml,
+            &body,
+            &text_payload("<!-- c -->", PayloadMode::Prefix),
+        )
+        .unwrap();
+        assert_eq!(body_text(&out), "<!-- c --><order><item>W</item></order>");
+        assert_eq!(
+            out.headers.get("content-length"),
+            Some(body_text(&out).len().to_string().as_str())
+        );
+    }
+
     #[test]
     fn host_untouched_and_te_removed() {
         let req = request(

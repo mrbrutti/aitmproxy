@@ -5,9 +5,13 @@
 //! this file decides three things a reviewer should be able to check quickly:
 //!
 //! - **What is a point.** Query values, every path segment (the last one as a
-//!   file name when it reads like one), body values by format (form, JSON leaf,
-//!   XML text and attribute, multipart value and filename, else the whole body),
-//!   headers, cookies, and — only at `intensity >= medium` — parameter *names*.
+//!   file name when it reads like one), the whole body of every request that
+//!   has one plus that body's values by format (form, JSON leaf, XML text and
+//!   attribute, multipart value and filename), headers, cookies, and — only at
+//!   `intensity >= medium` — parameter *names*. A whole body that is a
+//!   recognised JSON or XML document carries [`PointTrait::Structured`]
+//!   (amendment 65), which is how a document-level check (`xxe`, `nosqli-json`)
+//!   and a value-level one tell the two apart.
 //! - **What is never a point.** The hop-by-hop and framing headers (mutating
 //!   them changes the request's shape rather than the application's input),
 //!   `content-type` (plan call A8: it decides which kind the body parses to),
@@ -67,18 +71,24 @@ const EXCLUDED_HEADERS: [&str; 12] = [
     "expect",
 ];
 
-/// [`PointTrait`]'s declaration order, so two points with the same traits always
-/// compare and serialise equal (plan call A12).
-const TRAIT_ORDER: [PointTrait; 8] = [
-    PointTrait::Url,
-    PointTrait::Filename,
-    PointTrait::Number,
-    PointTrait::Email,
-    PointTrait::Base64,
-    PointTrait::Json,
-    PointTrait::Id,
-    PointTrait::Session,
-];
+/// A trait's place in [`PointTrait`]'s declaration order, so two points with
+/// the same traits always compare and serialise equal (plan call A12).
+///
+/// The match is exhaustive on purpose: a new variant is a compile error here
+/// until it is given a rank, rather than silently falling out of every point.
+fn trait_rank(point_trait: PointTrait) -> u8 {
+    match point_trait {
+        PointTrait::Url => 0,
+        PointTrait::Filename => 1,
+        PointTrait::Number => 2,
+        PointTrait::Email => 3,
+        PointTrait::Base64 => 4,
+        PointTrait::Json => 5,
+        PointTrait::Id => 6,
+        PointTrait::Session => 7,
+        PointTrait::Structured => 8,
+    }
+}
 
 /// One [`IgnoreRule`] with its regex compiled.
 ///
@@ -205,6 +215,9 @@ struct Candidate {
 struct RecordFlags {
     /// The value was read out of a JSON body ([`PointTrait::Json`]).
     json: bool,
+    /// The value is a whole structured document rather than one field of it
+    /// ([`PointTrait::Structured`], amendment 65).
+    structured: bool,
     /// The name is the lane's own label for a path segment
     /// ([`path_segment_token`] produced it), not text read off the wire, so
     /// the secret-name vocabulary does not apply to it (R-M1, F4-2).
@@ -254,6 +267,26 @@ impl<'a> Collector<'a> {
         );
     }
 
+    /// Record the whole-body candidate (`entire_body`, named `body`).
+    ///
+    /// The traits come from the *declared* `format`, not from whether the
+    /// body parsed: a JSON or XML body is [`PointTrait::Structured`]
+    /// (amendment 65), and a JSON body is also [`PointTrait::Json`], the same
+    /// signal every `json_value` point of that body carries.
+    fn push_entire_body(&mut self, text: &str, format: &BodyFormat) {
+        self.record(
+            InsertionKind::EntireBody,
+            "body",
+            None,
+            text,
+            RecordFlags {
+                json: matches!(format, BodyFormat::Json),
+                structured: matches!(format, BodyFormat::Json | BodyFormat::Xml),
+                ..RecordFlags::default()
+            },
+        );
+    }
+
     /// Record one path candidate at the 1-based `index`. `placeholder` says
     /// the name is the lane's own label for the segment ([`path_segment_token`]
     /// produced it) rather than text read off the wire; `withhold` says its
@@ -274,9 +307,9 @@ impl<'a> Collector<'a> {
             Some(index.to_string()),
             value,
             RecordFlags {
-                json: false,
                 placeholder,
                 withhold,
+                ..RecordFlags::default()
             },
         );
     }
@@ -303,14 +336,15 @@ impl<'a> Collector<'a> {
         if flags.json {
             found.push(PointTrait::Json);
         }
+        if flags.structured {
+            found.push(PointTrait::Structured);
+        }
         if session_trait(name, flags.placeholder) || path_is_secret(kind, path.as_deref()) {
             found.push(PointTrait::Session);
         }
-        let traits: Vec<PointTrait> = TRAIT_ORDER
-            .iter()
-            .copied()
-            .filter(|point_trait| found.contains(point_trait))
-            .collect();
+        found.sort_by_key(|point_trait| trait_rank(*point_trait));
+        found.dedup();
+        let traits = found;
 
         // D8.1: a session point never shows its value, whatever it is named;
         // the caller withholds a path token's value the same way (S-M2); and a
@@ -604,6 +638,22 @@ fn body_candidates(
     bytes: &[u8],
     collector: &mut Collector<'_>,
 ) {
+    // Amendment 65: every body the lane reads is an insertion point of its
+    // own, recognised document or not, because the document-level checks
+    // (`xxe`'s DOCTYPE injection, `nosqli-json`'s operator objects) cannot be
+    // expressed from the value points and must not re-parse the body
+    // themselves. A JSON or XML body carries [`PointTrait::Structured`] so a
+    // check or a UI can tell a whole document from one field of it; the trait
+    // is information, never the skip mechanism (a value-level check skips the
+    // point through its `kinds`).
+    //
+    // It is recorded *before* the value points of the same body so the
+    // per-request cap, which keeps candidates in order, can never drop the
+    // document in favour of the hundredth value. [`parsed_body`] has already
+    // returned `None` for `BodyFormat::None` and `Unavailable`, so every
+    // format that reaches here is a body the lane read.
+    collector.push_entire_body(&String::from_utf8_lossy(bytes), format);
+
     match format {
         BodyFormat::Form => {
             let text = String::from_utf8_lossy(bytes);
@@ -696,10 +746,9 @@ fn body_candidates(
                 }
             }
         }
-        BodyFormat::Other => {
-            let text = String::from_utf8_lossy(bytes);
-            collector.push(InsertionKind::EntireBody, "body", None, &text, false);
-        }
+        // An unrecognised body has no value points: the whole-body candidate
+        // above is all of it.
+        BodyFormat::Other => {}
         BodyFormat::None | BodyFormat::Unavailable => {}
     }
 }
@@ -913,14 +962,19 @@ mod tests {
         assert!(has(&out, ParamNameBody, "profile", None));
         assert!(has(&out, ParamNameBody, "n", None));
 
-        // Session material, credentials, hop-by-hop headers and the body itself
-        // are never points.
+        // Session material, credentials and hop-by-hop headers are never
+        // points. The body itself is one: amendment 65 emits `entire_body`
+        // for every body, this one a structured JSON document.
         assert!(!has_named(&out, Cookie, "sid"));
         assert!(!has_named(&out, Header, "Authorization"));
         assert!(!has_named(&out, Header, "Host"));
         assert!(!has_named(&out, Header, "Content-Type"));
         assert!(!has_named(&out, Header, "Content-Length"));
-        assert!(!out.points.iter().any(|p| p.kind == EntireBody));
+        assert!(has(&out, EntireBody, "body", None), "{:?}", triples(&out));
+        assert_eq!(
+            point(&out, EntireBody, "body").traits,
+            vec![PointTrait::Json, PointTrait::Structured]
+        );
         assert_eq!(out.ignored, 2);
 
         // Everything that was a candidate is in `seen`, filtered or not.
@@ -1535,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn entire_body_only_for_unrecognised() {
+    fn entire_body_for_an_unrecognised_body() {
         let flow = captured_flow(
             request(
                 "POST",
@@ -1559,13 +1613,184 @@ mod tests {
         assert_eq!(bodies[0].name, "body");
         assert_eq!(bodies[0].path, None);
         assert_eq!(bodies[0].example.as_deref(), Some("hello"));
+        // An unrecognised body is not a document: no `structured` trait.
+        assert_eq!(bodies[0].traits, Vec::new());
+    }
 
-        let json = pinned_flow();
+    /// Amendment 65 (replacing "entire body, only when the body is not a
+    /// recognised format"): a recognised JSON document yields exactly one
+    /// `entire_body` point beside its unchanged `json_value` points, flagged
+    /// `structured` (and `json`, the content-type signal), and it is the
+    /// **first** of that body's points, so the per-request cap can never drop
+    /// the document point in favour of the hundredth value.
+    #[test]
+    fn entire_body_for_a_json_document_is_structured_and_comes_first() {
+        let flow = pinned_flow();
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
         let out = enumerate_v2(
-            &json,
+            &flow,
             &EnumerateOptions::from_profile(&profile, &ignore, None),
         );
-        assert!(!out.points.iter().any(|p| p.kind == EntireBody));
+
+        let bodies: Vec<_> = out.points.iter().filter(|p| p.kind == EntireBody).collect();
+        assert_eq!(bodies.len(), 1, "{:?}", triples(&out));
+        assert_eq!(bodies[0].name, "body");
+        assert_eq!(bodies[0].path, None);
+        assert_eq!(
+            bodies[0].traits,
+            vec![PointTrait::Json, PointTrait::Structured]
+        );
+        assert_eq!(
+            bodies[0].example.as_deref(),
+            Some(r#"{"profile":{"address":{"city":"Lisbon"}},"n":3}"#)
+        );
+
+        // The value points of the same body are untouched by amendment 65.
+        assert!(has(&out, JsonValue, "city", Some("profile.address.city")));
+        assert_eq!(
+            point(&out, JsonValue, "city").traits,
+            vec![PointTrait::Json]
+        );
+        assert!(has(&out, JsonValue, "n", Some("n")));
+
+        // ... and the document point precedes every one of them.
+        let body_order: Vec<InsertionKind> = out
+            .points
+            .iter()
+            .map(|p| p.kind)
+            .filter(|kind| matches!(kind, EntireBody | JsonValue))
+            .collect();
+        assert_eq!(body_order[0], EntireBody, "{:?}", triples(&out));
+        assert!(body_order[1..].iter().all(|kind| *kind == JsonValue));
+    }
+
+    /// The same for an XML document; a form and a multipart body get their
+    /// `entire_body` too, without `structured`, because neither is a document
+    /// a document-level check can target (amendment 65: the trait is
+    /// information, the kind is the contract).
+    #[test]
+    fn entire_body_is_structured_for_xml_and_plain_for_a_form() {
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+
+        let xml = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/x",
+                &[],
+                Some(("text/xml", br#"<order id="7"><item>W</item></order>"#)),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(
+            &xml,
+            &EnumerateOptions::from_profile(&profile, &ignore, None),
+        );
+        assert!(has(&out, EntireBody, "body", None), "{:?}", triples(&out));
+        assert_eq!(
+            point(&out, EntireBody, "body").traits,
+            vec![PointTrait::Structured]
+        );
+        assert_eq!(
+            point(&out, EntireBody, "body").example.as_deref(),
+            Some(r#"<order id="7"><item>W</item></order>"#)
+        );
+        // The XML value points are unchanged, and the document comes first of
+        // the body's own points (the path segment still precedes them all).
+        assert!(has(&out, XmlAttr, "id", Some("order@id")));
+        assert!(has(&out, XmlValue, "item", Some("order.item")));
+        assert_eq!(
+            first_body_kind(&out),
+            Some(EntireBody),
+            "{:?}",
+            triples(&out)
+        );
+
+        let form = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/login",
+                &[],
+                Some(("application/x-www-form-urlencoded", b"user=amy&n=2")),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(
+            &form,
+            &EnumerateOptions::from_profile(&profile, &ignore, None),
+        );
+        assert!(has(&out, EntireBody, "body", None), "{:?}", triples(&out));
+        assert_eq!(point(&out, EntireBody, "body").traits, Vec::new());
+        assert_eq!(
+            point(&out, EntireBody, "body").example.as_deref(),
+            Some("user=amy&n=2")
+        );
+        assert!(has(&out, InsertionKind::BodyParam, "user", None));
+        assert!(has(&out, InsertionKind::BodyParam, "n", None));
+        assert_eq!(first_body_kind(&out), Some(EntireBody));
+
+        let multipart = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/upload",
+                &[],
+                Some(("multipart/form-data; boundary=XyZ", MULTIPART_BODY)),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(
+            &multipart,
+            &EnumerateOptions::from_profile(&profile, &ignore, None),
+        );
+        assert!(has(&out, EntireBody, "body", None), "{:?}", triples(&out));
+        assert_eq!(point(&out, EntireBody, "body").traits, Vec::new());
+        assert!(has(&out, MultipartValue, "title", None));
+    }
+
+    /// A structured document is redacted by the same rule as any other whole
+    /// body: `scrub` masks a secret-named key inside it, so a JSON body
+    /// carrying `"token": ...` never shows the credential in its example
+    /// (D8.1, AC T2-6).
+    #[test]
+    fn a_structured_body_example_is_scrubbed_like_any_other_body() {
+        let flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/login",
+                &[],
+                Some((
+                    "application/json",
+                    br#"{"user":"amy","token":"s3cr3t-value"}"#,
+                )),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let profile = ScanProfile::default();
+        let no_ignore = CompiledIgnore::compile(&[]).unwrap();
+        let out = enumerate_v2(
+            &flow,
+            &EnumerateOptions::from_profile(&profile, &no_ignore, None),
+        );
+
+        let example = point(&out, EntireBody, "body")
+            .example
+            .clone()
+            .expect("the body point shows an example");
+        assert!(
+            !example.contains("s3cr3t-value"),
+            "the secret leaked into the whole-body example: {example}"
+        );
+        assert!(example.contains("amy"), "{example}");
+        assert!(example.contains("[redacted]"), "{example}");
     }
 
     #[test]
@@ -1593,6 +1818,15 @@ mod tests {
         );
         assert!(!out.points.iter().any(|p| is_body_kind(p.kind)));
         assert!(has(&out, Query, "q", None));
+    }
+
+    /// The kind of the first point this request's body contributed, in
+    /// candidate order: `entire_body` since amendment 65.
+    fn first_body_kind(out: &Enumerated) -> Option<InsertionKind> {
+        out.points
+            .iter()
+            .map(|p| p.kind)
+            .find(|kind| is_body_kind(*kind) && *kind != ParamNameBody)
     }
 
     fn is_body_kind(kind: InsertionKind) -> bool {
@@ -1891,6 +2125,10 @@ mod tests {
     /// Empty and malformed inputs enumerate nothing broken and never panic: a
     /// bare `GET`, a query made of separators, and bodies whose declared format
     /// does not parse (the query points still come out).
+    ///
+    /// A body that does not parse yields no *value* point, and since
+    /// amendment 65 it still yields its `entire_body` point: a body the lane
+    /// read is a point whether or not its declared format holds up.
     #[test]
     fn empty_and_malformed_inputs_do_not_panic() {
         let profile = ScanProfile::default();
@@ -1913,15 +2151,28 @@ mod tests {
         assert!(out.points.iter().all(|p| !p.name.is_empty()));
         assert!(has(&out, Query, "a", None), "{:?}", triples(&out));
 
-        for (content_type, body) in [
-            ("application/json", &b"{\"a\":"[..]),
-            ("application/json", &[0xff_u8, 0xfe][..]),
-            ("text/xml", &b"<a><b>"[..]),
+        // The traits come from the *declared* type, not from a parse that
+        // failed: a body sent as JSON is `[Json, Structured]` even when it is
+        // not JSON, one sent as XML is `[Structured]`, and a multipart or form
+        // body is a document of neither kind.
+        for (content_type, body, traits) in [
+            (
+                "application/json",
+                &b"{\"a\":"[..],
+                &[PointTrait::Json, PointTrait::Structured][..],
+            ),
+            (
+                "application/json",
+                &[0xff_u8, 0xfe][..],
+                &[PointTrait::Json, PointTrait::Structured][..],
+            ),
+            ("text/xml", &b"<a><b>"[..], &[PointTrait::Structured][..]),
             (
                 "multipart/form-data; boundary=XyZ",
                 &b"--nope\r\n\r\nx\r\n--nope--\r\n"[..],
+                &[][..],
             ),
-            ("application/x-www-form-urlencoded", &b"&&=&"[..]),
+            ("application/x-www-form-urlencoded", &b"&&=&"[..], &[][..]),
         ] {
             let flow = captured_flow(
                 request(
@@ -1935,10 +2186,22 @@ mod tests {
                 b"",
             );
             let out = enumerate_v2(&flow, &opts);
-            assert!(
-                !out.points.iter().any(|p| is_body_kind(p.kind)),
+            let body_kinds: Vec<InsertionKind> = out
+                .points
+                .iter()
+                .map(|p| p.kind)
+                .filter(|kind| is_body_kind(*kind))
+                .collect();
+            assert_eq!(
+                body_kinds,
+                vec![EntireBody],
                 "{content_type}: {:?}",
                 triples(&out)
+            );
+            assert_eq!(
+                point(&out, EntireBody, "body").traits,
+                traits,
+                "{content_type}"
             );
             assert!(has(&out, Query, "q", None), "{content_type}");
         }
