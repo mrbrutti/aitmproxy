@@ -9,6 +9,8 @@ import {
   hexRows,
   interceptBarModel,
   isKnownKind,
+  isL4Chip,
+  l4ChipMatches,
   KNOWN_KINDS,
   L4_ACTIVE_MS,
   L4_IDLE_SLOW_MS,
@@ -30,6 +32,7 @@ import {
   type L4PollClock,
   type L4ScopeEntryWire,
 } from './model';
+import { CHIPS } from '~/shell/chips';
 
 const scope = (iface: string): L4ScopeEntryWire => ({
   id: 's1',
@@ -82,6 +85,16 @@ describe('L4 derivations', () => {
   it('finds the flow-level sub-label across packets', () => {
     expect(flowSubLabel(flow({ packets: [{ dir: 'inbound', length: 4, injected: false, layers: ['IPv4', 'UDP'] }] }))).toBe('UDP');
     expect(flowSubLabel(flow({ packets: [] }))).toBe(null);
+  });
+
+  it('takes the flow-level proto first: list rows are read with limit 0 and carry no packets (spec §2)', () => {
+    expect(flowSubLabel(flow({ proto: 'UDP', packets: [] }))).toBe('UDP');
+    expect(flowSubLabel(flow({ proto: 'TCP', packets: [] }))).toBe('TCP');
+    expect(flowSubLabel(flow({ proto: 'ICMP', packets: [] }))).toBe('ICMP');
+    expect(flowSubLabel(flow({ proto: 'ICMPv6', packets: [] }))).toBe('ICMP');
+    // An unknown or null flow proto falls back to the packet scan.
+    expect(flowSubLabel(flow({ proto: null, packets: [{ dir: 'inbound', length: 4, injected: false, layers: ['IPv4', 'TCP'] }] }))).toBe('TCP');
+    expect(flowSubLabel(flow({ proto: 'SCTP', packets: [] }))).toBe(null);
   });
 });
 
@@ -354,5 +367,41 @@ describe('flowGetArgs offset (load more from next_offset)', () => {
     expect(flowGetArgs('F', 'inspect', true)).toEqual({ id: 'F', offset: 0, limit: 256 });
     expect(flowGetArgs('F', 'list', true, 69)).toEqual({ id: 'F', limit: 0 });
     expect(flowGetArgs('F', 'inspect', false, 69)).toEqual({ id: 'F' });
+  });
+});
+
+describe('TCP / UDP / L4 chips (spec §7(c), AC21)', () => {
+  it('the bar reads All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2, so ⌘5 is TCP', () => {
+    expect(CHIPS.map((c) => c.label).slice(0, 9)).toEqual(['All', 'HTTP', 'HTTPS', 'WebSocket', 'TCP', 'UDP', 'L4', 'h1', 'h2']);
+    expect(CHIPS[4]!.id).toBe('tcp');
+    expect(CHIPS[5]!.id).toBe('udp');
+    expect(CHIPS[6]!.id).toBe('l4');
+  });
+
+  it('TCP UDP L4 are their own group and h1 keeps its separator', () => {
+    expect(CHIPS[4]!.group).toBe(true);
+    expect(CHIPS[5]!.group).toBeFalsy();
+    expect(CHIPS[6]!.group).toBeFalsy();
+    expect(CHIPS[7]!.group).toBe(true);
+  });
+
+  it('isL4Chip names exactly tcp, udp and l4', () => {
+    expect(isL4Chip('tcp')).toBe(true);
+    expect(isL4Chip('udp')).toBe(true);
+    expect(isL4Chip('l4')).toBe(true);
+    expect(isL4Chip('http')).toBe(false);
+    expect(isL4Chip('all')).toBe(false);
+  });
+
+  it('l4ChipMatches: l4 matches every L4 row, tcp/udp by sub-label, any other chip never', () => {
+    expect(l4ChipMatches('tcp', { subLabel: 'TCP' })).toBe(true);
+    expect(l4ChipMatches('udp', { subLabel: 'TCP' })).toBe(false);
+    expect(l4ChipMatches('udp', { subLabel: 'UDP' })).toBe(true);
+    expect(l4ChipMatches('tcp', { subLabel: 'UDP' })).toBe(false);
+    expect(l4ChipMatches('l4', { subLabel: 'UDP' })).toBe(true);
+    expect(l4ChipMatches('l4', { subLabel: null })).toBe(true);
+    expect(l4ChipMatches('tcp', { subLabel: null })).toBe(false);
+    expect(l4ChipMatches('http', { subLabel: 'TCP' })).toBe(false);
+    expect(l4ChipMatches('all', { subLabel: 'TCP' })).toBe(false);
   });
 });

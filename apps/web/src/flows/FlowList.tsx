@@ -8,7 +8,7 @@ import type { FlowEntry } from '~/state/app';
 import { Menu, type MenuEntry } from '~/components/Menu';
 import { pointAnchor, type AnchorRect } from '~/components/floating';
 import { EVENTS } from '~/shell/shortcuts';
-import type { UnionRow } from '~/panels/l4/model';
+import { isL4Chip, l4ChipMatches, type UnionRow } from '~/panels/l4/model';
 import { compareFlows, createColumnState, type ColumnId, type ColumnStore } from './columns';
 import { FlowRow } from './FlowRow';
 import { L4FlowRow } from './L4FlowRow';
@@ -58,14 +58,17 @@ export const FlowList: Component<FlowListProps> = (props) => {
   const count = () => rows().length;
 
   // L4 sessions are top-level rows in this one list (parity with TUI/macOS). They are appended
-  // after the virtualised HTTP rows, and shown only in the unified view (chip "all") or the L4
-  // focus filter — never under an HTTP-specific chip or an app/domain/scope source.
+  // after the virtualised HTTP rows, and shown only in the unified view (chip "all") or under an
+  // L4 chip that matches them (`TCP` / `UDP` / `L4`, spec §7(c)) — never under an HTTP-specific
+  // chip or an app/domain/scope source. `matchesChip` already hides HTTP rows under an L4 chip.
   const l4Rows = createMemo<UnionRow[]>(() => {
     if (!l4 || !l4.present()) return [];
-    if (app.ui.chip !== 'all') return [];
     const side = app.ui.sidebar.kind;
     if (side !== 'all' && side !== 'l4') return [];
-    return l4.rows();
+    const chip = app.ui.chip;
+    if (chip === 'all') return l4.rows();
+    if (!isL4Chip(chip)) return [];
+    return l4.rows().filter((row) => l4ChipMatches(chip, row));
   });
 
   const virtualizer = createVirtualizer({

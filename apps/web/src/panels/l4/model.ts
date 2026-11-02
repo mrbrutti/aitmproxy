@@ -140,13 +140,44 @@ export function protoSubLabel(layers: readonly string[]): 'TCP' | 'UDP' | 'ICMP'
   return null;
 }
 
-/** A flow's sub-label: the transport proto across all its packets (first that decodes one). */
-export function flowSubLabel(flow: Pick<L4FlowWire, 'packets'>): 'TCP' | 'UDP' | 'ICMP' | null {
+/**
+ * A flow's sub-label. The flow-level `proto` (spec §2, from the first decodable packet) wins, since
+ * list rows are read with `limit: 0` and carry no packets; otherwise the first packet that decodes a
+ * transport.
+ */
+export function flowSubLabel(flow: Pick<L4FlowWire, 'packets' | 'proto'>): 'TCP' | 'UDP' | 'ICMP' | null {
+  if (flow.proto) {
+    const s = protoSubLabel([flow.proto]);
+    if (s) return s;
+  }
   for (const p of flow.packets) {
     const s = protoSubLabel(p.layers);
     if (s) return s;
   }
   return null;
+}
+
+// ---- the TCP / UDP / L4 chips (parity spec §7(c), AC21) ------------------------------------------
+
+export type L4Chip = 'tcp' | 'udp' | 'l4';
+
+/** Whether a chip id is one of the L4 chips; the HTTP chips never show an L4 row. */
+export function isL4Chip(chip: string): chip is L4Chip {
+  return chip === 'tcp' || chip === 'udp' || chip === 'l4';
+}
+
+/** `l4` matches every L4 row; `tcp` / `udp` match by the row's sub-label; any other chip never. */
+export function l4ChipMatches(chip: string, row: Pick<UnionRow, 'subLabel'>): boolean {
+  switch (chip) {
+    case 'l4':
+      return true;
+    case 'tcp':
+      return row.subLabel === 'TCP';
+    case 'udp':
+      return row.subLabel === 'UDP';
+    default:
+      return false;
+  }
 }
 
 const SESSION_STATE: Record<L4FlowWire['kind'], string> = {
