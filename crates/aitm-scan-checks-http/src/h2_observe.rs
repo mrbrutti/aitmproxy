@@ -73,7 +73,12 @@
 //! name and puts **every** address it resolves to through the SSRF gate and
 //! the live scope permit, exactly as PR 2a shipped that path; the verdict's
 //! detail then ends with "(dialled by name: the host reported no baseline peer
-//! address)" so the operator reads which aim was used. The strict dial comes
+//! address)" so the operator reads which aim was used. On this branch the
+//! acceptance clause above does **not** hold: a name that answers the probe
+//! with a different address than it gave the baseline is caught only if the
+//! new address fails the SSRF gate or the scope permit, so a second public,
+//! in-scope address is dialled (observe-only frames, no session header, at
+//! most eight streams) — the cost amendment 59 accepted. The strict dial comes
 //! back by itself, with no change here, the day the core fills `server_conn`
 //! on client-sent flows (plan amendment A5, T3-7, amendment 59).
 //!
