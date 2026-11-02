@@ -348,7 +348,7 @@ impl ScannerFile {
 
 /// The `scanner.ceilings:` block. Every key is optional and a key the file
 /// leaves out keeps the engine default, so raising one ceiling does not reset
-/// the other five.
+/// the other six.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct CeilingsFile {
@@ -360,6 +360,9 @@ struct CeilingsFile {
     l4_cases: Option<u32>,
     /// Maximum L4 send rate, in bytes per second.
     l4_bytes_per_s: Option<u32>,
+    /// Floor for a profile's `l4.icmp_pace_ms`, in milliseconds (amendment 46):
+    /// a lower profile value is raised to it and reported in `clamped`.
+    l4_icmp_pace_ms_min: Option<u32>,
     /// Maximum WebSocket frame payload one job may send, in bytes.
     ws_frame_bytes: Option<u32>,
     /// Maximum issues one job may record.
@@ -372,6 +375,7 @@ impl CeilingsFile {
         set(&mut c.time_s, self.time_s);
         set(&mut c.l4_cases, self.l4_cases);
         set(&mut c.l4_bytes_per_s, self.l4_bytes_per_s);
+        set(&mut c.l4_icmp_pace_ms_min, self.l4_icmp_pace_ms_min);
         set(&mut c.ws_frame_bytes, self.ws_frame_bytes);
         set(&mut c.max_issues, self.max_issues);
     }
@@ -1022,7 +1026,7 @@ mod tests {
     }
 
     /// Tester (spec D11): every key of the `scanner:` section reaches its
-    /// `ScannerConfig` field, all six ceilings included, and the two fields the
+    /// `ScannerConfig` field, all seven ceilings included, and the two fields the
     /// file never sets (`findings_dir`, `l4_allow_agent_inject`) stay at their
     /// defaults — they are copied from elsewhere by `wire.rs`, not read here.
     #[test]
@@ -1041,6 +1045,7 @@ mod tests {
             "    l4_bytes_per_s: 4\n",
             "    ws_frame_bytes: 5\n",
             "    max_issues: 6\n",
+            "    l4_icmp_pace_ms_min: 7\n",
             "  default_profile: my-api\n",
             "  profiles:\n",
             "    my-api:\n",
@@ -1062,6 +1067,7 @@ mod tests {
                 time_s: 2,
                 l4_cases: 3,
                 l4_bytes_per_s: 4,
+                l4_icmp_pace_ms_min: 7,
                 ws_frame_bytes: 5,
                 max_issues: 6,
             }
@@ -1077,6 +1083,28 @@ mod tests {
         assert_eq!(s.scanner.max_depth, ScannerConfig::default().max_depth);
     }
 
+    /// Amendment 46 (spec D11): `scanner.ceilings.l4_icmp_pace_ms_min` is a file
+    /// key of its own; setting it alone leaves every other ceiling at its default.
+    #[test]
+    fn scanner_ceilings_icmp_pace_floor_is_a_key() {
+        let s = parse_settings("scanner:\n  ceilings:\n    l4_icmp_pace_ms_min: 6\n")
+            .expect("the floor key parses");
+        assert_eq!(s.scanner.ceilings.l4_icmp_pace_ms_min, 6);
+        assert_eq!(
+            s.scanner.ceilings.probes, 20_000,
+            "the other ceilings keep their defaults"
+        );
+        assert_eq!(
+            parse_settings("")
+                .expect("empty settings parse")
+                .scanner
+                .ceilings
+                .l4_icmp_pace_ms_min,
+            1_000,
+            "the default floor is 1000 ms"
+        );
+    }
+
     /// Tester: `deny_unknown_fields` holds one level down too — a typo inside
     /// `ceilings:` or inside a declared profile is refused naming the key, and a
     /// value of the wrong type is refused rather than coerced.
@@ -1085,6 +1113,10 @@ mod tests {
         let err = parse_settings("scanner:\n  ceilings:\n    probe: 10\n")
             .expect_err("a ceilings typo must be refused");
         assert!(format!("{err:#}").contains("probe"), "{err:#}");
+
+        let err = parse_settings("scanner:\n  ceilings:\n    l4_icmp_pace_ms_mn: 10\n")
+            .expect_err("a misspelled floor key must be refused");
+        assert!(format!("{err:#}").contains("l4_icmp_pace_ms_mn"), "{err:#}");
 
         let err = parse_settings(concat!(
             "scanner:\n",

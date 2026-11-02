@@ -150,6 +150,7 @@ fn http_flow_with_response() -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Bytes(b"upstream-body".to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         });
     }
     flow

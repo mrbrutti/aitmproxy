@@ -111,6 +111,56 @@ pub struct ProbeCounters {
     pub by_lane: BTreeMap<LaneKind, u64>,
 }
 
+/// Why every request of an all-failing client crawl failed (spec D5,
+/// amendment 39). A closed token on [`CrawlCounters::last_error`]: a crawl that
+/// made at least one request and had every one fail (no page fetched) says why,
+/// so the job can run its passive checks over what it still has ("degrade, do
+/// not fail") and a frontend can still name the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrawlErrorKind {
+    /// A forced `h2` against an h1-only listener (amendment 21's counted probe
+    /// error `h2_not_negotiated`).
+    H2NotNegotiated,
+    /// The connection was refused.
+    ConnectRefused,
+    /// A TLS handshake or certificate failure.
+    Tls,
+    /// The probe timed out.
+    Timeout,
+    /// Any other connect or transport failure.
+    Transport,
+    /// A free-text browser-crawl failure that is not one of the tokens above.
+    Other,
+}
+
+impl CrawlErrorKind {
+    /// The wire token for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::H2NotNegotiated => "h2_not_negotiated",
+            Self::ConnectRefused => "connect_refused",
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Other => "other",
+        }
+    }
+
+    /// The kind for an exact token, or `None` for free text (no heuristics).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "h2_not_negotiated" => Some(Self::H2NotNegotiated),
+            "connect_refused" => Some(Self::ConnectRefused),
+            "tls" => Some(Self::Tls),
+            "timeout" => Some(Self::Timeout),
+            "transport" => Some(Self::Transport),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
 /// Crawler counters (spec D5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
@@ -134,6 +184,11 @@ pub struct CrawlCounters {
     /// `unsubscribe`, `confirm`). Additive, 2026-11-01; absent on the wire
     /// means 0.
     pub forms_skipped: u64,
+    /// Why an all-failing client crawl failed: set only when the crawl made at
+    /// least one request and every one failed (`errors > 0 && pages == 0`), so
+    /// a frontend can name the cause (amendment 39). Additive, 2026-11-01;
+    /// absent on the wire means none.
+    pub last_error: Option<CrawlErrorKind>,
 }
 
 /// Insertion-point counters (spec D5).
@@ -172,6 +227,47 @@ pub struct CheckCounters {
     pub done: u64,
     /// The ids of the checks running right now (bounded to 8 by the engine).
     pub running: Vec<String>,
+    /// Check runs that ended in an `error` verdict — the check could not say
+    /// whether the point is vulnerable (a missing runner, a refused budget, a
+    /// panic). Additive (amendment 58): absent on an older record, read as 0.
+    pub errors: u64,
+    /// The first [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` error
+    /// pairs of the job, so an operator sees *why* a lane was inert instead
+    /// of a bare counter. Additive (amendment 58): absent, read as empty.
+    pub error_samples: Vec<CheckErrorSample>,
+    /// Items the engine could not run because no lane could host the point —
+    /// an origin item of a lane that builds hosts from captured flows, a
+    /// point whose flow left the store. A skipped item settles its point's
+    /// owed count (so `points.audited` is unaffected) but never bumps
+    /// [`CheckCounters::done`], so `done + skipped == scheduled` at the end
+    /// of a job. Additive (amendment 69): absent on an older record, read
+    /// as 0.
+    pub skipped: u64,
+    /// The first [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` skip
+    /// reasons, detail scrubbed and bounded like an error sample, so a skip
+    /// is never silent. Kept apart from
+    /// [`CheckCounters::error_samples`] so an operator never reads a skip as
+    /// a check error. Additive (amendment 69): absent, read as empty.
+    pub skipped_samples: Vec<CheckErrorSample>,
+}
+
+/// The most entries `CheckCounters.error_samples` keeps per job (amendment
+/// 58). Distinct `(check, detail)` pairs past the cap are counted in
+/// `checks.errors` but not sampled.
+pub const MAX_CHECK_ERROR_SAMPLES: usize = 8;
+
+/// One sampled `error` verdict (amendment 58): which check, the first point it
+/// failed on, and its detail — scrubbed and bounded like an evidence excerpt
+/// by the engine before it is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct CheckErrorSample {
+    /// The check's id (`CheckMeta.id`).
+    pub check: String,
+    /// The id of the first insertion point the pair was seen on.
+    pub point: String,
+    /// The verdict's detail, scrubbed and cut to an excerpt.
+    pub detail: String,
 }
 
 /// Issue counters (spec D5).
@@ -376,25 +472,26 @@ mod tests {
     /// Panel Q4 — the summary is structurally the status minus exactly the
     /// per-phase detail: every surviving key carries the same value, and no
     /// key is added.
-    /// Additive crawl counters (2026-11-01): `errors` and `forms_skipped`
-    /// default to 0 when absent on the wire, so an older frontend's record or
-    /// a lane that never reports them still parses; both serialize by name.
+    /// Additive crawl counters (2026-11-01, amendment 53): `errors`,
+    /// `forms_skipped` and `forms_submitted` default to 0 when absent on the
+    /// wire — a record written before any of them existed carries none of
+    /// the three keys — so an older frontend's record or a lane that never
+    /// reports them still parses; they serialize by name.
     #[test]
     fn crawl_counters_additive_fields_default_to_zero() {
-        let old: CrawlCounters =
-            serde_json::from_str(r#"{"pages":3,"queued":0,"depth":1,"forms_submitted":2}"#)
-                .expect("a record without the additive fields parses");
+        let old: CrawlCounters = serde_json::from_str(r#"{"pages":3,"queued":0,"depth":1}"#)
+            .expect("a record without the additive fields parses");
         assert_eq!(
             old,
             CrawlCounters {
                 pages: 3,
                 depth: 1,
-                forms_submitted: 2,
                 ..CrawlCounters::default()
             }
         );
         assert_eq!(old.errors, 0);
         assert_eq!(old.forms_skipped, 0);
+        assert_eq!(old.forms_submitted, 0);
 
         let json = serde_json::to_value(CrawlCounters {
             forms_skipped: 4,
@@ -404,6 +501,85 @@ mod tests {
         .expect("serializes");
         assert_eq!(json["forms_skipped"], 4);
         assert_eq!(json["errors"], 1);
+    }
+
+    /// Amendment 58: `checks.errors` and `checks.error_samples` are additive
+    /// — a record written before them parses to 0 / empty — and a sample
+    /// round-trips by name with its three fields.
+    #[test]
+    fn check_counters_additive_fields_default_to_zero() {
+        let old: CheckCounters = serde_json::from_str(r#"{"scheduled":4,"done":4,"running":[]}"#)
+            .expect("a record without the additive fields parses");
+        assert_eq!(
+            old,
+            CheckCounters {
+                scheduled: 4,
+                done: 4,
+                ..CheckCounters::default()
+            }
+        );
+        assert_eq!(old.errors, 0);
+        assert!(old.error_samples.is_empty());
+
+        let json = serde_json::to_value(CheckCounters {
+            errors: 2,
+            error_samples: vec![CheckErrorSample {
+                check: "http.xss".into(),
+                point: "p1".into(),
+                detail: "runner missing".into(),
+            }],
+            ..CheckCounters::default()
+        })
+        .expect("serializes");
+        assert_eq!(json["errors"], 2);
+        assert_eq!(json["error_samples"][0]["check"], "http.xss");
+        assert_eq!(json["error_samples"][0]["point"], "p1");
+        assert_eq!(json["error_samples"][0]["detail"], "runner missing");
+        assert_eq!(MAX_CHECK_ERROR_SAMPLES, 8);
+    }
+
+    /// Tester (amendment 69): `checks.skipped` and `checks.skipped_samples`
+    /// are additive — a record written before them, even one that already
+    /// carries amendment 58's fields, reads 0 / empty — a skip sample
+    /// round-trips by name, and it travels apart from `error_samples`
+    /// (call C6): a skip is never read back as an error.
+    #[test]
+    fn check_counters_skipped_fields_are_additive_and_apart_from_errors() {
+        let old: CheckCounters = serde_json::from_str(
+            r#"{"scheduled":4,"done":3,"running":[],"errors":1,
+                "error_samples":[{"check":"http.xss","point":"p1","detail":"runner missing"}]}"#,
+        )
+        .expect("a record without the skip fields parses");
+        assert_eq!(old.skipped, 0);
+        assert!(old.skipped_samples.is_empty());
+        assert_eq!(old.errors, 1, "the amendment-58 fields are untouched");
+        assert_eq!(old.error_samples.len(), 1);
+
+        let json = serde_json::to_value(CheckCounters {
+            skipped: 3,
+            skipped_samples: vec![CheckErrorSample {
+                check: "fake.point".into(),
+                point: "p1".into(),
+                detail: "the lane hosts nothing".into(),
+            }],
+            ..CheckCounters::default()
+        })
+        .expect("serializes");
+        assert_eq!(json["skipped"], 3);
+        assert_eq!(json["skipped_samples"][0]["check"], "fake.point");
+        assert_eq!(json["skipped_samples"][0]["point"], "p1");
+        assert_eq!(
+            json["skipped_samples"][0]["detail"],
+            "the lane hosts nothing"
+        );
+        assert_eq!(json["errors"], 0, "a skip is not an error");
+        assert_eq!(json["error_samples"], serde_json::json!([]));
+        assert_eq!(json["done"], 0, "a skip is not a finished run");
+
+        let back: CheckCounters = serde_json::from_value(json).expect("round-trips");
+        assert_eq!(back.skipped, 3);
+        assert_eq!(back.skipped_samples.len(), 1);
+        assert_eq!(back.skipped_samples[0].detail, "the lane hosts nothing");
     }
 
     #[test]
@@ -458,6 +634,95 @@ mod tests {
         }
         let summary = serde_json::to_value(status.summary()).expect("summary serializes");
         assert_eq!(full, summary);
+    }
+
+    /// Amendment 39, the three spellings of one token: `as_str` (what the
+    /// lane hands `report_crawl_error`), `parse` (what the worker reads back)
+    /// and serde (what `scan.status` puts on the wire) must agree for every
+    /// variant, or a classified failure silently degrades to `other` between
+    /// the lane and the operator. Every token is distinct, so no two kinds
+    /// collapse into one.
+    #[test]
+    fn every_crawl_error_kind_has_one_token_in_all_three_spellings() {
+        const ALL: [CrawlErrorKind; 6] = [
+            CrawlErrorKind::H2NotNegotiated,
+            CrawlErrorKind::ConnectRefused,
+            CrawlErrorKind::Tls,
+            CrawlErrorKind::Timeout,
+            CrawlErrorKind::Transport,
+            CrawlErrorKind::Other,
+        ];
+
+        let mut tokens = std::collections::BTreeSet::new();
+        for kind in ALL {
+            let token = kind.as_str();
+            assert!(tokens.insert(token), "`{token}` names two kinds");
+            assert_eq!(
+                CrawlErrorKind::parse(token),
+                Some(kind),
+                "`{token}` does not parse back to {kind:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(kind).expect("serializes"),
+                serde_json::Value::String(token.to_string()),
+                "the wire token and `as_str` disagree for {kind:?}"
+            );
+            let back: CrawlErrorKind =
+                serde_json::from_value(serde_json::Value::String(token.to_string()))
+                    .expect("the wire token deserializes");
+            assert_eq!(back, kind);
+            assert_eq!(
+                CrawlErrorKind::parse(&token.to_uppercase()),
+                None,
+                "`parse` is an exact match, not a case-insensitive one"
+            );
+        }
+        assert_eq!(tokens.len(), 6);
+    }
+
+    /// Amendment 39: the crawl's all-failed reason is a closed token on
+    /// `crawl.last_error`. `parse` is an exact token match (no heuristics), its
+    /// inverse `as_str` is the wire token, a free-text browser reason parses to
+    /// `None`, and the field round-trips as that token while an old record
+    /// without it loads as `None`.
+    #[test]
+    fn crawl_error_kind_parses_exact_tokens_and_round_trips() {
+        assert_eq!(
+            CrawlErrorKind::parse("h2_not_negotiated"),
+            Some(CrawlErrorKind::H2NotNegotiated)
+        );
+        assert_eq!(
+            CrawlErrorKind::parse("connect_refused"),
+            Some(CrawlErrorKind::ConnectRefused)
+        );
+        assert_eq!(
+            CrawlErrorKind::parse("timeout"),
+            Some(CrawlErrorKind::Timeout)
+        );
+        assert_eq!(CrawlErrorKind::parse("tls"), Some(CrawlErrorKind::Tls));
+        assert_eq!(
+            CrawlErrorKind::parse("transport"),
+            Some(CrawlErrorKind::Transport)
+        );
+        assert_eq!(CrawlErrorKind::parse("other"), Some(CrawlErrorKind::Other));
+        assert_eq!(CrawlErrorKind::parse("the browser refused the seed"), None);
+        assert_eq!(
+            CrawlErrorKind::H2NotNegotiated.as_str(),
+            "h2_not_negotiated"
+        );
+        assert_eq!(CrawlErrorKind::ConnectRefused.as_str(), "connect_refused");
+
+        let json = serde_json::to_value(CrawlCounters {
+            last_error: Some(CrawlErrorKind::Timeout),
+            ..CrawlCounters::default()
+        })
+        .expect("serializes");
+        assert_eq!(json["last_error"], "timeout");
+
+        let old: CrawlCounters =
+            serde_json::from_str(r#"{"pages":1}"#).expect("a record without last_error parses");
+        assert_eq!(old.last_error, None);
+        assert_eq!(old.pages, 1);
     }
 
     #[test]

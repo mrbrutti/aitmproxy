@@ -1134,6 +1134,7 @@ impl WsConn {
                 trailers: HeaderMap::new(),
                 body: Body::Empty,
                 timestamp: self.opened,
+                peer: None,
             }),
             client_conn: conn.clone(),
             server_conn: Some(conn.clone()),

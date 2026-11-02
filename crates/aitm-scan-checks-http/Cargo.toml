@@ -39,6 +39,15 @@ tokio = { workspace = true, features = [
 # matcher as a string for the PoC engine to compile, and the tests check that
 # it says what it means.
 regex.workspace = true
+# The REAL Rhai bridge. `tests/rhai_harness/` loads the shipped
+# `scripts/bundled/active/*.rhai` through `RhaiLoader` and runs the
+# `ScriptCheck` the bridge registered, so the bundled checks are tested on the
+# engine that ships rather than on a stand-in (T3 plan Task 11, decision
+# D-2b-1). No cycle: `aitm-plugin-rhai` does not depend on this crate.
+aitm-plugin-rhai.workspace = true
+# `testing::RecordingHost`, the reply table those script checks probe against.
+# The crate already depends on `aitm-scan-model`; this adds only the feature.
+aitm-scan-model = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

@@ -28,6 +28,7 @@
 mod app;
 mod control;
 pub mod grader;
+mod h2count;
 pub mod l4;
 mod listeners;
 mod log;

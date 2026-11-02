@@ -19,6 +19,7 @@ fn http_flow_terminal(authority: &str, path: &str, body_len: usize) -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Bytes(vec![b'x'; body_len]),
             timestamp: SystemTime::now(),
+            peer: None,
         });
     }
     flow
@@ -145,6 +146,7 @@ fn http_flow_with_fields(path: &str, headers: HeaderMap, trailers: HeaderMap) ->
             trailers,
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         });
     }
     flow
@@ -258,6 +260,7 @@ fn a_response_keeps_trailers_beside_its_headers_never_in_them() {
             trailers,
             body: Body::Bytes(b"hello".to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         });
     }
 
@@ -339,6 +342,7 @@ fn tunnel_row(info: TunnelInfo, status: Option<u16>, duration: Option<Duration>)
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         });
         h.metadata.tunnel = Some(info);
         h.metadata.duration = duration;

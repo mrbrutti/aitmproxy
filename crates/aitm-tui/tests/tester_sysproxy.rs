@@ -6,7 +6,7 @@
 //! `system_proxy` objects and replies, cross-verb errors, command-line
 //! spelling, the key table's neighbours, the palette as the operator reaches
 //! it, and the toolbar at every width. Every app is `App::new` populated by
-//! hand — there is no fixture.
+//! hand: there is no fixture.
 
 mod common;
 
@@ -104,8 +104,8 @@ fn last_toast(app: &App) -> (Level, &str) {
 
 /// §D12/§D14: the word sits between the address and `· capture paused` too
 /// (the coder pinned only `· intercept armed`); `off` and `needs_privilege`
-/// reach the toolbar; and the full frame — not just the bare `toolbar`
-/// call — shows the word.
+/// reach the toolbar; and the full frame (not just the bare `toolbar`
+/// call) shows the word.
 #[test]
 fn pill_word_sits_before_capture_paused_and_reaches_the_full_frame() {
     let mut app = listening_app();
@@ -413,7 +413,7 @@ fn malformed_set_replies_settle_the_flag_and_fall_back_to_verb_ok() {
     assert_eq!(last_toast(&app), (Level::Info, "proxy.system.status: ok"));
 }
 
-/// §D14: a bus error for `set`/`unset` settles the flag and is verbatim —
+/// §D14: a bus error for `set`/`unset` settles the flag and is verbatim:
 /// but an error for `proxy.system.status` or for an unrelated verb that
 /// lands mid-flight must not fake-settle the pill.
 #[test]
@@ -456,7 +456,10 @@ fn only_set_and_unset_errors_settle_the_flight() {
     assert!(toolbar_text(&app).contains("· sys-proxy off"));
 
     // The refusal wording of an agent-token bus (§D14 "shown verbatim"),
-    // including odd whitespace and an empty message.
+    // including odd whitespace and an empty message. A toast is stored
+    // with its control characters stripped (scanner v2 fix round H, H47:
+    // `App::toast` bounds every toast once with `text::cut_to`), so the
+    // newline of the last message is gone and nothing else changes.
     for msg in [
         "proxy.system.unset is operator-only",
         "  leading and trailing  ",
@@ -467,7 +470,8 @@ fn only_set_and_unset_errors_settle_the_flight() {
         assert!(app.sysproxy_setting);
         let _ = app.on_bus(failed("proxy.system.unset", msg));
         assert!(!app.sysproxy_setting, "{msg:?}");
-        assert_eq!(last_toast(&app), (Level::Error, msg), "{msg:?}");
+        let shown = aitm_tui::text::clean(msg);
+        assert_eq!(last_toast(&app), (Level::Error, shown.as_str()), "{msg:?}");
     }
 }
 
@@ -550,7 +554,7 @@ fn key_s_is_flows_only_and_its_neighbours_are_untouched() {
         "capital S must stay the scope panel"
     );
     // Ctrl-S is not asserted: `flows()` ignores `ctrl` for every plain
-    // letter (`l`, `t` alike), so Ctrl-S toggles too — the table's existing
+    // letter (`l`, `t` alike), so Ctrl-S toggles too: the table's existing
     // convention, recorded in the tester report, not this task's defect.
     for mode in [
         Mode::Inspector,
@@ -648,12 +652,16 @@ fn palette_finds_sysproxy_by_name_and_description_and_enter_shows_usage() {
 // ------------------------------------------------------------------- help
 
 /// The help overlay keeps the `s` line in key order (after `b / l / t`,
-/// before `y / o`) and its footer at the smallest screen the 37-row box fits.
+/// before `y / o`) at every size, and its footer: drawn at once where the
+/// box fits (160x50), reached with `End` on a terminal too short for the
+/// whole overlay (the help scrolls since fix round G, G85).
 #[test]
-fn help_overlay_orders_the_s_line_and_fits_at_37_rows() {
+fn help_overlay_orders_the_s_line_and_keeps_its_footer() {
     let mut app = listening_app();
-    app.mode = Mode::Help;
     for (c, r) in [(100u16, 37u16), (120, 40), (160, 50)] {
+        let _ = app.update(Action::Resize(c, r));
+        app.mode = Mode::Help;
+        app.help_scroll = 0;
         let text = text_of(&app, c, r);
         let blt = line_index(&text, "toggle sidebar · layout below/right · auto-select")
             .unwrap_or_else(|| panic!("no b/l/t line at {c}×{r}:\n{text}"));
@@ -668,9 +676,17 @@ fn help_overlay_orders_the_s_line_and_fits_at_37_rows() {
             blt < s && s < yo,
             "order at {c}×{r}: b/l/t={blt} s={s} y/o={yo}"
         );
+        let _ = app.update(Action::End);
+        let end = text_of(&app, c, r);
         assert!(
-            text.contains("Any key closes this help."),
-            "footer clipped at {c}×{r}:\n{text}"
+            end.contains("any other key closes this help."),
+            "footer unreachable at {c}×{r}:\n{end}"
         );
+        if r >= 50 {
+            assert!(
+                text.contains("any other key closes this help."),
+                "footer clipped at {c}×{r}:\n{text}"
+            );
+        }
     }
 }

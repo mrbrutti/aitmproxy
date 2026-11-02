@@ -898,7 +898,7 @@ async fn tui_l4_cua_against_a_live_core() {
             vec!["l4.inject".to_string()],
             "the inject key reaches the wire only through l4.inject"
         );
-        if privileged_wire() && cua.app.mode == Mode::L4Confirm {
+        if privileged_wire() && cua.app.mode == Mode::WireConfirm {
             // Privileged host: the confirm overlay shows the wire summary, then
             // `y` re-issues with the `_confirm` token and the real packet
             // reaches the target. (Linux / elevated only.)
@@ -951,7 +951,7 @@ async fn tui_l4_cua_against_a_live_core() {
         );
         assert_ne!(
             cua.app.mode,
-            Mode::L4Confirm,
+            Mode::WireConfirm,
             "no overlay without privilege"
         );
         assert!(cua.app.l4.pending.is_none(), "no inject left pending");

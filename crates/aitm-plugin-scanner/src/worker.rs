@@ -25,7 +25,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -33,11 +33,12 @@ use aitm_core::{
     BrowserDriver, CommandHost, Flow, FlowId, FlowStore, HttpFlow, ProxyClient, ScopeRateGuard,
 };
 use aitm_scan_model::{
-    scan_error, Canary, CheckMeta, Confidence, Discovery, Evidence, InsertionPoint, IssueLocation,
-    IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters, L4Location,
-    L4Transport, Lane, LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse, RawProbe,
-    RecordProbes, ScanErrorCode, ScanProfile, SessionMaterial, SessionMode, SessionStatus,
-    SiteNode, StoppedReason, Technique, UseBrowser, Verdict, JOB_KIND_SCAN,
+    scan_error, Canary, CheckErrorSample, CheckMeta, Confidence, CrawlErrorKind, Discovery,
+    Evidence, InsertionPoint, IssueLocation, IssueTarget, JobCtx, JobEvent, JobNotification,
+    JobState, JobStatus, L4Counters, L4Location, L4Transport, Lane, LaneKind, OnLost, Outcome,
+    Payload, ProbeHost, ProbeResponse, RawProbe, RecordProbes, ScanErrorCode, ScanProfile,
+    SessionMaterial, SessionMode, SessionStatus, SiteNode, StoppedReason, Technique, UseBrowser,
+    Verdict, JOB_KIND_SCAN, MAX_CHECK_ERROR_SAMPLES,
 };
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -233,7 +234,12 @@ pub struct JobRuntime {
     session: Option<Arc<SessionMaterial>>,
     budget: Arc<JobBudget>,
     status: Arc<RwLock<JobStatus>>,
-    markers: AtomicU64,
+    /// The per-call marker counter (amendment 57), as wide as
+    /// [`crate::util::marker`]'s counter: it wraps rather than truncates.
+    markers: AtomicU32,
+    /// Per-job marker seed (amendment 55): minted once when the runtime is
+    /// built, mixed into every marker so two jobs' first markers differ.
+    marker_seed: u32,
     /// Set by [`JobCtx::report_session_lost`] or by the `scan: session_lost: `
     /// error prefix; the worker reads it between items.
     session_lost: AtomicBool,
@@ -259,13 +265,77 @@ pub struct JobRuntime {
     /// Crawls of one origin that failed outright (`JobCtx::report_crawl_error`),
     /// folded into `crawl.errors` by `sync_counters`.
     crawl_errors: AtomicU64,
+    /// The classified kind of the most recent crawl failure a lane reported
+    /// (amendment 39). Surfaced on `crawl.last_error` only when the crawl made
+    /// requests and every one failed (`crawl.errors > 0 && crawl.pages == 0`);
+    /// a free-text browser reason that is not a token stores `Other`.
+    last_crawl_error: Mutex<Option<CrawlErrorKind>>,
     /// Forms the crawl deliberately did not submit
     /// (`JobCtx::report_forms_skipped`), folded into `crawl.forms_skipped` by
     /// `sync_counters`.
     forms_skipped: AtomicU64,
+    /// Forms the crawl submitted (`JobCtx::report_forms_submitted`), folded
+    /// into `crawl.forms_submitted` by `sync_counters` (amendment 53).
+    forms_submitted: AtomicU64,
+    /// Check runs that ended in an `Outcome::Error` verdict, folded into
+    /// `checks.errors` by `sync_counters` (amendment 58).
+    check_errors: AtomicU64,
+    /// The first [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` error
+    /// pairs, each with the first point it was seen on, folded into
+    /// `checks.error_samples` by `sync_counters` (amendment 58). The detail is
+    /// stored scrubbed and bounded, so what is deduped is what is shown.
+    check_error_samples: Mutex<Vec<CheckErrorSample>>,
+}
+
+/// The handles a [`JobRuntime`] works through: the job's metered client, the
+/// flow store, the scope guard, and the optional browser and session material.
+pub(crate) struct RuntimeServices {
+    pub(crate) client: Arc<dyn ProxyClient>,
+    pub(crate) store: Arc<dyn FlowStore>,
+    pub(crate) guard: Arc<dyn ScopeRateGuard>,
+    pub(crate) browser: Option<Arc<dyn BrowserDriver>>,
+    pub(crate) session: Option<Arc<SessionMaterial>>,
 }
 
 impl JobRuntime {
+    /// A runtime for `job` with every counter at zero, no lane running, no
+    /// session lost, and a fresh marker seed (amendment 55). The inputs are
+    /// the only things that vary between runtimes; everything else starts
+    /// from the same empty state, so a new counter is added here once.
+    pub(crate) fn new(
+        job: String,
+        profile: ScanProfile,
+        services: RuntimeServices,
+        budget: Arc<JobBudget>,
+        status: Arc<RwLock<JobStatus>>,
+    ) -> Self {
+        Self {
+            job,
+            profile,
+            client: services.client,
+            store: services.store,
+            guard: services.guard,
+            browser: services.browser,
+            session: services.session,
+            budget,
+            status,
+            markers: AtomicU32::new(0),
+            marker_seed: crate::util::marker_seed(),
+            session_lost: AtomicBool::new(false),
+            lane_charges: AtomicU64::new(0),
+            charges_by_lane: Mutex::new(BTreeMap::new()),
+            current_lane: Mutex::new(None),
+            in_crawl: AtomicBool::new(false),
+            crawl_charges: AtomicU64::new(0),
+            crawl_errors: AtomicU64::new(0),
+            last_crawl_error: Mutex::new(None),
+            forms_skipped: AtomicU64::new(0),
+            forms_submitted: AtomicU64::new(0),
+            check_errors: AtomicU64::new(0),
+            check_error_samples: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Whether a lane has reported the session gone.
     fn session_is_lost(&self) -> bool {
         self.session_lost.load(Ordering::SeqCst)
@@ -275,6 +345,43 @@ impl JobRuntime {
     fn mark_session_lost(&self) {
         self.session_lost.store(true, Ordering::SeqCst);
         self.with_session(|session| session.lost = true);
+    }
+
+    /// One check run ended in an `Outcome::Error` verdict (amendment 58): the
+    /// error counter rises, and a `(check, detail)` pair not sampled yet is
+    /// kept (up to [`MAX_CHECK_ERROR_SAMPLES`]) and logged **once** — never
+    /// per probe, never per repeat. The detail is scrubbed first and cut like
+    /// an evidence excerpt (spec amendment 16: scrub, then bound), so neither
+    /// the sample nor the log line can carry a credential a runner echoed.
+    /// Past the cap a new distinct pair is counted but neither kept nor
+    /// logged.
+    fn note_check_error(&self, check: &str, point: &str, detail: &str) {
+        self.check_errors.fetch_add(1, Ordering::SeqCst);
+        let detail = Evidence::excerpt(&util::scrub(detail));
+        let mut samples = self
+            .check_error_samples
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !keep_sample(&mut samples, check, point, detail.clone()) {
+            return;
+        }
+        tracing::warn!(
+            target: "aitm::scanner",
+            job = %self.job,
+            check = %check,
+            point = %point,
+            "the check reported an error: {detail}",
+        );
+        if samples.len() == MAX_CHECK_ERROR_SAMPLES {
+            // Said once, when the store fills: later distinct errors are
+            // counted in `checks.errors` but neither sampled nor logged, so
+            // a flood of near-identical details cannot flood the log either.
+            tracing::warn!(
+                target: "aitm::scanner",
+                job = %self.job,
+                "check error samples are full ({MAX_CHECK_ERROR_SAMPLES}); further distinct errors are counted only",
+            );
+        }
     }
 
     /// Budget units lanes charged outside an HTTP send.
@@ -309,6 +416,14 @@ impl JobRuntime {
     /// Units the HTTP lane charged during the crawling phase.
     fn crawl_charges(&self) -> u64 {
         self.crawl_charges.load(Ordering::SeqCst)
+    }
+
+    /// The classified kind of the most recent crawl failure, if any.
+    fn last_crawl_error(&self) -> Option<CrawlErrorKind> {
+        *self
+            .last_crawl_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Edit the session block of the status, creating it when the profile runs
@@ -400,8 +515,13 @@ impl JobCtx for JobRuntime {
         self.budget.cancel.is_cancelled()
     }
 
+    /// A new token on every call (amendment 57): the per-job counter steps,
+    /// so no two calls on one job agree. Not a key — `job_id()` is. The
+    /// counter is mixed with this job's seed (amendment 55), so no two jobs
+    /// share a first marker either.
     fn marker(&self) -> String {
-        crate::util::marker(self.markers.fetch_add(1, Ordering::SeqCst))
+        let counter = self.markers.fetch_add(1, Ordering::SeqCst);
+        crate::util::marker(self.marker_seed, counter)
     }
 
     /// Fold the lane's counters in by **per-field maximum** (call B27), so a
@@ -421,18 +541,40 @@ impl JobCtx for JobRuntime {
 
     fn report_crawl_error(&self, origin: &str, reason: &str) {
         self.crawl_errors.fetch_add(1, Ordering::SeqCst);
-        // Scrubbed at the sink: a lane's reason may quote a URL or an error
-        // that carries a secret (security review, delta, 2026-11-01).
-        tracing::warn!(
-            target: "aitm::scanner",
-            origin,
-            reason = %util::scrub(reason),
-            "crawl failed; discovery continues over what the lane still has"
-        );
+        // A client-crawl reason is a `CrawlErrorKind` token; a browser-crawl
+        // reason is free text, which stores `Other` and keeps the warn line.
+        let parsed = CrawlErrorKind::parse(reason);
+        *self
+            .last_crawl_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(parsed.unwrap_or(CrawlErrorKind::Other));
+        if parsed.is_some() {
+            // A classified per-request failure is routine; the fold onto
+            // `crawl.last_error` is the operator-visible signal.
+            tracing::debug!(
+                target: "aitm::scanner",
+                origin,
+                reason,
+                "crawl request failed; discovery continues over what the lane still has"
+            );
+        } else {
+            // Scrubbed at the sink: a free-text reason may quote a URL or an
+            // error that carries a secret (security review, delta, 2026-11-01).
+            tracing::warn!(
+                target: "aitm::scanner",
+                origin,
+                reason = %util::scrub(reason),
+                "crawl failed; discovery continues over what the lane still has"
+            );
+        }
     }
 
     fn report_forms_skipped(&self, count: u64) {
         self.forms_skipped.fetch_add(count, Ordering::SeqCst);
+    }
+
+    fn report_forms_submitted(&self, count: u64) {
+        self.forms_submitted.fetch_add(count, Ordering::SeqCst);
     }
 
     fn report_session_canary(&self, canary: Canary) {
@@ -578,26 +720,19 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         slot.canary = picked;
     }
 
-    let runtime = Arc::new(JobRuntime {
-        job: job.clone(),
-        profile: profile.clone(),
-        client: Arc::clone(&job_client),
-        store: Arc::clone(&store),
-        guard,
-        browser,
-        session: observed.as_ref().map(|s| Arc::new(s.material.clone())),
-        budget: Arc::clone(&budget),
-        status: Arc::clone(&status),
-        markers: AtomicU64::new(0),
-        session_lost: AtomicBool::new(false),
-        lane_charges: AtomicU64::new(0),
-        charges_by_lane: Mutex::new(BTreeMap::new()),
-        current_lane: Mutex::new(None),
-        in_crawl: AtomicBool::new(false),
-        crawl_charges: AtomicU64::new(0),
-        crawl_errors: AtomicU64::new(0),
-        forms_skipped: AtomicU64::new(0),
-    });
+    let runtime = Arc::new(JobRuntime::new(
+        job.clone(),
+        profile.clone(),
+        RuntimeServices {
+            client: Arc::clone(&job_client),
+            store: Arc::clone(&store),
+            guard,
+            browser,
+            session: observed.as_ref().map(|s| Arc::new(s.material.clone())),
+        },
+        Arc::clone(&budget),
+        Arc::clone(&status),
+    ));
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
 
     set_phase(&status, JobState::Running, aitm_scan_model::Phase::Crawling);
@@ -654,8 +789,17 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
     runtime.set_crawling(false);
     {
         let pages = crawl_pages(&runtime, store.as_ref(), &before, &job, &profile);
+        let crawl_errors = runtime.crawl_errors.load(Ordering::SeqCst);
+        let last_crawl_error = runtime.last_crawl_error();
         let mut guarded = status.write().unwrap_or_else(|e| e.into_inner());
         bump(&mut guarded.crawl.pages, pages);
+        // Amendment 39: fold the crawl's error tally in now, and when the crawl
+        // made requests and every one failed (no page fetched) name why. A
+        // partial failure (`pages > 0`) is visible in `crawl.errors` alone; the
+        // job runs its passive checks over what it captured ("degrade, do not
+        // fail"), so no `stopped_reason` or `error` is set here.
+        raise(&mut guarded.crawl.errors, crawl_errors);
+        fold_crawl_last_error(&mut guarded, last_crawl_error);
         bump(&mut guarded.points.found, points.len() as u64);
     }
     *discovery.write().unwrap_or_else(|e| e.into_inner()) = Discovery {
@@ -688,6 +832,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
     let run = RunCtx {
         engine: &engine,
         job: &job,
+        plan: &plan,
         profile: &profile,
         status: &status,
         progress,
@@ -754,6 +899,9 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
 struct RunCtx<'a> {
     engine: &'a Arc<Engine>,
     job: &'a str,
+    /// The plan the items came from, so an item's index resolves to a
+    /// discovered point or to an origin item (amendment 38).
+    plan: &'a SchedulePlan,
     profile: &'a ScanProfile,
     status: &'a Arc<RwLock<JobStatus>>,
     progress: &'a Progress,
@@ -774,6 +922,12 @@ struct RunCtx<'a> {
 }
 
 impl RunCtx<'_> {
+    /// The insertion point an item names: a discovered point, or the origin
+    /// item an index past `points.len()` addresses (amendment 38).
+    fn point_of(&self, item: &ScheduleItem) -> Option<&InsertionPoint> {
+        self.plan.point_at(self.points, item.point)
+    }
+
     /// Copy the live meters onto the status.
     fn sync(&self) {
         sync_counters(
@@ -814,7 +968,7 @@ impl RunCtx<'_> {
         if self.runtime.session_is_lost() && self.profile.session.on_lost == OnLost::Stop {
             return Some(StoppedReason::SessionLost);
         }
-        if let Some(point) = item.and_then(|item| self.points.get(item.point)) {
+        if let Some(point) = item.and_then(|item| self.point_of(item)) {
             let host = host_of_point(point);
             if !host.is_empty() && self.meter.ladder_state(&host) == LadderState::Tripped {
                 return Some(StoppedReason::Errors);
@@ -860,23 +1014,55 @@ impl RunCtx<'_> {
         item: &ScheduleItem,
         owed: &mut std::collections::HashMap<usize, usize>,
     ) {
-        let Some(point) = self.points.get(item.point) else {
+        let Some(point) = self.point_of(item) else {
             return;
         };
         let meta = item.check.meta().clone();
         let Some(lane) = self.lanes.iter().find(|l| l.lane() == point.lane) else {
-            self.item_done(item.point, owed);
+            // Amendment 69, one branch earlier: a point whose lane is not on
+            // this build cannot be hosted either; it is skipped with a sample,
+            // never a silent `done`.
+            let reason = format!(
+                "lane {} is not on this build",
+                util::wire_token(&point.lane)
+            );
+            self.item_skipped(item, &reason, owed);
             return;
         };
         // Whatever this item charges belongs to this lane (spec D5,
         // `probes.by_lane`).
         self.runtime.set_lane(lane.lane());
 
-        let host = match lane.probe_host_for(point, Arc::clone(self.job_ctx)) {
+        let hosted = match lane.probe_host_for(point, Arc::clone(self.job_ctx)) {
+            // Amendment 38: an origin item carries no captured flow, and a lane
+            // crate whose host is built from the captured flow refuses it
+            // (`aitm-scan-http`: "has no source flow"). The engine then hosts
+            // it itself, over the interim lane's synthesized `GET <origin>/`,
+            // so origin-scoped checks run whatever crate holds the http slot.
+            Err(lane_error)
+                if point.flow.is_none()
+                    && point.id.starts_with("origin:")
+                    && point.lane == aitm_scan_model::LaneKind::Http =>
+            {
+                self.engine
+                    .interim
+                    .probe_host_for(point, Arc::clone(self.job_ctx))
+                    .map_err(|engine_error| {
+                        anyhow::anyhow!("{lane_error}; engine origin host: {engine_error}")
+                    })
+            }
+            other => other,
+        };
+        let host = match hosted {
             Ok(host) => ArcHost(Arc::from(host)),
+            // Amendment 69: the lane could not host this item — a flowless
+            // origin item the engine's interim host did not rescue above, a
+            // point whose flow left the store, a lost session. It is a skip
+            // with a sample, never a silent `checks.done`.
             Err(e) => {
-                self.note_lane_text(&e.to_string());
-                self.item_done(item.point, owed);
+                let reason = e.to_string();
+                self.note_lane_text(&reason);
+                self.item_skipped(item, &reason, owed);
                 return;
             }
         };
@@ -917,9 +1103,10 @@ impl RunCtx<'_> {
                 }
                 return;
             }
+            // The error path below counts, samples and logs it once per
+            // distinct panic text (amendment 58).
             Err(payload) => {
                 let detail = format!("the check panicked: {}", panic_text(payload.as_ref()));
-                tracing::warn!(target: "aitm::scanner", job = %self.job, check = %meta.id, "{detail}");
                 Verdict {
                     outcome: Outcome::Error,
                     confidence: Confidence::Tentative,
@@ -933,6 +1120,12 @@ impl RunCtx<'_> {
         };
         if !matches!(verdict.outcome, Outcome::Vulnerable) {
             self.note_lane_text(&verdict.detail);
+        }
+        // Amendment 58: an `error` verdict is counted, sampled and logged;
+        // `inconclusive` is a verdict like `clean` and leaves no trace here.
+        if verdict.outcome == Outcome::Error {
+            self.runtime
+                .note_check_error(&meta.id, &point.id, &verdict.detail);
         }
         for (verdict, new) in issues_from_verdict(self.job, point, &meta, &verdict, self.nodes) {
             self.record_issue(new, &verdict, &meta, &host).await;
@@ -1134,9 +1327,25 @@ impl RunCtx<'_> {
         }
     }
 
-    /// One item finished: the check counter rises, and the point's counter
-    /// rises with the last item that named it.
-    fn item_done(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
+    /// One item is accounted for — it ran, or the engine could not run it:
+    /// the point's owed counter falls, and the point is audited with the last
+    /// item that named it.
+    ///
+    /// An origin item is an item like any other — it is in `points.queued` and
+    /// `checks.scheduled` — but it is not a discovered insertion point, so it
+    /// never bumps `points.audited` (amendment 38). A skipped item settles the
+    /// owed count exactly as a finished one does (amendment 69, call C7), so
+    /// `points.audited` reads the same whether a lane could host the point or
+    /// not; only `checks.done` tells the two apart.
+    ///
+    /// Returns whether this item settled a discovered point — the caller bumps
+    /// `points.audited` under the same lock as its check counter, so a
+    /// `scan.status` read never sees one move without the other.
+    fn settle_point(
+        &self,
+        point: usize,
+        owed: &mut std::collections::HashMap<usize, usize>,
+    ) -> bool {
         let last = match owed.get_mut(&point) {
             Some(left) => {
                 *left = left.saturating_sub(1);
@@ -1144,12 +1353,97 @@ impl RunCtx<'_> {
             }
             None => false,
         };
+        last && point < self.points.len()
+    }
+
+    /// One item finished: the check counter rises, and the point settles —
+    /// both under one acquisition of the status lock.
+    fn item_done(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
+        let audited = self.settle_point(point, owed);
         let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
         bump(&mut status.checks.done, 1);
-        if last {
+        if audited {
             bump(&mut status.points.audited, 1);
         }
     }
+
+    /// One item the engine could not run because no lane could host its point
+    /// (amendment 69): it is counted on `checks.skipped`, never on
+    /// `checks.done`, and the first distinct `(check, detail)` reason is kept
+    /// on `checks.skipped_samples` (up to [`MAX_CHECK_ERROR_SAMPLES`], the
+    /// same [`keep_sample`] rule as `error_samples`) and logged **once** — so
+    /// a lane that hosts nothing says so instead of reporting a job of silent
+    /// successes. When the samples fill, one debug line says that further
+    /// distinct skips are counted only, as the error side does. The reason is
+    /// scrubbed first and cut like an evidence excerpt (spec amendment 16:
+    /// scrub, then bound). Kept apart from `checks.errors`/`error_samples`
+    /// (call C6): a skip is not an `error` verdict. The point still settles
+    /// (call C7), under the same lock acquisition as the skip counter.
+    fn item_skipped(
+        &self,
+        item: &ScheduleItem,
+        reason: &str,
+        owed: &mut std::collections::HashMap<usize, usize>,
+    ) {
+        let check = item.check.meta().id.clone();
+        let point_id = self
+            .point_of(item)
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+        let audited = self.settle_point(item.point, owed);
+        let detail = Evidence::excerpt(&util::scrub(reason));
+        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
+        bump(&mut status.checks.skipped, 1);
+        if audited {
+            bump(&mut status.points.audited, 1);
+        }
+        let samples = &mut status.checks.skipped_samples;
+        if !keep_sample(samples, &check, &point_id, detail.clone()) {
+            return;
+        }
+        tracing::debug!(
+            target: "aitm::scanner",
+            job = %self.job,
+            check = %check,
+            point = %point_id,
+            "no lane could host the point; the item is skipped: {detail}",
+        );
+        if samples.len() == MAX_CHECK_ERROR_SAMPLES {
+            tracing::debug!(
+                target: "aitm::scanner",
+                job = %self.job,
+                "skipped-item samples are full ({MAX_CHECK_ERROR_SAMPLES}); further distinct skips are counted only",
+            );
+        }
+    }
+}
+
+/// The one dedupe-and-cap rule behind `checks.error_samples` and
+/// `checks.skipped_samples`: a `(check, detail)` pair already in `samples` is
+/// not kept again (the first point it was seen on stays), nothing is kept once
+/// the list holds [`MAX_CHECK_ERROR_SAMPLES`], and otherwise the sample is
+/// pushed. Returns whether it pushed, so the caller logs at its own level
+/// exactly once per kept pair. `detail` is already scrubbed and bounded by
+/// the caller — what is deduped is what is shown.
+fn keep_sample(
+    samples: &mut Vec<CheckErrorSample>,
+    check: &str,
+    point: &str,
+    detail: String,
+) -> bool {
+    if samples.len() >= MAX_CHECK_ERROR_SAMPLES
+        || samples
+            .iter()
+            .any(|s| s.check == check && s.detail == detail)
+    {
+        return false;
+    }
+    samples.push(CheckErrorSample {
+        check: check.to_string(),
+        point: point.to_string(),
+        detail,
+    });
+    true
 }
 
 /// Turn one check run into the issues it reports: the root verdict plus its
@@ -1239,12 +1533,10 @@ fn new_issue(
         .as_ref()
         .and_then(|l| l.name.clone())
         .unwrap_or_else(|| point.name.clone());
+    // The model's one scrub rule (amendment 67): `payload` scrubbed, `matched`
+    // scrubbed then bounded. The manual path applies the same `Verdict::scrub`.
     let mut evidence = verdict.evidence.clone();
-    evidence.matched = evidence
-        .matched
-        .as_deref()
-        .map(|text| Evidence::excerpt(&util::scrub(text)));
-    evidence.payload = evidence.payload.as_deref().map(util::scrub);
+    evidence.scrub();
 
     NewIssue {
         job: job.to_string(),
@@ -1366,6 +1658,18 @@ fn is_crawl_capture(flow: &Flow, job_mark: &str) -> bool {
             .any(|mark| mark == crate::interim_lane::CRAWL_MARK)
 }
 
+/// Amendment 39: a client crawl that made at least one request and had every
+/// one fail (no page fetched) names why on `crawl.last_error`, so a frontend
+/// can report the cause; a partial failure (`pages > 0`) is visible in
+/// `crawl.errors` alone and leaves `last_error` as it was. Applied once, at the
+/// end of the crawling phase, over the already-folded `crawl.errors`/`pages`.
+/// `sync_counters` never touches `last_error`.
+fn fold_crawl_last_error(status: &mut JobStatus, last_error: Option<CrawlErrorKind>) {
+    if status.crawl.errors > 0 && status.crawl.pages == 0 {
+        status.crawl.last_error = last_error;
+    }
+}
+
 /// Copy the live meters onto the status, monotonically.
 ///
 /// `probes.sent` is the probe meter's reading **plus** the units lanes
@@ -1416,6 +1720,26 @@ fn sync_counters(
         &mut guarded.crawl.forms_skipped,
         runtime.forms_skipped.load(Ordering::SeqCst),
     );
+    raise(
+        &mut guarded.crawl.forms_submitted,
+        runtime.forms_submitted.load(Ordering::SeqCst),
+    );
+    raise(
+        &mut guarded.checks.errors,
+        runtime.check_errors.load(Ordering::SeqCst),
+    );
+    // The sample list only ever grows (to its cap) on the runtime, so a
+    // longer reading is the newer one and never walks the status backwards.
+    // Compared under the lock and cloned only when it has grown: this runs
+    // after every item, and the list is usually the same length as last time.
+    let samples = runtime
+        .check_error_samples
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if samples.len() > guarded.checks.error_samples.len() {
+        guarded.checks.error_samples = samples.clone();
+    }
+    drop(samples);
     raise(
         &mut guarded.probes.rate_waits,
         meter.rate_waits.load(Ordering::SeqCst),
@@ -1569,9 +1893,603 @@ mod tests {
 
     use aitm_core::{AgentPolicy, Flow, FlowStore};
     use aitm_scan_model::{
-        JobEvent, JobNotification, JobState, JobStatus, L4Counters, LaneKind, OnLost, Phase,
-        RecordProbes, StoppedReason,
+        CrawlErrorKind, JobEvent, JobNotification, JobState, JobStatus, L4Counters, LaneKind,
+        OnLost, Phase, RecordProbes, StoppedReason,
     };
+
+    /// Amendment 38 (spec D4/D8): an origin-scoped HTTP check runs once per
+    /// target origin even when the crawl discovered no insertion point at all,
+    /// and it is run against the origin item, not against a discovered point.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_origin_scoped_check_runs_on_an_origin_without_points() {
+        let check = FakeCheck::with_scope(
+            "fake.origin",
+            "demo",
+            aitm_scan_model::CheckScope::Origin,
+            FakeRun::clean(),
+        );
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_points(Vec::new())
+                .with_check(Arc::clone(&check) as Arc<dyn aitm_scan_model::Check>),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        assert_eq!(status.points.found, 0, "the lane discovered nothing");
+        assert_eq!(status.points.audited, 0, "an origin is not a point");
+        assert_eq!(status.points.queued, 1, "the origin item is queued");
+        assert_eq!(status.checks.scheduled, 1);
+        assert_eq!(status.checks.done, 1);
+        assert_eq!(
+            check.points_seen(),
+            vec!["origin:http://scan.test:80".to_string()],
+            "the check ran once, against the origin item"
+        );
+    }
+
+    /// Amendment 38 on a lane crate whose host needs a captured flow
+    /// (`aitm-scan-http` refuses "a point with no source flow"): the origin
+    /// item is still run, hosted by the engine's own origin host (the interim
+    /// lane's synthesized `GET <origin>/`), so the origin-scoped checks do not
+    /// vanish from the product when a lane crate takes the http slot (found
+    /// live: `test_t3_h2_observe.py` produced no issue on T2's lane).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_origin_item_is_hosted_by_the_engine_when_the_lane_cannot() {
+        // Like a real origin-scoped check (the h2 observe kinds), the fake
+        // sends nothing through `probe()`: an origin host has no insertion
+        // point to inject into and refuses it.
+        let check = FakeCheck::with_scope(
+            "fake.origin",
+            "demo",
+            aitm_scan_model::CheckScope::Origin,
+            FakeRun::clean().with_probes(0),
+        );
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_points(Vec::new())
+                .refusing_flowless_points()
+                .with_check(Arc::clone(&check) as Arc<dyn aitm_scan_model::Check>),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.checks.scheduled, 1);
+        assert_eq!(status.checks.done, 1);
+        assert_eq!(
+            check.points_seen(),
+            vec!["origin:http://scan.test:80".to_string()],
+            "the origin check ran on the engine's origin host"
+        );
+        assert_eq!(
+            status.checks.errors, 0,
+            "a hosted origin item is not a check error"
+        );
+    }
+
+    /// Amendment 38: an origin item is counted in `points.queued` and
+    /// `checks.scheduled` like any other item, but never in `points.audited` —
+    /// that counter is about discovered insertion points.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn origin_items_do_not_count_as_audited_points() {
+        let origin = FakeCheck::with_scope(
+            "fake.origin",
+            "demo",
+            aitm_scan_model::CheckScope::Origin,
+            FakeRun::clean(),
+        );
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
+                .with_check(Arc::clone(&origin) as Arc<dyn aitm_scan_model::Check>),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.points.found, 2);
+        assert_eq!(status.points.audited, 2, "the two discovered points");
+        // Two points x (the lane's point check + the engine's three shipped
+        // passive checks, spec amendment 24) plus the one origin item.
+        assert_eq!(
+            status.checks.scheduled, 9,
+            "four point checks per point plus one origin item"
+        );
+        assert_eq!(
+            status.points.queued, 9,
+            "every scheduled item is queued work"
+        );
+        assert_eq!(status.checks.done, 9);
+        assert_eq!(
+            origin.points_seen(),
+            vec!["origin:http://scan.test:80".to_string()]
+        );
+    }
+
+    /// Amendment 69, one branch earlier: a point whose lane is not on this
+    /// build (a WS point discovered on an http-only build) is skipped with a
+    /// sample naming the lane, never a silent `done`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_whose_lane_is_not_on_this_build_is_skipped_with_a_sample() {
+        let mut ws_point = fake_point("w1", "chan", "ws://scan.test/socket");
+        ws_point.lane = LaneKind::Ws;
+        let h = Harness::new().with_lane(FakeLane::http().with_points(vec![ws_point]).with_check(
+            FakeCheck::on_lane("fake.ws", "demo", LaneKind::Ws, FakeRun::clean()),
+        ));
+        h.bind();
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.lanes = vec![LaneKind::Http, LaneKind::Ws];
+        let started = crate::jobs::start(&h.engine, profile, operator(), false)
+            .expect("the http lane is available");
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        let ws_samples: Vec<_> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .filter(|s| s.check == "fake.ws")
+            .collect();
+        assert!(
+            status.checks.skipped >= 1 && !ws_samples.is_empty(),
+            "the ws item on an http-only build is skipped with a sample: {:?}",
+            status.checks
+        );
+        assert_eq!(ws_samples[0].detail, "lane ws is not on this build");
+        // Tester: the lane-absent branch keeps every amendment-69 promise the
+        // cannot-host branch makes — nothing is a silent `done`, the skips
+        // account for the schedule, a skip is not an error, and the one
+        // sample names the point it was seen on.
+        assert_eq!(
+            status.checks.done, 0,
+            "an item nobody could host never finished: {:?}",
+            status.checks
+        );
+        assert_eq!(
+            status.checks.done + status.checks.skipped,
+            status.checks.scheduled,
+            "every scheduled item is accounted for: {:?}",
+            status.checks
+        );
+        assert_eq!(status.checks.errors, 0, "a skip is not a check error");
+        assert!(status.checks.error_samples.is_empty());
+        assert_eq!(ws_samples.len(), 1, "one sample per (check, detail)");
+        assert_eq!(ws_samples[0].point, "w1");
+        assert_eq!(status.stopped_reason, None);
+    }
+
+    /// Amendment 69: an item whose lane cannot host it — a point the lane
+    /// refuses to build a host for (no captured flow, a lost session) — is
+    /// `checks.skipped` with a sample naming the check, the first point and
+    /// the scrubbed reason, never a silent `checks.done`. Call C7: the item
+    /// still settles its point's owed count, so `points.audited` reads the
+    /// same as it would have, and `done + skipped == scheduled`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_the_lane_cannot_host_is_skipped_with_a_sample_not_done() {
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
+                .with_host_error("the fake lane hosts nothing"),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        // Two points x (the lane's point check + the engine's three shipped
+        // passive checks, spec amendment 24); the lane hosts none of them.
+        assert_eq!(status.checks.scheduled, 8);
+        assert_eq!(
+            status.checks.done, 0,
+            "an item that never ran is not a finished run"
+        );
+        assert_eq!(status.checks.skipped, 8);
+        assert_eq!(
+            status.checks.done + status.checks.skipped,
+            status.checks.scheduled,
+            "every scheduled item is accounted for"
+        );
+        assert_eq!(
+            status.checks.errors, 0,
+            "a skip is not a check error (call C6)"
+        );
+        assert!(
+            status.checks.error_samples.is_empty(),
+            "a skip is not sampled as an error: {:?}",
+            status.checks.error_samples
+        );
+        assert_eq!(
+            status.checks.skipped_samples.len(),
+            4,
+            "one sample per distinct (check, detail): the two points share \
+             each of the four checks, and every skip has the same reason: {:?}",
+            status.checks.skipped_samples
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.detail == "the fake lane hosts nothing"),
+            "{:?}",
+            status.checks.skipped_samples
+        );
+        let sampled: std::collections::BTreeSet<&str> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .map(|s| s.check.as_str())
+            .collect();
+        assert_eq!(
+            sampled,
+            std::collections::BTreeSet::from([
+                "cookie-flag",
+                "fake.point",
+                "reflection",
+                "security-header",
+            ]),
+            "every scheduled check is named once"
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.point == "p1" || s.point == "p2"),
+            "a sample names the first point the pair was seen on: {:?}",
+            status.checks.skipped_samples
+        );
+        assert_eq!(
+            status.points.audited, 2,
+            "a skipped item still settles its point (call C7)"
+        );
+        assert_eq!(status.issues.total, 0, "a skip is not an issue");
+    }
+
+    /// Amendment 69 (call C6): a skip sample's detail goes through
+    /// `util::scrub` before it is stored, and the list stops at
+    /// [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` pairs while
+    /// `checks.skipped` keeps counting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skipped_samples_are_scrubbed_and_capped() {
+        let mut lane =
+            FakeLane::http().with_points(vec![fake_point("p1", "q", "http://scan.test/search")]);
+        for i in 0..9 {
+            lane = lane.with_check(FakeCheck::new(
+                &format!("fake.point{i}"),
+                "demo",
+                FakeRun::clean(),
+            ));
+        }
+        let h =
+            Harness::new().with_lane(lane.with_host_error("no host: Authorization: Bearer abc"));
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        // One point x (nine lane checks + the engine's three shipped passive
+        // checks, spec amendment 24): twelve items, none of them hosted.
+        assert_eq!(status.checks.scheduled, 12);
+        assert_eq!(status.checks.skipped, 12);
+        assert_eq!(status.checks.done, 0);
+        assert_eq!(
+            status.checks.skipped_samples.len(),
+            aitm_scan_model::MAX_CHECK_ERROR_SAMPLES,
+            "twelve distinct checks, eight kept: {:?}",
+            status.checks.skipped_samples
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.detail == "no host: Authorization: [redacted]"),
+            "the bearer token never reaches scan.status: {:?}",
+            status.checks.skipped_samples
+        );
+        let named: std::collections::BTreeSet<&str> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .map(|s| s.check.as_str())
+            .collect();
+        assert_eq!(named.len(), 8, "every kept sample names a distinct check");
+    }
+
+    /// Tester (amendment 69, spec amendment 16): a skip reason is cut like an
+    /// evidence excerpt after the scrub — a lane that refuses with a
+    /// response-sized message leaves a bounded sample, never the whole text —
+    /// and the cut never splits a character.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skip_reason_is_bounded_like_an_evidence_excerpt() {
+        let long_reason = format!("no host: {}", "é".repeat(300));
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
+                .with_host_error(&long_reason),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.checks.done, 0);
+        assert_eq!(status.checks.skipped, status.checks.scheduled);
+        assert!(
+            !status.checks.skipped_samples.is_empty(),
+            "{:?}",
+            status.checks
+        );
+        // The 9-byte prefix plus 123 two-byte `é` is 255 bytes: the last
+        // whole character under the 256-byte bound (a 124th would make 257).
+        let expected = format!("no host: {}", "é".repeat(123));
+        assert_eq!(expected.len(), 255);
+        for sample in &status.checks.skipped_samples {
+            assert_eq!(sample.detail, expected);
+            assert!(sample.detail.len() <= aitm_scan_model::MAX_EXCERPT_BYTES);
+        }
+    }
+
+    /// `keep_sample` is the one dedupe-and-cap rule behind both
+    /// `checks.error_samples` and `checks.skipped_samples`: a `(check, detail)`
+    /// pair is kept once, the same detail on another check is a new pair, and
+    /// past [`MAX_CHECK_ERROR_SAMPLES`] nothing more is kept — the caller
+    /// learns which from the return value.
+    #[test]
+    fn keep_sample_dedupes_on_check_and_detail_and_stops_at_the_cap() {
+        let mut samples = Vec::new();
+        assert!(super::keep_sample(
+            &mut samples,
+            "c1",
+            "p1",
+            "no host".into()
+        ));
+        assert!(
+            !super::keep_sample(&mut samples, "c1", "p2", "no host".into()),
+            "the same (check, detail) on another point is not kept again"
+        );
+        assert!(
+            super::keep_sample(&mut samples, "c2", "p1", "no host".into()),
+            "the same detail on another check is a new pair"
+        );
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].point, "p1", "the first point seen stays");
+        for i in 0..(aitm_scan_model::MAX_CHECK_ERROR_SAMPLES - 2) {
+            assert!(super::keep_sample(
+                &mut samples,
+                "c3",
+                "p1",
+                format!("reason {i}")
+            ));
+        }
+        assert_eq!(samples.len(), aitm_scan_model::MAX_CHECK_ERROR_SAMPLES);
+        assert!(
+            !super::keep_sample(&mut samples, "c4", "p1", "brand new".into()),
+            "past the cap a distinct pair is counted by the caller, not kept"
+        );
+        assert_eq!(samples.len(), aitm_scan_model::MAX_CHECK_ERROR_SAMPLES);
+        assert_eq!(
+            samples.last().map(|s| s.detail.as_str()),
+            Some("reason 5"),
+            "the cap keeps the first eight, in order"
+        );
+    }
+
+    /// Amendment 58 (T5's inert lane): a check that answers `Outcome::Error`
+    /// is counted on `checks.errors` once per run, and its first distinct
+    /// `(check, detail)` pair is kept on `checks.error_samples` naming the
+    /// check and the first point it failed on — one sample for two points,
+    /// not two. The run is still `done`, still counted, and reports no issue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_erroring_check_is_counted_sampled_and_logged() {
+        let h = Harness::new().with_lane(FakeLane::http().with_check(FakeCheck::new(
+            "fake.error",
+            "demo",
+            FakeRun::error("runner missing"),
+        )));
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        // Two points x (the erroring check + the engine's three shipped
+        // passive checks, spec amendment 24); only the erroring check errors.
+        assert_eq!(status.checks.scheduled, 8);
+        assert_eq!(
+            status.checks.done, 8,
+            "an erroring run is still a finished run"
+        );
+        assert_eq!(
+            status.checks.errors, 2,
+            "one error per point the check ran on"
+        );
+        assert_eq!(
+            status.checks.error_samples,
+            vec![aitm_scan_model::CheckErrorSample {
+                check: "fake.error".to_string(),
+                point: "p1".to_string(),
+                detail: "runner missing".to_string(),
+            }],
+            "one sample per distinct (check, detail), naming the first point"
+        );
+        assert_eq!(status.issues.total, 0, "an error is not an issue");
+    }
+
+    /// Amendment 58: a sample's detail goes through `util::scrub` before it is
+    /// stored (a credential a runner echoed never reaches `scan.status`), and
+    /// the job keeps at most eight distinct samples — a ninth distinct detail
+    /// is counted in `checks.errors` but not kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_error_samples_are_scrubbed_and_capped_at_eight() {
+        const DETAILS: [&str; 9] = [
+            "runner missing: token=abc123",
+            "detail two",
+            "detail three",
+            "detail four",
+            "detail five",
+            "detail six",
+            "detail seven",
+            "detail eight",
+            "detail nine",
+        ];
+        let mut lane = FakeLane::http();
+        for (i, detail) in DETAILS.iter().enumerate() {
+            lane = lane.with_check(FakeCheck::new(
+                &format!("fake.error{i}"),
+                "demo",
+                FakeRun::error(*detail),
+            ));
+        }
+        let h = Harness::new().with_lane(lane);
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.checks.errors, 18, "nine checks over two points");
+        assert_eq!(
+            status.checks.error_samples.len(),
+            aitm_scan_model::MAX_CHECK_ERROR_SAMPLES,
+            "the ninth distinct detail is not kept: {:?}",
+            status.checks.error_samples
+        );
+        let scrubbed = status
+            .checks
+            .error_samples
+            .iter()
+            .find(|s| s.check == "fake.error0")
+            .expect("the first check's sample is kept");
+        assert_eq!(scrubbed.point, "p1");
+        assert_eq!(scrubbed.detail, "runner missing: token=[redacted]");
+        assert!(!scrubbed.detail.contains("abc123"));
+        let kept: std::collections::BTreeSet<&str> = status
+            .checks
+            .error_samples
+            .iter()
+            .map(|s| s.detail.as_str())
+            .collect();
+        assert_eq!(kept.len(), 8, "every kept sample is a distinct detail");
+        let missing: Vec<&str> = DETAILS[1..]
+            .iter()
+            .copied()
+            .filter(|d| !kept.contains(d))
+            .collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "exactly one of the nine details is dropped"
+        );
+    }
+
+    /// Amendment 58: a sample's detail is bounded like an evidence excerpt,
+    /// and the bound is applied **after** the scrub (amendment 16's order), so
+    /// a runner that dumps a whole response into its error cannot grow the
+    /// status and cannot smuggle a credential past the redactor by sitting
+    /// near the cut. Bounded first, the scrub would shrink the text below
+    /// `MAX_EXCERPT_BYTES`; the length is what tells the two orders apart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_error_detail_is_scrubbed_then_bounded() {
+        let detail = format!("runner missing: token=abc123 {}", "b".repeat(300));
+        let h = Harness::new().with_lane(FakeLane::http().with_check(FakeCheck::new(
+            "fake.loud",
+            "demo",
+            FakeRun::error(detail),
+        )));
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        let sample = status
+            .checks
+            .error_samples
+            .first()
+            .expect("the error is sampled");
+        assert!(
+            !sample.detail.contains("abc123"),
+            "the credential survived: {:?}",
+            sample.detail
+        );
+        assert!(sample
+            .detail
+            .starts_with("runner missing: token=[redacted] b"));
+        assert_eq!(
+            sample.detail.len(),
+            aitm_scan_model::check::MAX_EXCERPT_BYTES,
+            "scrubbed first, then cut to the excerpt bound"
+        );
+    }
 
     /// AC T1-1 (spec D3/D5): `scan.start` returns while the job is still
     /// queued, and the worker takes it all the way to `done` on its own.
@@ -1602,8 +2520,12 @@ mod tests {
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.points.found, 2);
         assert_eq!(status.points.audited, 2);
-        assert_eq!(status.checks.scheduled, 2);
-        assert_eq!(status.checks.done, 2);
+        // Two points x (the lane's one check + the engine's three shipped
+        // passive checks, which run on every http point whatever lane holds
+        // the slot; spec amendment 24). The passives read the captured flow
+        // and send nothing, so the probe count is the fake check's alone.
+        assert_eq!(status.checks.scheduled, 8);
+        assert_eq!(status.checks.done, 8);
         assert!(status.checks.running.is_empty());
         assert_eq!(status.probes.sent, 2, "one probe per point");
         assert!(status.finished_at.is_some());
@@ -1613,17 +2535,19 @@ mod tests {
     /// moves to `cancelled` with its issues intact and sends nothing more.
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_moves_to_cancelled_and_keeps_issues() {
-        let h = Harness::new().with_lane(
-            FakeLane::http()
-                // The catalogue is id-sorted, so `fake.hit` is scheduled
-                // before `fake.wait` and the issue exists before the block.
-                .with_check(FakeCheck::scripted(
-                    "fake.hit",
-                    "demo",
-                    vec![FakeRun::vulnerable()],
-                ))
-                .with_check(FakeCheck::blocking("fake.wait")),
-        );
+        let h = Harness::new()
+            .with_lane(
+                FakeLane::http()
+                    // The catalogue is id-sorted, so `fake.hit` is scheduled
+                    // before `fake.wait` and the issue exists before the block.
+                    .with_check(FakeCheck::scripted(
+                        "fake.hit",
+                        "demo",
+                        vec![FakeRun::vulnerable()],
+                    ))
+                    .with_check(FakeCheck::blocking("fake.wait")),
+            )
+            .with_egress();
         h.bind();
 
         let started = crate::jobs::start(
@@ -1644,17 +2568,39 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        // A running job holds the egress posture: race-free here because the
+        // blocking check keeps the job open until the cancel below (the
+        // panicking-lane test used to read this and raced its own finaliser).
+        assert!(h.egress_confined(), "a running job holds the posture");
+
         let cancelling = h
             .engine
             .registry
             .cancel(&started.job)
             .expect("the job is in the registry");
-        assert_eq!(cancelling.state, JobState::Cancelling);
+        // `cancel` answers with the status as it stands: `Cancelling` while the
+        // worker is still unwinding, or already `Cancelled` when the finaliser
+        // beat this read on the multi-thread runtime (CI Rust gate on #229,
+        // #287, #290, #292, 2026-11-02: "left: Cancelled, right: Cancelling";
+        // coordinator's amendment 71b, test determinism). Either says the cancel
+        // took; the terminal facts are asserted after the signal below.
+        assert!(
+            matches!(cancelling.state, JobState::Cancelling | JobState::Cancelled),
+            "cancel answered {:?}",
+            cancelling.state
+        );
 
         let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Cancelled);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Cancelled));
         assert_eq!(h.engine.issues.for_job(&started.job).len(), 1);
+        // Spec D5 "Cancellation": the confinement token drops with the entry;
+        // `finish` clears it before flipping the terminal signal, so this read
+        // is deterministic (PR 2a spec panel Minor).
+        assert!(
+            !h.egress_confined(),
+            "the egress hold outlived the cancelled job"
+        );
 
         let finished_at = status
             .finished_at
@@ -1670,9 +2616,88 @@ mod tests {
         assert_eq!(again.state, JobState::Cancelled);
     }
 
-    /// Spec D5 / call B15: a host whose answers are all unusable trips the
-    /// per-host error ladder, and the job ends `done` with
-    /// `stopped_reason: errors`.
+    /// Amendment 39, full run: a lane whose crawl failed on every request
+    /// (three `h2_not_negotiated` reports, no page) ends `done` with
+    /// `stopped_reason: null` and `error: null` (D5 "degrade, do not fail"),
+    /// and the status says why: `crawl.errors == 3`,
+    /// `crawl.last_error == h2_not_negotiated`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_all_failing_crawl_surfaces_its_reason_and_the_job_still_finishes() {
+        let h = Harness::new().with_lane(FakeLane::http().with_crawl_errors(vec![
+            ("http://scan.test", "h2_not_negotiated"),
+            ("http://scan.test", "h2_not_negotiated"),
+            ("http://scan.test", "h2_not_negotiated"),
+        ]));
+        h.bind();
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        assert_eq!(status.error, None);
+        assert_eq!(status.crawl.errors, 3);
+        assert_eq!(status.crawl.pages, 0);
+        assert_eq!(
+            status.crawl.last_error,
+            Some(aitm_scan_model::CrawlErrorKind::H2NotNegotiated)
+        );
+    }
+
+    /// Amendment 39, full run: one failed request beside a fetched page is a
+    /// partial failure — counted in `crawl.errors`, no `last_error`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partially_failing_crawl_sets_no_reason_in_a_full_run() {
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_crawl_flows(1)
+                .with_crawl_errors(vec![("http://scan.test", "connect_refused")]),
+        );
+        h.bind();
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.crawl.errors, 1);
+        assert!(status.crawl.pages >= 1, "pages: {}", status.crawl.pages);
+        assert_eq!(status.crawl.last_error, None);
+    }
+
+    /// Amendment 53, full run: a lane that reports three submitted forms
+    /// through `JobCtx::report_forms_submitted` ends with
+    /// `crawl.forms_submitted == 3` on the terminal status — the counter the
+    /// model carried but nothing wrote until the hook existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reported_form_submissions_reach_the_status() {
+        let h = Harness::new().with_lane(FakeLane::http().with_forms_submitted(3));
+        h.bind();
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.crawl.forms_submitted, 3, "{:?}", status.crawl);
+        assert_eq!(status.crawl.forms_skipped, 0, "a submit is not a skip");
+        assert_eq!(status.crawl.errors, 0);
+    }
+
+    /// Spec D5 / call B15: a host whose every request fails in transport
+    /// (amendment 40: connect and transport failures climb the ladder, a
+    /// status never does) trips the per-host error ladder, and the job ends
+    /// `done` with `stopped_reason: errors`.
     ///
     /// Whole-branch quality finding: the ladder was keyed two ways — the
     /// client recorded under the raw request authority (`scan.test`) and
@@ -1684,7 +2709,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_all_erroring_host_stops_the_job_with_stopped_reason_errors() {
         let h = Harness::new()
-            .answering(500)
+            // Amendment 40: a 5xx is an answer; only a transport failure or a
+            // timeout counts on the ladder, so the host fails at the transport.
+            .failing("connect refused")
             .with_lane(FakeLane::http().with_check(FakeCheck::new(
                 "fake.probe",
                 "demo",
@@ -1693,8 +2720,8 @@ mod tests {
         h.bind();
 
         let mut profile = h.profile(&["http://scan.test"]);
-        // One unusable answer is enough; the ratio rule can never fire, so the
-        // only thing under test is the consecutive ladder and its key.
+        // One transport failure is enough; the ratio rule can never fire, so
+        // the only thing under test is the consecutive ladder and its key.
         profile.budget.per_host_errors = aitm_scan_model::PerHostErrors {
             consecutive: 1,
             ratio: 1.0,
@@ -2165,9 +3192,7 @@ mod tests {
         job: &str,
         started_at: u64,
     ) -> (super::JobRuntime, Arc<std::sync::RwLock<JobStatus>>) {
-        use std::collections::BTreeMap;
-        use std::sync::atomic::{AtomicBool, AtomicU64};
-        use std::sync::{Mutex, RwLock};
+        use std::sync::RwLock;
         use std::time::Instant;
 
         let status = Arc::new(RwLock::new(JobStatus {
@@ -2175,31 +3200,83 @@ mod tests {
             started_at,
             ..JobStatus::default()
         }));
-        let runtime = super::JobRuntime {
-            job: job.to_string(),
-            profile: h.profile(&["http://scan.test"]),
-            client: Arc::clone(&h.client) as Arc<dyn aitm_core::ProxyClient>,
-            store: Arc::clone(&h.store) as Arc<dyn FlowStore>,
-            guard: Arc::clone(&h.guard) as Arc<dyn aitm_core::ScopeRateGuard>,
-            browser: None,
-            session: None,
-            budget: Arc::new(crate::client::JobBudget::new(
+        let runtime = super::JobRuntime::new(
+            job.to_string(),
+            h.profile(&["http://scan.test"]),
+            super::RuntimeServices {
+                client: Arc::clone(&h.client) as Arc<dyn aitm_core::ProxyClient>,
+                store: Arc::clone(&h.store) as Arc<dyn FlowStore>,
+                guard: Arc::clone(&h.guard) as Arc<dyn aitm_core::ScopeRateGuard>,
+                browser: None,
+                session: None,
+            },
+            Arc::new(crate::client::JobBudget::new(
                 100,
                 Instant::now() + Duration::from_secs(60),
                 tokio_util::sync::CancellationToken::new(),
             )),
-            status: Arc::clone(&status),
-            markers: AtomicU64::new(0),
-            session_lost: AtomicBool::new(false),
-            lane_charges: AtomicU64::new(0),
-            charges_by_lane: Mutex::new(BTreeMap::new()),
-            current_lane: Mutex::new(None),
-            in_crawl: AtomicBool::new(false),
-            crawl_charges: AtomicU64::new(0),
-            crawl_errors: AtomicU64::new(0),
-            forms_skipped: AtomicU64::new(0),
-        };
+            Arc::clone(&status),
+        );
         (runtime, status)
+    }
+
+    /// Amendment 57 (T5/T6 keyed per-job state on `marker()` and missed every
+    /// lookup): `JobCtx::marker` mints a fresh token on every call, while
+    /// `JobCtx::job_id` is the stable per-job key and is the status's `job`.
+    #[test]
+    fn markers_are_fresh_per_call_and_job_id_is_stable() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee7", 1);
+
+        let first = runtime.marker();
+        let second = runtime.marker();
+        assert_ne!(first, second, "every marker() call is a new token");
+        assert_eq!(first.len(), second.len(), "same shape, different value");
+
+        let id = runtime.job_id().to_string();
+        assert_eq!(runtime.job_id(), id, "job_id() is stable across calls");
+        assert_eq!(runtime.job_id(), "scan-0c0ffee7");
+        assert_eq!(
+            status.read().unwrap_or_else(|e| e.into_inner()).job,
+            id,
+            "job_id() is the status's job"
+        );
+    }
+
+    /// Amendment 55 (T3's 2b panel, security Minor): every job mints its own
+    /// marker seed, so two jobs' first markers differ — a target cannot forge
+    /// a verdict by echoing `aitm00000000` before it has seen a probe — while
+    /// one job's markers still step (the second differs from the first).
+    #[test]
+    fn two_jobs_first_markers_differ() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (job_a, _) = bare_runtime(&h, "scan-0000aaaa", 1);
+        let (job_b, _) = bare_runtime(&h, "scan-0000bbbb", 1);
+
+        let first_a = job_a.marker();
+        let first_b = job_b.marker();
+        assert_ne!(
+            first_a, first_b,
+            "two jobs on one engine never share a first marker"
+        );
+        assert_ne!(
+            first_a, "aitm00000000",
+            "a job's first marker is not the bare counter"
+        );
+        let second_a = job_a.marker();
+        assert_ne!(first_a, second_a, "a job's markers keep stepping");
+        for m in [&first_a, &first_b, &second_a] {
+            assert_eq!(m.len(), 12, "{m:?} is not aitm+8 hex");
+            assert!(m.starts_with("aitm"), "{m:?} is not aitm+8 hex");
+            assert!(
+                m[4..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "{m:?} is not aitm+8 lowercase hex"
+            );
+        }
     }
 
     /// T7/T2 live runs (2026-11-01): a crawl error a lane reports through
@@ -2228,6 +3305,136 @@ mod tests {
         let seen = status.read().expect("status");
         assert_eq!(seen.crawl.errors, 1, "a sync copies, it does not add");
         assert_eq!(seen.crawl.forms_skipped, 1);
+    }
+
+    /// Amendment 53: `report_forms_submitted` accumulates across calls and a
+    /// sync copies the runtime's tally onto `crawl.forms_submitted` — it does
+    /// not add it again — exactly as `forms_skipped` behaves.
+    #[test]
+    fn reported_form_submissions_are_copied_not_added_by_a_sync() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee2", 1);
+        let meter = crate::client::ProbeMeter::default();
+        let issues = crate::issues::IssueStore::new(None);
+
+        runtime.report_forms_submitted(2);
+        runtime.report_forms_submitted(1);
+        super::sync_counters(&status, &meter, &runtime, &issues, "scan-0c0ffee2");
+        assert_eq!(status.read().expect("status").crawl.forms_submitted, 3);
+
+        super::sync_counters(&status, &meter, &runtime, &issues, "scan-0c0ffee2");
+        let seen = status.read().expect("status");
+        assert_eq!(
+            seen.crawl.forms_submitted, 3,
+            "a sync copies, it does not add"
+        );
+        assert_eq!(seen.crawl.forms_skipped, 0);
+    }
+
+    /// Replicate the end-of-crawling fold the worker does: fold `crawl.errors`
+    /// from the runtime (via `sync_counters`) and then apply amendment 39's
+    /// reason rule over the page count the crawl reached.
+    fn fold_crawl_phase(
+        status: &Arc<std::sync::RwLock<JobStatus>>,
+        runtime: &super::JobRuntime,
+        pages: u64,
+    ) {
+        let meter = crate::client::ProbeMeter::default();
+        let issues = crate::issues::IssueStore::new(None);
+        {
+            let mut guarded = status.write().expect("status");
+            guarded.crawl.pages = pages;
+        }
+        let job = {
+            let guarded = status.read().expect("status");
+            guarded.job.clone()
+        };
+        super::sync_counters(status, &meter, runtime, &issues, &job);
+        let last = runtime.last_crawl_error();
+        let mut guarded = status.write().expect("status");
+        super::fold_crawl_last_error(&mut guarded, last);
+    }
+
+    /// Amendment 39 (spec D5 "degrade, do not fail"): a crawl that made requests
+    /// and had every one fail (no page fetched) surfaces its classified reason
+    /// on `crawl.last_error`, while the job sets no `stopped_reason` or `error`
+    /// of its own from the crawl errors — it runs on over what it still has.
+    #[test]
+    fn an_all_failing_crawl_surfaces_its_reason() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee3", 1);
+
+        // Three failed requests, all classified `h2_not_negotiated`; no page.
+        for _ in 0..3 {
+            runtime.report_crawl_error("http://scan.test", "h2_not_negotiated");
+        }
+        fold_crawl_phase(&status, &runtime, 0);
+
+        let seen = status.read().expect("status");
+        assert_eq!(seen.crawl.errors, 3);
+        assert_eq!(seen.crawl.pages, 0);
+        assert_eq!(seen.crawl.last_error, Some(CrawlErrorKind::H2NotNegotiated));
+        assert_eq!(seen.stopped_reason, None, "the crawl errors do not stop it");
+        assert_eq!(seen.error, None);
+    }
+
+    /// Amendment 39, call C4: a partial failure (`pages > 0`) shows in
+    /// `crawl.errors` alone — no reason is named, so a frontend reads it as "the
+    /// crawl lost some requests" rather than "the crawl failed".
+    #[test]
+    fn a_partially_failing_crawl_sets_no_reason() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee4", 1);
+
+        runtime.report_crawl_error("http://scan.test", "connect_refused");
+        fold_crawl_phase(&status, &runtime, 1);
+
+        let seen = status.read().expect("status");
+        assert_eq!(seen.crawl.errors, 1);
+        assert!(seen.crawl.pages >= 1);
+        assert_eq!(seen.crawl.last_error, None);
+    }
+
+    /// A free-text browser-crawl reason is not a token: it stores `Other` (and
+    /// keeps the warn log), so the reason surface is still a closed vocabulary.
+    #[test]
+    fn a_free_text_crawl_reason_stores_other() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee5", 1);
+
+        runtime.report_crawl_error("http://scan.test", "the browser refused the seed");
+        assert_eq!(runtime.last_crawl_error(), Some(CrawlErrorKind::Other));
+
+        fold_crawl_phase(&status, &runtime, 0);
+        assert_eq!(
+            status.read().expect("status").crawl.last_error,
+            Some(CrawlErrorKind::Other)
+        );
+    }
+
+    /// The fold rule in isolation: a reason is named only when the crawl made
+    /// requests (`errors > 0`) and fetched no page (`pages == 0`).
+    #[test]
+    fn fold_crawl_last_error_follows_the_errors_and_pages_rule() {
+        let mut all_failed = JobStatus::default();
+        all_failed.crawl.errors = 2;
+        all_failed.crawl.pages = 0;
+        super::fold_crawl_last_error(&mut all_failed, Some(CrawlErrorKind::Timeout));
+        assert_eq!(all_failed.crawl.last_error, Some(CrawlErrorKind::Timeout));
+
+        let mut partial = JobStatus::default();
+        partial.crawl.errors = 2;
+        partial.crawl.pages = 1;
+        super::fold_crawl_last_error(&mut partial, Some(CrawlErrorKind::Timeout));
+        assert_eq!(partial.crawl.last_error, None, "a page was fetched");
+
+        let mut clean = JobStatus::default();
+        super::fold_crawl_last_error(&mut clean, Some(CrawlErrorKind::Timeout));
+        assert_eq!(clean.crawl.last_error, None, "no request failed");
     }
 
     /// Spec D5 "monotonic from `started_at`" (T9 live run, panel delta
@@ -2670,7 +3877,11 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        assert!(h.egress_confined(), "a running job holds the posture");
+        // No pre-terminal read of the hold here: on the multi-thread runtime
+        // the lane's panic can end the job before this line runs, so "a
+        // running job holds the posture" raced the supervisor (CI Rust gate on
+        // #289, 2026-11-02; coordinator's amendment 71b). The cancel test above
+        // pins that property race-free behind its blocking check.
 
         // The terminal signal decides when the job is over; `TERMINAL_NET` is
         // the only net (the old 2 s bound tripped on a loaded gate machine).
@@ -2764,10 +3975,11 @@ mod tests {
         assert_eq!(status.state, JobState::Done, "{:?}", status.error);
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.error, None);
-        // Two points x two checks: every item, the panicking ones included,
-        // counts as done, and the point count follows.
-        assert_eq!(status.checks.scheduled, 4);
-        assert_eq!(status.checks.done, 4);
+        // Two points x (two lane checks + the engine's three shipped passive
+        // checks): every item, the panicking ones included, counts as done,
+        // and the point count follows.
+        assert_eq!(status.checks.scheduled, 10);
+        assert_eq!(status.checks.done, 10);
         assert_eq!(status.points.audited, 2);
         assert!(status.checks.running.is_empty());
         // `fake.hit` still ran after `fake.boom` panicked on the same point.

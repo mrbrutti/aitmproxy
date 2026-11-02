@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "aitm"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-browser",
  "aitm-bus-client",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-browser"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-bus-client"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "anyhow",
  "serde",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-ca"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-cli"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-mcp",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-core"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "anyhow",
  "dirs",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-findings"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-l4-helper"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-proto-l4",
  "caps",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-mcp"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-plugins",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-peer-process"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "core-foundation",
@@ -209,14 +209,14 @@ dependencies = [
 
 [[package]]
 name = "aitm-peer-token"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "aitm-plugin"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-maprules"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-rules",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-passthrough"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-rhai"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-browser",
  "aitm-core",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-scanner"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-findings",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-sessionio"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-wsctl"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugins"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-poc"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-browser",
  "aitm-core",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-http"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-l4"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-test"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-ws"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-rules"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -452,9 +452,10 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-checks-http"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
+ "aitm-plugin-rhai",
  "aitm-poc",
  "aitm-proto-http",
  "aitm-scan-model",
@@ -467,14 +468,22 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-http"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
+ "aitm-core",
  "aitm-scan-model",
+ "anyhow",
+ "futures",
+ "regex",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
 name = "aitm-scan-l4-packet"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -484,19 +493,32 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "aitm-scan-l4-stream"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
+ "aitm-core",
+ "aitm-poc",
  "aitm-proto-l4",
  "aitm-scan-model",
+ "anyhow",
+ "futures",
+ "hickory-proto",
+ "rand 0.9.5",
+ "rand_chacha",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "aitm-scan-model"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -509,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-ws"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -538,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-sysproxy"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-ca",
  "aitm-core",
@@ -562,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-testtarget"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-core",
  "aitm-findings",
@@ -585,9 +607,11 @@ dependencies = [
 
 [[package]]
 name = "aitm-tui"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aitm-bus-client",
+ "aitm-poc",
+ "aitm-scan-model",
  "anyhow",
  "crossterm",
  "futures",
@@ -849,6 +873,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "chromiumoxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -910,6 +945,16 @@ checksum = "678d5146e74f16fc4a41978b275af572cd913de1f10270d2b93b6c276bc57d80"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "combine"
+version = "4.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4356eba6976435498d05a311ee9fc486da3bc81c200d3f0d7dd9703b41913f92"
+dependencies = [
+ "bytes",
+ "memchr",
 ]
 
 [[package]]
@@ -1495,6 +1540,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1544,6 +1590,25 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hickory-proto"
+version = "0.26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
+dependencies = [
+ "data-encoding",
+ "idna",
+ "ipnet",
+ "jni",
+ "once_cell",
+ "rand 0.10.3",
+ "ring",
+ "thiserror 2.0.21",
+ "tinyvec",
+ "tracing",
+ "url",
+]
 
 [[package]]
 name = "http"
@@ -1798,6 +1863,55 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jni"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5efd9a482cf3a427f00d6b35f14332adc7902ce91efb778580e180ff90fa3498"
+dependencies = [
+ "cfg-if",
+ "combine",
+ "jni-macros",
+ "jni-sys",
+ "log",
+ "simd_cesu8",
+ "thiserror 2.0.21",
+ "walkdir",
+ "windows-link",
+]
+
+[[package]]
+name = "jni-macros"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a00109accc170f0bdb141fed3e393c565b6f5e072365c3bd58f5b062591560a3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rustc_version",
+ "simd_cesu8",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "jni-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6377a88cb3910bee9b0fa88d4f42e1d2da8e79915598f65fb0c7ee14c878af2"
+dependencies = [
+ "jni-sys-macros",
+]
+
+[[package]]
+name = "jni-sys-macros"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
+dependencies = [
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "js-sys"
@@ -2137,6 +2251,7 @@ version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 dependencies = [
+ "critical-section",
  "portable-atomic",
 ]
 
@@ -2499,6 +2614,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_chacha"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2522,6 +2648,12 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "ratatui"
@@ -2841,6 +2973,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3000,6 +3141,22 @@ dependencies = [
  "errno 0.3.14",
  "libc",
 ]
+
+[[package]]
+name = "simd_cesu8"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11031e251abf8611c80f460e19dbdeb54a66db918e49c65a7065b46ac7aec520"
+dependencies = [
+ "rustc_version",
+ "simdutf8",
+]
+
+[[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "similar"
@@ -3366,6 +3523,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3676,6 +3839,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "walkdir"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
+dependencies = [
+ "same-file",
+ "winapi-util",
+]
+
+[[package]]
 name = "want"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3889,6 +4062,15 @@ name = "winapi-i686-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "winapi-x86_64-pc-windows-gnu"

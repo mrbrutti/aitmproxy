@@ -428,6 +428,7 @@ async fn drive_stream(
             trailers: HeaderMap::new(),
             body: Body::Bytes(b"request body exceeds the configured limit".to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         };
         let mut staged = Some(model.clone());
         ctx.store().update(id, &mut |f: &mut Flow| {
