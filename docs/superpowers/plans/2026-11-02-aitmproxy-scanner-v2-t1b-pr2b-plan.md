@@ -30,3 +30,13 @@
 ## Review log
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 1 | Spec | Critical | "scheme-default port filled" had no test: removing `guard_authority` passed every test | fixed 2aa99a92: `the_budget_is_charged_under_the_scheme_default_port` (ex.test → `ex.test:443` disabled, `:8080` served; `[::1]` likewise) |
+| 1 | Spec | Important | the host-wide window disabling an explicit port was untested | fixed 2aa99a92: `an_unported_disable_covers_every_port_of_the_host` |
+| 1 | Spec / Quality / Security | Minor | the unported view was a `"host:"` string-prefix scan (IPv6 `::1` vs `::1:2` over-match; three spellings of the key; whole-map scan under the lock, never pruned) | fixed 2aa99a92: maps keyed on `Authority`, exact host comparison, expired windows pruned on lookup; `ipv6_authorities_are_keyed_by_host_and_port_not_by_prefix` |
+| 1 | Quality | Important | `guard_authority` dropped IPv6 brackets: charged key ≠ looked-up key for every IPv6 target | fixed 2aa99a92: `Authority::to_string()` (brackets); covered by the two IPv6 cases |
+| 1 | Security | Minor | the client checked the breaker under the request's spelling but charged the ported one, so an unported request was refused host-wide | fixed 2aa99a92: `check_active(&authority)` with the ported spelling; the scope refusal names `host:port` (one test pin updated) |
+| 2 | Security / Quality | Minor | `LateHandles` forwarded `send_opts` but not `send_probe` (a wrapper would silently revert 80) | fixed 2aa99a92: forward added (one arm, `crates/aitm/src/scripts.rs`) |
+| 2 | Quality | Minor | positional `bool` in `send_inner`; duplicated 503 sender; new tests split existing docs; discarded results in assertions | fixed 2aa99a92: `SendKind::{Proxied, Probe}`, module-level `ServerErrorSender`, docs restored, `.expect(..)` |
+| 2 | Security | Minor | a probe dropped at the scanner's 30 s ceiling (`MAX_AWAIT`) before the sender's 60 s timeout never reaches `record_error`, so a tarpit is bounded by the scanner's ladder only, not the core breaker | **accepted as a follow-up (amendment candidate 81)**: the `JobClient` holds no guard; the fix is a drop-guard in `send_inner` or passing `ScanServices.guard` into the job client — a design change outside this PR's two rulings |
+| 1 | Security | Minor | per-port keys multiply the three maps; `host_errors`/`disable_count` are never pruned | partly addressed 2aa99a92 (windows pruned); counters bounded by scope × ports; cap per host left as a follow-up note |
+| all | Spec | Note | amendment rows 74/80 not yet in the spec on main | coordinator's docs PR |
