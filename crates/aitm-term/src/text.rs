@@ -156,9 +156,10 @@ pub fn wrap(s: &str, width: usize, indent: &str) -> Vec<String> {
 /// space, so a message is always one line. Content strings from other crates
 /// (WARN/ERROR text and fields, `anyhow` chains, Rhai `log.warn` text,
 /// client-supplied authorities inside errors) pass through here as they enter
-/// the reporter; the renderer's own SGR and cursor codes never do. Clean text
-/// is returned borrowed.
-pub(crate) fn sanitize(s: &str) -> Cow<'_, str> {
+/// the reporter; the renderer's own SGR and cursor codes never do. Also used
+/// by the one-shot remote path for text a core sends: prompts, error texts,
+/// tool names. Clean text is returned borrowed.
+pub fn sanitize(s: &str) -> Cow<'_, str> {
     if !s.chars().any(|c| replacement(c).is_some()) {
         return Cow::Borrowed(s);
     }

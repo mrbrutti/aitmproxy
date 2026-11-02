@@ -237,14 +237,16 @@ pub fn resolve(
         }
         [one] => *one,
         many => {
-            let cores: Vec<CoreRef> = many.iter().map(|found| core_ref(&found.pointer)).collect();
-            return Err(refuse::two_cores(
-                dotted,
-                &cores,
-                effective_path,
-                r.now_unix,
-                argv,
-            ));
+            // Canonical paths on both sides, as the preference above compared
+            // them, so a tie among symlinked configs reads "Both", not "Neither".
+            let cores: Vec<CoreRef> = many
+                .iter()
+                .map(|found| CoreRef {
+                    config: Some(canonical(&found.pointer.config)),
+                    ..core_ref(&found.pointer)
+                })
+                .collect();
+            return Err(refuse::two_cores(dotted, &cores, &wanted, r.now_unix, argv));
         }
     };
 
@@ -453,7 +455,9 @@ mod tests {
     /// A pointer's `started_unix` twelve minutes before `NOW`.
     const STARTED: u64 = NOW - 720;
 
-    /// A unique empty temp directory for one test, removed by the test.
+    /// A unique empty temp directory for one test, removed by the test. The
+    /// path is canonical (`/tmp` is a symlink on macOS), so the paths a
+    /// panel prints after canonicalizing equal the ones the tests build.
     fn temp_root(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -462,7 +466,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp root");
-        dir
+        fs::canonicalize(&dir).expect("canonical temp root")
     }
 
     fn lo(port: u16) -> SocketAddr {
@@ -1070,6 +1074,58 @@ mod tests {
         .expect("the one matching pointer wins");
         assert_eq!(target.addr, lo(50514));
         assert_eq!(target.token, "optoken-test-b");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Two live pointers whose `config` is a symlinked path to the effective
+    /// config: the preference compares canonical paths, so both tie; the
+    /// panel must say so in canonical terms too ("Both", not "Neither").
+    #[test]
+    fn symlinked_config_tie_reads_both() {
+        let root = temp_root("symlink-tie");
+        let cores = root.join("cores");
+        let real = root.join("real");
+        fs::create_dir_all(&real).expect("real dir");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink the config dir");
+        let real_cfg = real.join("a.yaml");
+        write_config(&real_cfg, "optoken-test-a", 0o600);
+        let linked_cfg = link.join("a.yaml");
+        let _one = pointer::write(&cores, &ptr(200, 50512, &linked_cfg)).expect("write one");
+        let _two = pointer::write(&cores, &ptr(300, 50513, &linked_cfg)).expect("write two");
+
+        let argv = args(&["scope", "list"]);
+        let r = resolver(&no_env, &pointer::liveness, &cores);
+        let report = what(resolve(
+            &r,
+            &BusArgs::default(),
+            &Config::default(),
+            &real_cfg,
+            false,
+            "scope.list",
+            &argv,
+        ));
+        assert_eq!(report.what, "two running cores found");
+        let canonical_cfg = fs::canonicalize(&real_cfg).expect("canonical config");
+        assert_eq!(
+            report.why,
+            vec![
+                format!(
+                    "127.0.0.1:50512 · pid 200 · started 12 min ago · {}",
+                    canonical_cfg.display()
+                ),
+                format!(
+                    "127.0.0.1:50513 · pid 300 · started 12 min ago · {}",
+                    canonical_cfg.display()
+                ),
+                format!(
+                    "Both were started from {}, so aitm cannot tell which one scope list means. Nothing was changed.",
+                    canonical_cfg.display()
+                ),
+            ]
+        );
+        assert!(report.why[2].contains("Both were started from"));
 
         fs::remove_dir_all(&root).expect("cleanup");
     }
