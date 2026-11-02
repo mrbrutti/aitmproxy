@@ -325,7 +325,7 @@ Amendment after T6's live run on main `395f9281` (Patched `resp`/`memcached`/`sm
 
 - **Satisfies:** S2-S6 (via the self-check), S7-S10; parent T10-1, T10-2, T10-3.
 - **Depends on:** B1, B2.
-- **Files:** `tests/e2e/scan/test_t10_target_selfcheck.py`, `tests/e2e/scan/test_t10_harness_config.py`, `tests/e2e/scan/test_t10_bundled_passive_regression.py` (create).
+- **Files:** `tests/e2e/scan/test_t10_target_selfcheck.py`, `tests/e2e/scan/test_t10_harness_config.py`, `tests/e2e/scan/test_t10_bundled_passive_regression.py` (create). Amendment 60 (2026-11-01) adds `tests/e2e/aitm_e2e/core.py` (`_spawn` sets `AITM_BUNDLED_SCRIPTS`) and the fourth cell `test_t10_bundled_catalogue_default.py`.
 - **Amendments (PR B panel, 2026-11-01):** `test_t10_harness_config.py` carries ` serial` (it boots several cores and writes `scanner:` configs) and `test_t1_agent_gates.py` carries ` serial` (it flips the agent policy); the bundled cell attributes HTTP findings by `flow.get(flow_id).authority` and the WS finding by V's host in the finding `detail` (a WebSocket flow's own authority is null), polls up to 15 s, and imports `ScanTarget` from `aitm_e2e.scan` (that import produces its `calls: []` ledger file for S10); on today's build the `ws-cleartext-transport` third cannot fire (a pre-existing `aitm-plugin-rhai` bug: WebSocket flows expose an empty `request.url` to scripts; T1b's engine PR fixes it), so after proving the two header scripts fired the cell SKIPs 77 naming that bug, gated on `scan.start` being absent from `tools/list` (coordinator ruling 2026-11-01: main must never go red); the moment T1b lands the same miss is a hard FAIL, and the cell is T1b's acceptance for the fix.
 - **Cells:**
   - `test_t10_target_selfcheck.py` (`needs=http`; no core; SKIPs 77 only when the serve binary is missing): boots `ScanTarget` V and P with `l4=True`; asserts the five stdout lines were parsed (`tls_base`, `tls_h1_base`, `control` non-empty); `/services` names ⊇ the 4 HTTP/control names + 9 D5 names + 2 legacy; for each D3 seed row a trigger request (the row's trigger column, sent with `urllib`/raw sockets to the plain listener; Cookie/headers/JSON/multipart/XML bodies as needed) on V contains the row's signal and on P does not (literal signals from D3; `sqli-time` and `cmdi sleep` measure >= 2 s on V with `n=2` and < 1 s on P; `crlf` checks the `x-injected` header; `open-redirect` the `Location`); `curl -sk --http2 -w %{http_version}` on `tls_base` is `2`, with `--http1.1` is `1.1`, on `tls_h1_base` with `--http2` is `1.1`; `/log/http` then has `tls_handshake` entries `h2`, `http/1.1`, `http/1.1` and request entries with `version` `h2`/`h1`; `/ws` V with foreign Origin -> 101 + hello `anonymous`, echo of `<i>` -> `"html":"<b><i></b>"`; P -> 403, no Origin -> 101 and `&lt;i&gt;`; after `POST /login` hello is `alice`; for each of the nine services: benign exchange == the D5 bytes; V trigger -> down for 4 s (TCP connect refused / UDP silent), liveness OK by 6 s, `/log/l4?service=` `downtime` length 1 with `up_at_ms - down_at_ms == 5000`; P trigger -> the row's reply, no downtime; `GET /manifest`, `/manifest.yaml`, `/<seed id>` for a fixed list mirroring the manifest ids (28 today; the cell cannot read the never-served manifest) -> 404 on both origins; a request with `Cookie: session=abc` -> `/log/http` entry has `cookie_names == ["session"]`, no `cookie` key, `cookie_sha256` 16 hex. No scan verb (ledger `calls: []`).
@@ -455,7 +455,7 @@ Amendment after T6's live run on main `395f9281` (Patched `resp`/`memcached`/`sm
 | `scan.issues` / `scan.issue` | t1_issues, t1_finding_link, t2_mutable_points, t3_*, t4_*, t5_crash_oracle, t6_* (operator) |
 | `scan.issue.update` | t1_issues (operator) |
 | `scan.sitemap` | t2_crawl, t2_crawl_client, t2_points, t4_points, t2_no_secret_leak (operator) |
-| `scan.checks` | t1_catalogue, t1_lane_skip, t3_catalogue_sweep, every `require_lane` caller (operator) |
+| `scan.checks` | t1_catalogue, t1_lane_skip, t3_catalogue_sweep, every `require_lane` caller (operator), t10_bundled_catalogue_default |
 | `scan.profile.list/get/save/delete` | t10_harness_config (operator) |
 | `scan.session.preview` | t2_session_reuse, t2_no_secret_leak (operator) |
 | `scan.discover`, `scan.passive`, `scan.report` | t1_contract (operator) |
@@ -484,6 +484,7 @@ Amendment after T6's live run on main `395f9281` (Patched `resp`/`memcached`/`sm
 | B2 | `tests/e2e/aitm_e2e/scan.py` |
 | B3 | `tests/e2e/run.py` |
 | B4-B11 | their listed `tests/e2e/scan/test_*.py` |
+| B4 (amendment 60) | `tests/e2e/aitm_e2e/core.py` (`_spawn` env), `tests/e2e/scan/test_t10_bundled_catalogue_default.py` |
 
 Within a wave no two tasks share a file: A0 (alone in wave A-0) creates every module file and the `lib.rs` `mod` lines; in wave A-1 only A1 touches `lib.rs` (one `pub use` line); `lib.rs` is then edited sequentially by A5 (wave A-2) and A20 (wave A-4); `ws.rs` by A4, A5, A17 in successive waves; `Cargo.toml` by A0 and A21 in successive waves.
 

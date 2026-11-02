@@ -49,7 +49,7 @@ ACTIVE_DIR = Path(repo_root()) / "scripts" / "bundled" / "active"
 
 
 def scripts_declaring_add_check() -> list[str]:
-    return [f.name for f in sorted(ACTIVE_DIR.glob("*.rhai")) if "add_check" in f.read_text(errors="replace")]
+    return [f.name for f in sorted(ACTIVE_DIR.glob("*.rhai")) if "reg.add_check" in f.read_text(errors="replace")]
 
 
 def main() -> int:
@@ -66,11 +66,11 @@ def main() -> int:
 
         section("script.list: the bundled passive scripts are loaded")
         scripts = op.call("script.list") or []
-        names = sorted(str(s.get("name") or s.get("id") or "") for s in scripts)
+        names = sorted(str(s.get("name") or "") for s in scripts)
         missing = [p for p in PASSIVE if p not in names]
         check(not missing, f"script.list names {list(PASSIVE)} (missing {missing}; {len(names)} scripts loaded)")
         check(len(names) >= MIN_SCRIPTS, f"at least {MIN_SCRIPTS} bundled scripts loaded (got {len(names)})")
-        errors = [(s.get("name") or s.get("id"), s.get("last_error")) for s in scripts if s.get("last_error")]
+        errors = [(s.get("name"), s.get("last_error")) for s in scripts if s.get("last_error")]
         check(not errors, f"no bundled script reports a load error ({errors[:3]})")
 
         section("scan.checks: at least one bundled-origin check beside the natives")
