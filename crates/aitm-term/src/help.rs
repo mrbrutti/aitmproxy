@@ -3,14 +3,14 @@
 //! `aitm --help`, `aitm <group>` and `aitm <group> <verb> --help`.
 //!
 //! A page is a title, opening paragraphs, bare `Usage:` lines and an ordered
-//! list of [`Block`]s (sections of two-column rows, examples, prose), rendered
-//! in that order with one blank line between blocks. Rows put the description
+//! list of [`Block`]s (sections of two-column rows, examples, prose, verbatim
+//! lines), rendered in that order with one blank line between blocks. Rows put the description
 //! at a **fixed column** ([`DESC_COL`], plan C40): a left cell of at most
 //! [`LEFT_MAX`] columns is padded so its description starts there, a wider
 //! one stands alone and its description starts on the next line. Descriptions
 //! wrap greedily to the width with at least twenty columns of room; usage
 //! lines wrap in flag-and-placeholder units with a four-space continuation;
-//! example lines are never wrapped (copy-safe, plan C5).
+//! example lines and verbatim lines are never wrapped (copy-safe, plan C5).
 //!
 //! The rich form (a stream that animates *and* allows colour, plan C6) paints
 //! headings bold and every physical description line dim; everything else is
@@ -66,14 +66,19 @@ pub struct HelpSection {
 }
 
 /// One block of a page, in the order the page lists them (plan C41): a
-/// section of rows, an `Examples:` block of runnable lines, or prose
-/// paragraphs (a footer such as `Nothing is decrypted until a host is in
-/// Scope.`).
+/// section of rows, an `Examples:` block of runnable lines, prose paragraphs
+/// (a footer such as `Nothing is decrypted until a host is in Scope.`), or
+/// lines printed verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Section(HelpSection),
     Examples(Vec<String>),
     Text(Vec<String>),
+    /// Lines printed as they are, one per line, adjacent, with no indent:
+    /// never wrapped, never painted, so a two-space gap survives. Sanitised
+    /// and ASCII-substituted like every other content string (plan C41; the
+    /// top page's footer, M-W2-1).
+    Lines(Vec<String>),
 }
 
 /// A help page (plan C41), rendered title → about → `Usage:` → blocks.
@@ -240,8 +245,8 @@ fn prepare<'a>(caps: &Caps, glyphs: &Glyphs, s: &'a str) -> Cow<'a, str> {
 /// [`wrap_usage`] (when there is one); then each block — a `Section` as its
 /// heading and [`row_lines`] per row, `Examples` as `Examples:` and
 /// `  $ <example>` lines printed whole, `Text` as paragraphs wrapped to the
-/// width with no indent — with one blank line between blocks and between
-/// `Text` paragraphs. The output ends with exactly one `\n` and has no
+/// width with no indent, `Lines` as its lines verbatim and adjacent — with
+/// one blank line between blocks and between `Text` paragraphs. The output ends with exactly one `\n` and has no
 /// trailing blank line; a page with nothing to show renders as the empty
 /// string.
 ///
@@ -313,6 +318,9 @@ pub fn help_page(caps: &Caps, page: &HelpPage) -> String {
                 for paragraph in paragraphs {
                     blocks.push(text::wrap(&prep(paragraph), width, ""));
                 }
+            }
+            Block::Lines(lines) => {
+                blocks.push(lines.iter().map(|line| prep(line)).collect());
             }
         }
     }
@@ -694,6 +702,66 @@ mod tests {
         assert_eq!(
             help_page(&piped_utf8(), &page),
             "aitm scope — which hosts are decrypted\n\na · b …\n"
+        );
+    }
+
+    #[test]
+    fn help_page_lines_block_is_verbatim_and_unwrapped() {
+        let page = HelpPage {
+            title: String::new(),
+            about: Vec::new(),
+            usage: Vec::new(),
+            blocks: vec![Block::Lines(strings(&["a  b", "c  d"]))],
+        };
+        // Two-space gaps kept, the lines adjacent, no indent, at a width that
+        // would wrap any paragraph.
+        let narrow = Caps {
+            width: 10,
+            ..piped_utf8()
+        };
+        assert_eq!(help_page(&narrow, &page), "a  b\nc  d\n");
+        // Never painted: the rich form is the same bytes (C41).
+        let rich = help_page(&tty80(), &page);
+        assert_eq!(rich, "a  b\nc  d\n");
+        assert!(!rich.as_bytes().contains(&0x1b), "{rich:?}");
+        // Never wrapped: a line wider than the width stays whole (M-W2-1's
+        // footer, whose `aitm scope add --host <host>` literal is pinned).
+        let footer = HelpPage {
+            blocks: vec![Block::Lines(strings(&[
+                "Nothing is decrypted until a host is in Scope.  aitm scope add --host <host>",
+                "Trust the CA:  aitm ca install",
+            ]))],
+            ..page.clone()
+        };
+        assert_eq!(
+            help_page(&narrow, &footer),
+            "Nothing is decrypted until a host is in Scope.  aitm scope add --host <host>\n\
+             Trust the CA:  aitm ca install\n"
+        );
+        // Sanitised and ASCII-substituted like every other content string.
+        let dotted = HelpPage {
+            blocks: vec![Block::Lines(strings(&["a · b …", "x\x1b]0;evil\x07y"]))],
+            ..page.clone()
+        };
+        assert_eq!(
+            help_page(&Caps::plain(), &dotted),
+            "a - b ...\nx\u{FFFD}]0;evil\u{FFFD}y\n"
+        );
+        assert_eq!(
+            help_page(&piped_utf8(), &dotted),
+            "a · b …\nx\u{FFFD}]0;evil\u{FFFD}y\n"
+        );
+        // Among other blocks it is one block: a blank line separates it.
+        let between = HelpPage {
+            blocks: vec![
+                Block::Examples(strings(&["aitm"])),
+                Block::Lines(strings(&["a  b", "c  d"])),
+            ],
+            ..page.clone()
+        };
+        assert_eq!(
+            help_page(&piped_utf8(), &between),
+            "Examples:\n  $ aitm\n\na  b\nc  d\n"
         );
     }
 }
