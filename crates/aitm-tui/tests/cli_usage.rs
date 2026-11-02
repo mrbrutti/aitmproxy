@@ -1,7 +1,7 @@
 //! Tester (stage 5), spec 2026-10-31-remove-fake-data-ui-modes AC6, the
 //! static half, proved on the built `aitm-tui` binary rather than on
 //! `parse()` alone: the removed `--fixture` / `--snapshot` flags are unknown
-//! arguments — stderr begins `unknown argument `<flag>`` followed by the
+//! arguments: stderr begins `unknown argument `<flag>`` followed by the
 //! usage, exit status 2, nothing on stdout, no file written; with no `--bus`
 //! and no `AITM_BUS` the usage is printed and the status is 2; and the kept
 //! live arms of the transport match are still reached after the fixture arm
@@ -118,7 +118,7 @@ fn no_arguments_and_no_bus_environment_print_the_usage_and_exit_2() {
 }
 
 /// The transport match lost its fixture arm; the two live arms (`--bus`,
-/// `AITM_BUS`) and the S5 loopback refusal are still reached — each proved
+/// `AITM_BUS`) and the S5 loopback refusal are still reached, each proved
 /// at the check that comes *before* any connect, so no socket is opened.
 #[test]
 fn the_live_transport_arms_are_still_reached_and_refuse_before_connecting() {

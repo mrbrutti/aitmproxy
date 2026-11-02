@@ -12,5 +12,21 @@ description = "Scanner v2 HTTP lane (track T2): discovery, insertion points and 
 # without pulling in the scanner engine (spec D1).
 aitm-scan-model.workspace = true
 
+# Redaction (`scrub_text`, `is_secret_key`) and the shared HTTP types the lane
+# mutates; every example and logged URL goes through `src/redact.rs`.
+aitm-core.workspace = true
+anyhow.workspace = true
+# Every async seam in the lane is a `BoxFuture`.
+futures.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+# `time` for the deadline-bounded awaits, `sync` for the session monitors.
+tokio = { workspace = true, features = ["time", "sync"] }
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
 [lints]
 workspace = true

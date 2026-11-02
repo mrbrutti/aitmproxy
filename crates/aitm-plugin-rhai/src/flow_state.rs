@@ -220,6 +220,7 @@ impl FlowState {
                     trailers: HeaderMap::new(),
                     body: Body::Bytes(body),
                     timestamp: SystemTime::now(),
+                    peer: None,
                 }),
                 // The chain collects the parked receiver via `take_parked`; a
                 // command resumes through the handle stored in the flow's

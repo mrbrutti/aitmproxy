@@ -86,6 +86,7 @@ impl ProxyClient for StubClient {
                     trailers: HeaderMap::new(),
                     body: Body::Bytes(self.body.to_vec()),
                     timestamp: SystemTime::now(),
+                    peer: None,
                 }),
                 client_conn: conn(),
                 server_conn: None,

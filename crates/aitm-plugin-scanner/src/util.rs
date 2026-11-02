@@ -236,13 +236,53 @@ pub fn normalize_origin(input: &str) -> Result<String, String> {
 }
 
 /// The probe marker a check injects and looks for in the answer:
-/// `aitm<8 lowercase hex>` of `counter`.
+/// `aitm<8 lowercase hex>` of a per-job `seed` mixed with the job's `counter`.
 ///
 /// One spelling, because the shipped Rhai checks and the PoC assertions match
 /// on this literal shape: `ProbeHost::marker` is implemented twice (the job
 /// worker and the manual `check.<id>` path) and the two must agree.
-pub fn marker(counter: u64) -> String {
-    format!("aitm{:08x}", counter & 0xffff_ffff)
+///
+/// Amendment 55: the counter alone made every job's first marker
+/// `aitm00000000`, so a target that knows aitmproxy could forge a Vulnerable
+/// verdict by echoing it unprompted. The eight hex digits are now a 32-bit
+/// permutation ([`mix32`]) of `counter ^ seed`: a different seed per job
+/// moves every marker, and for one seed the map from counter to marker is a
+/// bijection, so a job never repeats a marker. The seed is not a secret and
+/// the mix is not a MAC; it defeats a-priori forgery, not an adversary who
+/// recovers the seed from a marker it was sent.
+pub fn marker(seed: u32, counter: u32) -> String {
+    format!("aitm{:08x}", mix32(counter ^ seed))
+}
+
+/// A per-job marker seed (amendment 55), minted once per job or per manual
+/// `check.<id>` invocation.
+///
+/// Drawn from `std`'s per-process randomized [`RandomState`] keys (seeded by
+/// the OS) over the clock, so two jobs — in one process or across processes —
+/// get different seeds without this crate growing a random-number dependency.
+pub fn marker_seed() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let h = RandomState::new().hash_one(nanos);
+    // Fold both halves so no 32 bits of the hash are thrown away.
+    (h as u32) ^ ((h >> 32) as u32)
+}
+
+/// A bijective 32-bit mix (Wellons' `lowbias32` finalizer): xorshifts and
+/// odd multiplies are each invertible on `u32`, so their composition is a
+/// permutation — distinct inputs give distinct outputs.
+fn mix32(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^= x >> 16;
+    x
 }
 
 // --- HTML scanning helpers --------------------------------------------------
@@ -656,21 +696,55 @@ mod tests {
         );
     }
 
-    /// The probe marker's literal shape: `aitm` plus exactly eight lowercase
-    /// hex digits, wrapping at 32 bits rather than growing a ninth.
+    /// `aitm` plus exactly eight lowercase hex digits, the shape every pin
+    /// and every script matcher relies on.
+    fn is_marker_shaped(m: &str) -> bool {
+        m.len() == 12
+            && m.starts_with("aitm")
+            && m[4..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// Amendment 55 (T3's 2b panel, security Minor): the marker keeps its
+    /// literal shape, but the eight hex digits mix a per-job seed with the
+    /// counter — two jobs' first markers differ (a target can no longer
+    /// forge a verdict by echoing `aitm00000000` unprompted) and, under one
+    /// seed, the counter maps to markers one-to-one (no collision in a job).
+    /// Both `ProbeHost::marker` impls must agree, so the function is pure in
+    /// `(seed, counter)`.
     #[test]
-    fn marker_is_aitm_plus_eight_hex_digits() {
-        assert_eq!(marker(0), "aitm00000000");
-        assert_eq!(marker(1), "aitm00000001");
-        assert_eq!(marker(0xdead_beef), "aitmdeadbeef");
-        assert_eq!(
-            marker(0x1_0000_0000),
-            "aitm00000000",
-            "the counter wraps at 32 bits; the marker never grows"
+    fn markers_keep_the_shape_and_differ_across_seeds() {
+        let a = 0x1234_5678;
+        let b = 0x9abc_def0;
+
+        let first_a = marker(a, 0);
+        let first_b = marker(b, 0);
+        assert!(is_marker_shaped(&first_a), "{first_a:?} is not aitm+8 hex");
+        assert!(is_marker_shaped(&first_b), "{first_b:?} is not aitm+8 hex");
+        assert_ne!(first_a, first_b, "two seeds, two first markers");
+        assert_ne!(
+            first_a, "aitm00000000",
+            "a seeded first marker is not the counter alone"
         );
-        let m = marker(0xffff_ffff);
-        assert_eq!(m, "aitmffffffff");
-        assert_eq!(m.len(), 12);
+        assert_eq!(
+            marker(a, 7),
+            marker(a, 7),
+            "pure in (seed, counter): the job and manual hosts agree"
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        for counter in 0..1000u32 {
+            let m = marker(a, counter);
+            assert!(is_marker_shaped(&m), "{m:?} is not aitm+8 hex");
+            assert!(seen.insert(m), "counter {counter} collided under one seed");
+        }
+        assert_eq!(seen.len(), 1000);
+
+        let s1 = marker_seed();
+        let s2 = marker_seed();
+        assert_ne!(s1, s2, "two minted seeds differ");
+        assert!(is_marker_shaped(&marker(s1, 0)));
     }
 
     /// `guard_authority` is the one `host:port` rule: an explicit port always,

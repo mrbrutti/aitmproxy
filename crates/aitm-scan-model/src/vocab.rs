@@ -156,6 +156,15 @@ pub enum PointTrait {
     Id,
     /// The value carries session state; ignored by default (spec D2).
     Session,
+    /// The value is a whole body declared as a JSON or XML document (whether
+    /// or not it parses), rather than one field of it.
+    ///
+    /// Information for checks and UIs, not a skip mechanism (spec amendment
+    /// 65): a value-level check skips such a point through its `kinds` (it
+    /// does not ask for `entire_body`), and a document-level check (`xxe`'s
+    /// DOCTYPE injection, `nosqli-json`'s operator objects) takes the
+    /// `entire_body` kind whatever the traits say.
+    Structured,
 }
 
 /// How sure a verdict is. Ordered: `Tentative` is weakest.
@@ -525,6 +534,20 @@ mod tests {
         assert!(Intensity::Passive < Intensity::Light);
         assert!(Intensity::Light < Intensity::Medium);
         assert!(Intensity::Medium < Intensity::Intrusive);
+    }
+
+    /// Amendment 65: a whole-document insertion point (`entire_body` for a
+    /// JSON or XML body) is flagged with the `structured` trait.
+    #[test]
+    fn point_trait_structured_wire_token() {
+        assert_eq!(
+            serde_json::to_string(&PointTrait::Structured).expect("serializes"),
+            "\"structured\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PointTrait>("\"structured\"").expect("deserializes"),
+            PointTrait::Structured
+        );
     }
 
     #[test]

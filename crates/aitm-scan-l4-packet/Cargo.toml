@@ -21,6 +21,10 @@ anyhow.workspace = true
 # `BoxFuture`, so the lane's trait impls stay object-safe.
 futures.workspace = true
 serde_json.workspace = true
+# The lane's one `info!` line: why a point's run stopped (a stop reason never
+# carries payload bytes), so a rig operator can read it from the core's log.
+# Everything else the lane traces is `debug` under `aitm::scanner::l4_packet`.
+tracing.workspace = true
 # `spawn_blocking` for the blocking `send_recv`, plus the lane's timers and locks.
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 

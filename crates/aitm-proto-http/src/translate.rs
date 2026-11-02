@@ -83,6 +83,7 @@ pub(crate) fn response_from_h2(head: &http::response::Parts) -> HttpResponse {
         trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: SystemTime::now(),
+        peer: None,
     }
 }
 
@@ -211,6 +212,7 @@ mod tests {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         };
         assert_eq!(
             h2_response_from(&model).status(),
@@ -240,6 +242,7 @@ mod tests {
             trailers,
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         };
 
         assert!(!h2_response_from(&model).headers().contains_key("x-sum"));

@@ -12,13 +12,16 @@ use std::time::SystemTime;
 
 use aitm_core::{
     Body, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest,
-    HttpResponse, HttpVersion, InterceptState, MemFlowStore, ProxyClient, StdGuard, WsDir, WsFlow,
-    WsMessage, WsOpcode,
+    HttpResponse, HttpVersion, InterceptState, MemFlowStore, ProxyClient, Registry, StdGuard,
+    WsDir, WsFlow, WsMessage, WsOpcode,
 };
+use aitm_plugin_rhai::command::ScriptRegHandle;
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
 use aitm_plugin_rhai::loader::RhaiLoader;
 use aitm_plugin_rhai::{ErrorSink, FindingSink};
+use aitm_scan_model::registry::CheckRegistry;
+use aitm_scan_model::vocab::CheckOrigin;
 
 const MAX_BODY: usize = 1 << 20;
 
@@ -132,6 +135,7 @@ fn vuln_http_flow(scheme: &str) -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Bytes(body.as_bytes().to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: conn(scheme == "https"),
         server_conn: None,
@@ -278,25 +282,65 @@ async fn passive_scripts_run_without_error_and_record_findings() {
     );
 }
 
+/// What the catalogue's operator-facing scripts install when `load(reg)` runs.
+///
+/// Since the v2 switchover an `active/` script declares a **check** with
+/// `reg.add_check` and registers no command; the `l4/` scripts are still
+/// commands. The check side is asserted by running the real bridge rather than
+/// by the lexical scan `validate_with_registers` does, because
+/// `loader::Registers` only records `add_command` / `add_option` — it cannot
+/// see an `add_check`, and a scan is not evidence that the registration
+/// succeeded anyway.
 #[tokio::test(flavor = "multi_thread")]
-async fn command_scripts_register_their_commands() {
+async fn active_scripts_register_a_check_and_l4_scripts_a_command() {
     let findings = Arc::new(MemoryFindingSink::new());
     let loader = loader(findings);
 
-    for sub in ["active", "l4"] {
-        let mut files = Vec::new();
-        rhai_files(&bundled_dir().join(sub), &mut files);
-        files.sort();
-        assert!(!files.is_empty(), "{sub}/ should ship command scripts");
-        for path in &files {
-            let v = loader
-                .validate_with_registers(path)
-                .unwrap_or_else(|e| panic!("{} failed to validate: {e}", path.display()));
-            assert!(
-                !v.registers.commands.is_empty(),
-                "{} registers no command (an operator-invoked script must)",
-                path.display()
-            );
-        }
+    let mut active = Vec::new();
+    rhai_files(&bundled_dir().join("active"), &mut active);
+    active.sort();
+    assert!(!active.is_empty(), "active/ should ship check scripts");
+    for path in &active {
+        let (ast, _meta) = loader
+            .compile(path)
+            .unwrap_or_else(|e| panic!("{} failed to compile: {e}", path.display()));
+        let checks = Arc::new(CheckRegistry::new());
+        let mut commands = Registry::new();
+        ScriptRegHandle::new(&mut commands)
+            .with_checks(
+                Arc::clone(&checks),
+                CheckOrigin::Bundled {
+                    path: path.display().to_string(),
+                },
+            )
+            .run_load(&loader.engine(), &Arc::new(ast))
+            .unwrap_or_else(|e| panic!("{} failed at load(reg): {e}", path.display()));
+
+        assert!(
+            !checks.is_empty(),
+            "{} registers no check (an active script must declare one)",
+            path.display()
+        );
+        let names: Vec<&str> = commands.commands().map(|c| c.name()).collect();
+        assert!(
+            names.is_empty(),
+            "{} still registers the command(s) {names:?}; an active script is a check now",
+            path.display()
+        );
+    }
+
+    let mut l4 = Vec::new();
+    rhai_files(&bundled_dir().join("l4"), &mut l4);
+    l4.sort();
+    assert!(!l4.is_empty(), "l4/ should ship command scripts");
+    for path in &l4 {
+        let v = loader
+            .validate_with_registers(path)
+            .unwrap_or_else(|e| panic!("{} failed to validate: {e}", path.display()));
+        assert!(
+            !v.registers.commands.is_empty(),
+            "{} registers no command (an operator-invoked script must)",
+            path.display()
+        );
     }
 }

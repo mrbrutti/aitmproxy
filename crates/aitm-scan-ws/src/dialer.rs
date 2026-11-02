@@ -1134,6 +1134,7 @@ impl WsConn {
                 trailers: HeaderMap::new(),
                 body: Body::Empty,
                 timestamp: self.opened,
+                peer: None,
             }),
             client_conn: conn.clone(),
             server_conn: Some(conn.clone()),
@@ -1259,9 +1260,14 @@ mod tests {
         Arc::new(guard)
     }
 
-    /// Five seconds from now: every hermetic test finishes long before this.
+    /// The job deadline handed to a dial that is expected to succeed: a safety
+    /// net, never a measured bound. Every test here runs over the in-process
+    /// duplex transport and finishes in milliseconds on an idle machine, but a
+    /// loaded CI runner stretched the old five-second figure into a `Timeout`
+    /// (2026-11-01, `upgrade_without_subprotocol_echo_is_still_upgraded`). A
+    /// test that expects the deadline to win passes its own short one.
     fn soon() -> Instant {
-        Instant::now() + Duration::from_secs(5)
+        Instant::now() + Duration::from_secs(60)
     }
 
     /// The value of one (lowercase) header of a logged handshake.
@@ -1605,8 +1611,10 @@ mod tests {
         );
 
         drop(held.pop());
+        // A safety net like `soon()`, not a measured bound: the dial proceeds
+        // as soon as a slot frees; 5 s was the same flake class under load.
         let fifth = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             dialer.dial(
                 &handshake,
                 &HandshakeOverrides::default(),

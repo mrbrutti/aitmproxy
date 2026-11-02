@@ -8,6 +8,8 @@
 
 mod support;
 
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,7 +19,7 @@ use aitm_proto_http::raw_h2::{
 use aitm_scan_checks_http::h2_observe::{h2_checks, RawH2Runner, RealRawH2Runner};
 use aitm_scan_model::{
     Check, CheckCost, CheckOrigin, Confidence, InsertionKind, InsertionPoint, Intensity, LaneKind,
-    Outcome, ProbeHost, Technique, Verdict,
+    Outcome, Payload, ProbeHost, ProbeResponse, RawProbe, ScanProfile, Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -30,9 +32,165 @@ const ORIGIN_URL: &str = "https://origin.test/x";
 /// carries it (the off-origin case has its own test).
 const ORIGIN: &str = "https://origin.test";
 
+/// The address the guarded baseline came from, as `ProbeHost::baseline_peer_addr`
+/// reports it. Documentation space (RFC 5737), on the origin's own port: these
+/// tests never dial, and no test here may name an address it does not own.
+const PEER: &str = "203.0.113.7:443";
+
+fn peer_addr() -> SocketAddr {
+    PEER.parse().expect("a literal peer address")
+}
+
+/// The host the five h2 checks see: a [`ScriptedHost`] plus the two
+/// [`ProbeHost`] hooks plan amendment A5 wires in —
+/// [`ProbeHost::baseline_peer_addr`], the peer the guarded baseline answered
+/// from, and [`ProbeHost::charge`], the budget a stimulus that bypasses
+/// `ProbeHost::probe` spends.
+///
+/// `ScriptedHost` takes neither (it is shared with the other check suites, and
+/// only these checks charge), so the wrapper owns them: it records every
+/// charge the check asked for, accepted or refused, and a charge it accepts
+/// really comes off `budget_left`.
+struct H2Host {
+    inner: ScriptedHost,
+    peer: Option<SocketAddr>,
+    charges: Mutex<Vec<u32>>,
+    spent: AtomicU32,
+    charge_refuses: bool,
+}
+
+impl H2Host {
+    /// `inner`, reporting [`PEER`] as the baseline's peer and charging for
+    /// real.
+    fn over(inner: ScriptedHost) -> Self {
+        Self {
+            inner,
+            peer: Some(peer_addr()),
+            charges: Mutex::new(Vec::new()),
+            spent: AtomicU32::new(0),
+            charge_refuses: false,
+        }
+    }
+
+    /// A host that does not know where its baseline came from.
+    fn without_a_peer(mut self) -> Self {
+        self.peer = None;
+        self
+    }
+
+    /// A host whose budget refuses every charge, whatever is left.
+    fn refusing_charges(mut self) -> Self {
+        self.charge_refuses = true;
+        self
+    }
+
+    /// Every charge the check asked for, in order, accepted or refused.
+    fn charges(&self) -> Vec<u32> {
+        self.charges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn baseline_calls(&self) -> usize {
+        self.inner.baseline_calls()
+    }
+
+    fn with_budget(mut self, left: u32) -> Self {
+        self.inner = self.inner.with_budget(left);
+        self
+    }
+
+    fn with_baseline_fails(mut self, fails: bool) -> Self {
+        self.inner = self.inner.with_baseline_fails(fails);
+        self
+    }
+
+    fn with_cancelled(mut self, cancelled: bool) -> Self {
+        self.inner = self.inner.with_cancelled(cancelled);
+        self
+    }
+
+    fn with_deadline(mut self, at: Instant) -> Self {
+        self.inner = self.inner.with_deadline(at);
+        self
+    }
+
+    fn with_profile(mut self, profile: ScanProfile) -> Self {
+        self.inner = self.inner.with_profile(profile);
+        self
+    }
+
+    /// The payloads the inner host was asked to send through `probe`.
+    fn sent(&self) -> Vec<String> {
+        self.inner.sent()
+    }
+}
+
+impl ProbeHost for H2Host {
+    fn baseline(&self) -> BoxFuture<'_, anyhow::Result<ProbeResponse>> {
+        self.inner.baseline()
+    }
+
+    fn probe<'a>(&'a self, payload: &'a Payload) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+        self.inner.probe(payload)
+    }
+
+    fn probe_raw(&self, req: RawProbe) -> BoxFuture<'_, anyhow::Result<ProbeResponse>> {
+        self.inner.probe_raw(req)
+    }
+
+    fn marker(&self) -> String {
+        self.inner.marker()
+    }
+
+    fn budget_left(&self) -> u32 {
+        self.inner
+            .budget_left()
+            .saturating_sub(self.spent.load(AtomicOrdering::SeqCst))
+    }
+
+    fn deadline(&self) -> Instant {
+        self.inner.deadline()
+    }
+
+    fn profile(&self) -> &ScanProfile {
+        self.inner.profile()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn held_flows(&self) -> Vec<aitm_core::Flow> {
+        self.inner.held_flows()
+    }
+
+    fn baseline_peer_addr(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    fn charge(&self, units: u32) -> bool {
+        self.charges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(units);
+        if self.charge_refuses || self.budget_left() < units {
+            return false;
+        }
+        self.spent.fetch_add(units, AtomicOrdering::SeqCst);
+        true
+    }
+}
+
 /// The scripted host every test uses: the profile targets [`ORIGIN`].
-fn h2host() -> ScriptedHost {
-    ScriptedHost::new().with_origins(&[ORIGIN])
+fn h2host() -> H2Host {
+    h2host_for(&[ORIGIN])
+}
+
+/// The same, for a profile that names `origins` instead.
+fn h2host_for(origins: &[&str]) -> H2Host {
+    H2Host::over(ScriptedHost::new().with_origins(origins))
 }
 
 type Script = dyn Fn(&RawH2Plan) -> anyhow::Result<RawH2Observation> + Send + Sync;
@@ -117,7 +275,7 @@ fn origin_point() -> InsertionPoint {
     point(InsertionKind::Query, "q", ORIGIN_URL)
 }
 
-async fn run(check: &Arc<dyn Check>, host: &ScriptedHost) -> Verdict {
+async fn run(check: &Arc<dyn Check>, host: &H2Host) -> Verdict {
     check.run(&origin_point(), host).await
 }
 
@@ -326,7 +484,8 @@ async fn settings_observe_reports_the_advertised_values() {
         plan.target,
         RawH2Target {
             scheme: "https".to_string(),
-            authority: "origin.test".to_string()
+            authority: "origin.test".to_string(),
+            addr: Some(peer_addr()),
         }
     );
 }
@@ -724,7 +883,7 @@ async fn the_guard_is_per_authority_and_per_scheme() {
         "https://other.test/x",
         "http://origin.test/x",
     ] {
-        let host = ScriptedHost::new().with_origins(&[
+        let host = h2host_for(&[
             "https://origin.test",
             "https://origin.test:8443",
             "https://other.test",
@@ -836,10 +995,166 @@ async fn a_stopped_job_sends_nothing() {
     }
 }
 
-/// The raw connection cannot charge the host — `ProbeHost` has no `charge` —
-/// so the check refuses to open one the job could not have paid for: the
-/// budget left after the baseline must cover the streams the plan will open.
-/// A three-stream check on a job with one unit of budget sends nothing.
+/// T3-6 (plan amendment A5): the raw connection is charged to the job before
+/// it is opened, so a budget that refuses the charge opens nothing. The host
+/// here refuses whatever is left, which is what the engine's own host does
+/// when the job's `JobBudget` is spent or the rate guard will not pace
+/// another egress.
+#[tokio::test]
+async fn a_refused_charge_opens_no_raw_connection() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let host = h2host().refusing_charges();
+
+    let v = run(&check, &host).await;
+
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert_eq!(v.detail, "budget refused the raw probe");
+    assert_eq!(host.charges(), vec![8]);
+    assert_eq!(runner.calls(), 0);
+    // The authority was not claimed, so a job that can pay still probes it.
+    let paying = h2host();
+    let allowed = run(&check, &paying).await;
+    assert_eq!(allowed.outcome, Outcome::Vulnerable);
+    assert_eq!(paying.charges(), vec![8]);
+    assert_eq!(runner.calls(), 1);
+}
+
+/// T3-6: what each of the five charges — one unit per stream it will open,
+/// and one for the stream-less settings probe (`max(1)`), the same literals
+/// the live cell watches `scan.status.probes.sent` grow by (0/8/3/2/2 streams).
+#[tokio::test]
+async fn every_h2_check_charges_one_unit_per_stream_before_it_dials() {
+    for (id, units) in [
+        ("h2-settings-observe", 1u32),
+        ("h2-pseudo-header-validation", 3),
+        ("h2-header-crlf-tolerance", 2),
+        ("h2-cl-te-downgrade-indicator", 2),
+        ("h2-rapid-reset-mitigation", 8),
+    ] {
+        let runner = FakeRunner::scripted(|plan| match &plan.mode {
+            RawH2Mode::SettingsOnly => Ok(obs(vec![])),
+            _ => Ok(resets(plan.streams as usize)),
+        });
+        let check = check_named(&runner, id);
+        // Twenty units: one for the baseline, the rest for the probe.
+        let host = h2host().with_budget(20);
+
+        let v = run(&check, &host).await;
+
+        assert_ne!(v.outcome, Outcome::Inconclusive, "{id}: {}", v.detail);
+        assert_eq!(host.charges(), vec![units], "{id}");
+        assert_eq!(runner.calls(), 1, "{id}");
+        assert_eq!(
+            host.budget_left(),
+            19 - units,
+            "{id}: the baseline and the streams both came off the budget"
+        );
+    }
+}
+
+/// T3-7 (plan amendment A5, as F12c amended it): a host that does not know
+/// where its baseline came from no longer stops the probe — it loses the
+/// strict dial and nothing else. The plan carries no address, so the driver
+/// resolves the authority's own name and puts every address it resolves to
+/// through the SSRF gate and the live scope permit (what PR 2a shipped); the
+/// job still pays one unit per stream; and the verdict says, in the detail
+/// the operator reads, that this connection was aimed by name.
+///
+/// Live on the real bus (2026-11-01): `aitm-core`'s `ProxyClient` records
+/// `server_conn: None` for every client-sent flow, so no host on main can
+/// report a peer and the old gate turned all five checks Inconclusive.
+#[tokio::test]
+async fn a_host_without_a_baseline_peer_address_dials_by_name() {
+    for (id, units) in [
+        ("h2-settings-observe", 1u32),
+        ("h2-pseudo-header-validation", 3),
+        ("h2-header-crlf-tolerance", 2),
+        ("h2-cl-te-downgrade-indicator", 2),
+        ("h2-rapid-reset-mitigation", 8),
+    ] {
+        let runner = FakeRunner::scripted(|plan| match &plan.mode {
+            RawH2Mode::SettingsOnly => Ok(obs(vec![])),
+            _ => Ok(resets(plan.streams as usize)),
+        });
+        let check = check_named(&runner, id);
+        // Twenty units: one for the baseline, the rest for the probe.
+        let host = h2host().with_budget(20).without_a_peer();
+
+        let v = run(&check, &host).await;
+
+        assert_eq!(runner.calls(), 1, "{id}: the probe was sent");
+        assert_eq!(
+            runner.only_plan().target.addr,
+            None,
+            "{id}: the driver resolves the name and gates what it resolves"
+        );
+        assert_eq!(
+            host.charges(),
+            vec![units],
+            "{id}: the charge still happened"
+        );
+        assert_eq!(host.baseline_calls(), 1, "{id}: the baseline was taken");
+        assert_ne!(v.outcome, Outcome::Inconclusive, "{id}: {}", v.detail);
+        assert!(
+            v.detail
+                .ends_with(" (dialled by name: the host reported no baseline peer address)"),
+            "{id}: {}",
+            v.detail
+        );
+    }
+}
+
+/// The note describes a dial, so only a verdict the probe actually produced
+/// carries it (the coder's reading of the amendment, pinned here): a
+/// peer-less host whose budget refuses the streams is still refused in that
+/// gate's own plain words, with nothing dialled and nothing to describe.
+#[tokio::test]
+async fn a_gate_that_sends_nothing_claims_no_dial_by_name() {
+    let runner = FakeRunner::answering(resets(3));
+    let check = check_named(&runner, "h2-pseudo-header-validation");
+    let host = h2host().with_budget(1).without_a_peer();
+
+    let v = run(&check, &host).await;
+
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert_eq!(v.detail, "budget refused the raw probe");
+    assert_eq!(runner.calls(), 0);
+}
+
+/// T3-7: every one of the five hands the driver the baseline's own address,
+/// so the dial cannot land anywhere else. There is nothing for the driver to
+/// re-resolve and so nothing that could differ from what the baseline
+/// reported: the "refuses when the address differs" half of the acceptance
+/// criterion holds by construction, and the driver refuses an address on
+/// another port outright (`aitm_proto_http::raw_h2`).
+#[tokio::test]
+async fn every_h2_check_dials_the_address_the_baseline_came_from() {
+    for id in ALL_IDS {
+        let runner = FakeRunner::scripted(|plan| match &plan.mode {
+            RawH2Mode::SettingsOnly => Ok(obs(vec![])),
+            _ => Ok(resets(plan.streams as usize)),
+        });
+        let check = check_named(&runner, id);
+
+        run(&check, &h2host()).await;
+
+        let plan = runner.only_plan();
+        assert_eq!(
+            plan.target,
+            RawH2Target {
+                scheme: "https".to_string(),
+                authority: "origin.test".to_string(),
+                addr: Some("203.0.113.7:443".parse().expect("a literal address")),
+            },
+            "{id}"
+        );
+    }
+}
+
+/// The charge is what refuses a connection the job could not have paid for:
+/// the budget left after the baseline must cover the streams the plan will
+/// open. A three-stream check on a job with one unit of budget sends nothing.
 #[tokio::test]
 async fn a_budget_that_cannot_cover_the_streams_opens_no_raw_connection() {
     let runner = FakeRunner::answering(resets(3));
@@ -849,7 +1164,7 @@ async fn a_budget_that_cannot_cover_the_streams_opens_no_raw_connection() {
     let v = run(&check, &host).await;
 
     assert_eq!(v.outcome, Outcome::Inconclusive);
-    assert_eq!(v.detail, "budget too low for the raw probe");
+    assert_eq!(v.detail, "budget refused the raw probe");
     assert_eq!(runner.calls(), 0);
     // The authority was not claimed, so a job with budget can still probe it.
     let allowed = run(&check, &h2host().with_budget(8)).await;
@@ -857,12 +1172,11 @@ async fn a_budget_that_cannot_cover_the_streams_opens_no_raw_connection() {
     assert_eq!(runner.calls(), 1);
 }
 
-/// What the raw probe does *not* do: spend the host's budget. Nine units are
-/// one for the baseline and eight the eight-stream probe must be able to
-/// cover; after the probe, eight are still there, because nothing charged for
-/// the streams it opened.
+/// What the raw probe does spend (T3-6): nine units are one for the baseline
+/// and eight for the eight streams the probe opens, and after the probe
+/// nothing is left — the connection is budgeted, not free.
 #[tokio::test]
-async fn the_raw_probe_does_not_spend_the_hosts_budget() {
+async fn the_raw_probe_spends_one_unit_of_the_hosts_budget_per_stream() {
     let runner = FakeRunner::answering(resets(8));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
     let host = h2host().with_budget(9);
@@ -871,7 +1185,12 @@ async fn the_raw_probe_does_not_spend_the_hosts_budget() {
 
     assert_eq!(v.outcome, Outcome::Vulnerable);
     assert_eq!(runner.calls(), 1);
-    assert_eq!(host.budget_left(), 8, "only the baseline was charged");
+    assert_eq!(host.charges(), vec![8]);
+    assert_eq!(
+        host.budget_left(),
+        0,
+        "the baseline took one and the eight streams the other eight"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -900,7 +1219,7 @@ async fn the_target_is_derived_from_the_point_url() {
     for (url, scheme, authority, path) in cases {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
-        let host = ScriptedHost::new().with_origins(&[
+        let host = h2host_for(&[
             "https://origin.test",
             "https://origin.test:8443",
             "http://origin.test",
@@ -982,7 +1301,7 @@ async fn a_point_outside_the_profile_origins_is_never_dialled() {
     for id in ALL_IDS {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, id);
-        let host = ScriptedHost::new().with_origins(&["https://origin.test"]);
+        let host = h2host_for(&["https://origin.test"]);
 
         let v = check
             .run(
@@ -1003,7 +1322,7 @@ async fn a_point_outside_the_profile_origins_is_never_dialled() {
 async fn an_empty_profile_origin_list_authorises_no_raw_probe() {
     let runner = FakeRunner::answering(resets(8));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
-    let host = ScriptedHost::new();
+    let host = H2Host::over(ScriptedHost::new());
 
     let v = run(&check, &host).await;
 
@@ -1026,7 +1345,7 @@ async fn the_origin_gate_is_per_scheme_and_per_port() {
     ] {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
-        let host = ScriptedHost::new().with_origins(&[origin]);
+        let host = h2host_for(&[origin]);
 
         let v = check
             .run(&point(InsertionKind::Query, "q", url), &host)
@@ -1051,13 +1370,13 @@ async fn the_default_port_is_the_same_origin_and_the_same_guard_claim() {
     let first = check
         .run(
             &point(InsertionKind::Query, "q", "https://origin.test/a"),
-            &ScriptedHost::new().with_origins(&["https://origin.test"]),
+            &h2host_for(&["https://origin.test"]),
         )
         .await;
     let second = check
         .run(
             &point(InsertionKind::Query, "q", "https://ORIGIN.test:443/b"),
-            &ScriptedHost::new().with_origins(&["https://origin.test"]),
+            &h2host_for(&["https://origin.test"]),
         )
         .await;
 
@@ -1080,7 +1399,7 @@ async fn a_profile_origin_matches_a_point_however_the_default_port_is_written() 
     ] {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
-        let host = ScriptedHost::new().with_origins(&[origin]);
+        let host = h2host_for(&[origin]);
 
         let v = check
             .run(&point(InsertionKind::Query, "q", url), &host)
@@ -1211,6 +1530,7 @@ async fn the_real_runner_refuses_session_material_before_dialling() {
         target: RawH2Target {
             scheme: "https".to_string(),
             authority: "origin.test".to_string(),
+            addr: None,
         },
         headers: vec![h(":method", "GET"), h("cookie", "sid=1")],
         mode: RawH2Mode::SingleRequest,
@@ -1340,6 +1660,7 @@ async fn every_dialled_authority_is_a_profile_origin_whatever_the_point_url_look
             dialled_origin(&RawH2Target {
                 scheme,
                 authority: authority.to_string(),
+                addr: None,
             })
         })
         .collect();
@@ -1380,7 +1701,7 @@ async fn every_dialled_authority_is_a_profile_origin_whatever_the_point_url_look
     for url in urls {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
-        let host = ScriptedHost::new().with_origins(&profile);
+        let host = h2host_for(&profile);
 
         let v = check
             .run(&point(InsertionKind::Query, "q", url), &host)
@@ -1475,7 +1796,7 @@ async fn a_profile_origin_is_read_however_the_operator_wrote_it() {
     ] {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
-        let host = ScriptedHost::new().with_origins(&[origin]);
+        let host = h2host_for(&[origin]);
 
         let v = check
             .run(&point(InsertionKind::Query, "q", url), &host)
@@ -1516,7 +1837,7 @@ async fn a_profile_entry_that_names_no_origin_authorises_nothing() {
     ] {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
-        let host = ScriptedHost::new().with_origins(&origins);
+        let host = h2host_for(&origins);
 
         let v = run(&check, &host).await;
 
@@ -1530,13 +1851,13 @@ async fn a_profile_entry_that_names_no_origin_authorises_nothing() {
     }
 }
 
-/// The budget pre-check at its exact boundary, for every check: after the
-/// baseline has spent one unit, `max(1, streams)` units must remain. One
-/// short refuses with nothing opened and the authority unclaimed; exactly
-/// enough runs. This is what pins `max(1, ..)` for the zero-stream settings
-/// probe and the `<` of the comparison.
+/// The charge at its exact boundary, for every check: after the baseline has
+/// spent one unit, `max(1, streams)` units must remain for `charge` to
+/// accept. One short refuses with nothing opened and the authority
+/// unclaimed; exactly enough runs and leaves nothing. This is what pins
+/// `max(1, ..)` for the zero-stream settings probe.
 #[tokio::test]
-async fn the_budget_precheck_is_exact_for_every_stream_count() {
+async fn the_budget_charge_is_exact_for_every_stream_count() {
     for (id, streams) in [
         ("h2-settings-observe", 0u32),
         ("h2-pseudo-header-validation", 3),
@@ -1555,23 +1876,25 @@ async fn the_budget_precheck_is_exact_for_every_stream_count() {
         let short = h2host().with_budget(need);
         let v = run(&check, &short).await;
         assert_eq!(v.outcome, Outcome::Inconclusive, "{id} with {} units", need);
-        assert_eq!(v.detail, "budget too low for the raw probe", "{id}");
+        assert_eq!(v.detail, "budget refused the raw probe", "{id}");
         assert_eq!(
             short.baseline_calls(),
             1,
             "{id}: the baseline was taken first"
         );
+        assert_eq!(short.charges(), vec![need], "{id}");
         assert_eq!(runner.calls(), 0, "{id} dialled on a short budget");
 
-        // Exactly enough: the probe runs and charges nothing itself.
+        // Exactly enough: the probe runs and spends the rest.
         let enough = h2host().with_budget(1 + need);
         let v = run(&check, &enough).await;
         assert_ne!(v.outcome, Outcome::Inconclusive, "{id}: {}", v.detail);
         assert_eq!(runner.calls(), 1, "{id}");
+        assert_eq!(enough.charges(), vec![need], "{id}");
         assert_eq!(
             enough.budget_left(),
-            need,
-            "{id}: only the baseline was charged"
+            0,
+            "{id}: the baseline and the streams spent it all"
         );
     }
 }

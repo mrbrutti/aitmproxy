@@ -8,6 +8,14 @@
 //! The catalogue's own test in `aitm-plugin-rhai` compiles the scripts and runs
 //! the passive hooks; it never ran `load(reg)`, which is where a closure that
 //! captures a top-level constant, or an absent optional namespace, fails.
+//!
+//! Since the v2 switchover (T3 plan Task 11) an `active/` script registers a
+//! **check**, not a command: `load(reg)` calls `reg.add_check`, the check lands
+//! in the tier's catalogue (`tier.checks`), and the only commands left in the
+//! `Registry` are the three `l4.*` verbs. The per-check `check.<id>` verbs, and
+//! the native `check.xss-reflected` / `check.open-redirect` ones, are built by
+//! the scanner plugin from that catalogue — a wiring this test does not load,
+//! which is why no `check.*` name appears in `EXPECTED_COMMANDS`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -26,28 +34,32 @@ use aitm_proto_l4::flow::InMemoryL4FlowStore;
 use aitm_proto_l4::guard::L4Guard;
 use aitm_proto_l4::L4Language;
 
-/// Every command the `active/` and `l4/` scripts register in `load(reg)`. A
+/// Every command the catalogue's scripts register in `load(reg)`. Only the
+/// `l4/` scripts register one: an `active/` script declares a check instead. A
 /// script whose `load` fails installs nothing, so a missing name here is the
 /// operator-visible symptom.
-const EXPECTED_COMMANDS: &[&str] = &[
-    "check.cmdi",
-    "check.cors",
-    "check.crlf",
-    "check.headers",
-    "check.ldapi",
-    "check.methods",
-    "check.nosqli",
-    "check.open_redirect",
-    "check.path_traversal",
-    "check.paths",
-    "check.sqli",
-    "check.ssrf",
-    "check.ssti",
-    "check.xss",
-    "check.xxe",
-    "l4.recon",
-    "l4.tcp_probe",
-    "l4.udp_probe",
+const EXPECTED_COMMANDS: &[&str] = &["l4.recon", "l4.tcp_probe", "l4.udp_probe"];
+
+/// Every check the `active/` scripts declare with `reg.add_check`, which is
+/// what the scanner schedules. `xss` and `open_redirect` are absent on purpose:
+/// their classes are owned by the native `xss-reflected` and `open-redirect`
+/// checks now, and a class is single-sourced.
+const EXPECTED_CHECKS: &[&str] = &[
+    "cmdi",
+    "cors",
+    "crlf",
+    "header-reflection",
+    "headers",
+    "ldapi",
+    "methods",
+    "nosqli",
+    "nosqli-json",
+    "path_traversal",
+    "paths",
+    "sqli",
+    "ssrf",
+    "ssti",
+    "xxe",
 ];
 
 fn catalogue_dir() -> PathBuf {
@@ -145,6 +157,21 @@ fn assert_catalogue_loaded(tier: &ScriptTier, registry: &Registry, failures: &[S
         "missing from the registry: {:?}; registered but not in EXPECTED_COMMANDS: {:?}",
         expected.difference(&registered).collect::<Vec<_>>(),
         registered.difference(&expected).collect::<Vec<_>>()
+    );
+
+    let declared: BTreeSet<String> = tier
+        .checks
+        .snapshot()
+        .iter()
+        .map(|check| check.meta().id.clone())
+        .collect();
+    let wanted: BTreeSet<String> = EXPECTED_CHECKS.iter().map(|id| (*id).to_string()).collect();
+    assert_eq!(
+        declared,
+        wanted,
+        "missing from the catalogue: {:?}; declared but not in EXPECTED_CHECKS: {:?}",
+        wanted.difference(&declared).collect::<Vec<_>>(),
+        declared.difference(&wanted).collect::<Vec<_>>()
     );
 }
 

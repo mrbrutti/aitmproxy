@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
 
+use crate::text::fit;
 use crate::theme::Theme;
-use crate::ui::text::fit;
 
 /// Lines per side the diff looks at (the viewers' page size).
 pub const MAX_DIFF_LINES: usize = crate::viewers::MAX_VIEWER_LINES;

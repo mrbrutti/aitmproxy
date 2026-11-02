@@ -12,7 +12,7 @@ What it proves, Vulnerable (V) next to Patched (P), both booted with `--l4`:
     negotiates `1.1`, the h1-only listener negotiates `1.1` under `--http2`; the
     control log then holds `tls_handshake` entries with those ALPNs and `request`
     entries with `version` h2/h1 and `conn_req_index == 1`
-  - one seed per D3 class, then EVERY remaining D3 row (the `SEEDS` table, 20 rows
+  - one seed per D3 class, then EVERY remaining D3 row (the `SEEDS` table, 21 rows
     plus the stored-XSS round trip), answers on V with the row's literal signal
     and on P with the row's patched answer; the timing rows (`SLEEP(2)`,
     `;sleep 2`) take >= 2 s on V and < 1 s on P
@@ -525,6 +525,11 @@ SEEDS = (
     ("cmdi ;sleep 2", "GET", "/ping?host=" + Q("localhost;sleep 2"), None, None,
      lambda st, h, t, dt: st == 200 and dt >= 2.0,
      lambda st, h, t, dt: st == 400 and dt < 1.0),
+    # The bundled Rhai cmdi check's probe shape: a split marker only execution
+    # reassembles (amendment 64). The raw `echo AAA` must not appear in V's body.
+    ("cmdi ;echo marker", "GET", "/ping?host=" + Q("localhost;echo AAABBB"), None, None,
+     lambda st, h, t, dt: st == 200 and "\nAAABBB</pre>" in t and "echo AAA" not in t,
+     lambda st, h, t, dt: st == 400 and t == "invalid host"),
     ("xxe", "POST", "/xml", {"content-type": "text/xml"}, XXE_BODY,
      lambda st, h, t, dt: st == 200 and TRAVERSAL_MARKER in t,
      lambda st, h, t, dt: st == 400 and t == "DTD not allowed"),
