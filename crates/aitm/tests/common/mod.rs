@@ -1,8 +1,11 @@
 //! Scaffolding shared by the source-scan pins (`no_bypass.rs`,
-//! `no_stdout_tracing.rs`, `scan_tail_rule.rs`; quality Q5): the workspace
-//! walk, the production-line rule and the `Hit` they report. Cargo's shared
-//! test-helper convention: each pin declares `mod common;`, and because every
-//! binary uses a different subset, `dead_code` is allowed here.
+//! `no_stdout_tracing.rs`; quality Q5): the workspace walk, the
+//! production-line rule and the `Hit` they report. Cargo's shared test-helper
+//! convention: each pin declares `mod common;`, and because every binary uses
+//! a different subset, `dead_code` is allowed here.
+//!
+//! Boundary (quality Q19): `common` is textual source scans of the tree only;
+//! proxy assembly, CA directories and service helpers live in `support/mod.rs`.
 //!
 //! The scan is deliberately textual — `std::fs::read_dir` and `str::lines`,
 //! no `syn`, no `walkdir` — so the pins stay dependency-free and a reader can

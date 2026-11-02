@@ -35,7 +35,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use crate::startup::args::TermOpts;
+use crate::startup::args::{rust_log_active, TermOpts};
 use crate::startup::errors::StartupError;
 use crate::tui::{TuiLog, LOG_PATH_ENV};
 
@@ -103,17 +103,9 @@ pub fn build_env_filter(rust_log: Option<String>) -> EnvFilter {
     }
 }
 
-/// The one definition of "`RUST_LOG` is active" (quality Q2, tester F4):
-/// the value is set and non-empty after trimming, the way
-/// [`build_env_filter`] has always read it. Every consumer — the file
-/// directive, the raw stderr stream ([`raw_stream`]) and the caps'
-/// animation switch (`TermOpts::caps_from_parts`) — reads it through here,
-/// so `RUST_LOG=" "` is inactive everywhere at once.
-pub fn rust_log_active(value: Option<&str>) -> bool {
-    value.is_some_and(|v| !v.trim().is_empty())
-}
-
-/// The `RUST_LOG` value when [`rust_log_active`], else `None`.
+/// The `RUST_LOG` value when [`rust_log_active`] (the one predicate, shared
+/// with `args.rs`, which `log.rs` imports rather than the reverse; quality
+/// Q2, tester F4, Q17), else `None`.
 fn rust_log_set(rust_log: Option<&str>) -> Option<&str> {
     rust_log.filter(|v| rust_log_active(Some(v)))
 }
@@ -748,20 +740,11 @@ mod tests {
         assert!(!raw_stream(&opts(Verbosity::Quiet), None, false));
     }
 
-    /// Quality Q2 / tester F4: the one predicate every consumer reads.
-    /// Unset, empty and blank are inactive; anything with a non-space
-    /// character is active, however it is padded; `raw_stream` and the file
-    /// directive agree with it on the blank value.
+    /// Quality Q2 / tester F4: `raw_stream` and the file directive read
+    /// `RUST_LOG` through `args::rust_log_active` (its own table is beside
+    /// it, in `args.rs`; Q17), so they agree with it on a blank value.
     #[test]
-    fn rust_log_active_is_trimmed_non_empty() {
-        assert!(!rust_log_active(None));
-        assert!(!rust_log_active(Some("")));
-        assert!(!rust_log_active(Some(" ")));
-        assert!(!rust_log_active(Some("\t\n")));
-        assert!(rust_log_active(Some("info")));
-        assert!(rust_log_active(Some(" warn ")));
-        assert!(rust_log_active(Some("x")));
-
+    fn raw_stream_and_file_directive_read_rust_log_through_the_one_predicate() {
         assert!(!raw_stream(&opts(Verbosity::Normal), Some(" "), false));
         assert_eq!(
             file_directive(Some(" "), Verbosity::Normal),

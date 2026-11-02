@@ -10,11 +10,12 @@
 //! parser unchanged (AC-W1-12). Finally [`TermOpts::detect_caps`] turns the
 //! flags and the environment into the [`Caps`] the reporter draws with, with
 //! animation off whenever the raw tracing stream is on (`-v`, `-vv`,
-//! `RUST_LOG`; spec D2 rule 5, AC-W1-20).
+//! `RUST_LOG`; spec D2 rule 5, AC-W1-20). [`rust_log_active`] is the one
+//! definition of "`RUST_LOG` is on" that this module and `log.rs` share; it
+//! lives here because `log.rs` already imports [`TermOpts`] from this module
+//! (quality Q17: no import cycle between the two).
 
 use aitm_term::caps::{Caps, ColorChoice, Verbosity};
-
-use crate::startup::log::rust_log_active;
 
 /// The terminal flags every invocation accepts before its mode word
 /// (spec D9). `Default` is the bare invocation: normal verbosity, `--color
@@ -64,15 +65,49 @@ impl TermOpts {
     }
 }
 
+/// The one definition of "`RUST_LOG` is active" (quality Q2, tester F4):
+/// the value is set and non-empty after trimming, the way the file directive
+/// has always read it. Every consumer — the caps' animation switch
+/// ([`TermOpts::caps_from_parts`]), the raw stderr stream and the file
+/// directive in `log.rs` — reads it through here, so `RUST_LOG=" "` is
+/// inactive everywhere at once.
+pub(crate) fn rust_log_active(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty())
+}
+
 /// The flags whose value is the next token; the scan steps over the value so
 /// `--config -v` (a file literally named `-v`) is never read as a flag and a
 /// `-v` after the value still is (plan C26).
 const VALUED_FLAGS: &[&str] = &["--config", "--script", "--bus-endpoint-file"];
 
-/// The value-less terminal flags [`split_term_args`] strips, which
-/// [`pre_boot`] steps over before matching the alias (tester F3). `--color`
-/// is the one valued terminal flag and is handled beside `--config`.
-const TERM_SWITCHES: &[&str] = &["-v", "-vv", "--verbose", "-q", "--quiet"];
+/// What one value-less terminal switch does to the parsed [`TermOpts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Switch {
+    /// Raise the verbosity this many levels (capped at `Debug`).
+    Verbose(u8),
+    /// `-q`: errors only.
+    Quiet,
+}
+
+/// The value-less terminal flags and their effect: the ONE list
+/// [`split_term_args`] strips and [`pre_boot`] steps over before matching
+/// the alias (tester F3, quality Q18). `--color` is the one valued terminal
+/// flag and is handled beside `--config`.
+const TERM_SWITCHES: &[(&str, Switch)] = &[
+    ("-v", Switch::Verbose(1)),
+    ("-vv", Switch::Verbose(2)),
+    ("--verbose", Switch::Verbose(1)),
+    ("-q", Switch::Quiet),
+    ("--quiet", Switch::Quiet),
+];
+
+/// The switch `token` spells, if it is one of [`TERM_SWITCHES`].
+fn term_switch(token: &str) -> Option<Switch> {
+    TERM_SWITCHES
+        .iter()
+        .find(|(flag, _)| *flag == token)
+        .map(|(_, switch)| *switch)
+}
 
 /// Strip the terminal flags from the raw argv (spec D9; plan C26).
 ///
@@ -102,10 +137,18 @@ pub fn split_term_args(argv: Vec<String>) -> Result<(TermOpts, Vec<String>), Str
             color = parse_color(value)?;
             continue;
         }
+        match term_switch(&token) {
+            Some(Switch::Verbose(levels)) => {
+                verbose = verbose.saturating_add(levels);
+                continue;
+            }
+            Some(Switch::Quiet) => {
+                quiet = true;
+                continue;
+            }
+            None => {}
+        }
         match token.as_str() {
-            "-v" | "--verbose" => verbose = verbose.saturating_add(1),
-            "-vv" => verbose = verbose.saturating_add(2),
-            "-q" | "--quiet" => quiet = true,
             "--color" => {
                 let value = tokens
                     .next()
@@ -175,7 +218,7 @@ pub fn pre_boot(argv: &[String]) -> Option<PreBoot> {
         if token.starts_with("--config=") || token.starts_with("--color=") {
             continue;
         }
-        if TERM_SWITCHES.contains(&token.as_str()) {
+        if term_switch(token).is_some() {
             continue;
         }
         break token;
@@ -412,7 +455,7 @@ mod tests {
             "an empty RUST_LOG is not active"
         );
         // Quality Q2 / tester F4: one definition of "RUST_LOG is active"
-        // (`startup::log::rust_log_active`, trimmed and non-empty), so a
+        // (`rust_log_active`, trimmed and non-empty), so a
         // blank value does not switch the raw stream on for the caps while
         // `raw_stream` leaves it off.
         let blank_rust_log = env_of(&[
@@ -748,5 +791,65 @@ mod tests {
         let caps = TermOpts::default().caps_from_parts(true, Some(100), &ci);
         assert!(caps.ci, "CI present with an empty value counts (plan C22)");
         assert!(!caps.animate, "CI on a TTY: plain lines");
+    }
+
+    /// Quality Q17: `log.rs` imports `TermOpts` from this module, so this
+    /// module never imports from `log.rs` (the "is `RUST_LOG` active"
+    /// predicate lives here, with the flags it belongs beside); a reverse
+    /// import is a cycle between the two startup leaves.
+    #[test]
+    fn args_never_imports_from_the_log_module() {
+        let offenders: Vec<&str> = include_str!("args.rs")
+            .lines()
+            .filter(|line| line.trim_start().starts_with("use crate::startup::log"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "args.rs imports from log.rs (log.rs imports TermOpts from args.rs): {offenders:?}"
+        );
+    }
+
+    /// Quality Q2 / tester F4 / Q17: the one predicate every consumer reads
+    /// (`caps_from_parts` here, `raw_stream` and the file directive in
+    /// `log.rs`). Unset, empty and blank are inactive; anything with a
+    /// non-space character is active, however it is padded.
+    #[test]
+    fn rust_log_active_is_trimmed_non_empty() {
+        assert!(!rust_log_active(None));
+        assert!(!rust_log_active(Some("")));
+        assert!(!rust_log_active(Some(" ")));
+        assert!(!rust_log_active(Some("\t\n")));
+        assert!(rust_log_active(Some("info")));
+        assert!(rust_log_active(Some(" warn ")));
+        assert!(rust_log_active(Some("x")));
+    }
+
+    /// Quality Q18: `TERM_SWITCHES` is the ONE list of value-less terminal
+    /// switches; `split_term_args` strips every entry (and each one changes
+    /// the parsed opts) and `pre_boot` steps over every entry, so a switch
+    /// added to the table is honoured by both scans at once.
+    #[test]
+    fn every_term_switch_is_stripped_by_split_term_args_and_stepped_over_by_pre_boot() {
+        assert_eq!(TERM_SWITCHES.len(), 5, "-v, -vv, --verbose, -q, --quiet");
+        for &(flag, switch) in TERM_SWITCHES {
+            let (parsed, rest) =
+                split(&[flag, "scope", "list"]).unwrap_or_else(|err| panic!("{flag}: {err}"));
+            assert_eq!(
+                rest,
+                argv(&["scope", "list"]),
+                "{flag} was left in the argv"
+            );
+            let expected = match switch {
+                Switch::Verbose(1) => Verbosity::Verbose,
+                Switch::Verbose(_) => Verbosity::Debug,
+                Switch::Quiet => Verbosity::Quiet,
+            };
+            assert_eq!(parsed, opts(expected, ColorChoice::Auto), "{flag}");
+            assert_eq!(
+                pre_boot(&argv(&[flag, "--version"])),
+                Some(PreBoot::Version),
+                "{flag} was not stepped over"
+            );
+        }
     }
 }
