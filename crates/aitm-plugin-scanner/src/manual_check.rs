@@ -508,7 +508,11 @@ mod tests {
     impl Harness {
         fn new() -> Self {
             let cfg = ScannerConfig::default();
-            let plugin = ScannerPlugin::new(cfg.clone());
+            // The native slot holds the lane's two legacy active checks, standing
+            // in for the T3 natives the binary puts there (PR 2a), so
+            // `check.xss-reflected` exists to drive these tests with.
+            let plugin = ScannerPlugin::new(cfg.clone())
+                .with_native_checks(crate::interim_lane::legacy_active_checks());
             let late = plugin.late();
             let mut reg = Registry::new();
             reg.add_plugin(Box::new(plugin));
@@ -673,7 +677,10 @@ mod tests {
 
         let mut reg = Registry::new();
         reg.add_command(Arc::new(Squatter));
-        reg.add_plugin(Box::new(ScannerPlugin::new(ScannerConfig::default())));
+        reg.add_plugin(Box::new(
+            ScannerPlugin::new(ScannerConfig::default())
+                .with_native_checks(crate::interim_lane::legacy_active_checks()),
+        ));
 
         assert_eq!(
             reg.command("check.xss-reflected")
