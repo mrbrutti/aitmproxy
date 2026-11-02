@@ -25,7 +25,7 @@ import Testing
     /// A model that has read `scan.list.json`, so it knows `scan-1a2b3c4d` and `scan-55667788`.
     static func listed() throws -> ScanSurfaceModel {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: load("scan.list.json")))
         return model
     }
 
@@ -158,7 +158,7 @@ import Testing
 
     @Test func aProgressLineIsATriggerNotAValue() throws {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
         let before = model.jobs
 
@@ -363,12 +363,12 @@ import Testing
 
     @Test func sidebarCountIsRunningJobsElseOpenIssues() throws {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.runningJobs.map(\.job) == ["scan-1a2b3c4d"])
         #expect(model.sidebarCount == 1)
 
         let finished = ScanPack.edited(try Self.load("scan.list.json"), path: ["jobs", "0", "state"], to: "done")
-        model.applyList(try ScanListResult(json: finished), now: 0)
+        model.applyList(try ScanListResult(json: finished))
         #expect(model.runningJobs.isEmpty)
         #expect(model.sidebarCount == 0)
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
@@ -380,7 +380,7 @@ import Testing
         var model = ScanSurfaceModel()
         #expect(model.tabTitle(.jobs) == "Jobs")
         #expect(model.tabTitle(.issues) == "Issues")
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
         #expect(model.tabTitle(.jobs) == "Jobs 2")
         #expect(model.tabTitle(.issues) == "Issues 2")
@@ -474,7 +474,7 @@ import Testing
 
         // Jobs view spec D3: the list selects its newest job when nothing is selected,
         // so the walk starts from `scan-1a2b3c4d`, not from no selection.
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.selectedJob == "scan-1a2b3c4d")
         model.moveSelection(in: .jobs, by: 1)
         #expect(model.selectedJob == "scan-55667788")
@@ -716,7 +716,7 @@ extension ScanSurfaceTests {
 
     @Test func pushLinesForUnknownJobsAndIssueLinesWithoutAnIssueStillTrigger() throws {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
         let before = model
 
@@ -852,7 +852,7 @@ extension ScanSurfaceTests {
         #expect(Set(model.launchNotices.keys) == ["scan-local"])
 
         // The list carries scan-1a2b3c4d and scan-55667788 but not scan-elsewhere; scan-local waits.
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
         #expect(Set(model.statuses.keys) == ["scan-1a2b3c4d", "scan-local"])
         #expect(Set(model.lastSeq.keys) == ["scan-1a2b3c4d"])
@@ -861,7 +861,7 @@ extension ScanSurfaceTests {
         #expect(model.locallyStarted == ["scan-local"])
 
         // An empty list keeps only what this app started.
-        model.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        model.applyList(try ScanListResult(json: ["jobs": []]))
         #expect(model.jobs.map(\.job) == ["scan-local"])
         #expect(Set(model.statuses.keys) == ["scan-local"])
         #expect(model.lastSeq.isEmpty)
@@ -873,10 +873,10 @@ extension ScanSurfaceTests {
         var jobs = try #require(listed["jobs"]?.arrayValue)
         jobs.append(ScanPack.edited(jobs[1], path: ["job"], to: "scan-local"))
         listed = ScanPack.edited(listed, path: ["jobs"], to: .array(jobs))
-        model.applyList(try ScanListResult(json: listed), now: 0)
+        model.applyList(try ScanListResult(json: listed))
         #expect(model.locallyStarted.isEmpty)
         #expect(Set(model.statuses.keys) == ["scan-local"])
-        model.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        model.applyList(try ScanListResult(json: ["jobs": []]))
         #expect(model.jobs.isEmpty)
         #expect(model.statuses.isEmpty)
         #expect(model.launchNotices.isEmpty)
@@ -1302,13 +1302,13 @@ extension ScanSurfaceTests {
     @Test func aJobTheCoreStopsListingIsDropped() throws {
         var started = ScanSurfaceModel()
         started.applyStart(try ScanStartResult(json: Self.load("scan.start.json")))
-        started.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        started.applyList(try ScanListResult(json: ["jobs": []]))
         #expect(started.jobs.map(\.job) == ["scan-1a2b3c4d"], "a job this app started stays until the list carries it")
 
         var listed = ScanSurfaceModel()
-        listed.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        listed.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(listed.jobs.count == 2)
-        listed.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        listed.applyList(try ScanListResult(json: ["jobs": []]))
         #expect(listed.jobs.isEmpty, "scan.list is the truth for a job it carried before")
     }
 
@@ -1349,7 +1349,7 @@ extension ScanSurfaceTests {
         start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
         model.applyStart(try ScanStartResult(json: start))
         model.noteReadFailure(text: "old", now: 0)
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
         #expect(model.jobsError == nil)
         #expect(model.selectedJob == "scan-local")
@@ -1359,14 +1359,14 @@ extension ScanSurfaceTests {
         var jobs = try #require(listed["jobs"]?.arrayValue)
         jobs.append(ScanPack.edited(jobs[1], path: ["job"], to: "scan-local"))
         listed = ScanPack.edited(listed, path: ["jobs"], to: .array(jobs))
-        model.applyList(try ScanListResult(json: listed), now: 0)
+        model.applyList(try ScanListResult(json: listed))
         #expect(model.jobs.map(\.job) == ["scan-1a2b3c4d", "scan-55667788", "scan-local"])
         #expect(model.jobs[2].state == .done)
         #expect(model.statuses["scan-local"]?.state == .queued, "the start's status stays until scan.status replaces it")
 
         // applyStatus replaces the matching row and only that row; a stranger is stored without a row.
         var statusModel = ScanSurfaceModel()
-        statusModel.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        statusModel.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         let status = try ScanJobStatus(json: ScanPack.edited(Self.load("scan.status.json"), path: ["probes", "sent"], to: 777))
         statusModel.applyStatus(status)
         #expect(statusModel.jobs[0].probes.sent == 777)
@@ -1664,7 +1664,7 @@ extension ScanSurfaceTests {
         var model = ScanSurfaceModel()
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == nil, "nothing to seed from")
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == "scan-1a2b3c4d")
         model.seedSitemapJobIfNeeded()
@@ -1678,7 +1678,7 @@ extension ScanSurfaceTests {
         // A chosen job is never overridden.
         var chosen = ScanSurfaceModel()
         chosen.sitemapJob = "scan-55667788"
-        chosen.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        chosen.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         chosen.seedSitemapJobIfNeeded()
         #expect(chosen.sitemapJob == "scan-55667788")
 
@@ -1828,7 +1828,7 @@ extension ScanSurfaceTests {
         model.clearRefreshFlags()
 
         // The list omits the stranger: its tables go, the listed job's stay.
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.statuses["scan-elsewhere"] == nil)
         #expect(model.lastSeq["scan-elsewhere"] == nil)
         #expect(model.statuses["scan-1a2b3c4d"]?.probes.sent == 418)
@@ -1864,7 +1864,7 @@ extension ScanSurfaceTests {
         #expect(acceptedLocal)
         #expect(model.lastSeq["scan-local"] == 3)
         model.clearRefreshFlags()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
         #expect(model.statuses["scan-local"]?.state == .queued)
         #expect(model.launchNotices["scan-local"]
@@ -1877,7 +1877,7 @@ extension ScanSurfaceTests {
 
         // The same list twice changes nothing.
         var twice = model
-        twice.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        twice.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(twice == model)
 
         // A stranger's issue or terminal line is a list request only: the issues flag is not raised for it.
@@ -1926,7 +1926,7 @@ extension ScanSurfaceTests {
 
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
         model.applyIssue(try ScanIssue(json: Self.load("scan.issue.json")))
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
         model.applyProfiles(try ScanProfileListResult(json: Self.load("scan.profile.list.json")))
         model.applyProfile(try Self.standardProfile())
@@ -1991,19 +1991,19 @@ extension ScanSurfaceTests {
         #expect(model.jobs.first?.job == "scan-new")
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == nil, "All jobs stands after the first seed")
-        model.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        model.applyList(try ScanListResult(json: ["jobs": []]))
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == nil)
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == nil)
 
         // A chosen job survives the list dropping and re-adding jobs.
         model.sitemapJob = "scan-55667788"
-        model.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        model.applyList(try ScanListResult(json: ["jobs": []]))
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == "scan-55667788")
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == "scan-55667788")
 
@@ -2012,7 +2012,7 @@ extension ScanSurfaceTests {
         early.sitemapJob = nil
         early.seedSitemapJobIfNeeded()
         #expect(early.sitemapJob == nil)
-        early.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        early.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         early.seedSitemapJobIfNeeded()
         #expect(early.sitemapJob == "scan-1a2b3c4d")
 
@@ -2021,7 +2021,7 @@ extension ScanSurfaceTests {
         let list = try Self.load("scan.list.json")
         let rows = try #require(list["jobs"]?.arrayValue)
         let reversed = ScanPack.edited(list, path: ["jobs"], to: .array(Array(rows.reversed())))
-        doneFirst.applyList(try ScanListResult(json: reversed), now: 0)
+        doneFirst.applyList(try ScanListResult(json: reversed))
         doneFirst.seedSitemapJobIfNeeded()
         #expect(doneFirst.sitemapJob == "scan-55667788")
     }

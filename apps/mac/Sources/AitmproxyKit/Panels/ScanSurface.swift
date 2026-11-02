@@ -702,10 +702,6 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     public var selectedJob: String?
     /// Per job: the `clamped` and `lanes.skipped` notices of its `scan.start` result.
     public var launchNotices: [String: [String]] = [:]
-    /// When the last `scan.list` landed (epoch ms, the caller's clock); nil before the first (Jobs view D6).
-    /// The freshness stamp: it changes on every list beat, so no view reads it directly; the
-    /// inline error reads the age through `ScanJobsLink.valuesAgeMs` (plan fix 1.5h).
-    public var jobsLoadedAt: Int?
     /// The last failed Jobs read (`scan.list`, `scan.status` or `scan.cancel`): its own
     /// wording and when it failed; the one stored failure fact. Set by `noteReadFailure`,
     /// cleared by the next list that lands, the proof the core answers (Jobs view D6
@@ -928,15 +924,16 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     // MARK: Mutations: jobs
 
     /// `scan.list`, newest first as delivered. A job this app started that the
-    /// list does not carry yet stays in front of it. `now` (epoch ms, the caller's
-    /// clock) stamps `jobsLoadedAt` and clears `readFailure` (Jobs view D6). The
-    /// selection follows the list (Jobs view D3): nothing selected → the newest
+    /// list does not carry yet stays in front of it. Clears `readFailure` (Jobs view
+    /// D6). The selection follows the list (Jobs view D3): nothing selected → the newest
     /// job; a selection the core dropped and this app is not waiting on → the
     /// first row; an existing selection is never replaced by a newer job.
     ///
-    /// Every write but the stamp compares first (plan fix 1.5h): the poll re-applies the
-    /// same list every 2 s, and a value that did not change is not assigned.
-    public mutating func applyList(_ result: ScanListResult, now: Int) {
+    /// Every write compares first (plan fix 1.5h): the poll re-applies the same list
+    /// every 2 s, and a value that did not change is not assigned, so an identical list
+    /// leaves the model equal (MS-R1, #308). The freshness stamp `jobsLoadedAt` therefore
+    /// lives on `ScanPanelState`, outside the published model: it moves on every beat.
+    public mutating func applyList(_ result: ScanListResult) {
         let listed = Set(result.jobs.map(\.job))
         // Only a job this app started and the core has not listed yet stays ahead of the
         // list; a job the core itself stopped listing (restart, history cap) goes with it.
@@ -955,7 +952,6 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         if launchNotices != keptNotices { launchNotices = keptNotices }
         let keptRefresh = refreshNeeded.intersection(kept)
         if refreshNeeded != keptRefresh { refreshNeeded = keptRefresh }
-        jobsLoadedAt = now
         if readFailure != nil { readFailure = nil }
         if let selected = selectedJob {
             if !jobs.contains(where: { $0.job == selected }), !locallyStarted.contains(selected) {
@@ -969,7 +965,7 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 
     /// A Jobs read (`scan.list`, `scan.status`, `scan.cancel`) that failed: `text` is the
     /// read's own wording (`Unable to list jobs: <core>` and the like), `now` the caller's
-    /// clock, the same one `applyList` stamps with. Records the one failure fact (Jobs view
+    /// clock, the same one `ScanPanelState` stamps `jobsLoadedAt` with. Records the one failure fact (Jobs view
     /// D6 amendment): `jobsError`, `readFailedAt` and `inlineJobsError(ageMs:)` all read it,
     /// and only the next list that lands clears it. The rows and their counters stay.
     /// The text carries the core's words, so it is bounded like `ScanJobStatus.error`:

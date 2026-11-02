@@ -111,7 +111,7 @@ import Testing
 
         // `facts(for:)` is the one accessor: it merges the listed row with the stored status; nil when unlisted.
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.statuses["scan-1a2b3c4d"] = try Self.status(state: .running, elapsedMs: 43_000, profile: "standard")
         let facts = try #require(model.facts(for: "scan-1a2b3c4d"))
         #expect(facts.summary.elapsedMs == 43_000)
@@ -140,21 +140,19 @@ import Testing
     @Test func applyListSelectsWhenNothingIsSelected() throws {
         var model = ScanSurfaceModel()
         #expect(model.selectedJob == nil)
-        #expect(model.jobsLoadedAt == nil)
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 1_000)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.selectedJob == "scan-1a2b3c4d")
-        #expect(model.jobsLoadedAt == 1_000)
 
         // An existing selection is never replaced by a newer job.
         var kept = ScanSurfaceModel()
         kept.selectedJob = "scan-55667788"
-        kept.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        kept.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(kept.selectedJob == "scan-55667788")
 
         // A selected job the list no longer carries, and this app is not waiting on, falls to the first row.
         var gone = ScanSurfaceModel()
         gone.selectedJob = "scan-gone"
-        gone.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        gone.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(gone.selectedJob == "scan-1a2b3c4d")
 
         // A job this app started stays selected while the list has yet to carry it.
@@ -163,12 +161,12 @@ import Testing
         start = ScanPack.edited(start, path: ["job"], to: "scan-local")
         start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
         local.applyStart(try ScanStartResult(json: start))
-        local.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        local.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(local.selectedJob == "scan-local")
 
         // An empty list leaves nothing selected and does not invent a selection.
         var empty = ScanSurfaceModel()
-        empty.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        empty.applyList(try ScanListResult(json: ["jobs": []]))
         #expect(empty.selectedJob == nil)
 
         // D6: a list failure stamps `readFailedAt` beside the error; the next list clears it.
@@ -177,17 +175,16 @@ import Testing
             text: "Unable to list jobs: the bus did not reply in time", now: 5_000)
         #expect(failed.jobsError == "Unable to list jobs: the bus did not reply in time")
         #expect(failed.readFailedAt == 5_000)
-        failed.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 7_000)
+        failed.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(failed.jobsError == nil)
         #expect(failed.readFailedAt == nil)
-        #expect(failed.jobsLoadedAt == 7_000)
     }
 
     /// AC7 (pure half): a cancelling job is never Cancel Scan's target, by the
     /// merged state; a queued or running one is.
     @Test func cancelTargetSkipsACancellingJob() throws {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.selectedJob = "scan-1a2b3c4d"
         #expect(model.cancelTarget == "scan-1a2b3c4d")
         #expect(model.mayCancel(job: "scan-1a2b3c4d") == true)
@@ -218,7 +215,7 @@ import Testing
         var rows = try #require(second["jobs"]?.arrayValue)
         rows[1] = ScanPack.edited(rows[1], path: ["state"], to: "running")
         second = ScanPack.edited(second, path: ["jobs"], to: .array(rows))
-        model.applyList(try ScanListResult(json: second), now: 0)
+        model.applyList(try ScanListResult(json: second))
         model.selectedJob = nil
         #expect(model.cancelTarget == nil)
     }
@@ -230,16 +227,14 @@ import Testing
     @Test func jobsWritesAreGuardedByChange() throws {
         var model = ScanSurfaceModel()
         let list = try ScanListResult(json: Self.load("scan.list.json"))
-        model.applyList(list, now: 1_000)
+        model.applyList(list)
         let afterFirstList = model
-        #expect(model.jobsLoadedAt == 1_000)
         #expect(model.selectedJob == "scan-1a2b3c4d")
 
-        // The same list two seconds later: only the freshness stamp moves.
-        model.applyList(list, now: 3_000)
-        var expected = afterFirstList
-        expected.jobsLoadedAt = 3_000
-        #expect(model == expected)
+        // The same list two seconds later: nothing moves (the freshness stamp lives on the
+        // state, outside the published model; MS-R1).
+        model.applyList(list)
+        #expect(model == afterFirstList)
 
         // The same status twice: equal after the second apply; a changed one is stored.
         let running = try Self.status(state: .running, elapsedMs: 43_000)
@@ -269,9 +264,8 @@ import Testing
         let beforeSelect = model
         model.select(job: "scan-1a2b3c4d")
         #expect(model == beforeSelect)
-        model.applyList(list, now: 11_000)
+        model.applyList(list)
         #expect(model.readFailure == nil)
-        #expect(model.jobsLoadedAt == 11_000)
     }
 
     /// Plan fix 1.5h: the verb gate without a clock, so the rows, the context menu and
@@ -495,7 +489,7 @@ import Testing
                 == "Unable to list jobs: the bus did not reply in time. Retrying every 2 s.")
 
         // The next list that lands clears the failure with the stamp and the error.
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 45_000)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.readFailure == nil)
         #expect(model.readFailedAt == nil)
         #expect(model.jobsError == nil)
@@ -512,7 +506,7 @@ import Testing
                 == .unanswered)
         #expect(model.inlineJobsError(ageMs: 42_000)
                 == "Unable to read job scan-1a2b3c4d: the bus did not reply in time. Showing values from 0:42 ago; retrying every 2 s.")
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 45_000)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.readFailure == nil)
         #expect(model.inlineJobsError(ageMs: 0) == nil)
 
@@ -576,7 +570,7 @@ import Testing
         // The cancel gate: an unknown merged state is never a target; a locally started job
         // the list has not carried yet is (its `scan.start` status is queued).
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         model.applyStatus(storedPaused)
         #expect(model.facts(for: "scan-1a2b3c4d")?.summary.state == .other("paused"))
         #expect(model.mayCancel(job: "scan-1a2b3c4d") == false)
@@ -598,7 +592,7 @@ import Testing
         var rows = try #require(twoJobs["jobs"]?.arrayValue)
         rows[1] = ScanPack.edited(rows[1], path: ["state"], to: "running")
         twoJobs = ScanPack.edited(twoJobs, path: ["jobs"], to: .array(rows))
-        model.applyList(try ScanListResult(json: twoJobs), now: 0)
+        model.applyList(try ScanListResult(json: twoJobs))
         model.applyStatus(try Self.status(state: .cancelling, elapsedMs: 43_000))
         model.selectedJob = "scan-1a2b3c4d"
         #expect(model.cancelTarget == nil)
@@ -611,7 +605,7 @@ import Testing
         // falls to nothing when the list is empty too.
         var dropped = ScanSurfaceModel()
         dropped.selectedJob = "scan-gone"
-        dropped.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        dropped.applyList(try ScanListResult(json: ["jobs": []]))
         #expect(dropped.selectedJob == nil)
 
         // D6: a connecting bus outranks a failed list; a second failure moves the stamp and
@@ -621,12 +615,11 @@ import Testing
         #expect(connectingFailed.kind == .reconnecting)
         #expect(connectingFailed.verbsEnabled == false)
         var failing = ScanSurfaceModel()
-        failing.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 1_000)
+        failing.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         failing.noteReadFailure(
             text: "Unable to list jobs: the bus did not reply in time", now: 31_000)
         failing.noteReadFailure(text: "Unable to list jobs: the core closed the bus", now: 33_000)
         #expect(failing.readFailedAt == 33_000)
-        #expect(failing.jobsLoadedAt == 1_000)
         #expect(failing.jobs.count == 2, "the rows and their counters stay through a failure")
         #expect(failing.inlineJobsError(ageMs: 32_000)
                 == "Unable to list jobs: the core closed the bus. Showing values from 0:32 ago; retrying every 2 s.")
@@ -637,9 +630,8 @@ import Testing
         #expect(hourOld.bannerText == "Bus disconnected · showing values from 1:00:00 ago · Proxy ▸ Reconnect Bus (⌃⌘R) to retry")
         // (D6 amendment of 2026-11-02: a failed status or cancel read marks the link too;
         // `cancellingTitleAndInlineListError` pins it.)
-        failing.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 35_000)
+        failing.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(failing.inlineJobsError(ageMs: 0) == nil)
-        #expect(failing.jobsLoadedAt == 35_000)
     }
 
     /// Tester (Jobs view plan 1.6): the end-text edges D4 and the plan's gap 8 imply but

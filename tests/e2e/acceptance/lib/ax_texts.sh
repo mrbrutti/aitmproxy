@@ -30,6 +30,30 @@ end run
 APPLESCRIPT
   exit 0
 fi
+# Fast path (2026-11-02): the AXUIElement walk in ax_texts.swift — the AppleScript walk below costs one
+# Apple Event per attribute and took 49.7 s for 142 rows on an idle 0.5.15, past the cells' 30 s
+# budget even with the app fully idle. Built once per source change into a cache dir; falls back to
+# the AppleScript walk when swiftc is missing or the build fails. Same rows, same column order.
+here=$(cd "$(dirname "$0")" && pwd)
+cache=${AX_TEXTS_CACHE:-/tmp/claude/acceptance/ax-cache}
+bin="$cache/ax_texts-$(shasum -a 256 "$here/ax_texts.swift" | cut -c1-12)"
+if [ ! -x "$bin" ]; then
+  if ! command -v swiftc >/dev/null 2>&1; then
+    echo "ax_texts.sh: swiftc not found, using the slow AppleScript walk" >&2
+  elif [ ! -e "$cache/build-failed-$(basename "$bin")" ]; then
+    # build to a temp name and move into place, so a concurrent caller never execs a half-linked binary
+    mkdir -p "$cache"
+    if swiftc -O -o "$bin.$$.tmp" "$here/ax_texts.swift" 2>"$cache/build.log"; then
+      mv -f "$bin.$$.tmp" "$bin"
+    else
+      rm -f "$bin.$$.tmp"; touch "$cache/build-failed-$(basename "$bin")"
+      echo "ax_texts.sh: ax_texts.swift failed to build (see $cache/build.log), using the slow AppleScript walk" >&2
+    fi
+  else
+    echo "ax_texts.sh: ax_texts.swift failed to build earlier (see $cache/build.log), using the slow AppleScript walk" >&2
+  fi
+fi
+[ -x "$bin" ] && exec "$bin"
 osascript <<'APPLESCRIPT'
 set out to {}
 tell application "System Events" to tell process "Aitmproxy"
