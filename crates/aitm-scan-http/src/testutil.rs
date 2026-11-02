@@ -165,6 +165,10 @@ pub(crate) struct ScriptedClient {
     script: Script,
     /// An artificial per-send delay, for a test that exercises a deadline.
     pub delay: Option<Duration>,
+    /// The server peer every returned flow reports in `server_conn`, when a
+    /// test wired one; `None` leaves `server_conn` unset, as a flow whose
+    /// upstream connection was never observed would be.
+    pub peer: Option<SocketAddr>,
 }
 
 impl ScriptedClient {
@@ -178,6 +182,7 @@ impl ScriptedClient {
             store: None,
             script: Box::new(script),
             delay: None,
+            peer: None,
         }
     }
 
@@ -191,6 +196,13 @@ impl ScriptedClient {
     /// Sleep `delay` inside every send, for a deadline or cancellation test.
     pub(crate) fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
+        self
+    }
+
+    /// Report `peer` as the upstream `server_conn` of every returned flow, the
+    /// way the real client reports the address it actually connected to.
+    pub(crate) fn with_peer(mut self, peer: SocketAddr) -> Self {
+        self.peer = Some(peer);
         self
     }
 
@@ -236,7 +248,7 @@ impl ProxyClient for ScriptedClient {
                 request: req,
                 response: Some(response),
                 client_conn: conn(),
-                server_conn: None,
+                server_conn: self.peer.map(|peer| ConnInfo { peer, ..conn() }),
                 metadata: FlowMeta {
                     is_replay: true,
                     marks: opts.marks,

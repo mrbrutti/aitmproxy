@@ -34,6 +34,13 @@
 //!   `RecordPolicy::Never` and keeps at most [`MAX_HELD_FLOWS`] flows in memory
 //!   for the engine to re-record on a `vulnerable` verdict (D5, seam S6); `all`
 //!   sends with `RecordPolicy::Always`.
+//! - **The baseline's peer is remembered.** The address the guarded client
+//!   actually connected to for the baseline (`server_conn.peer` of the flow it
+//!   returned) is kept and handed out through
+//!   [`ProbeHost::baseline_peer_addr`], so T3's observe-only raw-h2 checks dial
+//!   the validated address instead of re-resolving the name (spec D2,
+//!   amendment 15: no DNS-rebinding window between the scope check and the
+//!   connect). Only the baseline send records it; a probe never does.
 //! - **No value in a line.** Nothing here logs a header value, a cookie value
 //!   or a body: the one URL in an error goes through [`redact::safe_url`], a
 //!   rejected header is named and never quoted (`HeaderError`'s `Display`
@@ -49,6 +56,7 @@
 //! reports the canary it armed, so `JobStatus.session` shows both (spec D5).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -86,6 +94,9 @@ pub(crate) struct HttpProbeHost {
     monitor: Arc<SessionMonitor>,
     /// The unmutated response, taken once per host.
     baseline: OnceCell<ProbeResponse>,
+    /// The upstream peer the baseline flow reported, `None` until the baseline
+    /// has been taken or when its sender did not observe the connection.
+    baseline_peer: Mutex<Option<SocketAddr>>,
     /// The last [`MAX_HELD_FLOWS`] flows this host produced, for the engine's
     /// issue re-recording under `issues_only` (D5).
     held: Mutex<VecDeque<Flow>>,
@@ -136,6 +147,7 @@ impl HttpProbeHost {
             job,
             monitor,
             baseline: OnceCell::new(),
+            baseline_peer: Mutex::new(None),
             held: Mutex::new(VecDeque::new()),
         })
     }
@@ -166,7 +178,15 @@ impl HttpProbeHost {
     /// `what` names the stage (`baseline`, `probe`, `probe_raw`) and is the
     /// only thing that reaches the error text besides a scrubbed sender
     /// message.
-    async fn send_bounded(&self, req: HttpRequest, what: &str) -> Result<ProbeResponse> {
+    ///
+    /// Returns the bounded response and the upstream peer the sender reported
+    /// for this flow (`None` when it observed no connection); the baseline is
+    /// the one caller that keeps the peer.
+    async fn send_bounded(
+        &self,
+        req: HttpRequest,
+        what: &str,
+    ) -> Result<(ProbeResponse, Option<SocketAddr>)> {
         if self.monitor.should_stop() {
             return Err(self.monitor.lost_error(what));
         }
@@ -226,17 +246,21 @@ impl HttpProbeHost {
 
         let id = flow.id;
         let stored = record == RecordPolicy::Always || self.job.store().get(id).is_some();
+        let peer = flow.server_conn.as_ref().map(|conn| conn.peer);
         self.hold(Flow::Http(flow));
 
-        Ok(ProbeResponse {
-            status,
-            headers,
-            body,
-            elapsed_ms,
-            flow: stored.then_some(FlowRef(id)),
-            ws_frames: None,
-            l4: None,
-        })
+        Ok((
+            ProbeResponse {
+                status,
+                headers,
+                body,
+                elapsed_ms,
+                flow: stored.then_some(FlowRef(id)),
+                ws_frames: None,
+                l4: None,
+            },
+            peer,
+        ))
     }
 
     /// Keep `flow` for the engine's issue re-recording, dropping the oldest
@@ -373,7 +397,19 @@ impl ProbeHost for HttpProbeHost {
         Box::pin(async move {
             let answer = self
                 .baseline
-                .get_or_try_init(|| self.send_bounded(self.source.clone(), "baseline"))
+                .get_or_try_init(|| async {
+                    let (answer, peer) = self.send_bounded(self.source.clone(), "baseline").await?;
+                    // The baseline is the one send whose peer is kept: it is
+                    // the address the guarded client validated, which T3's
+                    // raw-h2 checks dial in place of a re-resolved name.
+                    // A poisoned lock is recovered: the address is a fact
+                    // about this send, not state another thread half-wrote.
+                    *self
+                        .baseline_peer
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = peer;
+                    Ok::<_, anyhow::Error>(answer)
+                })
                 .await?;
             Ok(answer.clone())
         })
@@ -382,15 +418,24 @@ impl ProbeHost for HttpProbeHost {
     fn probe<'a>(&'a self, payload: &'a Payload) -> BoxFuture<'a, Result<ProbeResponse>> {
         Box::pin(async move {
             let req = mutate::build_request(&self.source, &self.point, payload)?;
-            self.send_bounded(req, "probe").await
+            let (answer, _peer) = self.send_bounded(req, "probe").await?;
+            Ok(answer)
         })
     }
 
     fn probe_raw(&self, req: RawProbe) -> BoxFuture<'_, Result<ProbeResponse>> {
         Box::pin(async move {
             let built = self.raw_request(&req)?;
-            self.send_bounded(built, "probe_raw").await
+            let (answer, _peer) = self.send_bounded(built, "probe_raw").await?;
+            Ok(answer)
         })
+    }
+
+    fn baseline_peer_addr(&self) -> Option<SocketAddr> {
+        *self
+            .baseline_peer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn marker(&self) -> String {
@@ -588,6 +633,7 @@ impl SessionMonitors {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1640,5 +1686,86 @@ mod tests {
         );
         assert_eq!(sent[0].0.headers.get("authorization"), Some("Bearer tok"));
         assert_eq!(sent[0].0.headers.get("x-api-key"), Some("tok"));
+    }
+
+    // --- baseline_peer_addr: T3's raw-h2 rebinding guard (spec D2, amendment 15)
+
+    /// The upstream address the double reports for every flow it returns.
+    fn upstream() -> SocketAddr {
+        "192.0.2.9:8080".parse().unwrap()
+    }
+
+    /// Before any baseline the host has no validated address to offer, so a
+    /// raw-h2 check asking for one is told `None` rather than a guess.
+    #[tokio::test]
+    async fn baseline_peer_addr_is_none_before_any_baseline() {
+        let fx = fixture(ok_200().with_peer(upstream()));
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        assert_eq!(host.baseline_peer_addr(), None);
+        assert_eq!(fx.sent().len(), 0, "asking for the address sends nothing");
+    }
+
+    /// After the baseline the host reports exactly the peer the baseline
+    /// flow's `server_conn` carried: the address the guarded client actually
+    /// connected to, so the raw probe dials it instead of re-resolving.
+    #[tokio::test]
+    async fn baseline_peer_addr_is_the_baseline_flows_peer() {
+        let fx = fixture(ok_200().with_peer(upstream()));
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        host.baseline().await.unwrap();
+
+        assert_eq!(host.baseline_peer_addr(), Some(upstream()));
+        assert_eq!(
+            host.baseline_peer_addr(),
+            Some("192.0.2.9:8080".parse().unwrap())
+        );
+        // The cached baseline does not re-send or lose the address.
+        host.baseline().await.unwrap();
+        assert_eq!(fx.sent().len(), 1);
+        assert_eq!(host.baseline_peer_addr(), Some(upstream()));
+    }
+
+    /// A probe or raw probe never stands in for the baseline: only the
+    /// baseline's own send records the address, however many probes came
+    /// first and whatever peer they reached.
+    #[tokio::test]
+    async fn a_probe_never_sets_the_baseline_peer_addr() {
+        let fx = fixture(ok_200().with_peer(upstream()));
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        host.probe(&replace("x")).await.unwrap();
+        host.probe_raw(RawProbe {
+            method: "GET".to_string(),
+            url: "http://t:8080/raw".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(fx.sent().len(), 2);
+        assert_eq!(
+            host.baseline_peer_addr(),
+            None,
+            "a probe set the baseline peer address"
+        );
+
+        host.baseline().await.unwrap();
+        assert_eq!(host.baseline_peer_addr(), Some(upstream()));
+    }
+
+    /// A baseline whose flow carries no `server_conn` (the sender did not
+    /// observe the upstream connection) leaves the address unknown rather than
+    /// inventing one, so the raw-h2 check stays Inconclusive instead of dialing
+    /// a re-resolved name.
+    #[tokio::test]
+    async fn baseline_without_a_server_conn_leaves_the_peer_unknown() {
+        let fx = fixture(ok_200());
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        host.baseline().await.unwrap();
+
+        assert_eq!(host.baseline_peer_addr(), None);
     }
 }
