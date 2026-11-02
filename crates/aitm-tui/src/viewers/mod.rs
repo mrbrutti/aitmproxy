@@ -124,7 +124,7 @@ pub fn headers<'a>(theme: &Theme, headers: &'a [(String, String)]) -> Vec<Line<'
 
 /// Cookies parsed from the served headers (§2.7). `set_cookie` picks the
 /// response `Set-Cookie:` headers (one cookie each, with attributes) over the
-/// request `Cookie:` headers (`a=1; b=2` pairs). Values keep their encoding —
+/// request `Cookie:` headers (`a=1; b=2` pairs). Values keep their encoding:
 /// the table shows them as sent. Mirrors the web `cookies.ts` / `CookieTable`.
 pub fn cookies<'a>(theme: &Theme, headers: &[(String, String)], set_cookie: bool) -> Vec<Line<'a>> {
     let wanted = if set_cookie { "set-cookie" } else { "cookie" };
@@ -374,7 +374,7 @@ fn with_truncated<'a>(theme: &Theme, mut lines: Vec<Line<'a>>, truncated: bool) 
         lines.insert(
             0,
             Line::styled(
-                "⚠ body truncated by the proxy's capture cap — the client received the full stream",
+                "⚠ body truncated by the proxy's capture cap: the client received the full stream",
                 theme.intercept_armed_quiet(),
             ),
         );

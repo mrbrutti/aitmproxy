@@ -1,0 +1,66 @@
+# Redis RESP (the REdis Serialization Protocol), the request half.
+#
+# A client request is an array of bulk strings. `ECHO hi` goes on the wire as
+#
+#     *2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n
+#
+# the `*` and a count, then one `$`, a byte count and the bytes for each
+# argument. The first argument is the command name. Every argument carries its
+# own length, so no byte inside an argument is ever interpreted as syntax --
+# which is exactly what makes the length fields worth mutating.
+#
+# This file holds two documents. The first is the array form above, which is
+# what the lane generates and what a modern client sends. The second, after the
+# `---` line, is the inline form: a bare command line such as `PING\r\n`, which
+# Redis also accepts and which turns up in captured traffic. `Resp::parse`
+# tries the array form first and falls back to the inline one.
+grammar: resp
+transport: tcp
+default_ports: [6379]
+reply: >
+  The server answers each request with one frame, typed by its first byte: `+`
+  a simple status line, `-` an error, `:` an integer, `$` a bulk string that
+  declares its length first (`$-1` is the null string), `*` an array of further
+  frames. RESP3 adds `_` null, `#` boolean, `,` double, `(` big number, `!`
+  blob error, `=` verbatim string, `%` map, `~` set and `>` push. Only `-`
+  means the server rejected what it was sent; every other type is a
+  well-formed answer, whatever it says. A frame ends at its CRLF, or after the
+  declared number of bytes for `$`, or once its declared number of elements
+  have been read for `*`.
+message:
+  - name: array
+    type: group
+    fields:
+      - { name: star, type: delim, value: "*" }
+      # How many arguments follow. The `args` repeat below takes its element
+      # count from this field by name (`count_from: count`), and this field
+      # declares which repeat it counts (`count: { of: args }`): the two name
+      # each other, and the validator refuses a grammar where they disagree.
+      - { name: count, type: decimal, count: { of: args } }
+      - { name: crlf, type: delim, value: "\r\n" }
+  - name: args
+    type: repeat
+    count_from: count
+    fields:
+      - { name: dollar, type: delim, value: "$" }
+      # The declared length of this argument. It is read, not trusted: a
+      # length that does not fit what is left marks the node broken instead of
+      # failing the parse.
+      - { name: len, type: decimal, len: { of: [data] } }
+      - { name: crlf, type: delim, value: "\r\n" }
+      - { name: data, type: bytes }
+      - { name: crlf2, type: delim, value: "\r\n" }
+---
+# The inline form: one command line, which Redis splits on spaces itself.
+#
+# A captured `PING\r\n` or `GET key\r\n` is a RESP request too, and dropping it
+# would lose a seed. The lane parses it as a single `line` field: there is no
+# length to mutate and no element to repeat, so the byte-level mutators are the
+# whole vocabulary here.
+grammar: resp
+transport: tcp
+default_ports: [6379]
+reply: >
+  Identical to the array form: one frame, typed by its first byte.
+message:
+  - { name: inline, type: line, terminator: "\r\n" }
