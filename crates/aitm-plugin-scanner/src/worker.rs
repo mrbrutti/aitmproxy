@@ -2672,9 +2672,8 @@ mod tests {
         .expect("the job starts");
         assert!(h.egress_confined(), "a running job holds the posture");
 
-        // 10 s, not 2: the job is supervised through catch_unwind on a worker
-        // thread, and a load average near 300 (shared gate machine) stretched
-        // the hand-back past 2 s once (2026-11-01).
+        // The terminal signal decides when the job is over; `TERMINAL_NET` is
+        // the only net (the old 2 s bound tripped on a loaded gate machine).
         let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Failed);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Failed));

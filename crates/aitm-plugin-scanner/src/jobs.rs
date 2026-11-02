@@ -347,8 +347,8 @@ impl JobRegistry {
     }
 
     /// A receiver that reads `true` once the job is terminal (immediately for
-    /// a job that already is), or `None` for an unknown job. This is how a
-    /// test or a UI waits for the end without a wall-clock bound.
+    /// a job that already is), or `None` for an unknown job. This is how the
+    /// test harnesses wait for the end without a wall-clock bound.
     pub fn terminal_signal(&self, id: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
         self.lock().get(id).map(|e| e.terminal.subscribe())
     }
@@ -3213,6 +3213,15 @@ mod tests {
             Some("reloaded a non-terminal job record")
         );
         assert!(status.finished_at.is_some(), "a terminal record has an end");
+        // A reloaded record is already over: its terminal signal reads `true`
+        // at once, so a waiter never parks on it.
+        assert!(
+            *registry
+                .terminal_signal(&scan - 00000002)
+                .expect("the reloaded job has a signal")
+                .borrow(),
+            "a reloaded record starts terminal"
+        );
         assert_eq!(registry.active_count(), 0, "it holds no max_jobs slot");
         assert!(
             registry.active_origins().is_empty(),
