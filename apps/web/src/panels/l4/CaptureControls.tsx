@@ -109,10 +109,12 @@ export const CaptureControls: Component<CaptureControlsProps> = (props) => {
     if (operatorOnly() !== null) return; // D12: an agent connection sends nothing
     const p = pending();
     if (!p || p.busy) return;
-    setPending({ ...p, busy: true, refusal: null });
+    const busy: PendingScopeAdd = { ...p, busy: true, refusal: null };
+    setPending(busy);
     const outcome = await props.onConfirmAddScope(p.draft, p.token);
-    // The operator dismissed the dialog while the core was answering: nothing to show or re-open.
-    if (pending() === null) return;
+    // The outcome belongs to `busy` and nothing else: if the operator dismissed the dialog while the
+    // core was answering — or dismissed it and opened a new one for another draft — it is dropped.
+    if (pending() !== busy) return;
     if (outcome.kind === 'done') {
       setPending(null);
       return;

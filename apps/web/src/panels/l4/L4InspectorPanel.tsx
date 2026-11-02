@@ -62,13 +62,15 @@ export const L4InspectorPanel: Component<{ store: L4Store }> = (props) => {
 
   const confirm = async () => {
     const p = pending();
-    if (!p) return;
-    setPending({ ...p, busy: true, refusal: null });
+    if (!p || p.busy) return;
+    const busy: Pending = { ...p, busy: true, refusal: null };
+    setPending(busy);
     const outcome = p.injectArgs
       ? await confirmInject(store.call, p.injectArgs, p.token)
       : await confirmGuarded(store.call, p.tool, p.params, p.token);
-    // The operator dismissed the dialog while the core was answering: nothing to show or re-open.
-    if (pending() === null) return;
+    // The outcome belongs to `busy` and nothing else: if the operator dismissed the dialog while the
+    // core was answering — or dismissed it and opened a new one for another verdict — it is dropped.
+    if (pending() !== busy) return;
     if (p.injectArgs) {
       if (outcome.kind === 'sent') return afterSend(outcome.sent);
     } else if (outcome.kind === 'done') {

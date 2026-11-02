@@ -255,6 +255,71 @@ describe('CaptureControls: dialog dismissed while the confirm is in flight (fix 
   });
 });
 
+describe('CaptureControls: dialog dismissed while the confirm is in flight, then a new add (fix 4: stale-cancel by identity)', () => {
+  /** Open a dialog for the current draft, send it, cancel via the backdrop while the reply is out, then submit a second draft. */
+  async function twoHandshakes(r: ReturnType<typeof mount>, first: () => Promise<GuardedOutcome>) {
+    const { byId, handlers } = r;
+    handlers.onAddScope.mockResolvedValueOnce({ kind: 'confirm', prompt: 'FIRST PROMPT 9100-9199', token: 'T-1' });
+    handlers.onConfirmAddScope.mockImplementationOnce(first);
+    const form = byId('l4-scope-add-form') as HTMLFormElement;
+    fireEvent.input(form.querySelector('[aria-label="Scope ports"]')!, { target: { value: '9100-9199' } });
+    fireEvent.submit(form);
+    const dialog = await waitFor(() => {
+      const d = r.r.container.querySelector('[role="alertdialog"]');
+      if (!d) throw new Error('no dialog yet');
+      return d;
+    });
+    expect(dialog.textContent).toContain('FIRST PROMPT 9100-9199');
+    fireEvent.click([...dialog.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === 'Send to wire')!);
+    await waitFor(() => expect(handlers.onConfirmAddScope).toHaveBeenCalledTimes(1));
+    // Backdrop cancel while the core has not answered.
+    fireEvent.click(r.r.container.querySelector('[role="presentation"]')!);
+    await waitFor(() => expect(r.r.container.querySelector('[role="alertdialog"]')).toBeNull());
+    // A different draft: the core asks to confirm it, so a second dialog is open when the first reply lands.
+    handlers.onAddScope.mockResolvedValueOnce({ kind: 'confirm', prompt: 'SECOND PROMPT 9200-9299', token: 'T-2' });
+    fireEvent.input(form.querySelector('[aria-label="Scope ports"]')!, { target: { value: '9200-9299' } });
+    fireEvent.submit(form);
+    const second = await waitFor(() => {
+      const d = r.r.container.querySelector('[role="alertdialog"]');
+      if (!d) throw new Error('no second dialog yet');
+      return d;
+    });
+    expect(second.textContent).toContain('SECOND PROMPT 9200-9299');
+    expect(handlers.onAddScope).toHaveBeenLastCalledWith(expect.objectContaining({ ports: '9200-9299' }));
+    return second;
+  }
+
+  it('a late refusal from the first handshake leaves the second dialog untouched: its prompt stays, no refusal is shown', async () => {
+    const m = mount('operator', { tools: CONFIRMABLE });
+    let answer!: (o: GuardedOutcome) => void;
+    await twoHandshakes(m, () => new Promise<GuardedOutcome>((res) => (answer = res)));
+    answer({ kind: 'refused', message: 'late refusal from the core' });
+    await new Promise((res) => setTimeout(res, 10));
+    const dialog = m.r.container.querySelector('[role="alertdialog"]')!;
+    expect(dialog).not.toBeNull();
+    expect(dialog.textContent).toContain('SECOND PROMPT 9200-9299');
+    expect(dialog.textContent).not.toContain('FIRST PROMPT 9100-9199');
+    expect(dialog.textContent).not.toContain('late refusal from the core');
+    expect(dialog.querySelector('[role="alert"]')).toBeNull();
+    // Confirming now sends the SECOND draft with the SECOND token, never the stale pair.
+    fireEvent.click([...dialog.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === 'Send to wire')!);
+    await waitFor(() => expect(m.handlers.onConfirmAddScope).toHaveBeenCalledTimes(2));
+    expect(m.handlers.onConfirmAddScope).toHaveBeenLastCalledWith(expect.objectContaining({ ports: '9200-9299' }), 'T-2');
+  });
+
+  it('a late "done" from the first handshake does not close the second dialog', async () => {
+    const m = mount('operator', { tools: CONFIRMABLE });
+    let answer!: (o: GuardedOutcome) => void;
+    await twoHandshakes(m, () => new Promise<GuardedOutcome>((res) => (answer = res)));
+    answer({ kind: 'done', result: 's-late' });
+    await new Promise((res) => setTimeout(res, 10));
+    const dialog = m.r.container.querySelector('[role="alertdialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog!.textContent).toContain('SECOND PROMPT 9200-9299');
+    expect((m.byId('l4-scope-add') as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
 describe('CaptureControls: agent role (D12, AC24)', () => {
   it('on an agent connection Start is disabled "operator only" even when capture is available, and a forced click sends nothing', () => {
     const { start, byId, handlers } = mount('agent', { capture: AVAILABLE });
