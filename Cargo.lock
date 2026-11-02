@@ -131,6 +131,7 @@ version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-mcp",
+ "aitm-term",
  "anyhow",
  "futures",
  "serde_json",
