@@ -32,9 +32,9 @@ mod support;
 use Placement::{Live, Local};
 
 /// Every built-in verb and where a one-shot runs it (spec D6, the table
-/// expanded): the 111 of the default registry (73 before main's #232 added the
-/// fifteen scan-job verbs and the 23 native `check.*`), then the 22 native
-/// `l4.*` verbs `l4.enabled` adds. Enumerated from the tree, in registration order.
+/// expanded): the 114 of the default registry (73 before main's scanner v2
+/// track added the fifteen scan-job verbs and the 26 native `check.*`), then
+/// the 22 native `l4.*` verbs `l4.enabled` adds. Enumerated from the tree, in registration order.
 const EXPECTED: &[(&str, Placement)] = &[
     // flow.* — the core's flow store.
     ("flow.list", Live),
@@ -68,7 +68,8 @@ const EXPECTED: &[(&str, Placement)] = &[
     ("scan.profile.save", Live),
     ("scan.profile.delete", Live),
     ("scan.session.preview", Live),
-    // check.<id> — one check by hand on the core (natives since #232; the
+    // check.<id> — one check by hand on the core (natives since #232, three
+    // more L4 ones with #301; the
     // `check.` prefix puts them on the long lane).
     ("check.cmdi-time", Live),
     ("check.cookie-flag", Live),
@@ -78,8 +79,11 @@ const EXPECTED: &[(&str, Placement)] = &[
     ("check.h2-pseudo-header-validation", Live),
     ("check.h2-rapid-reset-mitigation", Live),
     ("check.h2-settings-observe", Live),
+    ("check.l4-crash", Live),
+    ("check.l4-latency-outlier", Live),
     ("check.l4-packet-crash", Live),
     ("check.l4-packet-reaction", Live),
+    ("check.l4-parser-fault", Live),
     ("check.open-redirect", Live),
     ("check.reflection", Live),
     ("check.security-header", Live),
