@@ -94,8 +94,8 @@ impl CorePointer {
     /// One compact JSON line, keys in the order
     /// `v,pid,bus,operator,config,started_unix,version`, trailing newline.
     ///
-    /// Built by hand so the key order never depends on whether `serde_json`
-    /// was compiled with `preserve_order`.
+    /// Built by hand: `aitm-mcp` has no `serde` derive (zero new edges, spec
+    /// §Constraints) and the key order is part of the D4 contract.
     pub fn to_json_line(&self) -> String {
         format!(
             "{{\"v\":{},\"pid\":{},\"bus\":{},\"operator\":{},\"config\":{},\"started_unix\":{},\"version\":{}}}\n",
@@ -258,13 +258,26 @@ impl Drop for Published {
 }
 
 /// Write `ptr` atomically as `<dir>/<pid>.json`, mode `0600`, locked before
-/// it becomes visible. Every directory this creates is `0700` and `dir`
-/// itself is tightened to `0700` if it already existed.
+/// it becomes visible. A `dir` this call creates is `0700` whatever the
+/// umask; one that already exists is the operator's (an `AITM_RUN_DIR` they
+/// chose, or a data dir they set up) and is left exactly as they have it,
+/// with one `debug!` when it is wider than `0700` (security S3).
 pub fn write(dir: &Path, ptr: &CorePointer) -> io::Result<Published> {
-    let mut builder = DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    match fs::symlink_metadata(dir) {
+        Ok(_) => {
+            let mode = fs::metadata(dir)?.mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::debug!(path = %dir.display(), mode = %format_args!("{mode:o}"), "the core pointer run dir already exists wider than 0700; leaving it as the operator has it");
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(dir)?;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+        Err(err) => return Err(err),
+    }
 
     let path = dir.join(format!("{}.json", ptr.pid));
     let tmp = dir.join(format!("{}.json.tmp", ptr.pid));
@@ -509,6 +522,37 @@ mod tests {
 
         File::create(&path).expect("an unlocked file");
         assert_eq!(liveness(&path), Liveness::Dead);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// S3 (security pass 1): a run dir that already exists is the operator's
+    /// (an `AITM_RUN_DIR` they chose, or a data dir they set up); its mode is
+    /// left exactly as it was, `0750` here, while the pointer inside is still
+    /// `0600`. A dir this call creates is `0700`.
+    #[test]
+    fn write_leaves_a_pre_existing_run_dir_mode_alone() {
+        let root = temp_root("preexisting");
+        let mode = |p: &Path| fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+
+        let theirs = root.join("theirs");
+        fs::create_dir(&theirs).expect("the operator's run dir");
+        fs::set_permissions(&theirs, fs::Permissions::from_mode(0o750)).expect("chmod 750");
+        let published = write(&theirs, &sample()).expect("write into the existing dir");
+        assert_eq!(
+            mode(&theirs),
+            0o750,
+            "a pre-existing run dir keeps its mode"
+        );
+        assert_eq!(mode(&published.path), 0o600);
+        assert_eq!(liveness(&published.path), Liveness::Alive);
+        drop(published);
+
+        let ours = root.join("made").join("cores");
+        let published = write(&ours, &sample()).expect("write into a new dir");
+        assert_eq!(mode(&ours), 0o700, "a dir this call created is 0700");
+        assert_eq!(mode(&published.path), 0o600);
+        drop(published);
 
         fs::remove_dir_all(&root).expect("cleanup");
     }
@@ -802,13 +846,13 @@ mod tests {
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
-    /// Tester — the writer given a run dir that is a symlink: `create_dir_all`
-    /// accepts the link, the `0700` tightening and the `0600` pointer land in
-    /// the link's target, `liveness` reads `Alive` through either path, and
-    /// the drop removes the file from the target. Pinned as observed: spec D4
-    /// does not rule on a symlinked run dir (it sits inside the user's own
-    /// `0700` data dir, or wherever `AITM_RUN_DIR` points by the operator's
-    /// choice).
+    /// Tester — the writer given a run dir that is a symlink: the link counts
+    /// as an existing dir, the `0600` pointer lands in the link's target,
+    /// `liveness` reads `Alive` through either path, and the drop removes the
+    /// file from the target. Pinned as observed: spec D4 does not rule on a
+    /// symlinked run dir (it sits inside the user's own `0700` data dir, or
+    /// wherever `AITM_RUN_DIR` points by the operator's choice). Since S3 the
+    /// pre-existing target keeps its `0755`: it is the operator's.
     #[test]
     fn tester_write_through_a_symlinked_run_dir_lands_in_the_target() {
         let root = temp_root("tester-linkdir");
@@ -822,7 +866,11 @@ mod tests {
         assert_eq!(published.path, link.join("4821.json"));
         let mode = |p: &Path| fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode(&real.join("4821.json")), 0o600);
-        assert_eq!(mode(&real), 0o700, "the target dir is tightened");
+        assert_eq!(
+            mode(&real),
+            0o755,
+            "a pre-existing target is left as the operator has it (S3)"
+        );
         assert!(
             fs::symlink_metadata(&link)
                 .expect("link metadata")

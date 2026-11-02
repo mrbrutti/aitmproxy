@@ -1243,6 +1243,12 @@ section_docs() {
   doc_grep README.md 'No `cli` line is written today' 0
   doc_grep site/docs.html 'The CLI talks to the running core' 1
   doc_grep INSTALL.md 'mints `mcp.operator_token`' 1
+  # The D13 addendum (the site items as whole elements; spec AC-R14-30 gains).
+  doc_grep site/features.html 'runs its own core' 0
+  doc_grep site/features.html 'has no browser' 0
+  doc_grep site/poc.html 'has no browser' 0
+  doc_grep docs/scanner.md 'not the one-shot CLI' 0
+  doc_grep site/poc.html 'poc_path pocs/reflected-xss-search-q.yaml' 1
   end_section
 }
 

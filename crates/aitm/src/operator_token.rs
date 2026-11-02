@@ -308,6 +308,19 @@ fn create_private_parent(path: &Path) -> std::io::Result<()> {
 /// reused, then an explicit `set_permissions` so the umask cannot widen or
 /// narrow it), so the renamed result is `0600` whatever the umask and whatever
 /// mode the old file had (spec §D3, research F7).
+///
+/// Durability (security S4; §D3 runs this on every first start): the temp
+/// file is `sync_all`ed before the rename, so its bytes are on disk before
+/// the name points at them and a crash right after the rename cannot leave
+/// a complete-looking empty config (the rename-after-write hazard of
+/// delayed-allocation filesystems); an fsync failure there is an error and
+/// the temp file is removed. After the rename the parent directory is
+/// `sync_all`ed so the new name itself is durable; a filesystem that refuses
+/// a directory fsync costs one `debug!`, not the write. So what holds when
+/// this returns `Ok`: the file is either the old config or the complete new
+/// one, never a torn one; that it is the new one after a crash is guaranteed
+/// only when the directory fsync succeeded, otherwise from the filesystem's
+/// next journal flush.
 fn write_atomically(path: &Path, data: &str) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -324,7 +337,8 @@ fn write_atomically(path: &Path, data: &str) -> std::io::Result<()> {
         .open(&tmp)?;
     let written = file
         .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .and_then(|()| file.write_all(data.as_bytes()));
+        .and_then(|()| file.write_all(data.as_bytes()))
+        .and_then(|()| file.sync_all());
     drop(file);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
@@ -333,6 +347,13 @@ fn write_atomically(path: &Path, data: &str) -> std::io::Result<()> {
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
+    }
+    if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::debug!(
+            path = %dir.display(),
+            error = %e,
+            "could not fsync the config's directory after the rename; the new name is durable at the next journal flush"
+        );
     }
     Ok(())
 }
@@ -629,6 +650,39 @@ mod tests {
             "token is not hex:\n{text}"
         );
         tok.to_string()
+    }
+
+    /// S4 (security pass 1): `write_atomically` fsyncs the temp file before
+    /// the rename and the parent directory after it. A directory the process
+    /// cannot open for that fsync (`0300`: it may create and rename inside it
+    /// but not read it) costs one `debug!`, never the write: the file lands
+    /// `0600` with the exact bytes and no temp sibling remains.
+    #[test]
+    fn write_atomically_tolerates_a_directory_it_cannot_fsync() {
+        let dir = mint_dir();
+        let path = dir.join("config.yaml");
+        let data = "mcp:\n  operator_token: not-a-real-token\n";
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let dir_opens = std::fs::File::open(&dir).is_ok();
+        let result = write_atomically(&path, data);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !dir_opens,
+            "premise: a 0300 directory cannot be opened for fsync (not running as root)"
+        );
+        result.expect("a directory fsync failure is tolerated");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), data);
+        assert_eq!(mode_of(&path), 0o600);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["config.yaml".to_string()],
+            "no temp sibling remains"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

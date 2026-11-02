@@ -8,7 +8,10 @@
 //! the card's `Operator bus` row. Dropping the [`OperatorBus`] aborts the
 //! serving task, which drops the `LoopbackTcp`, which removes the core
 //! pointer (spec D4): Ctrl-C, SIGTERM, the stdin-EOF exit and the TUI's `q`
-//! all end `run()` and so the bus.
+//! all end `run()` and so the bus. The other way round, `run()` learns that
+//! a dedicated bus died through [`OperatorBus::finished`] (security S1): a
+//! `select!` arm beside its other exit paths, pending for ever when there is
+//! no dedicated task.
 //!
 //! Why not a new `McpTransport` variant: the operator bus is not a transport
 //! the operator configures but a property every core has (spec D2).
@@ -105,6 +108,32 @@ impl OperatorBus {
     pub fn word(&self) -> OperatorBusWord {
         self.word.clone()
     }
+
+    /// Resolves when the dedicated serving task ends, with its outcome:
+    /// `Err` is why the bus died (the listener's error, or a panicked or
+    /// cancelled task as `the operator bus task ended abnormally: ..`);
+    /// `Ok(())` is a listener that ended without an error, which a serving
+    /// core never expects. For a `Shared` or `Off` bus (no task), and once an
+    /// outcome was taken, this pends for ever, so `run()` (Task 13) can make
+    /// it one `tokio::select!` arm beside Ctrl-C, SIGTERM, stdin EOF and the
+    /// TUI's `q` without a case split, and report a died bus the moment it
+    /// happens instead of serving on with a silently dead listener. Cancel
+    /// safe: a dropped `finished()` future leaves the task where it was.
+    pub async fn finished(&mut self) -> anyhow::Result<()> {
+        let Some(task) = self.task.as_mut() else {
+            return std::future::pending().await;
+        };
+        let outcome = task.await;
+        // A joined handle must not be polled again; dropping the bus now
+        // aborts nothing, which is right: the task is gone.
+        self.task = None;
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(join) => {
+                Err(anyhow::Error::new(join).context("the operator bus task ended abnormally"))
+            }
+        }
+    }
 }
 
 impl Drop for OperatorBus {
@@ -132,7 +161,10 @@ impl Drop for OperatorBus {
 ///
 /// `mint_failure` is the reason `plan` quotes when the token could not be
 /// minted (see [`plan`]). The eight parameters are the spec's own list.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the plan pins the eight-parameter signature"
+)]
 pub async fn start(
     cfg: &Config,
     config_path: &Path,
@@ -206,11 +238,13 @@ pub async fn start(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::path::Path;
+    use std::time::Duration;
 
     use aitm_core::{McpConfig, McpTransport};
 
-    use super::{plan, port_remedy, Plan};
+    use super::{plan, port_remedy, OperatorBus, OperatorBusWord, Plan};
 
     /// A loopback MCP transport with an agent token; the operator token is
     /// set separately by each case.
@@ -291,6 +325,54 @@ mod tests {
             port_remedy(Path::new("/x/config.yaml")),
             "Free it, or set mcp.operator_bus.port to another port in /x/config.yaml."
         );
+    }
+
+    /// S1 (security pass 1): `run()` learns that a dedicated bus died.
+    /// A task that ends with an error hands that error back and a panicked
+    /// task is an error too; a task that ends `Ok(())` is `Ok(())`; a
+    /// `Shared`/`Off` bus (no task) pends, so a `select!` arm on it never
+    /// fires; once the outcome was taken the bus pends as well.
+    #[tokio::test]
+    async fn finished_reports_a_died_bus_and_pends_without_one() {
+        let addr: SocketAddr = "127.0.0.1:50512".parse().expect("addr");
+
+        let mut died = OperatorBus {
+            word: OperatorBusWord::Dedicated(addr),
+            task: Some(tokio::spawn(async {
+                anyhow::bail!("accept loop ended: boom")
+            })),
+        };
+        let err = died.finished().await.expect_err("a died bus is an error");
+        assert_eq!(err.to_string(), "accept loop ended: boom");
+        assert!(died.task.is_none(), "the outcome was taken");
+        let again = tokio::time::timeout(Duration::from_millis(50), died.finished()).await;
+        assert!(again.is_err(), "pends once the outcome was taken");
+
+        let mut clean = OperatorBus {
+            word: OperatorBusWord::Dedicated(addr),
+            task: Some(tokio::spawn(async { Ok(()) })),
+        };
+        clean.finished().await.expect("a clean end is Ok");
+
+        let mut panicked = OperatorBus {
+            word: OperatorBusWord::Dedicated(addr),
+            task: Some(tokio::spawn(async { panic!("bus task panicked") })),
+        };
+        let err = panicked
+            .finished()
+            .await
+            .expect_err("a panicked task is an error");
+        assert!(
+            format!("{err:#}").starts_with("the operator bus task ended abnormally: "),
+            "{err:#}"
+        );
+
+        let mut off = OperatorBus {
+            word: OperatorBusWord::Off("mcp.operator_bus.enabled: false".to_string()),
+            task: None,
+        };
+        let pending = tokio::time::timeout(Duration::from_millis(50), off.finished()).await;
+        assert!(pending.is_err(), "a bus with no task pends forever");
     }
 
     // ---- tester additions (stage 5, R14 pass 1) ----

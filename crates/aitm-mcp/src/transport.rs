@@ -15,9 +15,10 @@ use aitm_core::Frontend;
 use anyhow::Context as _;
 use serde_json::Value as JsonValue;
 use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take,
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    Take,
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::task::JoinError;
 
 use crate::pointer;
@@ -26,6 +27,20 @@ use crate::server::{error_response, ConnCtx, McpServer, NotificationSink, UNAUTH
 /// Longest single message (one line) a transport accepts. Longer lines end the
 /// connection instead of growing a buffer without bound.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// How long a fresh loopback connection has to send its token line before
+/// the listener closes it (security S1). The operator bus is on by default
+/// (spec D2), so a same-user process that connects and says nothing must not
+/// hold a task and a socket for ever; ten seconds is generous for a client
+/// that means to speak and short for one that does not. Overridable per
+/// listener with [`LoopbackTcp::with_token_line_timeout`].
+pub const TOKEN_LINE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`LoopbackTcp::serve`] pauses after an `accept()` error of the
+/// descriptor-exhaustion class before accepting again (see
+/// [`accept_backoff`]), so a core out of file descriptors logs at a walking
+/// pace instead of spinning.
+const ACCEPT_EXHAUSTION_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Serve newline-delimited JSON-RPC on one connection: each line in is one
 /// message, each reply out is one line. Returns at EOF, at a read error, or when
@@ -285,6 +300,9 @@ pub struct LoopbackTcp {
     /// context was published; see [`LoopbackTcp::publish_pointer`]. The handle
     /// holds the pointer's advisory lock and removes the file when it drops.
     pointer: Option<pointer::Published>,
+    /// How long a connection has to send its token line; [`TOKEN_LINE_TIMEOUT`]
+    /// unless [`LoopbackTcp::with_token_line_timeout`] said otherwise.
+    token_line_timeout: Duration,
 }
 
 impl LoopbackTcp {
@@ -318,6 +336,7 @@ impl LoopbackTcp {
             operator_token: None,
             endpoint_file,
             pointer: None,
+            token_line_timeout: TOKEN_LINE_TIMEOUT,
         })
     }
 
@@ -340,6 +359,7 @@ impl LoopbackTcp {
             operator_token: Some(operator_token.into()),
             endpoint_file: None,
             pointer: None,
+            token_line_timeout: TOKEN_LINE_TIMEOUT,
         })
     }
 
@@ -347,6 +367,14 @@ impl LoopbackTcp {
     /// [`Frontend::Operator`]. An empty token is ignored (no operator token).
     pub fn with_operator_token(mut self, token: Option<String>) -> Self {
         self.operator_token = token.filter(|t| !t.is_empty()).map(Into::into);
+        self
+    }
+
+    /// Give each connection `limit` instead of [`TOKEN_LINE_TIMEOUT`] to send
+    /// its token line (security S1); a test's way to see the close without
+    /// waiting ten seconds.
+    pub fn with_token_line_timeout(mut self, limit: Duration) -> Self {
+        self.token_line_timeout = limit;
         self
     }
 
@@ -365,10 +393,27 @@ impl LoopbackTcp {
         self.pointer = pointer::publish_pointer(self.local_addr, self.operator_token.is_some());
     }
 
-    /// Accept connections forever, serving each on its own task.
+    /// Accept connections forever, serving each on its own task. An `accept()`
+    /// error is logged at `warn!` and the loop goes on (security S1): the
+    /// default-on operator bus must not end quietly on the first `EMFILE`,
+    /// which a neighbour that opens connections and holds them can provoke;
+    /// the descriptor-exhaustion class pauses [`ACCEPT_EXHAUSTION_BACKOFF`]
+    /// first so it cannot spin.
     pub async fn serve(self, server: Arc<McpServer>) -> anyhow::Result<()> {
         loop {
-            let (stream, peer) = self.listener.accept().await?;
+            let (stream, peer) = match self.listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "the bus listener could not accept a connection; still listening"
+                    );
+                    if let Some(pause) = accept_backoff(&err) {
+                        tokio::time::sleep(pause).await;
+                    }
+                    continue;
+                }
+            };
             // The bind is loopback-only already; this is belt and braces.
             if !peer.ip().is_loopback() {
                 continue;
@@ -376,12 +421,21 @@ impl LoopbackTcp {
             let srv = server.clone();
             let agent = self.agent_token.clone();
             let operator = self.operator_token.clone();
+            let token_line_timeout = self.token_line_timeout;
             tokio::spawn(async move {
                 // A failed connection is that client's problem, not the server's:
                 // it is logged at debug (never with a token; the errors carry none)
                 // and the listener goes on accepting.
-                if let Err(err) =
-                    serve_connection(srv, stream, agent.as_deref(), operator.as_deref()).await
+                let (read_half, write_half) = stream.into_split();
+                if let Err(err) = serve_connection(
+                    srv,
+                    read_half,
+                    write_half,
+                    agent.as_deref(),
+                    operator.as_deref(),
+                    token_line_timeout,
+                )
+                .await
                 {
                     tracing::debug!(
                         error = %format_args!("{err:#}"),
@@ -432,6 +486,24 @@ fn write_endpoint_file(path: &Path, addr: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The pause [`LoopbackTcp::serve`] takes after `err` from `accept()`: `Some`
+/// for the descriptor-exhaustion class (`EMFILE`, `ENFILE`, `WouldBlock`),
+/// which recurs the instant it is retried and would otherwise spin a core at
+/// full CPU, logging as fast as it loops; `None` for the per-connection
+/// errors (`ECONNABORTED`, `EINTR`, a reset), which the next `accept()`
+/// simply moves past.
+fn accept_backoff(err: &io::Error) -> Option<Duration> {
+    // `io::ErrorKind` has no variant for EMFILE/ENFILE (both decode as
+    // `Uncategorized`), so the raw errno is matched. The two numbers are the
+    // same on Linux, macOS and the BSDs, the platforms this Unix-only crate
+    // builds for (`pointer.rs` is `std::os::unix` throughout).
+    const ENFILE: i32 = 23;
+    const EMFILE: i32 = 24;
+    let exhausted = err.kind() == io::ErrorKind::WouldBlock
+        || matches!(err.raw_os_error(), Some(ENFILE | EMFILE));
+    exhausted.then_some(ACCEPT_EXHAUSTION_BACKOFF)
+}
+
 /// Remove the rendezvous file; a missing one is fine (idempotent).
 fn remove_endpoint_file(path: &Path) {
     match std::fs::remove_file(path) {
@@ -443,16 +515,35 @@ fn remove_endpoint_file(path: &Path) {
     }
 }
 
-async fn serve_connection(
+/// Serve one accepted connection: the token line first, within
+/// `token_line_timeout` (security S1), then [`serve_lines`] as the role the
+/// token names. A connection that sends no line in time is closed with one
+/// content-free `debug!`; the partial line is never logged, since it may be
+/// a token or part of one.
+async fn serve_connection<R, W>(
     server: Arc<McpServer>,
-    stream: TcpStream,
+    read_half: R,
+    mut write_half: W,
     agent_token: Option<&str>,
     operator_token: Option<&str>,
-) -> anyhow::Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+    token_line_timeout: Duration,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(read_half).take(MAX_MESSAGE_BYTES as u64);
     let mut first = String::new();
-    if !read_message(&mut reader, &mut first).await? {
+    let Ok(read) =
+        tokio::time::timeout(token_line_timeout, read_message(&mut reader, &mut first)).await
+    else {
+        tracing::debug!(
+            limit_secs = token_line_timeout.as_secs_f64(),
+            "closing a bus connection that sent no token line within the limit"
+        );
+        return Ok(());
+    };
+    if !read? {
         return Ok(());
     }
     let Some(role) = classify_token(&first, agent_token, operator_token) else {
@@ -524,11 +615,12 @@ mod tests {
 
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     use aitm_core::{McpTransport, Registry};
     use serde_json::json;
     use tokio::io::{duplex, split, DuplexStream, Lines, ReadHalf, WriteHalf};
-    use tokio::net::TcpSocket;
+    use tokio::net::{TcpSocket, TcpStream};
     use tokio::task::JoinHandle;
 
     /// A unique temp path for one test, cleaned up by the test itself.
@@ -685,6 +777,168 @@ mod tests {
             "no context, so no pointer was written"
         );
         drop(listener);
+    }
+
+    // ---- S1 (security pass 1): the default-on bus against a silent or
+    // ---- flooding same-user neighbour.
+
+    /// S1(b): only the descriptor-exhaustion class of `accept()` errors
+    /// (`EMFILE`, `ENFILE`, `WouldBlock`) earns the 100 ms pause; the
+    /// per-connection ones (`ECONNABORTED`, `EINTR`, a reset) are moved past
+    /// at once.
+    #[test]
+    fn accept_backoff_pauses_only_for_descriptor_exhaustion() {
+        let pause = Some(Duration::from_millis(100));
+        assert_eq!(accept_backoff(&io::Error::from_raw_os_error(24)), pause); // EMFILE
+        assert_eq!(accept_backoff(&io::Error::from_raw_os_error(23)), pause); // ENFILE
+        assert_eq!(
+            accept_backoff(&io::Error::from(io::ErrorKind::WouldBlock)),
+            pause
+        );
+        assert_eq!(
+            accept_backoff(&io::Error::from(io::ErrorKind::ConnectionAborted)),
+            None
+        );
+        assert_eq!(
+            accept_backoff(&io::Error::from(io::ErrorKind::Interrupted)),
+            None
+        );
+        assert_eq!(
+            accept_backoff(&io::Error::from(io::ErrorKind::ConnectionReset)),
+            None
+        );
+        assert_eq!(accept_backoff(&io::Error::other("anything else")), None);
+    }
+
+    /// S1(a): a connection that sends no token line within the limit is
+    /// closed quietly: the server side ends `Ok(())`, the client reads EOF
+    /// and not one byte before it. In-process over a duplex pipe with a
+    /// 200 ms limit; the production limit is `TOKEN_LINE_TIMEOUT`, 10 s.
+    #[tokio::test]
+    async fn a_connection_that_sends_no_token_line_in_time_is_closed() {
+        assert_eq!(TOKEN_LINE_TIMEOUT, Duration::from_secs(10));
+        let (server_side, client_side) = duplex(4096);
+        let (server_read, server_write) = split(server_side);
+        let (mut client_read, client_write) = split(client_side);
+        let started = Instant::now();
+        let serving = tokio::spawn(serve_connection(
+            bare_server(),
+            server_read,
+            server_write,
+            None,
+            Some("op"),
+            Duration::from_millis(200),
+        ));
+
+        // The client keeps its write half open and says nothing.
+        let mut got = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), client_read.read_to_end(&mut got))
+            .await
+            .expect("the server closes the connection within 5 s")
+            .expect("read to EOF");
+        assert_eq!(n, 0, "nothing is written before the close: {got:?}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "closed no earlier than the limit: {:?}",
+            started.elapsed()
+        );
+        let outcome = serving.await.expect("the connection task did not panic");
+        assert!(
+            outcome.is_ok(),
+            "the expiry is a quiet close, not an error: {outcome:?}"
+        );
+        drop(client_write);
+    }
+
+    /// S1(a): the limit is on the token line only. A client that sends it
+    /// within the limit is served (here as the operator) for as long as it
+    /// likes afterwards, well past the limit.
+    #[tokio::test]
+    async fn a_token_line_within_the_limit_is_served_past_it() {
+        let (server_side, client_side) = duplex(4096);
+        let (server_read, server_write) = split(server_side);
+        let (client_read, mut client_write) = split(client_side);
+        let serving = tokio::spawn(serve_connection(
+            bare_server(),
+            server_read,
+            server_write,
+            None,
+            Some("op"),
+            Duration::from_millis(200),
+        ));
+        let mut reader = BufReader::new(client_read);
+        client_write
+            .write_all(b"{\"token\":\"op\"}\n")
+            .await
+            .expect("send the token line in time");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let initialize = initialize_with_name("aitm-cli");
+        client_write
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .expect("send initialize after the limit");
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut reply))
+            .await
+            .expect("a reply within 5 s")
+            .expect("read the initialize reply");
+        assert!(
+            reply.contains("\"role\":\"operator\""),
+            "served as the operator after the limit: {reply:?}"
+        );
+
+        // A split duplex closes on `shutdown`, not on dropping one half.
+        client_write.shutdown().await.expect("client EOF");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the connection ends at client EOF")
+            .expect("the connection task did not panic");
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    /// S1(a) (socket, Terminal): through the served listener, a connection
+    /// that sends nothing is closed once the listener's token-line limit
+    /// (200 ms here, `with_token_line_timeout`) expires, and the listener
+    /// goes on serving: a second connection that sends the operator token is
+    /// answered as the operator.
+    #[tokio::test]
+    async fn served_listener_closes_a_silent_connection_after_the_token_line_limit() {
+        let listener = LoopbackTcp::bind_operator_only(0, "op".into())
+            .await
+            .expect("bind 127.0.0.1:0 as an operator-only listener")
+            .with_token_line_timeout(Duration::from_millis(200));
+        let addr = listener.local_addr();
+        let serving = tokio::spawn(listener.serve(bare_server()));
+
+        let silent = TcpStream::connect(addr).await.expect("connect");
+        let (mut silent_read, silent_write) = silent.into_split();
+        let mut got = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), silent_read.read_to_end(&mut got))
+            .await
+            .expect("the silent connection is closed within 5 s")
+            .expect("read to EOF");
+        assert_eq!(n, 0, "nothing is written to a silent client: {got:?}");
+        drop(silent_write);
+
+        let stream = TcpStream::connect(addr).await.expect("connect again");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let initialize = initialize_with_name("aitm-cli");
+        write_half
+            .write_all(format!("{{\"token\":\"op\"}}\n{initialize}\n").as_bytes())
+            .await
+            .expect("send the operator token and initialize");
+        let mut reply = String::new();
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read the initialize reply");
+        assert!(
+            reply.contains("\"role\":\"operator\""),
+            "the listener still serves after closing a silent connection: {reply:?}"
+        );
+        serving.abort();
     }
 
     /// An `initialize` request whose `clientInfo.name` is `name`.
