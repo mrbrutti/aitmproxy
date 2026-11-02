@@ -85,6 +85,10 @@ pub enum Mode {
     /// The L4 inject confirm-over-the-wire overlay (ui-ext §3.4, L4OPS-AC10):
     /// shows the server's wire summary; `y` re-issues with `_confirm`.
     L4Confirm,
+    /// The L4 panel (`:l4`, `L`): capture / intercept availability from the
+    /// status verbs, the running captures and the capture commands (L4 parity
+    /// spec §1, AC15). Renders live state only.
+    L4,
 }
 
 /// What the one-line prompt is collecting.
@@ -284,13 +288,17 @@ pub enum Layout {
     Vertical,
 }
 
-/// The content-type chip bar (§2.7).
+/// The content-type chip bar (§2.7). `Tcp` / `Udp` / `L4` are the L4 group
+/// after `WebSocket` (L4 parity AC14; the order web and macOS ship).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chip {
     All,
     Http,
     Https,
     WebSocket,
+    Tcp,
+    Udp,
+    L4,
     H1,
     H2,
     Json,
@@ -305,11 +313,14 @@ pub enum Chip {
 }
 
 impl Chip {
-    pub const ALL: [Chip; 15] = [
+    pub const ALL: [Chip; 18] = [
         Chip::All,
         Chip::Http,
         Chip::Https,
         Chip::WebSocket,
+        Chip::Tcp,
+        Chip::Udp,
+        Chip::L4,
         Chip::H1,
         Chip::H2,
         Chip::Json,
@@ -323,12 +334,27 @@ impl Chip {
         Chip::Other,
     ];
 
+    /// The content-type chips; `Other` is "typed, but none of these".
+    pub const CONTENT: [Chip; 8] = [
+        Chip::Json,
+        Chip::Form,
+        Chip::Xml,
+        Chip::Js,
+        Chip::Css,
+        Chip::GraphQl,
+        Chip::Document,
+        Chip::Media,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Chip::All => "All",
             Chip::Http => "HTTP",
             Chip::Https => "HTTPS",
             Chip::WebSocket => "WebSocket",
+            Chip::Tcp => "TCP",
+            Chip::Udp => "UDP",
+            Chip::L4 => "L4",
             Chip::H1 => "h1",
             Chip::H2 => "h2",
             Chip::Json => "JSON",
@@ -358,6 +384,9 @@ impl Chip {
             Chip::Http => row.kind == FlowKind::Http && row.scheme == "http",
             Chip::Https => row.kind == FlowKind::Http && row.scheme == "https",
             Chip::WebSocket => row.kind == FlowKind::WebSocket,
+            Chip::L4 => row.kind == FlowKind::L4,
+            Chip::Tcp => l4_proto(row) == Some("TCP"),
+            Chip::Udp => l4_proto(row) == Some("UDP"),
             Chip::H1 => row
                 .version
                 .as_deref()
@@ -379,11 +408,15 @@ impl Chip {
                     || ct.starts_with("audio/")
                     || ct.contains("font")
             }
-            Chip::Other => {
-                !ct.is_empty() && !Chip::ALL[6..14].iter().any(|c| c.matches(row, detail))
-            }
+            Chip::Other => !ct.is_empty() && !Chip::CONTENT.iter().any(|c| c.matches(row, detail)),
         }
     }
+}
+
+/// The transport sub-label of an L4 row (`TCP` / `UDP` / `ICMP`); `None` for
+/// an HTTP or WebSocket row.
+fn l4_proto(row: &FlowRow) -> Option<&str> {
+    row.l4.as_ref().and_then(|l| l.proto.as_deref())
 }
 
 /// Sidebar entries (§2.6 "Sidebar groups").
@@ -400,10 +433,12 @@ pub enum SidebarItem {
     Scripts,
     Agent,
     Scan,
+    /// The L4 panel; drawn only when the bus offers `l4.capture.status`.
+    L4,
 }
 
 impl SidebarItem {
-    pub const ALL: [SidebarItem; 11] = [
+    pub const ALL: [SidebarItem; 12] = [
         SidebarItem::Pinned,
         SidebarItem::Saved,
         SidebarItem::All,
@@ -415,6 +450,7 @@ impl SidebarItem {
         SidebarItem::Scripts,
         SidebarItem::Agent,
         SidebarItem::Scan,
+        SidebarItem::L4,
     ];
 
     pub fn label(self) -> &'static str {
@@ -430,6 +466,7 @@ impl SidebarItem {
             SidebarItem::Scripts => "Scripts",
             SidebarItem::Agent => "Agent",
             SidebarItem::Scan => "Scan",
+            SidebarItem::L4 => "L4",
         }
     }
 }
@@ -868,6 +905,18 @@ pub enum PaletteKind {
     Command(String),
     Tool(String),
     Flow(String),
+}
+
+/// A completion candidate for a `:` line is a command palette item: the
+/// candidate's label is the command line to run.
+impl From<crate::ui::complete::Candidate> for PaletteItem {
+    fn from(c: crate::ui::complete::Candidate) -> Self {
+        PaletteItem {
+            label: format!(":{}", c.label),
+            detail: c.detail,
+            kind: PaletteKind::Command(c.label),
+        }
+    }
 }
 
 /// The whole UI state.
@@ -1363,6 +1412,32 @@ impl App {
 
     /// Everything the palette can run, filtered by the typed query.
     pub fn palette_items(&self) -> Vec<PaletteItem> {
+        // An `:l4 …` line completes from live state only (L4 parity §7(b)):
+        // the sub-commands, the known interface names, the directions and the
+        // running capture ids. Case matters (ids), so the raw text is used.
+        let raw = self.prompt.trim_start().trim_start_matches(':');
+        // A `:scope …` line likewise: `add l4` and its words only against a
+        // core that can confirm the add (spec §3 / AC39).
+        if raw.starts_with("scope ") {
+            return crate::ui::complete::scope_command_candidates(
+                raw,
+                crate::l4::supports_operator_scope_add(&self.tools),
+                &self.l4_interfaces(),
+            )
+            .into_iter()
+            .map(PaletteItem::from)
+            .collect();
+        }
+        if raw.starts_with("l4 ") {
+            return crate::ui::complete::l4_command_candidates(
+                raw,
+                &self.l4_interfaces(),
+                &self.l4.captures,
+            )
+            .into_iter()
+            .map(PaletteItem::from)
+            .collect();
+        }
         let q = self.prompt.trim().to_lowercase();
         let mut items: Vec<PaletteItem> = BUILTIN_COMMANDS
             .iter()
@@ -1687,6 +1762,9 @@ impl App {
                 }
             }
             Action::Replay => {
+                if self.refuse_http_verb_on_l4("Replay") {
+                    return out;
+                }
                 if let Some(r) = self.selected_row().cloned() {
                     if r.kind != FlowKind::Http {
                         self.toast(
@@ -1718,6 +1796,9 @@ impl App {
                 }
             }
             Action::Mark => {
+                if self.refuse_http_verb_on_l4("Mark") {
+                    return out;
+                }
                 if self.selected.is_some() {
                     if self.has_tool("flow.mark") {
                         self.open_prompt(PromptKind::Mark);
@@ -1727,6 +1808,9 @@ impl App {
                 }
             }
             Action::Comment => {
+                if self.refuse_http_verb_on_l4("Comment") {
+                    return out;
+                }
                 if self.selected.is_some() {
                     if self.has_tool("flow.comment") {
                         self.open_prompt(PromptKind::Comment);
@@ -1739,6 +1823,9 @@ impl App {
                 }
             }
             Action::BuildPoc => {
+                if self.refuse_http_verb_on_l4("Build PoC") {
+                    return out;
+                }
                 if let Some(r) = self.selected_row().cloned() {
                     if self.gate(&r) {
                         self.poc_pending = Some((r.id, None));
@@ -1804,6 +1891,12 @@ impl App {
                     self.browser.busy = Some("loading the page");
                 }
             }
+            // The L4 panel reads only state the slow poll already holds; opening
+            // it sends nothing (AC15: the controls are the `:l4` commands).
+            Action::OpenL4 => {
+                self.mode = Mode::L4;
+                self.sidebar = SidebarItem::L4;
+            }
             Action::OpenScan => {
                 self.mode = Mode::Scan;
                 self.sidebar = SidebarItem::Scan;
@@ -1831,13 +1924,20 @@ impl App {
                 };
             }
             Action::AgentSet(p) => {
-                if self.has_tool("agent.set") {
-                    out.push(BusRequest::AgentSet(p));
-                } else {
+                // `auto` and `ask` are the core's to set: the TUI shows them
+                // but never sends them (plan 2026-10-31 decision 7).
+                if !p.settable() {
                     self.toast(
                         Level::Warn,
-                        "Agent policy needs core follow-up F1 (agent.set)",
+                        format!(
+                            "policy {} is display-only here; set it in the core config",
+                            p.label()
+                        ),
                     );
+                } else if self.has_tool("agent.set") {
+                    out.push(BusRequest::AgentSet(p));
+                } else {
+                    self.toast(Level::Warn, "agent.set is not on this bus");
                 }
             }
             Action::PaletteOpen => self.open_prompt(PromptKind::Palette),
@@ -1934,6 +2034,8 @@ impl App {
             Action::L4Build => out.extend(self.l4_build()),
             Action::L4Inject => out.extend(self.l4_inject()),
             Action::L4Confirm(yes) => out.extend(self.l4_answer_confirm(yes)),
+            Action::L4MutateParked => out.extend(self.l4_mutate_parked()),
+            Action::L4RevertParked => out.extend(self.l4_revert_parked()),
             Action::L4ToggleGate(gate) => out.extend(self.l4_toggle_gate(gate)),
         }
         out
@@ -1965,13 +2067,21 @@ impl App {
         }
     }
 
-    /// Inject the crafted packet via `l4.inject` only (L4OPS-AC10). Gated by L4
-    /// scope-as-authorisation; the guard's own refusal still surfaces verbatim
-    /// from the server, and the operator confirms over the wire before it sends.
+    /// Inject the crafted packet via `l4.inject` only (L4OPS-AC10). Refused
+    /// locally while `l4.capture.status` says unavailable (the status contract's
+    /// `needs_privilege` covers capture *and* inject, L4 parity spec §1; the
+    /// toast carries the core's reason, so nothing that can only fail reaches
+    /// the bus, AC33). Then gated by L4 scope-as-authorisation; the guard's own
+    /// refusal still surfaces verbatim from the server, and the operator
+    /// confirms over the wire before it sends.
     fn l4_inject(&mut self) -> Vec<BusRequest> {
         let Some(flow) = self.selected_l4().cloned() else {
             return Vec::new();
         };
+        if let Some(t) = self.l4.capture.refusal("inject") {
+            self.toast(Level::Warn, t);
+            return Vec::new();
+        }
         if !self.has_tool("l4.inject") {
             self.toast(Level::Warn, "l4.inject is not on this bus");
             return Vec::new();
@@ -2000,6 +2110,9 @@ impl App {
         if let Some(dst) = craft_dst(&spec) {
             args["dst"] = Value::String(dst);
         }
+        if self.l4_in_flight("l4.inject") {
+            return Vec::new();
+        }
         self.l4.pending = Some(("l4.inject".to_string(), args.clone()));
         vec![BusRequest::Call {
             name: "l4.inject".into(),
@@ -2010,7 +2123,12 @@ impl App {
     /// Answer the inject confirm overlay (L4OPS-AC10): `yes` re-issues the
     /// identical call plus the reserved `_confirm` token; `no` cancels.
     fn l4_answer_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
-        self.mode = Mode::Inspector;
+        // The scope add was typed from the palette, not the inspector: go
+        // back to the scope panel, where the entry will appear.
+        self.mode = match self.l4.confirm.as_ref().map(|c| c.call.as_str()) {
+            Some("l4.scope.add") => Mode::Scope,
+            _ => Mode::Inspector,
+        };
         let Some(c) = self.l4.confirm.take() else {
             return Vec::new();
         };
@@ -2022,6 +2140,37 @@ impl App {
         } else {
             self.toast(Level::Info, format!("{} cancelled", c.call));
             Vec::new()
+        }
+    }
+
+    /// `:scope add l4 <cidr> <ports> <iface> <direction> <capability>` (L4
+    /// parity spec §3, AC13): the operator L4 scope add through the core's
+    /// confirm-over-the-wire handshake. Only when `tools/list` marks
+    /// `l4.scope.add` `confirmable` (a core with unit (a')); against any other
+    /// core it is refused here and nothing reaches the bus (AC39, AC33). The
+    /// five strings go verbatim; the core validates and summarises them in the
+    /// prompt its `needs_confirmation` reply carries.
+    fn l4_scope_add(&mut self, words: &str) -> Vec<BusRequest> {
+        if !crate::l4::supports_operator_scope_add(&self.tools) {
+            self.toast(
+                Level::Warn,
+                "this core cannot confirm an operator L4 scope add",
+            );
+            return Vec::new();
+        }
+        match crate::l4::scope_add_args(words) {
+            Ok(_) if self.l4_in_flight("l4.scope.add") => Vec::new(),
+            Ok(args) => {
+                self.l4.pending = Some(("l4.scope.add".to_string(), args.clone()));
+                vec![BusRequest::Call {
+                    name: "l4.scope.add".into(),
+                    args,
+                }]
+            }
+            Err(usage) => {
+                self.toast(Level::Error, usage);
+                Vec::new()
+            }
         }
     }
 
@@ -2044,34 +2193,171 @@ impl App {
         }]
     }
 
-    /// Forward / Drop a parked in-path L4 packet (ui-ext §3.4, L4OPS-AC12),
-    /// through the same confirm-over-the-wire path; feature-detected from
-    /// `l4.intercept.*`, documented-limited when absent.
+    /// Forward / Drop a parked in-path L4 packet (ui-ext §3.4, L4OPS-AC12;
+    /// L4 parity spec §4), through the same confirm-over-the-wire path. While
+    /// `l4.intercept.status` says unavailable nothing reaches the bus: the
+    /// toast carries the core's reason (AC11). The verdict names the **parked
+    /// packet's id** from `l4.intercept.list`, the first listed for this flow
+    /// (oldest first), never the flow id (AC10).
     fn l4_intercept_verb(&mut self, tool: &str, flow: &crate::l4::L4Flow) -> Vec<BusRequest> {
-        if !self.has_tool(tool) {
-            self.toast(
-                Level::Warn,
-                format!("{tool} is not on this bus — in-path intercept is documented-limited here"),
-            );
+        let Some(parked_id) = self.l4_parked_target(tool, flow) else {
+            return Vec::new();
+        };
+        let args = json!({ "id": parked_id });
+        if self.l4_in_flight(tool) {
             return Vec::new();
         }
-        if flow.parked().is_none() {
-            self.toast(
-                Level::Info,
-                "No parked L4 packet — Forward/Drop need an in-path intercept session",
-            );
-            return Vec::new();
-        }
-        if !self.l4.in_scope(flow) {
-            self.toast(Level::Warn, "Out of L4 scope — intercept actions disabled");
-            return Vec::new();
-        }
-        let args = json!({ "id": flow.id });
         self.l4.pending = Some((tool.to_string(), args.clone()));
         vec![BusRequest::Call {
             name: tool.to_string(),
             args,
         }]
+    }
+
+    /// The single-flight rule for a guarded L4 control: while `pending`
+    /// already holds `call` (its first request has not been answered), a
+    /// second press toasts and sends nothing, so one overlay can never bind
+    /// to another in-flight request's prompt and token (the `CallOk` arm binds
+    /// by name alone). `true` means the caller must send nothing.
+    fn l4_in_flight(&mut self, call: &str) -> bool {
+        if !matches!(&self.l4.pending, Some((c, _)) if c == call) {
+            return false;
+        }
+        self.toast(
+            Level::Warn,
+            format!("{call} is already waiting for the core"),
+        );
+        true
+    }
+
+    /// The parked packet an `l4.intercept.*` verb acts on for `flow`, after the
+    /// refusals every parked-packet verb shares (B4/B5): intercept unavailable
+    /// (toast with the core's reason, AC11), the verb not on the bus, no parked
+    /// packet listed for the flow, or the flow out of L4 scope. `None` means
+    /// nothing may reach the bus; the toast says why.
+    fn l4_parked_target(&mut self, tool: &str, flow: &crate::l4::L4Flow) -> Option<String> {
+        if let Some(t) = self.l4.intercept.refusal("in-path intercept") {
+            self.toast(Level::Warn, t);
+            return None;
+        }
+        if !self.has_tool(tool) {
+            self.toast(
+                Level::Warn,
+                format!("{tool} is not on this bus — in-path intercept is documented-limited here"),
+            );
+            return None;
+        }
+        let Some(parked_id) = self.l4.parked_for(&flow.id).map(|p| p.id.clone()) else {
+            self.toast(Level::Info, "no parked packet on this flow");
+            return None;
+        };
+        if !self.l4.in_scope(flow) {
+            self.toast(Level::Warn, "Out of L4 scope — intercept actions disabled");
+            return None;
+        }
+        Some(parked_id)
+    }
+
+    /// Craft pane `m` (L4 parity spec §4, AC12): apply the editor's spec to the
+    /// selected intercept flow's parked packet — `l4.intercept.mutate {id, spec}`
+    /// with the parked id from `l4.intercept.list` and the same spec the pane's
+    /// Build sends to `l4.craft`. Same refusals as Forward / Drop; a spec the
+    /// editor cannot parse stays in the pane as its error and sends nothing. The
+    /// reply needs no confirm; the parked list refreshes on the slow poll.
+    fn l4_mutate_parked(&mut self) -> Vec<BusRequest> {
+        let Some(flow) = self.selected_l4().cloned() else {
+            return Vec::new();
+        };
+        let Some(parked_id) = self.l4_parked_target("l4.intercept.mutate", &flow) else {
+            return Vec::new();
+        };
+        let spec = match parse_craft_yaml(&self.l4.craft.text()) {
+            Ok(s) => s,
+            Err(e) => {
+                self.l4.craft.error = Some(e);
+                self.toast(
+                    Level::Warn,
+                    "Fix the craft YAML before applying it to the parked packet",
+                );
+                return Vec::new();
+            }
+        };
+        self.l4.craft.error = None;
+        vec![BusRequest::Call {
+            name: "l4.intercept.mutate".into(),
+            args: json!({ "id": parked_id, "spec": spec }),
+        }]
+    }
+
+    /// Craft pane `u` (AC12): discard the staged edit of the selected intercept
+    /// flow's parked packet — `l4.intercept.revert {id}`. Same refusals.
+    fn l4_revert_parked(&mut self) -> Vec<BusRequest> {
+        let Some(flow) = self.selected_l4().cloned() else {
+            return Vec::new();
+        };
+        let Some(parked_id) = self.l4_parked_target("l4.intercept.revert", &flow) else {
+            return Vec::new();
+        };
+        vec![BusRequest::Call {
+            name: "l4.intercept.revert".into(),
+            args: json!({ "id": parked_id }),
+        }]
+    }
+
+    /// Ask for the selected L4 flow's packet window (spec §2: the inspector,
+    /// not the list poll, fetches packets) on a core whose `l4.flow.get`
+    /// declares `offset` / `limit`. An older core sends the whole log on the
+    /// poll already, so nothing is asked.
+    fn request_l4_window(&self, id: &str, out: &mut Vec<BusRequest>) {
+        if self.has_tool("l4.flow.get") && crate::l4::supports_window(&self.tools) {
+            out.push(BusRequest::Call {
+                name: "l4.flow.get".into(),
+                args: crate::l4::inspect_args(id),
+            });
+        }
+    }
+
+    /// Upsert one parsed `l4.flow.get` object: the union list row and the full
+    /// flow in `self.l4.flows`. When the object carries no packets but the
+    /// stored flow does (a `limit: 0` poll reply over an inspected window), the
+    /// stored packets are kept; a grown `packet_count` on the selected flow
+    /// asks for the window again.
+    fn upsert_l4_flow(&mut self, mut f: crate::l4::L4Flow, out: &mut Vec<BusRequest>) {
+        if f.packets.is_empty() {
+            if let Some(prev) = self.l4.flows.get_mut(&f.id) {
+                if !prev.packets.is_empty() {
+                    let grown = f.packet_count != prev.packet_count;
+                    // `prev` is replaced below, so its packets move, not copy.
+                    f.packets = std::mem::take(&mut prev.packets);
+                    if self.selected.as_deref() == Some(f.id.as_str()) && grown {
+                        self.request_l4_window(&f.id, out);
+                    }
+                }
+            }
+        }
+        if let Some(&i) = self.index.get(&f.id) {
+            let seq = self.flows[i].seq;
+            self.flows[i] = FlowRow::from_l4(&f, seq);
+        } else {
+            let row = FlowRow::from_l4(&f, self.next_seq);
+            self.next_seq += 1;
+            self.index.insert(row.id.clone(), self.flows.len());
+            self.flows.push(row);
+        }
+        self.l4.flows.insert(f.id.clone(), f);
+    }
+
+    /// The HTTP verbs (replay, mark, comment, PoC) have no L4 meaning (L4
+    /// parity spec AC16): on a selected L4 row, toast
+    /// `<verb> is not available for L4 flows` and report `true` so the caller
+    /// sends nothing. Checked when the verb is pressed and again when its
+    /// prompt is submitted, in case the selection moved in between.
+    fn refuse_http_verb_on_l4(&mut self, verb: &str) -> bool {
+        if self.selected_row().is_some_and(|r| r.kind == FlowKind::L4) {
+            self.toast(Level::Warn, format!("{verb} is not available for L4 flows"));
+            return true;
+        }
+        false
     }
 
     fn gate(&mut self, r: &FlowRow) -> bool {
@@ -2579,6 +2865,15 @@ impl App {
                         self.close_prompt();
                         out.extend(self.call_tool(&name, json!({})));
                     }
+                    // An `:l4 …` completion is a whole line: Enter runs the
+                    // highlighted one (typed free text runs when none match).
+                    Some(PaletteItem {
+                        kind: PaletteKind::Command(cmd),
+                        ..
+                    }) if cmd.starts_with("l4 ") || cmd.starts_with("scope ") => {
+                        self.close_prompt();
+                        out.extend(self.run_command(&cmd));
+                    }
                     Some(PaletteItem {
                         kind: PaletteKind::Command(cmd),
                         ..
@@ -2609,15 +2904,19 @@ impl App {
                 }
             },
             Mode::Prompt(PromptKind::Comment) => {
-                if let Some(id) = self.selected.clone() {
-                    out.push(BusRequest::Comment { id, text });
+                if !self.refuse_http_verb_on_l4("Comment") {
+                    if let Some(id) = self.selected.clone() {
+                        out.push(BusRequest::Comment { id, text });
+                    }
                 }
                 self.close_prompt();
             }
             Mode::Prompt(PromptKind::Mark) => {
-                if let Some(id) = self.selected.clone() {
-                    let marks = text.split_whitespace().map(str::to_string).collect();
-                    out.push(BusRequest::Mark { id, marks });
+                if !self.refuse_http_verb_on_l4("Mark") {
+                    if let Some(id) = self.selected.clone() {
+                        let marks = text.split_whitespace().map(str::to_string).collect();
+                        out.push(BusRequest::Mark { id, marks });
+                    }
                 }
                 self.close_prompt();
             }
@@ -2944,9 +3243,13 @@ impl App {
     /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
     fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
         let mut next = step(&SidebarItem::ALL, self.sidebar, d);
-        // The Scan row is drawn only when the bus offers `scan.discover`;
-        // never land on a row the operator cannot see.
-        if next == SidebarItem::Scan && !self.has_tool("scan.discover") {
+        // Rows drawn only when the bus offers their verb (Scan: `scan.discover`;
+        // L4: `l4.capture.status`) are skipped: never land on a row the
+        // operator cannot see. Bounded to one lap.
+        for _ in 0..SidebarItem::ALL.len() {
+            if !self.sidebar_hidden(next) {
+                break;
+            }
             next = step(&SidebarItem::ALL, next, d);
         }
         self.sidebar = next;
@@ -2955,6 +3258,7 @@ impl App {
             SidebarItem::Agent => self.mode = Mode::Agent,
             SidebarItem::Browser => out.extend(self.update(Action::OpenBrowser)),
             SidebarItem::Scan => out.extend(self.update(Action::OpenScan)),
+            SidebarItem::L4 => out.extend(self.update(Action::OpenL4)),
             SidebarItem::Scripts => {
                 self.mode = Mode::Flows;
                 self.toast(Level::Info, "Scripts arrive with M3 (core follow-up F8)");
@@ -2964,6 +3268,16 @@ impl App {
                 self.toast(Level::Info, "Saved sessions need core follow-up F10");
             }
             _ => self.mode = Mode::Flows,
+        }
+    }
+
+    /// Whether a sidebar row is not drawn on this bus (`ui::sidebar` draws
+    /// Scan and L4 only when their verb is offered).
+    fn sidebar_hidden(&self, it: SidebarItem) -> bool {
+        match it {
+            SidebarItem::Scan => !self.has_tool("scan.discover"),
+            SidebarItem::L4 => !self.has_tool("l4.capture.status"),
+            _ => false,
         }
     }
 
@@ -2996,9 +3310,10 @@ impl App {
     /// Ask the bus for `id`'s detail when it can answer (`flow.detail`, F5)
     /// and the app neither has it nor has given up on it.
     fn request_detail(&mut self, id: &str, out: &mut Vec<BusRequest>) {
-        // L4 flows carry no `flow.detail`; their packets arrive on the `l4.*`
-        // poll and live in `self.l4.flows`.
+        // L4 flows carry no `flow.detail`; the list poll brings their fields and
+        // the inspector asks for the packet window (spec §2).
         if self.row(id).is_some_and(|r| r.kind == FlowKind::L4) {
+            self.request_l4_window(id, out);
             return;
         }
         if self.has_tool("flow.detail")
@@ -3218,6 +3533,96 @@ impl App {
         ))
     }
 
+    /// The interface names the `:l4` completion offers: live state only, the
+    /// `l4.scope.list` entries and the L4 flows (never a built-in list).
+    pub fn l4_interfaces(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .l4
+            .scope
+            .iter()
+            .map(|e| e.interface.clone())
+            .chain(self.l4.flows.values().map(|f| f.interface.clone()))
+            .filter(|i| !i.is_empty() && i != "any")
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// `:l4 capture <iface> [inbound|outbound]` (AC15): refused locally while
+    /// `l4.capture.status` says unavailable (the toast carries the core's
+    /// reason, so nothing that can only fail reaches the bus, AC33); else
+    /// exactly one `l4.capture.start {interface, direction}`.
+    fn l4_capture_start(&mut self, args: &str) -> Vec<BusRequest> {
+        let mut words = args.split_whitespace();
+        let Some(interface) = words.next() else {
+            self.toast(Level::Error, L4_USAGE);
+            return Vec::new();
+        };
+        let direction = match words.next() {
+            None | Some("inbound") => "inbound",
+            Some("outbound") => "outbound",
+            Some(_) => {
+                self.toast(Level::Error, "direction must be inbound or outbound");
+                return Vec::new();
+            }
+        };
+        if words.next().is_some() {
+            self.toast(Level::Error, L4_USAGE);
+            return Vec::new();
+        }
+        if let Some(t) = self.l4.capture.refusal("capture") {
+            self.toast(Level::Warn, t);
+            return Vec::new();
+        }
+        if !self.has_tool("l4.capture.start") {
+            self.toast(Level::Warn, "l4.capture.start is not on this bus");
+            return Vec::new();
+        }
+        vec![BusRequest::Call {
+            name: "l4.capture.start".into(),
+            args: json!({"interface": interface, "direction": direction}),
+        }]
+    }
+
+    /// `:l4 stop [<id>]`: one `l4.capture.stop {id}` for the named capture, or
+    /// one per running capture (the ids `l4.capture.status` reported). A typed
+    /// id is refused locally while capture is unavailable, like the start (the
+    /// verb is in the core's gated set; AC33); the bare form stops the ids the
+    /// status itself listed, and an unavailable status lists none.
+    fn l4_capture_stop(&mut self, id: &str) -> Vec<BusRequest> {
+        let mut words = id.split_whitespace();
+        let named = words.next();
+        if words.next().is_some() {
+            self.toast(Level::Error, L4_USAGE);
+            return Vec::new();
+        }
+        let ids: Vec<String> = match named {
+            Some(id) => {
+                if let Some(t) = self.l4.capture.refusal("capture") {
+                    self.toast(Level::Warn, t);
+                    return Vec::new();
+                }
+                vec![id.to_string()]
+            }
+            None => self.l4.captures.clone(),
+        };
+        if ids.is_empty() {
+            self.toast(Level::Info, "no running capture");
+            return Vec::new();
+        }
+        if !self.has_tool("l4.capture.stop") {
+            self.toast(Level::Warn, "l4.capture.stop is not on this bus");
+            return Vec::new();
+        }
+        ids.into_iter()
+            .map(|id| BusRequest::Call {
+                name: "l4.capture.stop".into(),
+                args: json!({"id": id}),
+            })
+            .collect()
+    }
+
     /// Run a `:` command line.
     pub fn run_command(&mut self, line: &str) -> Vec<BusRequest> {
         let mut out = Vec::new();
@@ -3258,6 +3663,11 @@ impl App {
             "scope" => {
                 let mut p = rest.splitn(2, ' ');
                 match (p.next().unwrap_or(""), p.next().unwrap_or("").trim()) {
+                    // `:scope add l4 …` is the operator L4 scope add (spec §3);
+                    // a host that happens to start with "l4" is not it.
+                    ("add", h) if h == "l4" || h.starts_with("l4 ") => {
+                        out.extend(self.l4_scope_add(h.strip_prefix("l4").unwrap_or("")));
+                    }
                     ("add", h) if !h.is_empty() => out.push(BusRequest::ScopeAdd(h.to_string())),
                     ("rm", h) | ("remove", h) if !h.is_empty() => {
                         if self.has_tool("scope.remove") {
@@ -3337,6 +3747,17 @@ impl App {
                 self.ask_ca_status(&mut out);
             }
             "browser" => out.extend(self.update(Action::OpenBrowser)),
+            // `:l4` opens the L4 panel; `:l4 capture <iface> [dir]` and
+            // `:l4 stop [<id>]` are the capture controls (L4 parity AC15).
+            "l4" => {
+                let mut p = rest.splitn(2, ' ');
+                match (p.next().unwrap_or(""), p.next().unwrap_or("").trim()) {
+                    ("", _) => out.extend(self.update(Action::OpenL4)),
+                    ("capture", args) => out.extend(self.l4_capture_start(args)),
+                    ("stop", id) => out.extend(self.l4_capture_stop(id)),
+                    _ => self.toast(Level::Error, L4_USAGE),
+                }
+            }
             // `:scan` opens the Scan view only (viewing never crawls; `r`
             // launches); `:scan <host>` opens it and crawls that host,
             // scope-gated.
@@ -3590,16 +4011,7 @@ impl App {
                     .collect();
                 for f in parsed {
                     seen.insert(f.id.clone());
-                    if let Some(&i) = self.index.get(&f.id) {
-                        let seq = self.flows[i].seq;
-                        self.flows[i] = FlowRow::from_l4(&f, seq);
-                    } else {
-                        let row = FlowRow::from_l4(&f, self.next_seq);
-                        self.next_seq += 1;
-                        self.index.insert(row.id.clone(), self.flows.len());
-                        self.flows.push(row);
-                    }
-                    self.l4.flows.insert(f.id.clone(), f);
+                    self.upsert_l4_flow(f, &mut out);
                 }
                 let before = self.flows.len();
                 self.flows
@@ -3625,6 +4037,24 @@ impl App {
                     .collect();
             }
             BusEvent::L4Agent(v) => self.l4.gates = crate::l4::L4Gates::from_json(&v),
+            // Spec §1: availability is whatever the core said last; a change
+            // never toasts (the panel and the bars show it).
+            BusEvent::L4Availability {
+                capture,
+                intercept,
+                captures,
+            } => {
+                self.l4.capture = capture;
+                self.l4.intercept = intercept;
+                self.l4.captures = captures;
+            }
+            // Spec §4: the parked packets in the core's order (oldest first).
+            BusEvent::L4Parked(values) => {
+                self.l4.parked = values
+                    .iter()
+                    .filter_map(crate::l4::L4Parked::from_json)
+                    .collect();
+            }
             BusEvent::Findings(library) => self.merge_library(library, &mut out),
             BusEvent::Agent(a) => self.agent = a,
             BusEvent::CallOk { name, value } => {
@@ -3862,6 +4292,16 @@ impl App {
                             self.request_detail(&id, &mut out);
                         }
                     }
+                    // The inspector's packet window (spec §2): fold it, no toast.
+                    "l4.flow.get" => {
+                        if let Some(f) = crate::l4::L4Flow::from_json(&value) {
+                            self.upsert_l4_flow(f, &mut out);
+                            let packets = self.selected_l4().map_or(0, |f| f.packets.len());
+                            self.l4.packet_cursor =
+                                self.l4.packet_cursor.min(packets.saturating_sub(1));
+                        }
+                        return out;
+                    }
                     // L4 craft build() → the hex preview (L4OPS-AC8).
                     "l4.craft" => {
                         let bytes = value
@@ -3891,25 +4331,81 @@ impl App {
                         }
                         return out;
                     }
-                    // L4 guarded wire verbs: a `needs_confirmation` reply opens
-                    // the confirm overlay (L4OPS-AC10); a plain reply is success.
-                    "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
-                        let (call, args) = self
-                            .l4
-                            .pending
-                            .take()
-                            .unwrap_or((name.clone(), Value::Null));
-                        match crate::l4::L4Confirm::from_reply(&call, &args, &value) {
-                            Some(confirm) => {
+                    // The L4 guarded verbs (L4OPS-AC10; L4 parity spec §3):
+                    // a `needs_confirmation` reply opens the confirm overlay
+                    // **for the pending call of the same name only** — the
+                    // overlay is the operator's trust point, so what it shows
+                    // is what `y` sends. A handshake with nothing pending for
+                    // its name (the generic tool form never sets `pending`)
+                    // opens nothing; one without a token is malformed, not a
+                    // success. A plain reply is the verb's success.
+                    "l4.inject"
+                    | "l4.send_recv"
+                    | "l4.intercept.forward"
+                    | "l4.intercept.drop"
+                    | "l4.scope.add" => {
+                        let pending = match self.l4.pending.take() {
+                            Some((call, args)) if call == *name => Some((call, args)),
+                            other => {
+                                self.l4.pending = other;
+                                None
+                            }
+                        };
+                        let bound = pending.is_some();
+                        let (call, args) = pending.unwrap_or((name.clone(), Value::Null));
+                        match crate::l4::L4Confirm::classify(&call, &args, &value) {
+                            crate::l4::ConfirmReply::Malformed => {
+                                self.toast(
+                                    Level::Warn,
+                                    format!("{name}: malformed confirmation reply (no token)"),
+                                );
+                                return out;
+                            }
+                            crate::l4::ConfirmReply::Handshake(_) if !bound => {
+                                self.toast(
+                                    Level::Warn,
+                                    format!(
+                                        "{name} needs confirmation: re-run it from the L4 controls"
+                                    ),
+                                );
+                                return out;
+                            }
+                            crate::l4::ConfirmReply::Handshake(confirm) => {
                                 self.l4.confirm = Some(confirm);
                                 self.mode = Mode::L4Confirm;
                                 return out;
                             }
-                            None => {
+                            crate::l4::ConfirmReply::Plain => {}
+                        }
+                        match name.as_str() {
+                            // The confirmed scope add's reply is the new id;
+                            // the scope is re-read so the panel shows it now.
+                            "l4.scope.add" => {
+                                let shown: String = value_text(&value).chars().take(60).collect();
+                                self.toast(Level::Info, format!("L4 scope + {shown}"));
+                                if self.has_tool("l4.scope.list") {
+                                    out.push(BusRequest::Call {
+                                        name: "l4.scope.list".into(),
+                                        args: json!({}),
+                                    });
+                                }
+                            }
+                            _ => {
                                 let shown: String = value_text(&value).chars().take(120).collect();
                                 self.toast(Level::Info, format!("{name}: {shown}"));
                             }
                         }
+                    }
+                    // A direct `l4.scope.list` read (after a scope add): the
+                    // same fold as the slow poll's, silently.
+                    "l4.scope.list" => {
+                        if let Value::Array(entries) = &value {
+                            self.l4.scope = entries
+                                .iter()
+                                .filter_map(crate::l4::L4ScopeEntry::from_json)
+                                .collect();
+                        }
+                        return out;
                     }
                     // L4 agent gate set/status reply: the four gate states.
                     "l4.agent.set" => {
@@ -4016,9 +4512,18 @@ impl App {
                         }
                     }
                     // A guard refusal (out-of-scope / rate / denylist / oversize /
-                    // count) is surfaced verbatim; drop the pending confirm.
-                    "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
-                        self.l4.pending = None;
+                    // count) is surfaced verbatim; drop the pending confirm —
+                    // only the one this failure names, so a foreign verb's
+                    // failure leaves another control's pending call in place
+                    // (symmetric with the `CallOk` take above).
+                    "l4.inject"
+                    | "l4.send_recv"
+                    | "l4.intercept.forward"
+                    | "l4.intercept.drop"
+                    | "l4.scope.add" => {
+                        if matches!(&self.l4.pending, Some((c, _)) if *c == name) {
+                            self.l4.pending = None;
+                        }
                     }
                     // A refused or failed crawl clears the running flag and keeps
                     // the reason in the Scan view until the next launch.
@@ -4253,6 +4758,15 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "scan",
         "Scan view: scope-bound scan.discover (r crawls; :scan <host> crawls a host)",
     ),
+    (
+        "l4",
+        "L4 panel: capture / intercept availability and running captures (L)",
+    ),
+    (
+        "l4 capture <iface> [inbound|outbound]",
+        "Start a packet capture (refused locally while capture is unavailable)",
+    ),
+    ("l4 stop [<id>]", "Stop one running capture, or every one"),
     ("layout h|v", "Inspector below or right"),
     ("split", "Split view (not built in this pass)"),
     ("export", "Export flows (needs F10)"),
@@ -4268,6 +4782,9 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("help", "Keys and commands"),
     ("quit", "Leave the TUI"),
 ];
+
+/// The `:l4` usage toast.
+const L4_USAGE: &str = "usage: :l4 [capture <iface> [inbound|outbound] | stop [<id>]]";
 
 /// Subsequence match: every char of `needle` appears in order in `hay`.
 /// Parse the craft editor's YAML into a `PacketSpec` JSON value for `l4.craft`
@@ -4393,6 +4910,7 @@ mod tests {
                 name: (*n).to_string(),
                 description: String::new(),
                 input_schema: json!({"type":"object","properties":{}}),
+                confirmable: false,
             })
             .collect()
     }
@@ -4747,13 +5265,18 @@ mod tests {
     fn features_absent_from_the_bus_degrade_to_a_toast() {
         let mut app = app_with_flows();
         assert!(app.update(Action::AgentSet(AgentPolicy::Paused)).is_empty());
-        assert!(app.current_toast().unwrap().text.contains("F1"));
+        assert!(app
+            .current_toast()
+            .unwrap()
+            .text
+            .contains("agent.set is not on this bus"));
         assert!(app.run_command("clear").is_empty());
         assert!(app.current_toast().unwrap().text.contains("F7"));
         app.tools.push(ToolInfo {
             name: "agent.set".into(),
             description: String::new(),
             input_schema: json!({}),
+            confirmable: false,
         });
         assert_eq!(
             app.update(Action::AgentSet(AgentPolicy::Paused)),

@@ -36,6 +36,7 @@ dependencies = [
  "aitm-core",
  "aitm-findings",
  "aitm-mcp",
+ "aitm-peer-process",
  "aitm-peer-token",
  "aitm-plugin",
  "aitm-plugin-maprules",
@@ -193,6 +194,15 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aitm-peer-process"
+version = "0.5.11"
+dependencies = [
+ "aitm-core",
+ "core-foundation",
+ "libc",
 ]
 
 [[package]]
@@ -401,6 +411,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "socket2",
  "thiserror 2.0.21",
  "tracing",
  "uuid",

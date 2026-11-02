@@ -566,7 +566,12 @@ pub fn assemble_with_scripts(
     let scan_late = scanner.late();
     let scanner_engine = scanner.engine_cell();
 
-    let mut builder = Proxy::builder().with_config(cfg.clone());
+    // The peer resolver names the loopback client of every proxied connection
+    // (spec 2026-11-01-proxied-client-attribution); `capture_interface` stays null
+    // on this path.
+    let mut builder = Proxy::builder()
+        .with_config(cfg.clone())
+        .with_peer_resolver(Arc::new(aitm_peer_process::ProcessResolver::new()));
     // Protocol modules, in registration order (first match claims the connection):
     // PassthroughModule before HttpModule so a pinned or out-of-scope host tunnels
     // past MITM.

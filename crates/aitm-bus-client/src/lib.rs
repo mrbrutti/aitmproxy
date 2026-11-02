@@ -391,11 +391,16 @@ pub struct ToolDef {
     pub description: String,
     /// The `inputSchema` object.
     pub input_schema: Value,
+    /// Whether the command offers confirm-over-the-wire (`tools/list`
+    /// `confirmable`): a first call answers `needs_confirmation` and the client
+    /// re-issues it with `_confirm`. Absent on the wire means `false`.
+    pub confirmable: bool,
 }
 
 impl ToolDef {
     /// Decode one `tools/list` entry. `name` is required; a missing
-    /// `description` is empty and a missing `inputSchema` is `Null`.
+    /// `description` is empty, a missing `inputSchema` is `Null` and a missing
+    /// `confirmable` is `false`.
     pub fn from_json(v: &Value) -> Result<Self, BusError> {
         Ok(Self {
             name: required_str(v, "name", "tool")?,
@@ -405,6 +410,10 @@ impl ToolDef {
                 .unwrap_or_default()
                 .to_string(),
             input_schema: v.get("inputSchema").cloned().unwrap_or(Value::Null),
+            confirmable: v
+                .get("confirmable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -592,12 +601,14 @@ mod tests {
         let full = ToolDef::from_json(&json!({
             "name": "flow.get",
             "description": "Summarize one flow.",
-            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+            "confirmable": true
         }))
         .expect("a complete entry");
         assert_eq!(full.name, "flow.get");
         assert_eq!(full.description, "Summarize one flow.");
         assert_eq!(full.input_schema["required"], json!(["id"]));
+        assert!(full.confirmable);
         let bare = ToolDef::from_json(&json!({"name": "flow.list"})).expect("name alone");
         assert_eq!(
             bare,
@@ -605,6 +616,7 @@ mod tests {
                 name: "flow.list".into(),
                 description: String::new(),
                 input_schema: Value::Null,
+                confirmable: false,
             }
         );
         let err = ToolDef::from_json(&json!({"description": "no name"})).unwrap_err();

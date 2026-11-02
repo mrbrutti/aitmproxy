@@ -53,6 +53,14 @@ tracing.workspace = true
 # with macOS; Linux needs `libpcap-dev`. The crate's own `unsafe` stays internal —
 # the aitm-proto-l4 crate root keeps `#![forbid(unsafe_code)]` (AC20).
 pcap = "2.5"
+# Linux loopback injection has to go through an `AF_INET`/`AF_INET6` raw socket
+# with `IP_HDRINCL` (see the `backend::pcap` module docs): a frame written at L2
+# on `lo` is sniffable but never processed by the IP stack. `socket2`'s API is
+# safe (the setsockopt `unsafe` stays inside it), so the crate root keeps
+# `#![forbid(unsafe_code)]`. Already in the workspace lock at 0.6.5 via
+# tokio/mio; the `all` feature is what exposes `set_header_included_v4/_v6` and
+# pulls in no further dependency.
+socket2 = { version = "0.6", features = ["all"] }
 
 # In-path interception (M5 Task 11): Linux NFQUEUE. `nfq` talks netlink directly
 # (no GPL `libnetfilter_queue` link), its public API is safe `fn`s so the crate
