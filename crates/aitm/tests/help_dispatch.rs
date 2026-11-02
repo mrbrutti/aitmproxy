@@ -189,8 +189,8 @@ fn without_log_line(stderr: &str) -> String {
 
 /// AC-W2-1, AC-W2-7, AC-W2-10's observable half: `aitm --help`, `aitm -h`
 /// and `aitm help` are byte-identical, exit 0, print nothing to stderr, open
-/// with the versioned title, list 19 groups with the catalogue and 18
-/// without, carry no escape byte even with colour forced onto the pipe, and
+/// with the versioned title, list 19 groups with or without the catalogue,
+/// carry no escape byte even with colour forced onto the pipe, and
 /// leave a fresh `HOME` with no file at all (no CA, no config, no log).
 #[test]
 fn top_page_forms_are_identical_pre_boot_and_create_nothing() {
@@ -250,13 +250,14 @@ fn top_page_forms_are_identical_pre_boot_and_create_nothing() {
         "an escape byte in a pipe: {page:?}"
     );
 
-    // Without the catalogue the `l4` row goes and 18 built-in groups stay.
+    // Without the catalogue the 19 built-in groups stay: `l4` is built in since
+    // p1b (main #267), the catalogue only adds verbs.
     let bare = aitm(&home, &[("AITM_NO_BUNDLED_SCRIPTS", "1")], &["--help"]);
     assert!(bare.ok(), "{:?} {:?}", bare.code, bare.stderr);
     let bare_rows = group_rows(&bare.stdout);
-    assert_eq!(bare_rows.len(), 18, "{bare_rows:#?}");
+    assert_eq!(bare_rows.len(), 19, "{bare_rows:#?}");
     assert!(
-        !bare_rows.iter().any(|row| row.starts_with("  l4 ")),
+        bare_rows.iter().any(|row| row.starts_with("  l4 ")),
         "{bare_rows:#?}"
     );
     assert!(
