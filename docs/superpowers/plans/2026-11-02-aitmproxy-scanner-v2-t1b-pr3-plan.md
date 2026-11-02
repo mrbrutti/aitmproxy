@@ -342,7 +342,12 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-Filled at stage 7.
+**PR 3a = #301** (`claude/scanner-v2-t1b-pr3` → `main`, base 253ce188), opened 2026-11-02 at 94522d95 (+ this note); merge is the coordinator's. Tasks 1, 2, 3, 5, 6, 7, 7b + tester + fix rounds X/Y.
+
+- Gate: full workspace gate exit 0 at f3739b5c (post-tester) and at 94522d95 (post-fix ready head; log lost to a watcher cleanup race, exit code captured). `target/` deleted after the runs.
+- Live proof: parallel `run.py scan` 33 pass / 7 skip / 0 fail at f3739b5c — `test_t3_catalogue_sweep.py` PASS with `open-redirect` found on V (amendment 83), h2_observe/h2_sender/mutable_points/version_override/record_policy PASS; ready head: exit 0 (no failing suite). 59: the h2 observe checks take the dialled-peer path; 67: bridge + manual verdicts reach the caller scrubbed; 68/69 unit-only.
+- Panel: security PASS, quality PASS, spec PASS, tester PASS; comment on #301.
+- PR 3b (Tasks 8–13) opens off the tip after #301 lands.
 
 ## Questions for the orchestrator (most important first)
 
