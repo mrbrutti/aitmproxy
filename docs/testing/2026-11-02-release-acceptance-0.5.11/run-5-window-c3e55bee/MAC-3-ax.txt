@@ -1,0 +1,57 @@
+AXStaticText	missing value	aitmproxy	text
+AXStaticText	missing value	TRAFFIC	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	TESTING	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	AUTOMATION	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXTextField	missing value		text field
+AXStaticText	missing value	⌘⇧F	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	Embedded · proxy 127.0.0.1:8080	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	operator · 127.0.0.1:57610	text
+AXButton	missing value	missing value	button
+AXStaticText	missing value	extension on · 1 host in scope	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	Core is running	text
+AXStaticText	missing value	Bus connected	text
+AXStaticText	missing value	system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core.	text
+AXButton	missing value	missing value	button
+AXStaticText	missing value	All Apps is on	text
+AXStaticText	missing value	Scope: 1 host decrypted	text
+AXStaticText	missing value	CA trusted (user keychain)	text
+AXStaticText	missing value	6 flows captured	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	1 / 6 rows	text
+AXStaticText	missing value	1 hosts in scope	text
+AXStaticText	missing value	↑ 0 B/s	text
+AXStaticText	missing value	↓ 0 B/s	text
+AXButton	missing value	missing value	button
+AXCheckBox	missing value	1	toggle button
+AXCheckBox	missing value	1	toggle button
+AXButton	missing value	missing value	Toggle Sidebar
+AXButton	missing value	missing value	Compose
+AXButton	missing value	missing value	Clear Session
+AXButton	missing value	missing value	Command Palette
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	close button
+AXButton	missing value	missing value	full screen button
+AXButton	missing value	missing value	minimize button

@@ -23,10 +23,12 @@ SKIP (77) conditions, each naming the missing thing:
   * the core does not advertise the `scan.*` verbs this cell calls (pre-T1b core);
   * `scan.checks` lists no check for the `l4_packet` lane (the T5 lane is not on this build);
   * the L4 module is not enabled on the core (no `l4.capture.status`);
-  * `l4.capture.status` says `available: false` -- the packet lane needs raw pcap privilege
-    (macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW). On Matt's Mac
-    /dev/bpf* is root-only, so this cell SKIPs there with the core's own `reason` until BPF
-    is granted or a Linux rig runs it;
+  * `l4.privilege` (or, on a pre-p1b core, `l4.capture.status`) says packet capture is not
+    available: the cell SKIPs with `packet-capture permission not granted (...)` naming the
+    product's own path (macOS: the Aitmproxy app's packet-capture helper; Linux: the
+    packet-capture helper, or the core process holding CAP_NET_RAW on a test rig), followed
+    by the core's own reason. A core that holds the capability through the helper rather
+    than its own process SKIPs too, naming that route (the proof is per-process today);
   * the core accepted the job but reported the `l4_packet` lane as skipped (its reason).
 
 serial: it runs a privileged loopback capture and a packet fuzz run. Exit 0 / 1 / 77.
@@ -107,7 +109,8 @@ def main() -> int:
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
         status = packet_lane_gate(op, *VERBS)
-        note("l4.capture.status", {k: v for k, v in status.items() if k != "reason"})
+        note("l4.capture.status", {k: v for k, v in status.items() if k not in ("reason", "privilege")})
+        note("l4.privilege (None on a core without the verb)", status.get("privilege"))
 
         section("observer 1: start the operator's own loopback capture before a single case is sent")
         started_cap = op.confirm("l4.capture.start", {"interface": iface, "direction": "inbound"})

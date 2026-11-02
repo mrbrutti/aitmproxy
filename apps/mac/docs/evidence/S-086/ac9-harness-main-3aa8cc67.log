@@ -1,0 +1,15 @@
+window 120 100 1440 900 footer-y 927
+tools: 121 […]
+job scan-e6b8d1df
+20:10:21 shot 92-final-run-t1; scan.status scan-e6b8d1df
+{"state": "done", "phase": "done", "elapsed_ms": 7782, "stopped_reason": null, "sent": 282, "budget": 2000, "audited": 482, "found": 485, "issues": {"critical": 0, "high": 0, "info": 0, "low": 4, "medium": 2}}
+20:10:40 shot 92-final-run-t2; scan.status scan-e6b8d1df
+{"state": "done", "phase": "done", "elapsed_ms": 7782, "stopped_reason": null, "sent": 282, "budget": 2000, "audited": 482, "found": 485, "issues": {"critical": 0, "high": 0, "info": 0, "low": 4, "medium": 2}}
+20:10:59 shot 92-final-run-t3; scan.status scan-e6b8d1df
+{"state": "done", "phase": "done", "elapsed_ms": 7782, "stopped_reason": null, "sent": 282, "budget": 2000, "audited": 482, "found": 485, "issues": {"critical": 0, "high": 0, "info": 0, "low": 4, "medium": 2}}
+20:11:03 click Cancel Scan
+20:11:26 shot 93-final-cancel-t1; scan.status scan-e6b8d1df
+{"state": "done", "phase": "done", "elapsed_ms": 7782, "stopped_reason": null, "sent": 282, "budget": 2000, "audited": 482, "found": 485, "issues": {"critical": 0, "high": 0, "info": 0, "low": 4, "medium": 2}}
+20:11:44 shot 93-final-cancel-t2; scan.status scan-e6b8d1df
+{"state": "done", "phase": "done", "elapsed_ms": 7782, "stopped_reason": null, "sent": 282, "budget": 2000, "audited": 482, "found": 485, "issues": {"critical": 0, "high": 0, "info": 0, "low": 4, "medium": 2}}
+20:12:10 scan.issues: {'critical': 0, 'high': 0, 'info': 0, 'low': 4, 'medium': 2}
