@@ -235,6 +235,20 @@ pub struct CheckCounters {
     /// pairs of the job, so an operator sees *why* a lane was inert instead
     /// of a bare counter. Additive (amendment 58): absent, read as empty.
     pub error_samples: Vec<CheckErrorSample>,
+    /// Items the engine could not run because no lane could host the point —
+    /// an origin item of a lane that builds hosts from captured flows, a
+    /// point whose flow left the store. A skipped item settles its point's
+    /// owed count (so `points.audited` is unaffected) but never bumps
+    /// [`CheckCounters::done`], so `done + skipped == scheduled` at the end
+    /// of a job. Additive (amendment 69): absent on an older record, read
+    /// as 0.
+    pub skipped: u64,
+    /// The first [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` skip
+    /// reasons, detail scrubbed and bounded like an error sample, so a skip
+    /// is never silent. Kept apart from
+    /// [`CheckCounters::error_samples`] so an operator never reads a skip as
+    /// a check error. Additive (amendment 69): absent, read as empty.
+    pub skipped_samples: Vec<CheckErrorSample>,
 }
 
 /// The most entries `CheckCounters.error_samples` keeps per job (amendment

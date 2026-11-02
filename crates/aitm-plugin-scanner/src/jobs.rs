@@ -1807,6 +1807,9 @@ pub(crate) mod test_support {
         /// host is built from the captured flow does (`aitm-scan-http`:
         /// "point ... has no source flow"); an origin item has none.
         refuse_flowless: bool,
+        /// Refuse to host *every* point with this text, as a lane whose
+        /// session is gone or whose host cannot be built does (amendment 69).
+        host_error: Option<String>,
         validate_error: Option<String>,
         l4_reports: Vec<L4Counters>,
         discoveries: AtomicU64,
@@ -1841,6 +1844,7 @@ pub(crate) mod test_support {
                 discover_error: None,
                 discover_panic: false,
                 refuse_flowless: false,
+                host_error: None,
                 validate_error: None,
                 l4_reports: Vec::new(),
                 discoveries: AtomicU64::new(0),
@@ -1920,6 +1924,13 @@ pub(crate) mod test_support {
             self
         }
 
+        /// The lane hosts nothing: every `probe_host_for` refuses with
+        /// `text`, so the engine can host no item on it (amendment 69).
+        pub(crate) fn with_host_error(mut self, text: &str) -> Self {
+            self.host_error = Some(text.to_string());
+            self
+        }
+
         pub(crate) fn with_validate_error(mut self, text: &str) -> Self {
             self.validate_error = Some(text.to_string());
             self
@@ -1990,6 +2001,9 @@ pub(crate) mod test_support {
             point: &InsertionPoint,
             job: Arc<dyn JobCtx>,
         ) -> anyhow::Result<Box<dyn ProbeHost>> {
+            if let Some(text) = &self.host_error {
+                anyhow::bail!("{text}");
+            }
             if self.refuse_flowless && point.flow.is_none() {
                 anyhow::bail!("scan: point {} has no source flow", point.id);
             }

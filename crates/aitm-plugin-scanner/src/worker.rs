@@ -1057,9 +1057,14 @@ impl RunCtx<'_> {
         };
         let host = match hosted {
             Ok(host) => ArcHost(Arc::from(host)),
+            // Amendment 69: the lane could not host this item — a flowless
+            // origin item the engine's interim host did not rescue above, a
+            // point whose flow left the store, a lost session. It is a skip
+            // with a sample, never a silent `checks.done`.
             Err(e) => {
-                self.note_lane_text(&e.to_string());
-                self.item_done(item.point, owed);
+                let reason = e.to_string();
+                self.note_lane_text(&reason);
+                self.item_skipped(item, &meta.id, &point.id, &reason, owed);
                 return;
             }
         };
@@ -1324,14 +1329,17 @@ impl RunCtx<'_> {
         }
     }
 
-    /// One item finished: the check counter rises, and the point's counter
-    /// rises with the last item that named it.
+    /// One item is accounted for — it ran, or the engine could not run it:
+    /// the point's owed counter falls, and the point is audited with the last
+    /// item that named it.
     ///
     /// An origin item is an item like any other — it is in `points.queued` and
-    /// `checks.scheduled`, and it bumps `checks.done` here — but it is not a
-    /// discovered insertion point, so it never bumps `points.audited`
-    /// (amendment 38).
-    fn item_done(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
+    /// `checks.scheduled` — but it is not a discovered insertion point, so it
+    /// never bumps `points.audited` (amendment 38). A skipped item settles the
+    /// owed count exactly as a finished one does (amendment 69, call C7), so
+    /// `points.audited` reads the same whether a lane could host the point or
+    /// not; only `checks.done` tells the two apart.
+    fn settle_point(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
         let last = match owed.get_mut(&point) {
             Some(left) => {
                 *left = left.saturating_sub(1);
@@ -1339,11 +1347,60 @@ impl RunCtx<'_> {
             }
             None => false,
         };
-        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
-        bump(&mut status.checks.done, 1);
         if last && point < self.points.len() {
+            let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
             bump(&mut status.points.audited, 1);
         }
+    }
+
+    /// One item finished: the check counter rises, and the point settles.
+    fn item_done(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
+        self.settle_point(point, owed);
+        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
+        bump(&mut status.checks.done, 1);
+    }
+
+    /// One item the engine could not run because no lane could host its point
+    /// (amendment 69): it is counted on `checks.skipped`, never on
+    /// `checks.done`, and the first distinct `(check, detail)` reason is kept
+    /// on `checks.skipped_samples` (up to [`MAX_CHECK_ERROR_SAMPLES`]) and
+    /// logged **once** — so a lane that hosts nothing says so instead of
+    /// reporting a job of silent successes. The reason is scrubbed first and
+    /// cut like an evidence excerpt (spec amendment 16: scrub, then bound).
+    /// Kept apart from `checks.errors`/`error_samples` (call C6): a skip is
+    /// not an `error` verdict. The point still settles (call C7).
+    fn item_skipped(
+        &self,
+        item: &ScheduleItem,
+        check: &str,
+        point_id: &str,
+        reason: &str,
+        owed: &mut std::collections::HashMap<usize, usize>,
+    ) {
+        self.settle_point(item.point, owed);
+        let detail = Evidence::excerpt(&util::scrub(reason));
+        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
+        bump(&mut status.checks.skipped, 1);
+        let samples = &mut status.checks.skipped_samples;
+        if samples.len() >= MAX_CHECK_ERROR_SAMPLES
+            || samples
+                .iter()
+                .any(|s| s.check == check && s.detail == detail)
+        {
+            return;
+        }
+        tracing::debug!(
+            target: "aitm::scanner",
+            job = %self.job,
+            check = %check,
+            point = %point_id,
+            "no lane could host the point; the item is skipped: {detail}",
+        );
+        samples.push(CheckErrorSample {
+            check: check.to_string(),
+            point: point_id.to_string(),
+            detail,
+        });
     }
 }
 
@@ -1934,6 +1991,160 @@ mod tests {
             origin.points_seen(),
             vec!["origin:http://scan.test:80".to_string()]
         );
+    }
+
+    /// Amendment 69: an item whose lane cannot host it — a point the lane
+    /// refuses to build a host for (no captured flow, a lost session) — is
+    /// `checks.skipped` with a sample naming the check, the first point and
+    /// the scrubbed reason, never a silent `checks.done`. Call C7: the item
+    /// still settles its point's owed count, so `points.audited` reads the
+    /// same as it would have, and `done + skipped == scheduled`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_the_lane_cannot_host_is_skipped_with_a_sample_not_done() {
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
+                .with_host_error("the fake lane hosts nothing"),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        // Two points x (the lane's point check + the engine's three shipped
+        // passive checks, spec amendment 24); the lane hosts none of them.
+        assert_eq!(status.checks.scheduled, 8);
+        assert_eq!(
+            status.checks.done, 0,
+            "an item that never ran is not a finished run"
+        );
+        assert_eq!(status.checks.skipped, 8);
+        assert_eq!(
+            status.checks.done + status.checks.skipped,
+            status.checks.scheduled,
+            "every scheduled item is accounted for"
+        );
+        assert_eq!(
+            status.checks.errors, 0,
+            "a skip is not a check error (call C6)"
+        );
+        assert!(
+            status.checks.error_samples.is_empty(),
+            "a skip is not sampled as an error: {:?}",
+            status.checks.error_samples
+        );
+        assert_eq!(
+            status.checks.skipped_samples.len(),
+            4,
+            "one sample per distinct (check, detail): the two points share \
+             each of the four checks, and every skip has the same reason: {:?}",
+            status.checks.skipped_samples
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.detail == "the fake lane hosts nothing"),
+            "{:?}",
+            status.checks.skipped_samples
+        );
+        let sampled: std::collections::BTreeSet<&str> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .map(|s| s.check.as_str())
+            .collect();
+        assert_eq!(
+            sampled,
+            std::collections::BTreeSet::from([
+                "cookie-flag",
+                "fake.point",
+                "reflection",
+                "security-header",
+            ]),
+            "every scheduled check is named once"
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.point == "p1" || s.point == "p2"),
+            "a sample names the first point the pair was seen on: {:?}",
+            status.checks.skipped_samples
+        );
+        assert_eq!(
+            status.points.audited, 2,
+            "a skipped item still settles its point (call C7)"
+        );
+        assert_eq!(status.issues.total, 0, "a skip is not an issue");
+    }
+
+    /// Amendment 69 (call C6): a skip sample's detail goes through
+    /// `util::scrub` before it is stored, and the list stops at
+    /// [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` pairs while
+    /// `checks.skipped` keeps counting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skipped_samples_are_scrubbed_and_capped() {
+        let mut lane =
+            FakeLane::http().with_points(vec![fake_point("p1", "q", "http://scan.test/search")]);
+        for i in 0..9 {
+            lane = lane.with_check(FakeCheck::new(
+                &format!("fake.point{i}"),
+                "demo",
+                FakeRun::clean(),
+            ));
+        }
+        let h =
+            Harness::new().with_lane(lane.with_host_error("no host: Authorization: Bearer abc"));
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        // One point x (nine lane checks + the engine's three shipped passive
+        // checks, spec amendment 24): twelve items, none of them hosted.
+        assert_eq!(status.checks.scheduled, 12);
+        assert_eq!(status.checks.skipped, 12);
+        assert_eq!(status.checks.done, 0);
+        assert_eq!(
+            status.checks.skipped_samples.len(),
+            aitm_scan_model::MAX_CHECK_ERROR_SAMPLES,
+            "twelve distinct checks, eight kept: {:?}",
+            status.checks.skipped_samples
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.detail == "no host: Authorization: [redacted]"),
+            "the bearer token never reaches scan.status: {:?}",
+            status.checks.skipped_samples
+        );
+        let named: std::collections::BTreeSet<&str> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .map(|s| s.check.as_str())
+            .collect();
+        assert_eq!(named.len(), 8, "every kept sample names a distinct check");
     }
 
     /// Amendment 58 (T5's inert lane): a check that answers `Outcome::Error`
