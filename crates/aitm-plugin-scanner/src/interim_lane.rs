@@ -201,6 +201,14 @@ impl InterimHttpLane {
         if crawled.forms_skipped > 0 {
             job.report_forms_skipped(u64::from(crawled.forms_skipped));
         }
+        // Amendment 39: each failed request is one `crawl.errors` unit, named by
+        // its classified token. `last_error` is the aggregate kind the crawl
+        // retained; the reason is a token, so there is nothing to scrub.
+        if let Some(kind) = crawled.last_error {
+            for _ in 0..crawled.failed {
+                job.report_crawl_error(origin, kind.as_str());
+            }
+        }
         crawled.stopped
     }
 
@@ -2885,6 +2893,113 @@ mod tests {
         assert_eq!(client.calls(), 0, "{:?}", client.trail());
         assert_eq!(store.list().len(), 1, "the browser's capture, and only it");
     }
+    /// A `ProxyClient` keyed on request path: a path mapped to `None` fails the
+    /// send with the given message, any other path is a 200 page (HTML when a
+    /// body is given), so a crawl can lose one link and keep the rest.
+    struct FailingSite {
+        pages: std::collections::HashMap<&'static str, &'static str>,
+        failures: std::collections::HashMap<&'static str, &'static str>,
+        default_failure: Option<&'static str>,
+    }
+
+    impl FailingSite {
+        /// Every send fails with `message`.
+        fn all_failing(message: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                pages: std::collections::HashMap::new(),
+                failures: std::collections::HashMap::new(),
+                default_failure: Some(message),
+            })
+        }
+
+        /// Serve each `(path, html)` as a page; fail each `(path, message)`.
+        fn new(
+            pages: Vec<(&'static str, &'static str)>,
+            failures: Vec<(&'static str, &'static str)>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                pages: pages.into_iter().collect(),
+                failures: failures.into_iter().collect(),
+                default_failure: None,
+            })
+        }
+    }
+
+    impl ProxyClient for FailingSite {
+        fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            self.send_opts(req, SendOptions::default())
+        }
+
+        fn send_opts(
+            &self,
+            req: HttpRequest,
+            _opts: SendOptions,
+        ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async move {
+                let path = req.path.split('?').next().unwrap_or("/");
+                if let Some(message) = self.failures.get(path).or(self.default_failure.as_ref()) {
+                    return Err(anyhow::anyhow!(*message));
+                }
+                let (ctype, body) = match self.pages.get(path) {
+                    Some(html) => ("text/html; charset=utf-8", *html),
+                    None => ("text/plain", "ok"),
+                };
+                Ok(HttpFlow {
+                    id: FlowId::new(),
+                    request: req,
+                    response: Some(response(200, &[("content-type", ctype)], body)),
+                    client_conn: conn(),
+                    server_conn: None,
+                    metadata: FlowMeta::default(),
+                    intercept: InterceptState::Observed,
+                })
+            })
+        }
+    }
+
+    /// Amendment 39: the lane turns each failed client-crawl request into one
+    /// `report_crawl_error` call naming the origin and the classified token —
+    /// once per failure, not once per crawl.
+    #[tokio::test]
+    async fn a_failed_crawl_request_is_reported_once_each() {
+        // Every send fails: the seed is the one failed request.
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = FailingSite::all_failing("h2_not_negotiated: scan.test:80: alpn");
+        let job = TestJob::new(Arc::clone(&store), client as _);
+
+        let _ = discover_origins(&job, &["http://scan.test"]).await;
+
+        assert_eq!(
+            job.crawl_errors(),
+            vec![(
+                "http://scan.test".to_string(),
+                "h2_not_negotiated".to_string()
+            )],
+        );
+
+        // A seed with two links, one of which the client refuses.
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let seed = concat!(
+            "<html><body>",
+            "<a href=\"/a\">a</a>",
+            "<a href=\"/b\">b</a>",
+            "</body></html>",
+        );
+        let client = FailingSite::new(vec![("/", seed)], vec![("/a", "connection refused")]);
+        let job = TestJob::new(Arc::clone(&store), client as _);
+
+        let _ = discover_origins(&job, &["http://scan.test"]).await;
+
+        assert_eq!(
+            job.crawl_errors(),
+            vec![(
+                "http://scan.test".to_string(),
+                "connect_refused".to_string()
+            )],
+            "exactly one entry, for the one refused link",
+        );
+    }
+
     /// Spec D3's `passive-only`: the built-in profile that asks for no crawl
     /// (`max_pages: 0`, `use_browser: never`) sends nothing at all, browser or
     /// no browser, and still maps what the proxy captured.

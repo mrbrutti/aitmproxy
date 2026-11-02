@@ -111,6 +111,56 @@ pub struct ProbeCounters {
     pub by_lane: BTreeMap<LaneKind, u64>,
 }
 
+/// Why every request of an all-failing client crawl failed (spec D5,
+/// amendment 39). A closed token on [`CrawlCounters::last_error`]: a crawl that
+/// made at least one request and had every one fail (no page fetched) says why,
+/// so the job can run its passive checks over what it still has ("degrade, do
+/// not fail") and a frontend can still name the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrawlErrorKind {
+    /// A forced `h2` against an h1-only listener (amendment 21's counted probe
+    /// error `h2_not_negotiated`).
+    H2NotNegotiated,
+    /// The connection was refused.
+    ConnectRefused,
+    /// A TLS handshake or certificate failure.
+    Tls,
+    /// The probe timed out.
+    Timeout,
+    /// Any other connect or transport failure.
+    Transport,
+    /// A free-text browser-crawl failure that is not one of the tokens above.
+    Other,
+}
+
+impl CrawlErrorKind {
+    /// The wire token for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::H2NotNegotiated => "h2_not_negotiated",
+            Self::ConnectRefused => "connect_refused",
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Other => "other",
+        }
+    }
+
+    /// The kind for an exact token, or `None` for free text (no heuristics).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "h2_not_negotiated" => Some(Self::H2NotNegotiated),
+            "connect_refused" => Some(Self::ConnectRefused),
+            "tls" => Some(Self::Tls),
+            "timeout" => Some(Self::Timeout),
+            "transport" => Some(Self::Transport),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
 /// Crawler counters (spec D5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
@@ -134,6 +184,11 @@ pub struct CrawlCounters {
     /// `unsubscribe`, `confirm`). Additive, 2026-11-01; absent on the wire
     /// means 0.
     pub forms_skipped: u64,
+    /// Why an all-failing client crawl failed: set only when the crawl made at
+    /// least one request and every one failed (`errors > 0 && pages == 0`), so
+    /// a frontend can name the cause (amendment 39). Additive, 2026-11-01;
+    /// absent on the wire means none.
+    pub last_error: Option<CrawlErrorKind>,
 }
 
 /// Insertion-point counters (spec D5).
@@ -458,6 +513,51 @@ mod tests {
         }
         let summary = serde_json::to_value(status.summary()).expect("summary serializes");
         assert_eq!(full, summary);
+    }
+
+    /// Amendment 39: the crawl's all-failed reason is a closed token on
+    /// `crawl.last_error`. `parse` is an exact token match (no heuristics), its
+    /// inverse `as_str` is the wire token, a free-text browser reason parses to
+    /// `None`, and the field round-trips as that token while an old record
+    /// without it loads as `None`.
+    #[test]
+    fn crawl_error_kind_parses_exact_tokens_and_round_trips() {
+        assert_eq!(
+            CrawlErrorKind::parse("h2_not_negotiated"),
+            Some(CrawlErrorKind::H2NotNegotiated)
+        );
+        assert_eq!(
+            CrawlErrorKind::parse("connect_refused"),
+            Some(CrawlErrorKind::ConnectRefused)
+        );
+        assert_eq!(
+            CrawlErrorKind::parse("timeout"),
+            Some(CrawlErrorKind::Timeout)
+        );
+        assert_eq!(CrawlErrorKind::parse("tls"), Some(CrawlErrorKind::Tls));
+        assert_eq!(
+            CrawlErrorKind::parse("transport"),
+            Some(CrawlErrorKind::Transport)
+        );
+        assert_eq!(CrawlErrorKind::parse("other"), Some(CrawlErrorKind::Other));
+        assert_eq!(CrawlErrorKind::parse("the browser refused the seed"), None);
+        assert_eq!(
+            CrawlErrorKind::H2NotNegotiated.as_str(),
+            "h2_not_negotiated"
+        );
+        assert_eq!(CrawlErrorKind::ConnectRefused.as_str(), "connect_refused");
+
+        let json = serde_json::to_value(CrawlCounters {
+            last_error: Some(CrawlErrorKind::Timeout),
+            ..CrawlCounters::default()
+        })
+        .expect("serializes");
+        assert_eq!(json["last_error"], "timeout");
+
+        let old: CrawlCounters =
+            serde_json::from_str(r#"{"pages":1}"#).expect("a record without last_error parses");
+        assert_eq!(old.last_error, None);
+        assert_eq!(old.pages, 1);
     }
 
     #[test]

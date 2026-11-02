@@ -33,11 +33,11 @@ use aitm_core::{
     BrowserDriver, CommandHost, Flow, FlowId, FlowStore, HttpFlow, ProxyClient, ScopeRateGuard,
 };
 use aitm_scan_model::{
-    scan_error, Canary, CheckMeta, Confidence, Discovery, Evidence, InsertionPoint, IssueLocation,
-    IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters, L4Location,
-    L4Transport, Lane, LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse, RawProbe,
-    RecordProbes, ScanErrorCode, ScanProfile, SessionMaterial, SessionMode, SessionStatus,
-    SiteNode, StoppedReason, Technique, UseBrowser, Verdict, JOB_KIND_SCAN,
+    scan_error, Canary, CheckMeta, Confidence, CrawlErrorKind, Discovery, Evidence, InsertionPoint,
+    IssueLocation, IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters,
+    L4Location, L4Transport, Lane, LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse,
+    RawProbe, RecordProbes, ScanErrorCode, ScanProfile, SessionMaterial, SessionMode,
+    SessionStatus, SiteNode, StoppedReason, Technique, UseBrowser, Verdict, JOB_KIND_SCAN,
 };
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -259,6 +259,11 @@ pub struct JobRuntime {
     /// Crawls of one origin that failed outright (`JobCtx::report_crawl_error`),
     /// folded into `crawl.errors` by `sync_counters`.
     crawl_errors: AtomicU64,
+    /// The classified kind of the most recent crawl failure a lane reported
+    /// (amendment 39). Surfaced on `crawl.last_error` only when the crawl made
+    /// requests and every one failed (`crawl.errors > 0 && crawl.pages == 0`);
+    /// a free-text browser reason that is not a token stores `Other`.
+    last_crawl_error: Mutex<Option<CrawlErrorKind>>,
     /// Forms the crawl deliberately did not submit
     /// (`JobCtx::report_forms_skipped`), folded into `crawl.forms_skipped` by
     /// `sync_counters`.
@@ -309,6 +314,14 @@ impl JobRuntime {
     /// Units the HTTP lane charged during the crawling phase.
     fn crawl_charges(&self) -> u64 {
         self.crawl_charges.load(Ordering::SeqCst)
+    }
+
+    /// The classified kind of the most recent crawl failure, if any.
+    fn last_crawl_error(&self) -> Option<CrawlErrorKind> {
+        *self
+            .last_crawl_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Edit the session block of the status, creating it when the profile runs
@@ -421,14 +434,32 @@ impl JobCtx for JobRuntime {
 
     fn report_crawl_error(&self, origin: &str, reason: &str) {
         self.crawl_errors.fetch_add(1, Ordering::SeqCst);
-        // Scrubbed at the sink: a lane's reason may quote a URL or an error
-        // that carries a secret (security review, delta, 2026-11-01).
-        tracing::warn!(
-            target: "aitm::scanner",
-            origin,
-            reason = %util::scrub(reason),
-            "crawl failed; discovery continues over what the lane still has"
-        );
+        // A client-crawl reason is a `CrawlErrorKind` token; a browser-crawl
+        // reason is free text, which stores `Other` and keeps the warn line.
+        let parsed = CrawlErrorKind::parse(reason);
+        *self
+            .last_crawl_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(parsed.unwrap_or(CrawlErrorKind::Other));
+        if parsed.is_some() {
+            // A classified per-request failure is routine; the fold onto
+            // `crawl.last_error` is the operator-visible signal.
+            tracing::debug!(
+                target: "aitm::scanner",
+                origin,
+                reason,
+                "crawl request failed; discovery continues over what the lane still has"
+            );
+        } else {
+            // Scrubbed at the sink: a free-text reason may quote a URL or an
+            // error that carries a secret (security review, delta, 2026-11-01).
+            tracing::warn!(
+                target: "aitm::scanner",
+                origin,
+                reason = %util::scrub(reason),
+                "crawl failed; discovery continues over what the lane still has"
+            );
+        }
     }
 
     fn report_forms_skipped(&self, count: u64) {
@@ -596,6 +627,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         in_crawl: AtomicBool::new(false),
         crawl_charges: AtomicU64::new(0),
         crawl_errors: AtomicU64::new(0),
+        last_crawl_error: Mutex::new(None),
         forms_skipped: AtomicU64::new(0),
     });
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
@@ -654,8 +686,17 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
     runtime.set_crawling(false);
     {
         let pages = crawl_pages(&runtime, store.as_ref(), &before, &job, &profile);
+        let crawl_errors = runtime.crawl_errors.load(Ordering::SeqCst);
+        let last_crawl_error = runtime.last_crawl_error();
         let mut guarded = status.write().unwrap_or_else(|e| e.into_inner());
         bump(&mut guarded.crawl.pages, pages);
+        // Amendment 39: fold the crawl's error tally in now, and when the crawl
+        // made requests and every one failed (no page fetched) name why. A
+        // partial failure (`pages > 0`) is visible in `crawl.errors` alone; the
+        // job runs its passive checks over what it captured ("degrade, do not
+        // fail"), so no `stopped_reason` or `error` is set here.
+        raise(&mut guarded.crawl.errors, crawl_errors);
+        fold_crawl_last_error(&mut guarded, last_crawl_error);
         bump(&mut guarded.points.found, points.len() as u64);
     }
     *discovery.write().unwrap_or_else(|e| e.into_inner()) = Discovery {
@@ -1366,6 +1407,18 @@ fn is_crawl_capture(flow: &Flow, job_mark: &str) -> bool {
             .any(|mark| mark == crate::interim_lane::CRAWL_MARK)
 }
 
+/// Amendment 39: a client crawl that made at least one request and had every
+/// one fail (no page fetched) names why on `crawl.last_error`, so a frontend
+/// can report the cause; a partial failure (`pages > 0`) is visible in
+/// `crawl.errors` alone and leaves `last_error` as it was. Applied once, at the
+/// end of the crawling phase, over the already-folded `crawl.errors`/`pages`.
+/// `sync_counters` never touches `last_error`.
+fn fold_crawl_last_error(status: &mut JobStatus, last_error: Option<CrawlErrorKind>) {
+    if status.crawl.errors > 0 && status.crawl.pages == 0 {
+        status.crawl.last_error = last_error;
+    }
+}
+
 /// Copy the live meters onto the status, monotonically.
 ///
 /// `probes.sent` is the probe meter's reading **plus** the units lanes
@@ -1569,8 +1622,8 @@ mod tests {
 
     use aitm_core::{AgentPolicy, Flow, FlowStore};
     use aitm_scan_model::{
-        JobEvent, JobNotification, JobState, JobStatus, L4Counters, LaneKind, OnLost, Phase,
-        RecordProbes, StoppedReason,
+        CrawlErrorKind, JobEvent, JobNotification, JobState, JobStatus, L4Counters, LaneKind,
+        OnLost, Phase, RecordProbes, StoppedReason,
     };
 
     /// AC T1-1 (spec D3/D5): `scan.start` returns while the job is still
@@ -2194,6 +2247,7 @@ mod tests {
             in_crawl: AtomicBool::new(false),
             crawl_charges: AtomicU64::new(0),
             crawl_errors: AtomicU64::new(0),
+            last_crawl_error: Mutex::new(None),
             forms_skipped: AtomicU64::new(0),
         };
         (runtime, status)
@@ -2225,6 +2279,111 @@ mod tests {
         let seen = status.read().expect("status");
         assert_eq!(seen.crawl.errors, 1, "a sync copies, it does not add");
         assert_eq!(seen.crawl.forms_skipped, 1);
+    }
+
+    /// Replicate the end-of-crawling fold the worker does: fold `crawl.errors`
+    /// from the runtime (via `sync_counters`) and then apply amendment 39's
+    /// reason rule over the page count the crawl reached.
+    fn fold_crawl_phase(
+        status: &Arc<std::sync::RwLock<JobStatus>>,
+        runtime: &super::JobRuntime,
+        pages: u64,
+    ) {
+        let meter = crate::client::ProbeMeter::default();
+        let issues = crate::issues::IssueStore::new(None);
+        {
+            let mut guarded = status.write().expect("status");
+            guarded.crawl.pages = pages;
+        }
+        let job = {
+            let guarded = status.read().expect("status");
+            guarded.job.clone()
+        };
+        super::sync_counters(status, &meter, runtime, &issues, &job);
+        let last = runtime.last_crawl_error();
+        let mut guarded = status.write().expect("status");
+        super::fold_crawl_last_error(&mut guarded, last);
+    }
+
+    /// Amendment 39 (spec D5 "degrade, do not fail"): a crawl that made requests
+    /// and had every one fail (no page fetched) surfaces its classified reason
+    /// on `crawl.last_error`, while the job sets no `stopped_reason` or `error`
+    /// of its own from the crawl errors — it runs on over what it still has.
+    #[test]
+    fn an_all_failing_crawl_surfaces_its_reason() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee3", 1);
+
+        // Three failed requests, all classified `h2_not_negotiated`; no page.
+        for _ in 0..3 {
+            runtime.report_crawl_error("http://scan.test", "h2_not_negotiated");
+        }
+        fold_crawl_phase(&status, &runtime, 0);
+
+        let seen = status.read().expect("status");
+        assert_eq!(seen.crawl.errors, 3);
+        assert_eq!(seen.crawl.pages, 0);
+        assert_eq!(seen.crawl.last_error, Some(CrawlErrorKind::H2NotNegotiated));
+        assert_eq!(seen.stopped_reason, None, "the crawl errors do not stop it");
+        assert_eq!(seen.error, None);
+    }
+
+    /// Amendment 39, call C4: a partial failure (`pages > 0`) shows in
+    /// `crawl.errors` alone — no reason is named, so a frontend reads it as "the
+    /// crawl lost some requests" rather than "the crawl failed".
+    #[test]
+    fn a_partially_failing_crawl_sets_no_reason() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee4", 1);
+
+        runtime.report_crawl_error("http://scan.test", "connect_refused");
+        fold_crawl_phase(&status, &runtime, 1);
+
+        let seen = status.read().expect("status");
+        assert_eq!(seen.crawl.errors, 1);
+        assert!(seen.crawl.pages >= 1);
+        assert_eq!(seen.crawl.last_error, None);
+    }
+
+    /// A free-text browser-crawl reason is not a token: it stores `Other` (and
+    /// keeps the warn log), so the reason surface is still a closed vocabulary.
+    #[test]
+    fn a_free_text_crawl_reason_stores_other() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee5", 1);
+
+        runtime.report_crawl_error("http://scan.test", "the browser refused the seed");
+        assert_eq!(runtime.last_crawl_error(), Some(CrawlErrorKind::Other));
+
+        fold_crawl_phase(&status, &runtime, 0);
+        assert_eq!(
+            status.read().expect("status").crawl.last_error,
+            Some(CrawlErrorKind::Other)
+        );
+    }
+
+    /// The fold rule in isolation: a reason is named only when the crawl made
+    /// requests (`errors > 0`) and fetched no page (`pages == 0`).
+    #[test]
+    fn fold_crawl_last_error_follows_the_errors_and_pages_rule() {
+        let mut all_failed = JobStatus::default();
+        all_failed.crawl.errors = 2;
+        all_failed.crawl.pages = 0;
+        super::fold_crawl_last_error(&mut all_failed, Some(CrawlErrorKind::Timeout));
+        assert_eq!(all_failed.crawl.last_error, Some(CrawlErrorKind::Timeout));
+
+        let mut partial = JobStatus::default();
+        partial.crawl.errors = 2;
+        partial.crawl.pages = 1;
+        super::fold_crawl_last_error(&mut partial, Some(CrawlErrorKind::Timeout));
+        assert_eq!(partial.crawl.last_error, None, "a page was fetched");
+
+        let mut clean = JobStatus::default();
+        super::fold_crawl_last_error(&mut clean, Some(CrawlErrorKind::Timeout));
+        assert_eq!(clean.crawl.last_error, None, "no request failed");
     }
 
     /// Spec D5 "monotonic from `started_at`" (T9 live run, panel delta

@@ -267,11 +267,14 @@ pub trait JobCtx: Send + Sync {
         let _ = cookie_names;
     }
 
-    /// A crawl of one origin failed outright (the browser crawl timed out or
-    /// was refused). The engine counts it in `crawl.errors` so the status says
-    /// the job ran on fewer points than it could have; the lane then falls back
-    /// to whatever discovery it still has. The runtime scrubs `reason` before
-    /// it is logged; lanes need not.
+    /// One failed crawl request (client crawl, `reason` = a
+    /// [`CrawlErrorKind`](crate::CrawlErrorKind) token) or one crawl that failed
+    /// outright (browser crawl, `reason` = free
+    /// text). The engine counts each in `crawl.errors` so the status says the
+    /// job ran on fewer points than it could have; when the crawl made requests
+    /// and every one failed it also names why on `crawl.last_error`. The lane
+    /// then falls back to whatever discovery it still has. The runtime scrubs a
+    /// free-text `reason` before it is logged; lanes need not.
     ///
     /// A no-op by default.
     fn report_crawl_error(&self, origin: &str, reason: &str) {
