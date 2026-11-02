@@ -434,6 +434,11 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1 | Coder (Task 1) | Note | Plan said only `origin_and_node_scoped_checks_run_once` needed new indices; in fact `scope_keys_without_nodes_fall_back_to_url_then_point` pinned the superseded rule and was re-pinned (indices `[4, 5, 6]` + origin-id assertion) | accepted by the orchestrator 2026-11-01: the old assertion encoded the rule amendment 38 replaces; committed in f4e7b90f |
+| 1 | Coder (Task 1) | Note | Plan wording "`scope_key` returns `None`" would mean per-point scheduling; implemented as the point loop `continue`-ing on origin-driven HTTP checks (the only reading matching the plan's own counts) | accepted; `scope_key`'s `Origin` arm stays for non-HTTP lanes |
+| 3 | Coder (Task 3) | Important (casualty) | `worker::tests::an_all_erroring_host_stops_the_job_with_stopped_reason_errors` used `answering(500)` as the host failure, which amendment 40 removes from the ladder; `StubClient` has no transport-failure mode; `jobs.rs` docs still say a 5xx is what the ladder counts | orchestrator fixes right after Task 2 lands (before Task 1b): `StubClient::failing(msg)` + `Harness::failing`, the test's stimulus becomes a transport error, `jobs.rs` docs corrected; `docs/scanner.md` `per_host_errors` wording is Task 6's per C8 |
+| 4 | Coder (Task 4) | Note | New ceiling placed after `l4_bytes_per_s`; "the other five" → "six" in `config_file.rs` and docs; only other `Ceilings` literal uses `..default()` | accepted; committed in c9fe6b3e |
+| all | Orchestrator | Note | Wave A coders ran into each other's mid-TDD states (expected in one tree); whole-package reds during Wave A were the Task 3 casualty above, not regressions | noted |
 
 ## Shipped
 
