@@ -339,8 +339,16 @@ Where each negative is observed (its cell):
   and refuses if the field is gone or moved — no stale coordinates) used on the Edit Scope field
   before the focus probe — the sheet does not focus its field when Scope already has hosts (run 5,
   MAC-5); the field is located by accessibility identifier when the app exposes one (`scope-add-host`
-  once the mac fix lands), else by its description "Host to add to scope"; `screencapture -R` loop
-  for N1. tui: `aitm_e2e/tui_pty.py` (extracted from `tests/e2e/tui/test_tui_flows_render.py`:
+  once the mac fix lands), else by its description "Host to add to scope"; `lib/ax_texts.sh` is the
+  read-only accessibility read of window 1 (rows `role · title · value · description`, text fields
+  also `identifier · x,y · w,h`; `menu <Menu>` and `bounds` sub-modes): a compiled AXUIElement walk
+  (`lib/ax_texts.swift`, built once per source hash into `${AX_TEXTS_CACHE:-/tmp/claude/acceptance/
+  ax-cache}`), falling back to the System Events `entire contents` walk when `swiftc` is absent. It
+  performs no click, keystroke or focus change and refuses unless exactly one
+  `/Applications/Aitmproxy.app` process is running and the terminal holds Accessibility permission.
+  Every `ax_texts.sh` call in the cell has a 30 s budget; since the compiled walk returns in well
+  under a second, a dump that exceeds it indicts the app's accessibility tree, not the harness;
+  `screencapture -R` loop for N1. tui: `aitm_e2e/tui_pty.py` (extracted from `tests/e2e/tui/test_tui_flows_render.py`:
   `TIOCSWINSZ` and the grid replayer; a plan task, not an existing module). web: Playwright
   Chromium (`apps/web/scripts/` has the CDP driver; Safari stays a hand step).
 - Nothing in the runner starts a core on a non-default port, seeds Scope over the bus, or edits the
@@ -521,3 +529,18 @@ the ~1 s timing) → fixed: the click is pre-restart only. Minors fixed: empty/n
 no coordinates on argv), identifier cross-checked against the description, float/zero/garbage tests, module-level
 import, Constraints wording. Accepted: the five-script refusal preamble stays duplicated (a `guard.sh` is a
 follow-up, not this PR).
+
+Run follow-up (2026-11-02, `fix/acceptance-ax-dump-swift`): the AppleScript `entire contents` walk in
+`lib/ax_texts.sh` cost one Apple Event per attribute and took 49.7 s for 142 rows on an idle 0.5.15,
+past the cell's 30 s per-call budget with the app doing nothing. The dump now runs through a compiled
+AXUIElement walk (`lib/ax_texts.swift`), same rows and column order, with the AppleScript walk kept as
+the fallback when `swiftc` is missing. Known rendering difference: System Events rendered a button
+whose `AXDescription` is unset as `button` (the role description) — the 0.5.10 report's "SwiftUI
+buttons expose no title through AX (only "button")" was that rendering —; the C API returns the real
+description where the app sets one, and the walk falls back to the role description only when it is
+empty. Dumps saved before and after this date differ in that column for that reason alone. The
+compiled binary is the harness's only write outside the run folder, under `/tmp/claude/acceptance/`.
+Panel (quality PASS, 8 Minors applied: distinct build-failure message with `build.log`, atomic build
+via temp + `mv`, `exec`, visited-set cycle guard with a truncation notice, 2 s AX messaging timeout,
+`\r`/`\t` flattening, numeric-pid refusal, comment wording; spec FAIL → this row and the D9
+sentence; cache moved under `/tmp/claude/acceptance/`).
