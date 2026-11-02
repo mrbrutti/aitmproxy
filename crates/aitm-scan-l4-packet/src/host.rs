@@ -1114,6 +1114,21 @@ impl PointRunner {
             }
         }
 
+        // The class histogram and the mean reply wait, so a rig log says what
+        // the cases were answered with and how fast (labels and counts only).
+        let mut classes: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut elapsed_total: u64 = 0;
+        for case in &run.cases {
+            let label = case
+                .class()
+                .map_or_else(|| "unsent".to_string(), |class| class.label());
+            *classes.entry(label).or_insert(0) += 1;
+            elapsed_total = elapsed_total.saturating_add(u64::from(case.elapsed_ms()));
+        }
+        let mean_elapsed_ms = elapsed_total
+            .checked_div(run.cases.len() as u64)
+            .unwrap_or(0);
         tracing::debug!(
             target: "aitm::scanner::l4_packet",
             job = %job_id,
@@ -1121,6 +1136,8 @@ impl PointRunner {
             sent_cases,
             allocated,
             cases = run.cases.len(),
+            classes = ?classes,
+            mean_elapsed_ms,
             stopped = run.stopped.is_some(),
             crash = run.crash.is_some(),
             "point run finished"
