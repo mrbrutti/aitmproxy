@@ -1262,7 +1262,8 @@ row it closes.
     container, each with the label `ScanFormat.jobAccessibilityLabel`
     produces (starts with the state or phase word), role button, and the
     selected one carrying the selected attribute (`AXSelected` true in the
-    dump, which prints `AXSelected`/`AXFocused` per row; the others false).
+    dump, which prints `AXSelected`/`AXFocused` per row; the others nil or
+    false, since an unselected row carries no `.isSelected` trait).
 12. **AC12 (P1, D6, C12; unit + live).** `ScanJobsLink.make(bus:
     .connecting("…"), readFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)`
     gives `kind == .reconnecting`, `valuesAgeMs == 42_000`, `verbsEnabled ==
@@ -1274,7 +1275,8 @@ row it closes.
     from 0:3x ago; retrying every 2 s.` or `Unable to list jobs: …` with the
     same clause (which read fails first depends on where the freeze lands in
     the tick, D6 amendment; the proof asserts the inline text literal, and
-    the age in the clause advances between a 10 s and a 35 s frame), Cancel
+    the age in the clause advances between two frames taken after the 30 s
+    client timeout, about 36 s and 47 s), Cancel
     Scan is disabled and the hover Cancel hidden, the rows keep their
     values; after `kill -CONT` the error clears within 5 s of the next list
     and Cancel Scan is enabled. The `ScanJobsLink.make` unit cases use

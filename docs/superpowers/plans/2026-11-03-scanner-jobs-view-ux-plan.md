@@ -174,8 +174,8 @@ with the other tasks named; everything else is sequential in the order listed.
 
 | Fix | What it fixed | Files |
 | --- | --- | --- |
-| 1.5b | `Cancelling…` title and the list error's age clause come from the Kit (`ScanFormat.cancellingTitle`, `ageClause`), not app literals | `ScanSurface.swift`, `ScanPanel+Jobs.swift`, `ScanSurfaceTests.swift` |
-| 1.5c | Any failed Jobs read (list, status, cancel) marks the link (`readFailedAt`, `readFailure`, `noteReadFailure`, `inlineJobsError`; D6 live-proof amendment); Cancel Scan never falls through to an unselected job (D2 amendment) | `ScanSurface.swift`, `ScanPanel.swift`, `ScanPanel+Jobs.swift`, `ScanSurfaceTests.swift` |
+| 1.5b | `Cancelling…` title and the list error's age clause come from the Kit (`ScanFormat.cancellingTitle`, `ageClause`), not app literals | `ScanSurface.swift`, `ScanPanel.swift`, `ScanPanel+Jobs.swift`, `ScanSurfaceTests.swift` |
+| 1.5c | Any failed Jobs read (list, status, cancel) marks the link (`readFailedAt`, `readFailure`, `noteReadFailure`, `inlineJobsError`; D6 live-proof amendment); Cancel Scan never falls through to an unselected job (D2 amendment) | `ScanSurface.swift`, `ScanPanel.swift`, `ScanSurfaceTests.swift` |
 | 1.5d | The age clock is an independent 1 s task (`clockTask`) so a hung bus read cannot freeze the clause (AC12 Critical) | `ScanPanel.swift` |
 | 1.5e | One failure record (`ScanReadFailure { text, at }`, computed `jobsError`/`readFailedAt`, `listErrorText` deleted); bounded core strings at decode (`ScanWire.boundedString`, AC1b); cancel in flight (`cancelsInFlight`, `cancelInFlight(_:)`); terminal-only Stopped section; `crawlTroubleLine`; `sentence` nil for a stale non-terminal status; no re-arm on a failed status read; `valuesAgeMs` clamp; `selectedNeedsStatusRead`; `ScanFormat.plural(_:_:grouped:)` replaces `ScanEndText.count`; `cancelHelpText`; `ageClause` internal; `ScanJobsFactsTests` moved to its own file | `ScanModel.swift`, `ScanSurface.swift`, `ScanPanel.swift`, `ScanPanel+Jobs.swift`, `ScanModelTests.swift`, `ScanSurfaceTests.swift`, `ScanJobsFactsTests.swift` (new) |
 
@@ -204,7 +204,7 @@ tasks per findings; re-run Task 1.6 on each fix. Recorded in the Review log.
   - AC8: with nothing selected (fresh launch, no jobs, or after `Open Profiles`), `bus scan.start {…}`: the row appears and the detail shows it (`by the operator` is PR 2's subtitle; PR 1 shows the header and counters) with no click.
   - AC10: the dead-target job's Stopped section frame + `dump` grep: `errors` appears once, in the data-face line `stopped_reason: errors`; the crawl line reads `The crawl fetched 1 page and hit 1 error` with no ` — ` suffix (today's engine sets `last_error` only when `pages == 0`; the suffix lands with scanner amendment 89 and is not proven here).
   - AC11: `dump` with three jobs lists exactly three row elements under `Jobs` with role `AXButton`, labels starting with the state/phase word, the selected one carrying the selected attribute (the dump prints `AXSelected`/`AXFocused` per row; the selected row's `AXSelected` is true, the others false).
-  - AC12: `kill -STOP <core pid>`; frames at 10 s and 35 s show `Unable to list jobs: <core text>` or `Unable to read job <id>: <core text>` (whichever read the freeze hit first, D6 amendment) followed by `. Showing values from 0:1x ago; retrying every 2 s.` then `… 0:3x ago …` — the age advances between the two frames (the clock task, fix 1.5d) and the literal is asserted, not only the button state; Cancel Scan and hover Cancel disabled, rows kept; `kill -CONT`; error gone within 5 s, Cancel Scan enabled.
+  - AC12: `kill -STOP <core pid>`; two frames after the 30 s client timeout (about 36 s and 47 s) show `Unable to list jobs: <core text>` or `Unable to read job <id>: <core text>` (whichever read the freeze hit first, D6 amendment) followed by `. Showing values from 0:1x ago; retrying every 2 s.` then `… 0:3x ago …` — the age advances between the two frames (the clock task, fix 1.5d) and the literal is asserted, not only the button state; Cancel Scan and hover Cancel disabled, rows kept; `kill -CONT`; error gone within 5 s, Cancel Scan enabled.
   - Frames downscaled with `sips -Z 1862`. `down` at the end; `target/` cleaned when idle.
 - **Done when:** the folder is committed on the branch and the PR carries a comment listing every AC with its frame; the orchestrator then marks the PR ready.
 
@@ -527,6 +527,9 @@ Three reviewers on `<Part 2 tip>..<Part 4 tip>`.
 12. **The age clock is not the poll tick (found at the PR 1 panel, fix 1.5d).** The poll loop is sequential and blocks inside a hung bus read for the client's 30 s timeout, so a `nowMs` advanced per tick froze the clause at `0:02 ago` over 38-s-old values. `nowMs` is set by an independent 1 s task on `ScanPanelState` (`clockTask`, started and cancelled with `poll()`); D16's "no view owns a timer" holds (the state owns it). `valuesAgeMs` is clamped at 0.
 13. **Help text (Minor at the PR 1 panel).** Task 1.5's original line quoted the UX section's PR 2 help text; D7 keeps PR 1's words (`Stop this job; its issues stay (⌥⌘.)`, `ScanFormat.cancelHelpText`). The PR 2 wording lands in Task 2.8.
 
+14. **Shared Cc/Cf scalar filter (follow-up, panel round 2).** `ScanWire.cleaned`, `AppIdentifier.withoutControlAndFormat` and `Flow.withoutControlAndBidi` are three copies of one rule; unify in a Kit `String` extension outside PR 1's files.
+15. **Other `job` ids (follow-up, panel round 2).** `ScanStartResult.job`, `ScanIssueSummary.job` and `ScanJobNotification.job` still decode unbounded; bound all three to `tokenMax` so a hostile id cannot miss the bounded summary/status key.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
@@ -556,6 +559,10 @@ Kept by the main session during stage 6. One row per finding.
 | Part 1 | security | Minor | core strings unbounded in the mac Kit (no `bound_status` equivalent) | fixed in 1.5e (`ScanWire.boundedString`, caps; AC1b); D1 amended |
 | Part 1 | security | Minor | two cancel presses within one round trip send two `scan.cancel`s | fixed in 1.5e (`cancelsInFlight`); D2 amended |
 | Part 1 | security | Minor | dev-bundle embedded core writes the durable audit log to the real config dir (pre-existing, outside the range) | tracked separately by the coordinator (own session proposed to Matt 2026-11-02); not in this PR |
+| Part 1 (round 2) | quality | Important | the re-arm half of rule 2 was dropped: a job whose one status read failed was never re-read until it left the list | fixed in 35a3148f (1.5f: `ScanStatusReadLedger.settle(afterList:stored:)`, pinned) |
+| Part 1 (round 2) | quality | Minor | `cancelsInFlight` was `@ObservationIgnored` yet rendered; the Cc/Cf scalar filter exists three times in the Kit; list cap and required-string bound re-spelled at call sites; `startClock` first tick late; computed expected array; `hasStoppedFacts` style | fixed in 35a3148f except the shared filter, which stays a follow-up (gap 14: unify `ScanWire.cleaned`, `AppIdentifier.withoutControlAndFormat`, `Flow.withoutControlAndBidi` outside PR 1's files) |
+| Part 1 (round 2) | security | Minor | `cleaned` cut on Characters (a combining-mark cluster is one Character); failure texts and job ids reached the screen unbounded; `cancelsInFlight` observation | fixed in 35a3148f (scalar cut; `noteReadFailure` cleans; `job` bounded to 64 in summary/status). Follow-up (gap 15): bound `job` in `ScanStartResult`, `ScanIssueSummary`, `ScanJobNotification` too |
+| Part 1 (round 2) | spec | Minor | AC12's "10 s frame" unreachable (the clause exists only after the 30 s timeout); AC11 says "false" where the dump prints nil; fix-task table off by one file for 1.5b/1.5c; three live clauses not re-shot at head | AC12/AC11 reworded by the orchestrator (docs); table corrected; pass 5 re-shoots AC5 +60 s, AC8 and AC6 at the merge candidate |
 
 ## Shipped
 
