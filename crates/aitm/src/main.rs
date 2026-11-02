@@ -101,23 +101,38 @@ const OPERATOR_TOKEN_USAGE: &str = pages::OPERATOR_TOKEN_USAGE_LINE;
 const SYSPROXY_WATCHDOG_USAGE: &str =
     "usage: aitm sysproxy-watchdog --pid <pid> --state <file> [--no-pipe]";
 
-/// Classify `argv`. `tui` takes no arguments; anything after it is a usage
-/// error carrying the line to print. `web` is recognised here and its
-/// options parsed by the caller (`web::parse_args`).
-fn parse_mode(argv: Vec<String>) -> Result<Mode, String> {
+/// Classify `argv`. `tui` takes no arguments; anything after it is a typed
+/// usage error ([`mode_usage_error`]). `web` is recognised here and its
+/// options parsed by the caller (`web::parse_args`). The hidden watchdog's
+/// errors stay strings and take `report_for`'s rule 4, as before.
+fn parse_mode(argv: Vec<String>) -> anyhow::Result<Mode> {
     match argv.first().map(String::as_str) {
         None => Ok(Mode::Server),
         Some("tui") if argv.len() == 1 => Ok(Mode::Tui),
-        Some("tui") => Err(format!(
-            "tui takes no further arguments, got `{}`\n{}",
-            argv[1],
-            tui::USAGE
+        Some("tui") => Err(mode_usage_error(
+            format!("tui takes no further arguments, got `{}`", argv[1]),
+            tui::USAGE,
         )),
         Some("web") => Ok(Mode::Web),
         Some("operator-token") => parse_operator_token(&argv[1..]),
-        Some("sysproxy-watchdog") => parse_sysproxy_watchdog(&argv[1..]),
+        Some("sysproxy-watchdog") => {
+            parse_sysproxy_watchdog(&argv[1..]).map_err(anyhow::Error::msg)
+        }
         Some(_) => Ok(Mode::Cli(argv)),
     }
+}
+
+/// A typed usage error of a mode parser (security S6, the shape of
+/// `web::parse_args`'s): `what` as the headline, the mode's one `Usage:`
+/// line as its cause, `aitm --help` as the pointer. `report_for`'s rule 0
+/// passes the report through as built (exit 2) whatever the token contains,
+/// so no line split can demote it, and the reporter folds a newline.
+fn mode_usage_error(what: String, usage_line: &str) -> anyhow::Error {
+    anyhow::Error::new(
+        ErrorReport::usage(what)
+            .with_why(vec![usage_line.to_string()])
+            .with_command("aitm --help"),
+    )
 }
 
 /// Classify the arguments after `sysproxy-watchdog`: `--pid <n>` and
@@ -222,9 +237,10 @@ fn log_recovery(phase: &str, recovery: &Recovery) {
 }
 
 /// Classify the arguments after `operator-token`. Only `generate [--force]` is
-/// valid; an unknown sub-verb or flag is a usage error carrying the line to
-/// print. This stays out of the CLI registry (spec F2) so no agent reaches it.
-fn parse_operator_token(rest: &[String]) -> Result<Mode, String> {
+/// valid; an unknown sub-verb or flag is a typed usage error carrying the
+/// `Usage:` line ([`mode_usage_error`]). This stays out of the CLI registry
+/// (spec F2) so no agent reaches it.
+fn parse_operator_token(rest: &[String]) -> anyhow::Result<Mode> {
     match rest.first().map(String::as_str) {
         Some("generate") => {
             let mut force = false;
@@ -232,19 +248,22 @@ fn parse_operator_token(rest: &[String]) -> Result<Mode, String> {
                 match arg.as_str() {
                     "--force" => force = true,
                     other => {
-                        return Err(format!(
-                            "unknown argument `{other}`\n{OPERATOR_TOKEN_USAGE}"
+                        return Err(mode_usage_error(
+                            format!("unknown argument `{other}`"),
+                            OPERATOR_TOKEN_USAGE,
                         ))
                     }
                 }
             }
             Ok(Mode::OperatorToken { force })
         }
-        Some(other) => Err(format!(
-            "unknown verb `{other}` for operator-token\n{OPERATOR_TOKEN_USAGE}"
+        Some(other) => Err(mode_usage_error(
+            format!("unknown verb `{other}` for operator-token"),
+            OPERATOR_TOKEN_USAGE,
         )),
-        None => Err(format!(
-            "operator-token needs a verb\n{OPERATOR_TOKEN_USAGE}"
+        None => Err(mode_usage_error(
+            "operator-token needs a verb".to_string(),
+            OPERATOR_TOKEN_USAGE,
         )),
     }
 }
@@ -292,27 +311,27 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
     // immediately.
     let mut web_args: Option<WebArgs> = None;
     if help.is_none() && argv.first().map(String::as_str) == Some("web") {
-        match web::parse_args(&argv[1..])? {
-            WebCommand::Run(args) => web_args = Some(args),
+        match web::parse_args(&argv[1..]) {
+            Ok(WebCommand::Run(args)) => web_args = Some(args),
             // Unreachable in practice (`help_request::parse` saw the flag
             // first); kept so `web::parse_args` is unchanged.
-            WebCommand::Help => {
+            Ok(WebCommand::Help) => {
                 help = Some(HelpRequest {
                     topic: vec!["web".into()],
                     explicit: true,
                     argv: argv.clone(),
                 })
             }
+            // Its typed usage report, through the same reporter as the two
+            // sibling mode errors below (quality Q23), not a fresh one.
+            Err(e) => exit_with(&report_for(&e, None), Some(&usage_reporter(&term))),
         }
     }
     let mode = match help {
         Some(req) => Mode::Help(req),
         None => match parse_mode(argv) {
             Ok(mode) => mode,
-            Err(usage) => exit_with(
-                &report_for(&anyhow::anyhow!(usage), None),
-                Some(&usage_reporter(&term)),
-            ),
+            Err(e) => exit_with(&report_for(&e, None), Some(&usage_reporter(&term))),
         },
     };
     Ok(Some(Invocation {
@@ -356,7 +375,7 @@ fn main() {
     // read, nothing created, no runtime), rendered for stdout's caps (C49); an
     // implicit bare token that names no group continues as `Mode::Cli`.
     if let Mode::Help(req) = &invocation.mode {
-        let caps = Caps::detect_stdout(invocation.term.color);
+        let stdout_caps = Caps::detect_stdout(invocation.term.color);
         let config_path = invocation
             .config_arg
             .clone()
@@ -365,7 +384,7 @@ fn main() {
             config_path: config_path.as_deref(),
             script_args: &invocation.script_args,
             env: &|k: &str| std::env::var(k).ok(),
-            caps: &caps,
+            caps: &stdout_caps,
             version: env!("CARGO_PKG_VERSION"),
         };
         let fall_through = match answer(req, &inputs, &reporter) {
@@ -1491,15 +1510,26 @@ mod tests {
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
         configured_agent_port, manages_system_proxy, pages, parse_invocation, parse_mode,
         scan_services, split_bus_endpoint_file_arg, split_config_arg, split_script_args,
-        usage_reporter, HelpRequest, Invocation, Mode, StartupError, TermOpts,
+        usage_reporter, ErrorReport, HelpRequest, Invocation, Mode, StartupError, TermOpts,
         OPERATOR_TOKEN_USAGE, SYSPROXY_WATCHDOG_USAGE,
     };
     use aitm_sysproxy::Recovery;
     use aitm_term::caps::{Caps, ColorChoice, Verbosity};
     use aitm_term::help::help_page;
+    use aitm_term::reporter::Reporter;
+    use aitm_term::testing::SharedSink;
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The typed usage report `parse_mode` refuses `argv` with (security S6);
+    /// panics when the error is not one.
+    fn usage_report(argv: &[&str]) -> ErrorReport {
+        let err = parse_mode(args(argv)).unwrap_err();
+        err.downcast_ref::<ErrorReport>()
+            .unwrap_or_else(|| panic!("{argv:?}: not a typed usage report: {err}"))
+            .clone()
     }
 
     /// L4PAR-AC34 (plan A10): the configured agent-transport port joins the L4
@@ -1817,28 +1847,28 @@ mod tests {
 
     #[test]
     fn empty_argv_is_the_server() {
-        assert_eq!(parse_mode(args(&[])), Ok(Mode::Server));
+        assert_eq!(parse_mode(args(&[])).unwrap(), Mode::Server);
     }
 
     #[test]
     fn a_subcommand_is_a_cli_dispatch() {
         assert_eq!(
-            parse_mode(args(&["flow", "list"])),
-            Ok(Mode::Cli(args(&["flow", "list"])))
+            parse_mode(args(&["flow", "list"])).unwrap(),
+            Mode::Cli(args(&["flow", "list"]))
         );
     }
 
     #[test]
     fn tui_alone_embeds_the_proxy() {
-        assert_eq!(parse_mode(args(&["tui"])), Ok(Mode::Tui));
+        assert_eq!(parse_mode(args(&["tui"])).unwrap(), Mode::Tui);
     }
 
     #[test]
     fn web_is_the_server_with_the_web_ui_attached() {
-        assert_eq!(parse_mode(args(&["web"])), Ok(Mode::Web));
+        assert_eq!(parse_mode(args(&["web"])).unwrap(), Mode::Web);
         assert_eq!(
-            parse_mode(args(&["web", "--listen", "127.0.0.1:8082"])),
-            Ok(Mode::Web),
+            parse_mode(args(&["web", "--listen", "127.0.0.1:8082"])).unwrap(),
+            Mode::Web,
             "web's own flags are parsed by web::parse_args, not here"
         );
     }
@@ -1846,42 +1876,83 @@ mod tests {
     #[test]
     fn operator_token_generate_is_its_own_mode() {
         assert_eq!(
-            parse_mode(args(&["operator-token", "generate"])),
-            Ok(Mode::OperatorToken { force: false })
+            parse_mode(args(&["operator-token", "generate"])).unwrap(),
+            Mode::OperatorToken { force: false }
         );
     }
 
     #[test]
     fn operator_token_generate_accepts_force() {
         assert_eq!(
-            parse_mode(args(&["operator-token", "generate", "--force"])),
-            Ok(Mode::OperatorToken { force: true })
+            parse_mode(args(&["operator-token", "generate", "--force"])).unwrap(),
+            Mode::OperatorToken { force: true }
         );
     }
 
     #[test]
     fn operator_token_rejects_unknown_subverb_and_flag() {
         const USAGE: &str = "Usage: aitm [--config <path>] operator-token generate [--force]";
+        let expected = |what: &str| {
+            ErrorReport::usage(what)
+                .with_why(vec![USAGE.to_string()])
+                .with_command("aitm --help")
+        };
         assert_eq!(
-            parse_mode(args(&["operator-token", "rotate"])),
-            Err(format!("unknown verb `rotate` for operator-token\n{USAGE}"))
+            usage_report(&["operator-token", "rotate"]),
+            expected("unknown verb `rotate` for operator-token")
         );
         assert_eq!(
-            parse_mode(args(&["operator-token"])),
-            Err(format!("operator-token needs a verb\n{USAGE}"))
+            usage_report(&["operator-token"]),
+            expected("operator-token needs a verb")
         );
-        let err = parse_mode(args(&["operator-token", "generate", "--oops"])).unwrap_err();
-        assert!(err.contains("--oops"), "{err}");
+        assert_eq!(
+            usage_report(&["operator-token", "generate", "--oops"]),
+            expected("unknown argument `--oops`")
+        );
     }
 
     #[test]
     fn tui_with_extra_arguments_is_a_usage_error() {
         assert_eq!(
-            parse_mode(args(&["tui", "extra"])),
-            Err(
-                "tui takes no further arguments, got `extra`\nUsage: aitm [--config <path>] tui"
-                    .to_string()
-            )
+            usage_report(&["tui", "extra"]),
+            ErrorReport::usage("tui takes no further arguments, got `extra`")
+                .with_why(vec!["Usage: aitm [--config <path>] tui".to_string()])
+                .with_command("aitm --help")
+        );
+    }
+
+    /// Security S6 (panel pass 5): the `tui` and `operator-token` usage
+    /// errors are typed reports, so an argv token carrying a newline cannot
+    /// split the headline from its `Usage:` line on the way through
+    /// `report_for` and demote the panel to a failure (exit 1). The reporter
+    /// folds the newline to one space and the panel keeps its shape.
+    #[test]
+    fn mode_usage_errors_survive_a_newline_in_the_token() {
+        let tui = usage_report(&["tui", "x\ny"]);
+        assert_eq!(tui.exit_code(), 2);
+        assert_eq!(tui.what, "tui takes no further arguments, got `x\ny`");
+        assert_eq!(
+            tui.why,
+            vec!["Usage: aitm [--config <path>] tui".to_string()]
+        );
+        let verb = usage_report(&["operator-token", "x\ny"]);
+        assert_eq!(verb.exit_code(), 2);
+        assert_eq!(verb.what, "unknown verb `x\ny` for operator-token");
+        assert_eq!(verb.why, vec![OPERATOR_TOKEN_USAGE.to_string()]);
+
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        reporter.error(&tui);
+        reporter.error(&verb);
+        reporter.finish();
+        assert_eq!(
+            sink.text(),
+            "error: tui takes no further arguments, got `x y`\n\
+             \x20 Usage: aitm [--config <path>] tui\n\
+             \x20 fix: aitm --help\n\
+             error: unknown verb `x y` for operator-token\n\
+             \x20 Usage: aitm [--config <path>] operator-token generate [--force]\n\
+             \x20 fix: aitm --help\n"
         );
     }
 
@@ -1890,12 +1961,12 @@ mod tests {
     #[test]
     fn parse_mode_sysproxy_watchdog() {
         assert_eq!(
-            parse_mode(args(&["sysproxy-watchdog", "--pid", "1", "--state", "/x"])),
-            Ok(Mode::SysproxyWatchdog {
+            parse_mode(args(&["sysproxy-watchdog", "--pid", "1", "--state", "/x"])).unwrap(),
+            Mode::SysproxyWatchdog {
                 pid: 1,
                 state: PathBuf::from("/x"),
                 no_pipe: false,
-            })
+            }
         );
         assert_eq!(
             parse_mode(args(&[
@@ -1905,31 +1976,31 @@ mod tests {
                 "--state",
                 "/x",
                 "--no-pipe"
-            ])),
-            Ok(Mode::SysproxyWatchdog {
+            ]))
+            .unwrap(),
+            Mode::SysproxyWatchdog {
                 pid: 1,
                 state: PathBuf::from("/x"),
                 no_pipe: true,
-            })
+            }
         );
-        let err = parse_mode(args(&["sysproxy-watchdog", "--pid", "1"])).unwrap_err();
-        assert!(err.contains("usage: aitm sysproxy-watchdog"), "{err}");
-        let err = parse_mode(args(&["sysproxy-watchdog", "--state", "/x"])).unwrap_err();
-        assert!(err.contains("usage: aitm sysproxy-watchdog"), "{err}");
-        let err =
-            parse_mode(args(&["sysproxy-watchdog", "--pid", "x", "--state", "/x"])).unwrap_err();
-        assert!(err.contains("usage: aitm sysproxy-watchdog"), "{err}");
-        let err = parse_mode(args(&[
+        let err = |argv: &[&str]| parse_mode(args(argv)).unwrap_err().to_string();
+        let e = err(&["sysproxy-watchdog", "--pid", "1"]);
+        assert!(e.contains("usage: aitm sysproxy-watchdog"), "{e}");
+        let e = err(&["sysproxy-watchdog", "--state", "/x"]);
+        assert!(e.contains("usage: aitm sysproxy-watchdog"), "{e}");
+        let e = err(&["sysproxy-watchdog", "--pid", "x", "--state", "/x"]);
+        assert!(e.contains("usage: aitm sysproxy-watchdog"), "{e}");
+        let e = err(&[
             "sysproxy-watchdog",
             "--pid",
             "1",
             "--state",
             "/x",
             "--bogus",
-        ]))
-        .unwrap_err();
-        assert!(err.contains("usage: aitm sysproxy-watchdog"), "{err}");
-        assert!(err.contains("--bogus"), "{err}");
+        ]);
+        assert!(e.contains("usage: aitm sysproxy-watchdog"), "{e}");
+        assert!(e.contains("--bogus"), "{e}");
     }
 
     /// §D9 (b): the watchdog subcommand is hidden — no usage text reachable
@@ -2170,7 +2241,7 @@ mod tests {
     fn script_flags_before_tui_still_embed() {
         let (scripts, rest) = split_script_args(args(&["--script", "a.rhai", "tui"])).unwrap();
         assert_eq!(scripts, [PathBuf::from("a.rhai")]);
-        assert_eq!(parse_mode(rest), Ok(Mode::Tui));
+        assert_eq!(parse_mode(rest).unwrap(), Mode::Tui);
     }
 
     /// Q1 (tester): the engine logs every recovery outcome at `info` as it
@@ -2312,10 +2383,13 @@ mod tests {
             parse(&["flow", "list"]).mode,
             Mode::Cli(args(&["flow", "list"]))
         );
-        // The watchdog is never intercepted: its own usage error, as before.
+        // The watchdog is never intercepted: its own usage error, as before
+        // (a string, for `report_for`'s rule 4).
         assert_eq!(
-            parse_mode(args(&["sysproxy-watchdog"])),
-            Err(SYSPROXY_WATCHDOG_USAGE.to_string())
+            parse_mode(args(&["sysproxy-watchdog"]))
+                .unwrap_err()
+                .to_string(),
+            SYSPROXY_WATCHDOG_USAGE
         );
         // A `--config` before the topic rides beside the request to `answer`.
         let with_config = parse(&["--config", "/c.yaml", "scope", "-h"]);

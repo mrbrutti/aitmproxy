@@ -187,10 +187,12 @@ fn first_line(err: &anyhow::Error) -> String {
 /// between serde's own delimiters (`"…"` for a string, `'…'` for a
 /// character, `` `…` `` for an integer, a boolean, a floating point or a
 /// variant) becomes `…`; the field path before it and the `expected …`
-/// clause after it stay, which is what the operator needs to find the line.
+/// clause after it stay, which is what the operator needs to find the
+/// offending line of the config.
 /// A message that quotes no value passes through unchanged (`unknown field`
-/// quotes a key).
-fn redact_scalars(line: &str) -> String {
+/// quotes a key). `text` is the whole root cause, which may span lines
+/// ([`first_line`] takes its first line afterwards, security S5).
+fn redact_scalars(text: &str) -> String {
     const KINDS: [&str; 2] = ["invalid type: ", "invalid value: "];
     const SHAPES: [(&str, &str); 5] = [
         ("string \"", "\""),
@@ -200,7 +202,7 @@ fn redact_scalars(line: &str) -> String {
         ("floating point `", "`"),
     ];
     const VARIANT_CLOSERS: [&str; 2] = ["`, expected ", "`, there are no variants"];
-    let mut out = line.to_string();
+    let mut out = text.to_string();
     for kind in KINDS {
         for (open, close) in SHAPES {
             let closer = format!("{close}, expected ");
@@ -211,23 +213,23 @@ fn redact_scalars(line: &str) -> String {
     out
 }
 
-/// Replaces with `…` what `line` holds between the first `opener` and the
+/// Replaces with `…` what `text` holds between the first `opener` and the
 /// last of the `closers` after it; nothing changes when `opener` is absent.
-fn redact_between(line: &mut String, opener: &str, closers: &[&str]) {
-    let Some(at) = line.find(opener) else {
+fn redact_between(text: &mut String, opener: &str, closers: &[&str]) {
+    let Some(at) = text.find(opener) else {
         return;
     };
     let start = at + opener.len();
     // The real closer follows the payload, and the payload (Debug-escaped for
     // strings, raw for variants) may itself contain a false closer, so take
-    // the last match, not the first. With no closer at all, redact to end of
-    // line: better to lose the position than echo the value.
+    // the last match, not the first. With no closer at all, redact to the end
+    // of the text: better to lose the position than echo the value.
     let end = closers
         .iter()
-        .filter_map(|closer| line[start..].rfind(*closer))
+        .filter_map(|closer| text[start..].rfind(*closer))
         .max()
-        .map_or(line.len(), |i| start + i);
-    line.replace_range(start..end, "…");
+        .map_or(text.len(), |i| start + i);
+    text.replace_range(start..end, "…");
 }
 
 /// `Settings` defaults, field by field (the type has no `Default`): what help

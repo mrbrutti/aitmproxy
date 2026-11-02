@@ -289,11 +289,9 @@ mod tests {
             report(&["--bogus"]),
             expected("unknown argument to `aitm web`: --bogus")
         );
-        assert_eq!(
-            report(&["extra"]),
-            expected("unknown argument to `aitm web`: extra")
-        );
-        assert_eq!(report(&["extra"]).exit_code(), 2);
+        let extra = report(&["extra"]);
+        assert_eq!(extra, expected("unknown argument to `aitm web`: extra"));
+        assert_eq!(extra.exit_code(), 2);
     }
 
     #[test]

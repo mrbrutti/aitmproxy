@@ -452,10 +452,13 @@ fn explicit_unknown_topics_are_pre_boot_usage_errors() {
 /// unknown operator-token verb), `aitm web --bad` and a valueless web flag
 /// print the headline, the one `Usage:` line and the pointer, exit 2, with
 /// nothing on stdout and nothing created (they are answered before boot).
+/// Security S6 (panel pass 5): a token carrying a newline cannot split the
+/// headline from its `Usage:` line and demote the panel to a failure — the
+/// renderer folds it to a space and the exit code stays 2.
 #[test]
 fn mode_usage_errors_take_the_usage_form_shape() {
     let home = temp_dir("modes");
-    let cases: [(&[&str], &str); 5] = [
+    let cases: [(&[&str], &str); 7] = [
         (
             &["tui", "--bad"],
             "error: tui takes no further arguments, got `--bad`\n  Usage: aitm [--config <path>] tui\n  fix: aitm --help\n",
@@ -475,6 +478,14 @@ fn mode_usage_errors_take_the_usage_form_shape() {
         (
             &["web", "--listen"],
             "error: --listen requires a value\n  Usage: aitm [--config <path>] web [--listen <addr>] [--token <token>] [--no-open]\n  fix: aitm web --help\n",
+        ),
+        (
+            &["tui", "x\ny"],
+            "error: tui takes no further arguments, got `x y`\n  Usage: aitm [--config <path>] tui\n  fix: aitm --help\n",
+        ),
+        (
+            &["operator-token", "x\ny"],
+            "error: unknown verb `x y` for operator-token\n  Usage: aitm [--config <path>] operator-token generate [--force]\n  fix: aitm --help\n",
         ),
     ];
     for (args, expected) in cases {

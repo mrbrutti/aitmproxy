@@ -138,7 +138,9 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
             shared.store.clone(),
         )
     });
-    let ws_language = aitm_scan_ws::language(handles.clone());
+    // Under the same certificate policy as `run()` builds it and the WS lane
+    // dials with (`ws_tls_policy`), so this tier matches the live one.
+    let ws_language = aitm_scan_ws::language::build_with(handles.clone(), ws_tls_policy(&core));
     let mut languages: Vec<&dyn ProtocolLanguage> = Vec::new();
     if let Some(lang) = &l4_language {
         languages.push(lang);
@@ -224,8 +226,7 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
     // the operator's `scanner:` section plus the two values that are not its
     // keys, the lanes, the native checks over the inert `StdGuard` (as the map
     // rules above; nothing is bound, so the h2 observe checks could open
-    // nothing), and the Rhai tier's check
-    // registry (call B9).
+    // nothing), and the Rhai tier's check registry (call B9).
     let mut scanner_cfg = settings.scanner.clone();
     scanner_cfg.findings_dir = core.findings.dir.clone();
     scanner_cfg.l4_allow_agent_inject = l4.allow_agent_inject;

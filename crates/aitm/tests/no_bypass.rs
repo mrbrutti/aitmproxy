@@ -28,7 +28,7 @@ const ALLOWED: [(&str, &str); 2] = [
     ),
     (
         "crates/aitm/src/startup/mod.rs",
-        "`write_stdout`: the pre-boot version/help text, `aitm web --help` and the operator-token confirmation",
+        "`write_stdout`: the pre-boot version line, the help page (`Mode::Help`: config read, nothing booted) and the operator-token confirmation",
     ),
 ];
 
