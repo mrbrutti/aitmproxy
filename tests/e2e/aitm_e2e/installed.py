@@ -10,15 +10,18 @@ token is returned to the caller and must never be printed or logged (use `redact
 
 Shared across the cells (quality-I2):
   SERVICES, TOOLING, scutil(), service_state(), replay(before, run=), config_bypass(),
-  bypass_applied(scutil_text), StepWriter(path, expected_steps), port_holder()/port_holder_pid(),
-  yes_set()/window_open(), append_leftover().
+  config_scope_entries(), tooling_mentioned(), bypass_applied(scutil_text),
+  StepWriter(path, expected_steps), port_holder()/port_holder_pid(), yes_set()/window_open(),
+  append_leftover(), exit_on_term().
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
@@ -36,7 +39,9 @@ TRUTH_VERBS = ("scope.list", "proxy.status", "capture.status", "proxy.system.sta
 SERVICES = ("Wi-Fi", "Display Ethernet")
 TOOLING = ("*.anthropic.com", "api.anthropic.com", "claude.ai", "*.claude.ai", "github.com", "*.githubusercontent.com")
 
-RESULTS = ("PASS", "FAIL", "SKIP", "BLOCKED", "ERROR")
+# Spec D1: `N/A` marks a step that does not exist on that surface or build; it is listed, never
+# performed, and never holds the verdict (counted like PASS by exit_code / report.verdict).
+RESULTS = ("PASS", "FAIL", "SKIP", "BLOCKED", "ERROR", "N/A")
 
 # `^(\d+) /Applications/Aitmproxy.app/.../aitm --config <dir>/config.yaml` — anchored to the
 # INSTALLED bundle so a `/tmp/claude/.../Aitmproxy.app` dev bundle never matches; `.+?` keeps a
@@ -61,6 +66,25 @@ def parse_core_lines(pgrep_out: str) -> list[tuple[int, str]]:
     return [(int(m.group(1)), m.group(2)) for m in _CORE_LINE.finditer(pgrep_out)]
 
 
+def read_core_config(pid: int, cfg: str) -> EmbeddedCore:
+    """The per-launch config + bus.endpoint of one embedded core. A file that cannot be read (the
+    core exited between pgrep and here, a permission change) is a RuntimeError naming the pid,
+    never a bare OSError out of a cell."""
+    token = ""
+    ep_path = os.path.join(os.path.dirname(cfg), "bus.endpoint")
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("operator_token:"):
+                    token = s.split(":", 1)[1].strip().strip('"').strip("'")
+        with open(ep_path, encoding="utf-8") as f:
+            addr = f.read().strip()
+    except OSError as e:
+        raise RuntimeError(f"embedded core {pid} config unreadable: {e}") from e
+    return EmbeddedCore(pid=pid, config_path=cfg, bus_addr=addr, operator_token=token)
+
+
 def find_embedded_core() -> EmbeddedCore | None:
     """The installed app's embedded core, or None when the app is not running."""
     out = subprocess.run(["pgrep", "-fl", APP_CORE_CMDLINE], capture_output=True, text=True).stdout
@@ -70,16 +94,7 @@ def find_embedded_core() -> EmbeddedCore | None:
     if len(hits) > 1:
         raise RuntimeError(f"{len(hits)} installed-bundle cores are running; refusing to pick one")
     pid, cfg = hits[0]
-    token = ""
-    with open(cfg, encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if s.startswith("operator_token:"):
-                token = s.split(":", 1)[1].strip().strip('"').strip("'")
-    ep_path = os.path.join(os.path.dirname(cfg), "bus.endpoint")
-    with open(ep_path, encoding="utf-8") as f:
-        addr = f.read().strip()
-    return EmbeddedCore(pid=pid, config_path=cfg, bus_addr=addr, operator_token=token)
+    return read_core_config(pid, cfg)
 
 
 def embedded_secret_lines(core: EmbeddedCore) -> list[str]:
@@ -217,10 +232,14 @@ def replay_file(path: str) -> int:
     return 0 if not errs and scutil() == rec["scutil"] else 1
 
 
-def config_bypass() -> list[str]:
+def _inline_list(rest: str) -> list[str]:
+    return [x.strip().strip("\"'") for x in rest.strip("[]").split(",") if x.strip()]
+
+
+def config_bypass(path: str | None = None) -> list[str]:
     """The operator's `system_proxy.bypass` entries from config.yaml (the TUI/web precondition).
     Reads only that block; never copies the file."""
-    p = os.path.join(DATA_DIR, "config.yaml")
+    p = path or os.path.join(DATA_DIR, "config.yaml")
     if not os.path.exists(p):
         return []
     out: list[str] = []
@@ -239,13 +258,48 @@ def config_bypass() -> list[str]:
                 sub = True
                 rest = s.split(":", 1)[1].strip()
                 if rest.startswith("["):
-                    out += [x.strip().strip("\"'") for x in rest.strip("[]").split(",") if x.strip()]
+                    out += _inline_list(rest)
                 continue
             if sub and s.startswith("- "):
                 out.append(s[2:].strip().strip("\"'"))
             elif sub and s and not s.startswith("- "):
                 sub = False
     return out
+
+
+def config_scope_entries(path: str | None = None) -> list[str]:
+    """The `scope:` block of the operator's config.yaml as exact strings (quotes stripped), for
+    the pre-existing-host decision (security S2: a host persisted in his config is HIS even when
+    the surface has not rendered it yet, so it is never removed). Reads only that block."""
+    p = path or os.path.join(DATA_DIR, "config.yaml")
+    if not os.path.exists(p):
+        return []
+    out: list[str] = []
+    inside = False
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("scope:"):
+                inside = True
+                rest = line.split(":", 1)[1].strip()
+                if rest.startswith("["):
+                    out += _inline_list(rest)
+                continue
+            if inside and line.strip() and not line.startswith(" "):
+                break
+            if inside and line.strip().startswith("- "):
+                out.append(line.strip()[2:].strip().strip("\"'"))
+    return out
+
+
+def tooling_mentioned(reading: str | Iterable[str]) -> bool:
+    """True iff the bypass READING (a config list, the app's Settings field, any text) names at
+    least one TOOLING host as a whole entry — the precondition every `yes` flip checks before
+    writing (spec Constraints, "Bypass is a precondition, not a promise")."""
+    if isinstance(reading, str):
+        entries = {x.strip().strip("\"'") for x in re.split(r"[,\s]+", reading) if x.strip()}
+    else:
+        entries = {str(x).strip().strip("\"'") for x in reading}
+    return any(t in entries for t in TOOLING)
 
 
 def bypass_applied(scutil_text: str, hosts: Iterable[str] = TOOLING) -> bool:
@@ -271,6 +325,13 @@ def window_open() -> bool:
 
 def keep_scope() -> bool:
     return os.environ.get("ACCEPT_KEEP_SCOPE") == "1"
+
+
+def exit_on_term() -> None:
+    """Turn SIGTERM (the runner's watchdog, a Ctrl-C'd run.sh's TERM) into SystemExit(2) so a
+    cell's `finally` (restore trap, Scope cleanup, step file) still runs. Every cell calls this
+    first thing in main(). Default SIGTERM disposition kills the interpreter outright."""
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(2))
 
 
 def append_leftover(out_dir: str, host: str, state: str, cell: str) -> None:
@@ -324,11 +385,13 @@ class StepWriter:
                 self.step(sid, "SKIP", "not reached")
 
     def exit_code(self) -> int:
+        """ERROR (2) > FAIL (1) > SKIP/BLOCKED (77) > PASS = N/A (0), the same order run.sh and
+        report.py rank the run."""
         vals = set(self.results.values())
-        if "FAIL" in vals:
-            return 1
         if "ERROR" in vals:
             return 2
+        if "FAIL" in vals:
+            return 1
         if vals & {"SKIP", "BLOCKED"}:
             return 77
         return 0

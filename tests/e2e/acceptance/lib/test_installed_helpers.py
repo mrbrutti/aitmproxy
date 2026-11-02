@@ -10,8 +10,11 @@ discovers it (AC10).
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 
 E2E = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, E2E)
@@ -20,9 +23,15 @@ from aitm_e2e.installed import (  # noqa: E402
     TOOLING,
     StepWriter,
     bypass_applied,
+    config_scope_entries,
     parse_core_lines,
+    read_core_config,
     replay,
+    tooling_mentioned,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report  # noqa: E402
 
 failures: list[str] = []
 
@@ -223,12 +232,165 @@ def test_step_writer() -> None:
         with open(os.path.join(d, "f.tsv"), encoding="utf-8") as f:
             check(len(f.read().splitlines()) == 1, "finish() is idempotent (one not-reached row, not two)")
 
+        # Spec D1: `N/A` is a sixth result; it is listed, never performed, and never holds the verdict.
+        w7 = StepWriter(os.path.join(d, "g.tsv"), ("G-1", "G-2"))
+        w7.step("G-1", "PASS", "x")
+        w7.step("G-2", "N/A", "no such control on this surface")
+        w7.finish()
+        check(w7.exit_code() == 0, f"PASS + N/A -> 0 (N/A does not block `pass`; got {w7.exit_code()})")
+        with open(os.path.join(d, "g.tsv"), encoding="utf-8") as f:
+            check(f.read().splitlines()[1] == "G-2\tN/A\tno such control on this surface\t\t", "the N/A row is written as `N/A`")
+        w8 = StepWriter(os.path.join(d, "h.tsv"), ("H-1",))
+        w8.step("H-1", "N/A", "x")
+        check(w8.exit_code() == 0, "only N/A rows -> 0")
+
+        # Precedence ERROR (2) > FAIL (1) > SKIP/BLOCKED (77) > N/A = PASS (0), matching run.sh and report.py.
+        w9 = StepWriter(os.path.join(d, "i.tsv"), ("I-1", "I-2", "I-3", "I-4"))
+        w9.step("I-1", "PASS")
+        w9.step("I-2", "N/A")
+        w9.step("I-3", "SKIP", "x")
+        check(w9.exit_code() == 77, "SKIP wins over PASS/N/A -> 77")
+        w9.step("I-4", "FAIL", "x")
+        check(w9.exit_code() == 1, "FAIL wins over SKIP -> 1")
+        w9.step("I-1", "ERROR", "x")
+        check(w9.exit_code() == 2, f"ERROR wins over FAIL -> 2 (got {w9.exit_code()})")
+        w10 = StepWriter(os.path.join(d, "j.tsv"), ("J-1", "J-2"))
+        w10.step("J-1", "ERROR", "x")
+        w10.step("J-2", "SKIP", "x")
+        check(w10.exit_code() == 2, "ERROR wins over SKIP -> 2")
+
+
+def test_report_verdict() -> None:
+    print("report.verdict / report.rows (N/A)")
+    check(report.verdict({"tui": {"PASS": 3, "N/A": 2}}) == "pass", "PASS + N/A -> `pass`")
+    check(report.verdict({"tui": {"PASS": 3, "N/A": 2, "SKIP": 1}}) == "incomplete", "a SKIP beside N/A -> `incomplete`")
+    check(report.verdict({"tui": {"N/A": 2}}) == "incomplete", "only N/A rows (nothing performed) -> `incomplete`, never `pass`")
+    check(report.verdict({"a": {"FAIL": 1}, "b": {"ERROR": 1}}) == "error", "ERROR wins over FAIL")
+    check(report.verdict({"a": {"FAIL": 1, "SKIP": 4}}) == "fail", "FAIL wins over SKIP")
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x-steps.tsv")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("X-1\tN/A\tnot on this surface\t\t\n")
+        r = report.rows(p)
+        check(r == [["X-1", "N/A", "not on this surface", "", ""]], f"report.rows accepts an N/A row (got {r})")
+        check("N/A" in report.RESULTS, "report.RESULTS lists N/A")
+
+
+def test_exit_on_term() -> None:
+    print("exit_on_term (SIGTERM -> SystemExit(2), finally runs)")
+    child = (
+        "import os, sys, time\n"
+        f"sys.path.insert(0, {E2E!r})\n"
+        "from aitm_e2e.installed import exit_on_term\n"
+        "exit_on_term()\n"
+        "print('armed', flush=True)\n"
+        "try:\n"
+        "    time.sleep(30)\n"
+        "finally:\n"
+        "    print('finally ran', flush=True)\n"
+    )
+    p = subprocess.Popen([sys.executable, "-c", child], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    first = p.stdout.readline()
+    check(first.strip() == "armed", f"child armed the handler (got {first!r})")
+    p.send_signal(signal.SIGTERM)
+    try:
+        out, err = p.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, err = p.communicate()
+        check(False, "the child did not exit within 10 s of SIGTERM")
+    check(p.returncode == 2, f"exit code 2 after SIGTERM (got {p.returncode}; stderr {err.strip()[:120]!r})")
+    check("finally ran" in out, f"the `finally` block ran (stdout {out!r})")
+    # A plain child without the handler dies with -SIGTERM and never reaches `finally` (the bug the helper closes).
+    plain = subprocess.Popen([sys.executable, "-c", "import time\nprint('up', flush=True)\ntry:\n    time.sleep(30)\nfinally:\n    print('finally ran', flush=True)\n"], stdout=subprocess.PIPE, text=True)
+    plain.stdout.readline()
+    plain.send_signal(signal.SIGTERM)
+    out2, _ = plain.communicate(timeout=10)
+    check(plain.returncode == -signal.SIGTERM and "finally ran" not in out2, "control: without the handler SIGTERM skips `finally` (so the test proves the helper)")
+
+
+SAMPLE_CONFIG = """\
+listen: 127.0.0.1:8080
+scope:
+  - example.com
+  - "httpbin.org:443"
+  - '*.corp.example'
+system_proxy:
+  auto: false
+  bypass:
+    - "*.anthropic.com"
+    - claude.ai
+mcp:
+  operator_token: do-not-read-me
+"""
+
+SAMPLE_CONFIG_INLINE = "scope: [a.example, \"b.example:80\"]\nsystem_proxy:\n  bypass: []\n"
+SAMPLE_CONFIG_EMPTY = "scope: []\nsystem_proxy:\n  bypass: []\n"
+
+
+def test_config_scope_entries() -> None:
+    print("config_scope_entries")
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "config.yaml")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_CONFIG)
+        got = config_scope_entries(p)
+        check(got == ["example.com", "httpbin.org:443", "*.corp.example"], f"the scope: block's entries, exact strings, quotes stripped (got {got})")
+        check("do-not-read-me" not in " ".join(got) and "*.anthropic.com" not in got, "nothing outside the scope: block is read (no bypass entry, no token)")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_CONFIG_INLINE)
+        got = config_scope_entries(p)
+        check(got == ["a.example", "b.example:80"], f"an inline list is read (got {got})")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_CONFIG_EMPTY)
+        check(config_scope_entries(p) == [], "scope: [] -> []")
+        check(config_scope_entries(os.path.join(d, "absent.yaml")) == [], "no config -> []")
+
+
+def test_tooling_mentioned() -> None:
+    print("tooling_mentioned")
+    check(tooling_mentioned("*.anthropic.com, api.anthropic.com, claude.ai") is True, "the recommended list -> True")
+    check(tooling_mentioned(["github.com", "*.local"]) is True, "a list with github.com -> True")
+    check(tooling_mentioned("") is False, "empty -> False")
+    check(tooling_mentioned([]) is False, "[] -> False")
+    check(tooling_mentioned("example.com, com") is False, "an unrelated host and the bare TLD -> False")
+    check(tooling_mentioned("*.githubusercontent.com") is True, "any one TOOLING host suffices")
+
+
+def test_read_core_config_oserror() -> None:
+    print("read_core_config (find_embedded_core's file reads)")
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            read_core_config(4242, os.path.join(d, "gone", "config.yaml"))
+            check(False, "an unreadable per-launch config raises RuntimeError")
+        except RuntimeError as e:
+            check("embedded core 4242 config unreadable" in str(e), f"RuntimeError names the pid and the cause (got {e})")
+        except OSError as e:
+            check(False, f"OSError leaked instead of RuntimeError ({e})")
+        cfg = os.path.join(d, "config.yaml")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write("listen: 127.0.0.1:8080\nmcp:\n  operator_token: \"tok-value\"\n  token: agent-value\n")
+        try:
+            read_core_config(4242, cfg)
+            check(False, "a missing bus.endpoint beside the config raises RuntimeError")
+        except RuntimeError as e:
+            check("bus.endpoint" in str(e) or "unreadable" in str(e), f"RuntimeError for the missing endpoint file (got {e})")
+        with open(os.path.join(d, "bus.endpoint"), "w", encoding="utf-8") as f:
+            f.write("127.0.0.1:9100\n")
+        core = read_core_config(4242, cfg)
+        check((core.pid, core.bus_addr, core.operator_token) == (4242, "127.0.0.1:9100", "tok-value"), "pid, endpoint and operator token are read")
+
 
 def main() -> int:
     test_bypass_applied()
     test_replay_argv()
     test_parse_core_lines()
     test_step_writer()
+    test_report_verdict()
+    test_exit_on_term()
+    test_config_scope_entries()
+    test_tooling_mentioned()
+    test_read_core_config_oserror()
     print()
     if failures:
         print(f"{len(failures)} FAILED:")

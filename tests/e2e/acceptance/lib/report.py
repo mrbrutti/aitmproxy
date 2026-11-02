@@ -4,7 +4,7 @@ the leftovers and the D1 verdict word.
 
 Usage: report.py <version> <outdir>  (stdout = README.md body)
 Each journey cell writes <outdir>/<journey>-steps.tsv with lines
-  <step-id>\t<PASS|FAIL|SKIP|BLOCKED|ERROR>\t<observed>\t<bus truth>\t<explains>
+  <step-id>\t<PASS|FAIL|SKIP|BLOCKED|ERROR|N/A>\t<observed>\t<bus truth>\t<explains>
 rendered as the spec's tables; an unknown result string is a hard error (a cell wrote something the
 contract does not know). Missing files render as "not run". <outdir>/leftovers.txt
 (`<host>\t<removed|kept|failed>\t<cell>`) renders as the Leftovers section.
@@ -13,8 +13,9 @@ Filled in BY HAND afterwards (the harness cannot know them): the D2 starting-sta
 the yes-list as Matt approved it verbatim, and the Explains STATE column (open / merged, unreleased /
 missing feature with its card) — the cells only name the owner.
 
-Verdict word (D1): `pass` (every step PASS), `fail` (a performed step FAILed), `incomplete` (no FAIL
-but a SKIP/BLOCKED), plus `error` when a cell was killed or wrote an ERROR row.
+Verdict word (D1): `pass` (every step PASS or N/A, at least one PASS), `fail` (a performed step
+FAILed), `incomplete` (no FAIL but a SKIP/BLOCKED), `error` when a cell was killed or wrote an ERROR
+row. `N/A` (a step that does not exist on that surface or build) is listed and never holds the verdict.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import sys
 from datetime import datetime, timezone
 
 JOURNEYS = ("cli", "mac", "negatives", "tui", "web")
-RESULTS = ("PASS", "FAIL", "SKIP", "BLOCKED", "ERROR")
+RESULTS = ("PASS", "FAIL", "SKIP", "BLOCKED", "ERROR", "N/A")
 
 
 def rows(path: str) -> list[list[str]]:
@@ -88,13 +89,13 @@ def main() -> int:
         print("```\n" + read(d) + "```\n")
     else:
         print("not taken\n")
-    print("## Summary\n\n| Journey | PASS | FAIL | SKIP | BLOCKED | ERROR |\n|---|---|---|---|---|---|")
+    print("## Summary\n\n| Journey | PASS | FAIL | SKIP | BLOCKED | ERROR | N/A |\n|---|---|---|---|---|---|---|")
     for j, c in counts.items():
-        print(f"| {j.upper()} | {c['PASS']} | {c['FAIL']} | {c['SKIP']} | {c['BLOCKED']} | {c['ERROR']} |")
+        print(f"| {j.upper()} | {c['PASS']} | {c['FAIL']} | {c['SKIP']} | {c['BLOCKED']} | {c['ERROR']} | {c['N/A']} |")
     v = verdict(counts)
     print()
     words = {
-        "pass": "every performed step PASSed — clears the tap bump.",
+        "pass": "every performed step PASSed (N/A rows are steps that do not exist on that surface) — clears the tap bump.",
         "fail": "a performed step FAILed — blocks the tap bump until every FAIL has an owner in a shipped release or Matt's written acceptance.",
         "incomplete": "no FAIL, but SKIP/BLOCKED steps remain (a yes, a hand or a free port was missing) — not green; run them or Matt accepts the gap in writing.",
         "error": "a cell was killed or exited 2 — no verdict for the release; fix the runner and re-run.",
