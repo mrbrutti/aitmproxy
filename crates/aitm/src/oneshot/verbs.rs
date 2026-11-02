@@ -63,8 +63,9 @@ pub const LONG_RUNNING_VERBS: &[&str] = &[
 /// absent there.
 pub const LONG_RUNNING_SCRIPT_VERBS: &[&str] = &["l4.recon", "l4.tcp_probe", "l4.udp_probe"];
 
-/// Verb-name prefixes whose every verb is on the long lane: the bundled
-/// `check.*` scripts and the `l4.intercept.*` natives.
+/// Verb-name prefixes whose every verb is on the long lane: the `check.*`
+/// checks (natives since the scanner v2 rewrite, bundled Rhai scripts before)
+/// and the `l4.intercept.*` natives.
 pub const LONG_RUNNING_PREFIXES: &[&str] = &["check.", "l4.intercept."];
 
 /// The budget for `connect` plus `initialize` (and `tools/list` for a verb
