@@ -639,7 +639,11 @@ async fn half_a_boolean_pair_is_never_a_finding() {
 async fn xss_reflected_fires_on_every_kind_it_declares() {
     let check = aitm_scan_checks_http::xss::check();
     let kinds = check.meta().kinds.clone();
-    assert_eq!(kinds.len(), 8, "the declared kinds");
+    assert_eq!(
+        kinds.len(),
+        9,
+        "the declared kinds (Cookie since T2's live run)"
+    );
 
     for kind in kinds {
         let host = ScriptedHost::new().with_marker(MARKER).on(
@@ -684,19 +688,29 @@ async fn open_redirect_fires_on_every_kind_it_declares() {
     }
 }
 
-/// The boolean threshold end to end, at the byte. `max(baseline / 20, 40)` with
-/// a **strict** comparison: against a 600-byte baseline a 40-byte difference is
-/// noise and a 41-byte one is the finding. One byte of drift here moves every
-/// boolean verdict the scanner will ever make.
+/// The boolean threshold end to end, at the byte, on a page compared by
+/// length — one whose control answer differs from the baseline in content (a
+/// nonce in the last byte here) and so cannot be compared byte for byte.
+/// `max(baseline / 20, 40)` with a **strict** comparison: against a 600-byte
+/// baseline a 40-byte difference is noise and a 41-byte one is the finding.
+/// One byte of drift here moves every boolean verdict the scanner makes on a
+/// noisy page.
+///
+/// On a page that answers the control byte for byte the check compares
+/// content instead (F8, live run 2026-11-01), and there the same 40-byte
+/// shrink of the false arm *is* the finding: the true arm reproduced the
+/// baseline exactly and the false arm did not.
 #[tokio::test]
 async fn the_boolean_length_threshold_is_strict_at_the_byte_end_to_end() {
+    let nonce_a = format!("{}A", body(599));
+    let nonce_b = format!("{}B", body(599));
     for (false_len, expected) in [(560usize, Outcome::Clean), (559, Outcome::Vulnerable)] {
         let host = ScriptedHost::new()
-            .with_baseline(html(200, &body(600)))
-            .on("seed", html(200, &body(600)))
-            .on("1=1", html(200, &body(600)))
+            .with_baseline(html(200, &nonce_a))
+            .on("seed", html(200, &nonce_b))
+            .on("1=1", html(200, &nonce_a))
             .on("1=2", html(200, &body(false_len)))
-            .with_fallback(html(200, &body(600)))
+            .with_fallback(html(200, &nonce_a))
             .with_budget(64);
 
         let verdict = aitm_scan_checks_http::sqli_boolean::check()
@@ -705,10 +719,29 @@ async fn the_boolean_length_threshold_is_strict_at_the_byte_end_to_end() {
 
         assert_eq!(
             verdict.outcome, expected,
-            "a false arm of {false_len} bytes against a 600-byte baseline \
-             (threshold is exactly 40 bytes, strictly exceeded)"
+            "length signature: a false arm of {false_len} bytes against a 600-byte baseline \
+             (threshold is exactly 40 bytes, strictly exceeded): {}",
+            verdict.detail
         );
     }
+
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, &body(600)))
+        .on("seed", html(200, &body(600)))
+        .on("1=1", html(200, &body(600)))
+        .on("1=2", html(200, &body(560)))
+        .with_fallback(html(200, &body(600)))
+        .with_budget(64);
+    let verdict = aitm_scan_checks_http::sqli_boolean::check()
+        .run(&q(), &host)
+        .await;
+    assert_eq!(
+        verdict.outcome,
+        Outcome::Vulnerable,
+        "content signature: on a byte-stable page a 40-byte shrink of the false arm is the \
+         finding: {}",
+        verdict.detail
+    );
 }
 
 /// The slope half of ZAP's acceptance rule, end to end. A target that answers
@@ -992,16 +1025,16 @@ async fn the_budget_gate_spends_exactly_the_plan_when_the_budget_allows_it() {
         v.detail
     );
 
-    // open-redirect: the same three-probe shape.
+    // open-redirect: the same shape over its six canary forms.
     let exact = ScriptedHost::new()
         .with_marker(MARKER)
         .with_fallback(html(200, "nothing"))
-        .with_budget(3);
+        .with_budget(6);
     let v = aitm_scan_checks_http::redirect::check()
         .run(&q(), &exact)
         .await;
     assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
-    assert_eq!(exact.sent().len(), 3);
+    assert_eq!(exact.sent().len(), 6);
 
     // sqli-time: a baseline plus two families of four.
     let exact = ScriptedHost::new()

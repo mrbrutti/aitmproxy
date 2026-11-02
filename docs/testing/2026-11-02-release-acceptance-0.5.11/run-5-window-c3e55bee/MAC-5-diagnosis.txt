@@ -1,0 +1,43 @@
+== press Proxy > Scope… (1)
+enabled=true
+pressed Proxy > Scope… (enabled=true)
+nodes:       87
+AXTextField	missing value		text field
+AXTextField	missing value		Host to add to scope
+AXStaticText	missing value	Edit Scope	text
+AXTextField	missing value		Host to add to scope
+== focus probe
+probed: typed 1
+AXTextField	missing value		text field
+AXTextField	missing value		Host to add to scope
+AXTextField	missing value		Host to add to scope
+PROBE NOT SEEN
+== focused element (System Events)
+AXSheet, sheet, missing value
+done
+== set focused on the 'Host to add to scope' field
+109:202: execution error: System Events got an error: Can’t make text field 1 of entire contents of window 1 of process "Aitmproxy" whose description = "Host to add to scope" into type specifier. (-1700)
+== probe again
+probed: typed 1
+AXTextField	missing value		text field
+AXTextField	missing value		Host to add to scope
+AXTextField	missing value		Host to add to scope
+PROBE NOT SEEN
+== value of the field directly
+68:73: execution error: System Events got an error: Can’t make text field 1 of entire contents of window 1 of process "Aitmproxy" whose description = "Host to add to scope" into type specifier. (-1700)
+done
+field not found
+== probe again
+probed: typed 1
+AXTextField	missing value		text field
+AXTextField	missing value		Host to add to scope
+AXTextField	missing value		Host to add to scope
+PROBE NOT SEEN
+done
+sheet closed
+== scutil
+  HTTPEnable : 0
+  HTTPSEnable : 0
+== scope.list
+["wikipedia.org"]
+done

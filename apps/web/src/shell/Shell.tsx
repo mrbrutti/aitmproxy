@@ -108,7 +108,11 @@ export const Shell: Component = () => {
       <Sidebar class={css.sidebar!} />
       <section class={css.main}>
         <Toolbar />
-        <RoleBanner />
+        {/* RoleBanner is a fragment of 0–2 banners; the always-present wrapper pins them to one
+            `auto` row of .main so the chip bar, filter row and body never shift down a row. */}
+        <div class={css.banners}>
+          <RoleBanner />
+        </div>
         <ChipBar />
         <Show when={app.ui.filtersOpen} fallback={<div />}>
           <FilterBar />
@@ -118,7 +122,12 @@ export const Shell: Component = () => {
             <Show when={l4 && app.ui.sidebar.kind === 'l4'}>
               <L4CaptureBar store={l4!} />
             </Show>
-            <FlowList />
+            {/* The list fills whatever the capture bar (L4 view) and the intercept bar (armed) leave;
+                the wrapper is the one flex item that grows, so the bar is never height-constrained
+                and the virtualised body keeps scrolling (min-height: 0). */}
+            <div class={css.listFill}>
+              <FlowList />
+            </div>
             <Show when={app.proxy.armed}>
               <InterceptBar />
             </Show>

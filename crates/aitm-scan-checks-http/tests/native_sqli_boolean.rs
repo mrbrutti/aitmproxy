@@ -93,9 +93,20 @@ async fn a_true_matching_and_false_diverging_pair_is_firm() {
         Some(FALSE_ARM.to_string()),
         "the payload that produced the reaction is the diverging arm"
     );
-    assert_eq!(
-        verdict.evidence.matched, None,
-        "a blind technique matched no text"
+    // A byte-stable page is compared by content, so the evidence names where
+    // the false arm parted from the baseline (the lengths alone could be
+    // identical, as the live seed's were); a length hit carries no excerpt.
+    assert!(
+        verdict
+            .evidence
+            .matched
+            .as_deref()
+            .is_some_and(|m| m.starts_with(
+                "true arm reproduced the baseline; false arm differed at byte 120 of the scrubbed \
+                 body: baseline \"xxxx"
+            )),
+        "{:?}",
+        verdict.evidence.matched
     );
     assert!(
         verdict.poc_hint.is_none(),
@@ -645,4 +656,265 @@ async fn the_cap_refuses_the_repeat_that_would_be_the_eleventh_probe() {
         "control plus four whole pairs; no eleventh"
     );
     assert!(host.sent().len() <= MAX_BOOLEAN_PROBES);
+}
+
+// ---------------------------------------------------------------------------
+// The content signature (F8, live run 2026-11-01)
+// ---------------------------------------------------------------------------
+
+/// T10's seeded `/items` answers the true arm with `<p>items: 1</p>` and the
+/// false arm with `<p>items: 0</p>`: fifteen bytes either way. On a page that
+/// answers the control byte for byte the check compares content, so the one
+/// changed digit is the finding, `firm`, with the lengths still in the `Diff`.
+#[tokio::test]
+async fn a_one_character_difference_at_equal_length_is_firm_on_a_stable_page() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>items: 1</p>"))
+        .on("1=1", html(200, "<p>items: 1</p>"))
+        .on("1=2", html(200, "<p>items: 0</p>"))
+        .with_fallback(html(200, "<p>items: 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(
+        verdict.evidence.diff,
+        Some(Diff {
+            baseline_len: 15,
+            true_len: 15,
+            false_len: 15,
+        })
+    );
+    assert_eq!(verdict.evidence.payload, Some(FALSE_ARM.to_string()));
+    assert!(
+        verdict.detail.contains(
+            "with a body identical to its 15-byte baseline (the sent value scrubbed out), \
+             and the always-false \" AND 1=2\" with a different body of 15 bytes"
+        ),
+        "{}",
+        verdict.detail
+    );
+}
+
+/// A page that only echoes the parameter is not different from itself: the
+/// echo of the sent value is scrubbed before the bodies are compared, so the
+/// two arms match the baseline and nothing is reported.
+#[tokio::test]
+async fn a_page_that_only_echoes_the_value_is_clean() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>you sent seed</p>"))
+        .on(EXAMPLE, html(200, "<p>you sent seed</p>"))
+        .on("1=1", html(200, "<p>you sent seed AND 1=1</p>"))
+        .on("1=2", html(200, "<p>you sent seed AND 1=2</p>"))
+        .with_fallback(html(200, "<p>you sent seed</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+    assert_eq!(verdict.evidence.payload, None);
+}
+
+/// An echoing page with a real reaction behind the echo — HTML-escaped echo,
+/// and the row count that changes — is still found.
+#[tokio::test]
+async fn an_echoing_page_with_a_reaction_behind_the_echo_is_firm() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>you sent seed</p><p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>you sent seed</p><p>items: 1</p>"))
+        .on(
+            "' AND '1'='1",
+            html(
+                200,
+                "<p>you sent seed&#39; AND &#39;1&#39;=&#39;1</p><p>items: 1</p>",
+            ),
+        )
+        .on(
+            "' AND '1'='2",
+            html(
+                200,
+                "<p>you sent seed&#39; AND &#39;1&#39;=&#39;2</p><p>items: 0</p>",
+            ),
+        )
+        .with_fallback(html(200, "<p>you sent seed</p><p>items: 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(verdict.evidence.payload, Some("' AND '1'='2".to_string()));
+}
+
+/// A page that varies between identical requests (a nonce) cannot be compared
+/// by content, so the check falls back to ZAP's length rule — the shipped
+/// behaviour — and the detail reads in bytes.
+#[tokio::test]
+async fn a_page_with_a_nonce_falls_back_to_the_length_signature() {
+    let nonce_a = format!("{}A", body(599));
+    let nonce_b = format!("{}B", body(599));
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, &nonce_a))
+        .on(EXAMPLE, html(200, &nonce_b))
+        .on("1=1", html(200, &nonce_a))
+        .on("1=2", html(200, &body(120)))
+        .with_fallback(html(200, &nonce_a));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(
+        verdict.evidence.diff,
+        Some(Diff {
+            baseline_len: 600,
+            true_len: 600,
+            false_len: 120,
+        })
+    );
+    assert!(
+        verdict
+            .detail
+            .contains("with 600 bytes, matching its 600-byte baseline, and the always-false"),
+        "{}",
+        verdict.detail
+    );
+}
+
+/// On a content-compared page a true arm that does not reproduce the baseline
+/// is a miss even when the lengths would have passed: the page reacted to the
+/// appended text, not to the condition.
+#[tokio::test]
+async fn a_true_arm_that_changes_a_stable_page_is_not_a_hit() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>items: 1</p>"))
+        .on("1=1", html(200, "<p>items: 2</p>"))
+        .on("1=2", html(200, "<p>items: 0</p>"))
+        .with_fallback(html(200, "<p>items: 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+}
+
+/// A pair answered 5xx on both arms is a syntax family that breaks this
+/// point's query, not a condition being evaluated. One such pair is dropped
+/// and the next family still gets its turn (a quoted pair on a numeric
+/// parameter must not hide the numeric pair's differential); two end the
+/// point as error-based territory, so the host's error ladder is not fed the
+/// remaining pairs (live run 2026-11-01: the seeded error-based `/products`
+/// tripped the ladder for the whole job; panel review of PR 2a).
+#[tokio::test]
+async fn two_pairs_answered_5xx_on_both_arms_end_the_point_as_error_based_territory() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>product 1</p>"))
+        .on(EXAMPLE, html(200, "<p>product 1</p>"))
+        .on("1=1", html(200, "<p>product 1</p>"))
+        .on("1=2", html(200, "<p>product 1</p>"))
+        .on("'1'='1", html(500, "<pre>SQL syntax error</pre>"))
+        .on("'1'='2", html(500, "<pre>SQL syntax error</pre>"))
+        .on("\"1\"=\"1", html(500, "<pre>SQL syntax error</pre>"))
+        .on("\"1\"=\"2", html(500, "<pre>SQL syntax error</pre>"))
+        .with_fallback(html(200, "<p>product 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert!(
+        verdict.detail.starts_with(
+            "the point answered 5xx to both arms of 2 condition pairs, the last \
+             \"\" AND \"1\"=\"1\" / \"\" AND \"1\"=\"2\""
+        ),
+        "{}",
+        verdict.detail
+    );
+    // Control, the numeric pair, the two quoted pairs: nothing after the second
+    // 5xx pair (the OR pair was never sent).
+    assert_eq!(host.sent().len(), 7, "{:?}", host.sent());
+}
+
+/// One 5xx pair among pairs that showed nothing is not Clean: part of the
+/// point was never tested as a boolean differential, and the detail says so.
+#[tokio::test]
+async fn one_pair_answered_5xx_keeps_the_point_inconclusive_not_clean() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>product 1</p>"))
+        .on(EXAMPLE, html(200, "<p>product 1</p>"))
+        .on("'1'='1", html(500, "<pre>SQL syntax error</pre>"))
+        .on("'1'='2", html(500, "<pre>SQL syntax error</pre>"))
+        .with_fallback(html(200, "<p>product 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert_eq!(
+        verdict.detail,
+        "1 of 4 condition pairs was answered 5xx on both arms (error-based territory) and the \
+         rest showed no differential against the 16-byte baseline"
+    );
+    // Every one of the four pairs was still sent: control + 4 pairs.
+    assert_eq!(host.sent().len(), 9, "{:?}", host.sent());
+}
+
+/// A numeric point whose quoted pair errors still gets its numeric
+/// differential found: the erroring pair is dropped, not the point.
+#[tokio::test]
+async fn an_erroring_quoted_pair_does_not_hide_a_later_differential() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>items: 1</p>"))
+        .on("'1'='1", html(500, "<pre>SQL syntax error</pre>"))
+        .on("'1'='2", html(500, "<pre>SQL syntax error</pre>"))
+        .on("OR 1=1", html(200, "<p>items: 1</p>"))
+        .on("OR 1=2", html(200, "<p>items: 0</p>"))
+        .on("1=1", html(200, "<p>items: 1</p>"))
+        .on("1=2", html(200, "<p>items: 1</p>"))
+        .with_fallback(html(200, "<p>items: 1</p>"))
+        // The hit is the fourth pair: control + 4 pairs = 9 probes, so the
+        // ten-probe cap leaves no room for a confirming repeat.
+        .with_accuracy(Accuracy::FewerFalseNegatives);
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.evidence.payload, Some(" OR 1=2".to_string()));
+}
+
+/// The repo's own escaper (and OWASP's) prints the apostrophe as `&#x27;`; the
+/// project's Patched seed echoes that way. The scrub recognises it, so the
+/// differential behind the echo is still found (panel review of PR 2a).
+#[tokio::test]
+async fn an_echo_escaped_with_hex_apostrophes_is_still_scrubbed() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>you sent seed</p><p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>you sent seed</p><p>items: 1</p>"))
+        .on(
+            "' AND '1'='1",
+            html(
+                200,
+                "<p>you sent seed&#x27; AND &#x27;1&#x27;=&#x27;1</p><p>items: 1</p>",
+            ),
+        )
+        .on(
+            "' AND '1'='2",
+            html(
+                200,
+                "<p>you sent seed&#x27; AND &#x27;1&#x27;=&#x27;2</p><p>items: 0</p>",
+            ),
+        )
+        .with_fallback(html(200, "<p>you sent seed</p><p>items: 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.evidence.payload, Some("' AND '1'='2".to_string()));
 }
