@@ -4,7 +4,7 @@
 //! [`PacketLane`] is the assembly point: it owns the one [`Shared`] context
 //! (guard, backend, lane-private case store, seed store, timings and the
 //! per-job [`LaneState`]), the [`RunnerRegistry`] that maps
-//! `(job marker, point id)` to the single [`PointRunner`] that owns a point's
+//! `(job id, point id)` to the single [`PointRunner`] that owns a point's
 //! fuzz run, and the two native checks that read that run. Discovery mints the
 //! points; `probe_host_for` builds and registers the runner; whichever check
 //! reaches the point first drives the cases and the other sends nothing.
@@ -16,6 +16,7 @@
 //! out verbatim.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use aitm_proto_l4::backend::pcap::PcapBackend;
@@ -24,12 +25,14 @@ use aitm_proto_l4::flow::{InMemoryL4FlowStore, L4FlowStore};
 use aitm_proto_l4::guard::L4Guard;
 use aitm_scan_model::{
     Check, Discovery, InsertionPoint, JobCtx, L4Counters, Lane, LaneKind, ProbeHost, ProfileTarget,
+    ScanProfile,
 };
 use anyhow::anyhow;
 use futures::future::BoxFuture;
 
 use crate::checks::checks;
-use crate::discover::discover_all;
+use crate::discover::{discover_all, ip_version};
+use crate::fields::validate_fields;
 use crate::host::{PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
 use crate::plan::{parse_point_id, requested_fields, target_key};
 use crate::state::{JobKey, JobStats, LaneState};
@@ -131,9 +134,9 @@ impl PacketLane {
     }
 
     /// The field list a job fuzzes when its profile requests none. The
-    /// profile's own `fields` always wins once [`requested_fields`] is flipped
-    /// at integration (call C1); an empty list here is the target's default
-    /// field table.
+    /// profile's own `L4Options.fields` always wins ([`requested_fields`] reads
+    /// it since task 4a of the live-proof plan); an empty list here is the
+    /// target's default field table.
     #[must_use]
     pub fn with_default_fields(mut self, fields: Vec<String>) -> Self {
         self.default_fields = fields;
@@ -234,6 +237,10 @@ impl Lane for PacketLane {
             let target_owned = target.clone();
             let profile_owned = profile.clone();
             let marker = job.marker();
+            // The engine's stable job id (not `marker`, which is minted fresh
+            // per call) seeds each target's source port, so two concurrent jobs
+            // against one target never share a reply five-tuple (amendment 73 b).
+            let job_id = job.job_id().to_string();
             let planned = tokio::task::spawn_blocking(move || {
                 discover_all(
                     guard.as_ref(),
@@ -243,6 +250,7 @@ impl Lane for PacketLane {
                     &profile_owned,
                     &requested,
                     &marker,
+                    &job_id,
                 )
             })
             .await;
@@ -256,8 +264,11 @@ impl Lane for PacketLane {
                     return Err(anyhow!("lane_unavailable: discovery task failed: {join}"))
                 }
             };
+            // Keyed by the job id alone: `job.marker()` was asked once, above,
+            // for the canary seed, and the engine mints a fresh token on every
+            // call (quality panel Minor).
             let forgotten = shared.state.begin_job(
-                JobKey::new(job.job_id(), &job.marker()),
+                JobKey::new(job.job_id()),
                 plans,
                 discovery.points.iter().map(|p| p.id.clone()).collect(),
                 profile.l4.cases,
@@ -266,9 +277,10 @@ impl Lane for PacketLane {
             );
             // A job whose state is gone has no run left to drive, so its
             // runners go with it: the registry is bounded by the same window
-            // (review findings SEC2/Q4).
-            for marker in forgotten {
-                self.registry.forget_marker(&marker);
+            // (review findings SEC2/Q4). `begin_job` hands back the job ids it
+            // dropped, which are the registry's keys (T5 live proof, 4b).
+            for job_id in forgotten {
+                self.registry.forget_job(&job_id);
             }
             Ok(discovery)
         })
@@ -309,22 +321,72 @@ impl Lane for PacketLane {
             .find(|plan| plan.key() == key)
             .ok_or_else(|| anyhow!("no target plan for point {} in job {job_id}", point.id))?;
 
-        let marker = job.marker();
         // Seed 0 is built here, once, so a seed that does not craft is refused
         // with its D3 code rather than at send time (review finding M8); it was
         // already validated at discovery, so this is unreachable short of a
-        // guard ceiling change mid-job.
+        // guard ceiling change mid-job. `PlanError` renders bare (quality panel
+        // Minor), so this is the one place that code is added on the host-time
+        // path and the text the engine notes is unchanged.
         let runner = PointRunner::new(Arc::clone(shared), job, point.clone(), plan, field)
-            .map_err(|err| anyhow!("{err}"))?;
-        // The registry owns the point's runner: a second host for the same
-        // point wraps the runner already registered, so both hosts drive one
-        // idempotent run (review finding Q3).
-        let runner = self.registry.register(&marker, &point.id, Arc::new(runner));
+            .map_err(|err| anyhow!("invalid_profile: {err}"))?;
+        // The registry owns the point's runner, keyed by the engine's stable
+        // job id — never `JobCtx::marker`, which mints a fresh token on every
+        // call, so the crash and reaction checks (which look the runner up by
+        // the host's `marker()`, itself the job id) would read `missing_runner`
+        // and the job would send nothing (T5 live proof, 4b). A second host for
+        // the same point wraps the runner already registered, so both hosts
+        // drive one idempotent run (review finding Q3).
+        let runner = self.registry.register(&job_id, &point.id, Arc::new(runner));
         Ok(Box::new(PacketHost::new(runner)))
     }
 
     fn checks(&self) -> Vec<Arc<dyn Check>> {
         self.checks.clone()
+    }
+
+    /// Refuse, before the job is spawned, a profile whose `L4Options.fields`
+    /// names a field this lane cannot fuzz (AC T5-3, spec D8.4).
+    ///
+    /// Every declared target is checked with the same [`validate_fields`] the
+    /// run itself uses, so a pinned path (`ipv4.src`, `dst`, `interface`,
+    /// `ether.src` ...), an unknown path, or a path that does not apply to the
+    /// target's IP version and transport is named by `scan.start` rather than
+    /// by a job the caller already believes started. `discover` keeps its own
+    /// identical check as the second line of defence: a lane can be driven
+    /// without the engine in front of it.
+    ///
+    /// Only the field list is decided here. Scope, privilege and seeds all need
+    /// the guard and the wire, so they stay with discovery — and a handle-less
+    /// lane validates rather than refusing, so `scan.start` still reports
+    /// `refused_l4` (call A18) instead of `invalid_profile`.
+    ///
+    /// # Errors
+    ///
+    /// The first offending path's [`FieldError`](crate::fields::FieldError),
+    /// rendered: the message is *bare*, because the engine renders it as
+    /// `scan: invalid_profile: <message>` (`aitm_scan_model::scan_error`) and
+    /// `DiscoverError`'s `Display` adds the same code on the discovery path.
+    /// The sentence after the code is the same on both paths.
+    fn validate(&self, target: &ProfileTarget, profile: &ScanProfile) -> Result<(), String> {
+        // The same substitution discovery makes: the profile's own list wins,
+        // and an empty one falls back to this lane's default list (empty in
+        // production, which `validate_fields` reads as the target's default
+        // table and always accepts).
+        let mut requested = requested_fields(profile);
+        if requested.is_empty() {
+            requested.clone_from(&self.default_fields);
+        }
+        for spec in &target.l4 {
+            // A target whose address does not parse has no IP version to check
+            // a path against; `resolve_target` refuses it at discovery with its
+            // own `invalid_profile` message naming the address.
+            let Ok(ip) = spec.ip.parse::<IpAddr>() else {
+                continue;
+            };
+            validate_fields(ip_version(ip), spec.proto, &requested)
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -358,8 +420,8 @@ mod tests {
     use super::PacketLane;
     use crate::host::Timing;
     use crate::testing::{
-        fields, l4_profile, loopback_guard, udp_target, with_hex_seed, MockBackend, MockReply,
-        TestJob,
+        fields, l4_profile, loopback_guard, tcp_target, udp_target, with_hex_seed, MockBackend,
+        MockReply, TestJob,
     };
 
     /// The job id and marker every [`TestJob`] runs under.
@@ -480,7 +542,14 @@ mod tests {
             .await
             .expect("the loopback target plans");
         assert_eq!(discovery.points.len(), 14);
-        assert!(discovery.nodes.is_empty());
+        // One node for the one declared target, named by all 14 points, so the
+        // engine can place an issue on it (`l4_location`).
+        assert_eq!(discovery.nodes.len(), 1);
+        assert_eq!(discovery.nodes[0].id, "l4:127.0.0.1:9/udp");
+        assert_eq!(discovery.nodes[0].points, 14);
+        for point in &discovery.points {
+            assert_eq!(point.site_node.as_deref(), Some("l4:127.0.0.1:9/udp"));
+        }
 
         let mut foreign = discovery.points[0].clone();
         foreign.lane = LaneKind::Http;
@@ -577,6 +646,64 @@ mod tests {
         assert_eq!(mock.inject_count(), 105);
     }
 
+    /// Task 4b (T5 live proof): the engine's `JobCtx::marker()` is a reflection
+    /// canary that mints a *fresh* token on every call (its trait doc and
+    /// `aitm_plugin_scanner::worker`), so the lane must key a point's runner by
+    /// the stable, unique job id instead. Driven by an engine-shaped job — one
+    /// whose marker changes every call — the whole lane path still works:
+    /// `probe_host_for` registers the runner and the crash check finds it, so
+    /// the verdict is a real reading and not the `missing_runner` error, and
+    /// the mock answers every one of the profile's cases. Keyed by the marker
+    /// instead, this is exactly what every real-bus packet job did: the check
+    /// looked the runner up under a different token, read `missing_runner`, and
+    /// the job finished `done` with zero cases and nothing on the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checks_find_the_runner_when_the_job_marker_is_fresh_per_call() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let lane = lane_with(Arc::clone(&mock), &["raw"]);
+        let profile = l4_profile(vec![udp_target(9)], 100);
+        let job = TestJob::new(profile.clone()).fresh_markers();
+
+        // The double really is the engine's canary: no two asks agree.
+        assert_ne!(
+            job.marker(),
+            job.marker(),
+            "fresh-markers mode mints a new token every call"
+        );
+
+        let discovery = lane
+            .discover(&profile.target, job.as_ref())
+            .await
+            .expect("one raw point");
+        assert_eq!(discovery.points.len(), 1);
+        let point = discovery.points[0].clone();
+        let host = lane
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts the point it minted");
+
+        let crash = lane.checks()[0].run(&point, host.as_ref()).await;
+        assert_ne!(
+            crash.outcome,
+            Outcome::Error,
+            "the runner must be found, not reported missing: {}",
+            crash.detail
+        );
+        assert!(
+            !crash.detail.contains("no packet-lane runner"),
+            "the registry key must not depend on the marker: {}",
+            crash.detail
+        );
+        assert_eq!(
+            lane.counters(JOB_ID).map(|counters| counters.cases),
+            Some(u64::from(profile.l4.cases)),
+            "the mock answers every case through the full lane path"
+        );
+        assert!(
+            job.markers_asked() >= 1,
+            "the engine was asked for a fresh marker at least once"
+        );
+    }
+
     /// Review findings SEC2/Q4: the runner registry is bounded by the same
     /// eight-job window `LaneState` keeps. Each runner holds its target plan
     /// and its cached run (up to the case ceiling of records), so a long-lived
@@ -587,12 +714,12 @@ mod tests {
         let mock = MockBackend::new(MockReply::Echo);
         let lane = lane_with(Arc::clone(&mock), &["raw"]);
         let profile = l4_profile(vec![udp_target(9)], 1);
+        // The registry keys by job id (T5 live proof, 4b): each job gets a
+        // distinct one, as the engine mints them.
         let mut first: Option<(String, String)> = None;
 
         for n in 0..9u32 {
-            let job = TestJob::new(profile.clone())
-                .with_job_id(&format!("scan-{n:08x}"))
-                .with_marker(&format!("aitm000{n}"));
+            let job = TestJob::new(profile.clone()).with_job_id(&format!("scan-{n:08x}"));
             let discovery = lane
                 .discover(&profile.target, job.as_ref())
                 .await
@@ -601,7 +728,7 @@ mod tests {
             lane.probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
                 .expect("the lane hosts the point it minted");
             if first.is_none() {
-                first = Some((job.marker(), point.id.clone()));
+                first = Some((job.job_id().to_string(), point.id.clone()));
             }
             assert!(
                 lane.registry.len() <= 8,
@@ -610,9 +737,9 @@ mod tests {
             );
         }
 
-        let (marker, point_id) = first.expect("the first job ran");
+        let (job_id, point_id) = first.expect("the first job ran");
         assert!(
-            lane.registry.get(&marker, &point_id).is_none(),
+            lane.registry.get(&job_id, &point_id).is_none(),
             "the first job's runner outlived its state"
         );
         assert_eq!(lane.registry.len(), 8);
@@ -641,14 +768,14 @@ mod tests {
             .expect("the lane hosts the point it minted");
         let runner = lane
             .registry
-            .get(&job.marker(), &point.id)
+            .get(job.job_id(), &point.id)
             .expect("the first host registered the point's runner");
         let second = lane
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("a second host for the same point");
         let again = lane
             .registry
-            .get(&job.marker(), &point.id)
+            .get(job.job_id(), &point.id)
             .expect("the second host finds a runner too");
         assert!(
             Arc::ptr_eq(&runner, &again),
@@ -884,6 +1011,134 @@ mod tests {
         }
     }
 
+    /// A UDP target on `[::1]:port`, for the IPv6 half of the field checks.
+    fn v6_target(port: u16) -> aitm_scan_model::L4TargetSpec {
+        aitm_scan_model::L4TargetSpec {
+            ip: "::1".to_string(),
+            port,
+            proto: aitm_scan_model::L4Transport::Udp,
+            grammar: None,
+        }
+    }
+
+    /// AC T5-3 / spec D8.4: a profile naming a pinned field is refused by
+    /// `Lane::validate`, synchronously, before the engine spawns the job
+    /// (`crates/aitm-plugin-scanner/src/jobs.rs` wraps the `Err` into
+    /// `scan: invalid_profile: <message>`), so the message carries no code of
+    /// its own.
+    #[test]
+    fn validate_refuses_a_pinned_field_synchronously() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = fields(&["ipv4.src"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "ipv4.src" is pinned and cannot be fuzzed"#.to_string())
+        );
+
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = fields(&["dst"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "dst" is pinned and cannot be fuzzed"#.to_string())
+        );
+
+        let mut profile = l4_profile(vec![v6_target(53)], 10);
+        profile.l4.fields = fields(&["ipv6.src"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "ipv6.src" is pinned and cannot be fuzzed"#.to_string())
+        );
+    }
+
+    /// A path the lane does not know is refused the same way, and named.
+    #[test]
+    fn validate_refuses_an_unknown_path() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = fields(&["udp.nope"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"unknown field path "udp.nope""#.to_string())
+        );
+    }
+
+    /// A fuzzable path and the empty list (the target's default table) both
+    /// pass, so `validate` refuses nothing a run would accept.
+    #[test]
+    fn validate_accepts_raw_and_the_empty_default() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = fields(&["raw"]);
+        assert_eq!(lane.validate(&profile.target, &profile), Ok(()));
+
+        let profile = l4_profile(vec![udp_target(9)], 10);
+        assert!(profile.l4.fields.is_empty());
+        assert_eq!(lane.validate(&profile.target, &profile), Ok(()));
+
+        // A profile with no L4 target at all is this lane's `Ok` too: the
+        // engine's own rule refuses that case (jobs.rs), not the lane.
+        let mut empty = l4_profile(vec![], 10);
+        empty.l4.fields = fields(&["ipv4.src"]);
+        assert_eq!(lane.validate(&empty.target, &empty), Ok(()));
+    }
+
+    /// Every declared target is checked, not just the first: `tcp.flags` is a
+    /// field on the TCP target and absent from the UDP one.
+    #[test]
+    fn validate_checks_every_l4_target() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+        let mut profile = l4_profile(vec![tcp_target(9), udp_target(53)], 10);
+        profile.l4.fields = fields(&["tcp.flags"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "tcp.flags" does not apply to a ipv4/udp target"#.to_string())
+        );
+    }
+
+    /// Tester (stage 5), AC T5-3: `validate` checks both dimensions of a
+    /// field's applicability — the transport *and* the IP version — against
+    /// **every** declared target, in profile order. A mixed-family profile is
+    /// the case the engine cannot catch for us: `ipv4.ttl` is a real, fuzzable
+    /// field of the v4 target and nonsense for the `[::1]` one, and
+    /// `ipv6.hop_limit` is the mirror image. Either way `scan.start` must
+    /// refuse, naming the family and transport that rejected the path, rather
+    /// than letting discovery raise `invalid_profile` later with a job
+    /// already begun.
+    ///
+    /// Mutation: `break` out of `validate`'s loop after the first target (or
+    /// check `spec.proto` without `ip_version(ip)`) and both halves pass
+    /// `Ok(())`.
+    #[test]
+    fn validate_checks_the_ip_version_of_every_target() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+
+        // Valid for the first (v4) target, nonsense for the second (v6) one.
+        let mut profile = l4_profile(vec![udp_target(9), v6_target(53)], 10);
+        profile.l4.fields = fields(&["ipv4.ttl"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "ipv4.ttl" does not apply to a ipv6/udp target"#.to_string())
+        );
+
+        // The mirror image, with the families the other way round.
+        let mut profile = l4_profile(vec![v6_target(53), udp_target(9)], 10);
+        profile.l4.fields = fields(&["ipv6.hop_limit"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "ipv6.hop_limit" does not apply to a ipv4/udp target"#.to_string())
+        );
+
+        // `raw` and `udp.*` apply to both families, so a mixed profile that
+        // names only portable paths is accepted: validate refuses nothing a
+        // run would accept.
+        let mut profile = l4_profile(vec![udp_target(9), v6_target(53)], 10);
+        profile.l4.fields = fields(&["raw", "udp.length"]);
+        assert_eq!(lane.validate(&profile.target, &profile), Ok(()));
+    }
+
     /// Tester (stage 5): `with_timing` on a handle-less lane keeps refusing,
     /// and its counters/stats/state are all `None`.
     #[test]
@@ -924,26 +1179,24 @@ mod tests {
         assert_eq!(lane.counters(JOB_ID).expect("the job counted").cases, 0);
     }
 
-    /// Tester (fix rounds, review findings SEC2/Q4): the eviction window and
-    /// the registry move together through a *re-begun* job too. Re-discovering
-    /// the first job under a new marker forgets its previous runner at once;
-    /// the ninth job then evicts that re-begun job — the oldest slot — and its
-    /// current runner goes with it, so the registry never exceeds eight and
-    /// never keeps a runner whose job state is gone.
+    /// Tester (fix rounds, review findings SEC2/Q4; keyed by job id, T5 live
+    /// proof 4b): the eviction window and the registry move together through a
+    /// *re-begun* job too. The engine never reuses a job id in production, but
+    /// re-discovering one forgets its previous runner at once — before the new
+    /// host registers, so a fresh runner takes the slot — and the ninth job
+    /// then evicts the oldest slot, its runner going with it, so the registry
+    /// never exceeds eight and never keeps a runner whose job state is gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn re_discovering_a_job_forgets_its_previous_runners_and_keeps_its_slot() {
         let mock = MockBackend::new(MockReply::Echo);
         let lane = lane_with(Arc::clone(&mock), &["raw"]);
         let profile = l4_profile(vec![udp_target(9)], 1);
-        let host_job = |job_id: &str, marker: &str| {
+        let host_job = |job_id: &str| {
             let lane = &lane;
             let profile = profile.clone();
             let job_id = job_id.to_string();
-            let marker = marker.to_string();
             async move {
-                let job = TestJob::new(profile.clone())
-                    .with_job_id(&job_id)
-                    .with_marker(&marker);
+                let job = TestJob::new(profile.clone()).with_job_id(&job_id);
                 let discovery = lane
                     .discover(&profile.target, job.as_ref())
                     .await
@@ -957,38 +1210,45 @@ mod tests {
 
         let mut point_id = String::new();
         for n in 0..8u32 {
-            point_id = host_job(&format!("scan-{n:08x}"), &format!("aitm000{n}")).await;
+            point_id = host_job(&format!("scan-{n:08x}")).await;
         }
         assert_eq!(lane.registry.len(), 8);
-        assert!(lane.registry.get("aitm0000", &point_id).is_some());
+        let first_runner = lane
+            .registry
+            .get("scan-00000000", &point_id)
+            .expect("job 0's runner");
 
-        // Job 0 again, under a new marker: its old runner is forgotten the
-        // moment the job is re-begun, before the new host registers.
-        host_job("scan-00000000", "aitm00re").await;
+        // Job 0's id again: its old runner is forgotten the moment the job is
+        // re-begun, before the new host registers, so a fresh runner takes the
+        // slot. The engine never reuses a job id — this only drives the window.
+        host_job("scan-00000000").await;
         assert_eq!(lane.registry.len(), 8, "one runner per live job");
+        let re_runner = lane
+            .registry
+            .get("scan-00000000", &point_id)
+            .expect("the re-begun job's new runner");
         assert!(
-            lane.registry.get("aitm0000", &point_id).is_none(),
-            "the re-begun job's previous runner is gone"
+            !Arc::ptr_eq(&first_runner, &re_runner),
+            "the re-begun job's previous runner is gone, replaced by a fresh one"
         );
-        assert!(lane.registry.get("aitm00re", &point_id).is_some());
         for n in 1..8u32 {
             assert!(
                 lane.registry
-                    .get(&format!("aitm000{n}"), &point_id)
+                    .get(&format!("scan-{n:08x}"), &point_id)
                     .is_some(),
                 "job {n} kept its runner"
             );
         }
 
         // The ninth job evicts the oldest slot, which is still job 0's.
-        host_job("scan-00000008", "aitm0008").await;
+        host_job("scan-00000008").await;
         assert_eq!(lane.registry.len(), 8);
         assert!(
-            lane.registry.get("aitm00re", &point_id).is_none(),
-            "the evicted job's current runner went with its state"
+            lane.registry.get("scan-00000000", &point_id).is_none(),
+            "the evicted job's runner went with its state"
         );
-        assert!(lane.registry.get("aitm0001", &point_id).is_some());
-        assert!(lane.registry.get("aitm0008", &point_id).is_some());
+        assert!(lane.registry.get("scan-00000001", &point_id).is_some());
+        assert!(lane.registry.get("scan-00000008", &point_id).is_some());
         assert_eq!(lane.counters("scan-00000000"), None);
         assert!(lane.counters("scan-00000001").is_some());
     }

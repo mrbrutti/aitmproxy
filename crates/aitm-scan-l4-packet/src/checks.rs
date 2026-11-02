@@ -3,7 +3,7 @@
 //!
 //! Neither check sends: both read the one cached [`crate::state::PointRun`] of
 //! the point they were handed, found through the
-//! [`RunnerRegistry`](crate::host::RunnerRegistry) by `(job marker, point id)`,
+//! [`RunnerRegistry`](crate::host::RunnerRegistry) by `(job id, point id)`,
 //! so whichever check reaches a point first drives its cases and the other
 //! renders a verdict over the same run (spec D8.4, plan call C2).
 //!
@@ -228,6 +228,11 @@ async fn resolve_run(
     point: &InsertionPoint,
     host: &dyn ProbeHost,
 ) -> Result<(Arc<PointRunner>, Arc<PointRun>), Verdict> {
+    // `host.marker()` is the packet host's job id — the stable key
+    // `Lane::probe_host_for` registered the runner under, not the engine's
+    // per-call `JobCtx::marker` canary (`PacketHost::marker`; T5 live proof,
+    // 4b). The `&dyn ProbeHost` is the only handle this preamble has to the
+    // runner's key, so the host must report the job id and nothing else here.
     let Some(runner) = registry.get(&host.marker(), &point.id) else {
         return Err(missing_runner(&point.id));
     };
@@ -552,11 +557,7 @@ mod tests {
     /// `Lane::probe_host_for` registers it before a check ever runs.
     fn registry_with(job: &Arc<TestJob>, runner: &Arc<PointRunner>) -> Arc<RunnerRegistry> {
         let registry = Arc::new(RunnerRegistry::new());
-        registry.register(
-            &job.marker(),
-            runner.point().id.as_str(),
-            Arc::clone(runner),
-        );
+        registry.register(job.job_id(), runner.point().id.as_str(), Arc::clone(runner));
         registry
     }
 
@@ -1081,7 +1082,7 @@ mod tests {
         let second = runner_for(&shared, &job, &plans, &disc.points, "udp.length");
         let registry = registry_with(&job, &first);
         registry.register(
-            &job.marker(),
+            job.job_id(),
             second.point().id.as_str(),
             Arc::clone(&second),
         );
@@ -1343,7 +1344,7 @@ mod tests {
         let second = runner_for(&shared, &job, &plans, &disc.points, "ipv4.ttl");
         let registry = registry_with(&job, &first);
         registry.register(
-            &job.marker(),
+            job.job_id(),
             second.point().id.as_str(),
             Arc::clone(&second),
         );
