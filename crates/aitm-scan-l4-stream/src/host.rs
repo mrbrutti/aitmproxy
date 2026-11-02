@@ -628,12 +628,12 @@ impl StreamHost {
         self.liveness().await
     }
 
-    /// Report the job's L4 counters to the engine (spec amendment A5).
-    ///
-    /// Deliberately empty: `JobCtx` has no `report_l4` yet and this crate may
-    /// not add one to the T1a contract, so the call site is here and the
-    /// integration task fills the body in.
-    fn report_l4_hook(&self) {}
+    /// Report the job's L4 counters to the engine (spec amendment A5): after
+    /// every case the engine's `JobCtx::report_l4` receives the job's current
+    /// `L4Counters`, so `scan.status` shows them while the campaign runs.
+    fn report_l4_hook(&self) {
+        self.job.report_l4(self.state.counters());
+    }
 
     /// The denylist verdict for one message.
     ///
