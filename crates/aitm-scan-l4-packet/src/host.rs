@@ -399,6 +399,16 @@ impl PointRunner {
     /// Send the unmutated seed and compare its class with the baseline's: the
     /// target is alive exactly while it reacts as it did before any case.
     ///
+    /// The correlation pins `dst_port`, as [`PointRunner::replay`] does and
+    /// whatever field this runner fuzzes: the probe sends seed 0, whose
+    /// transport header is intact, so the strict pin is always possible — and
+    /// it is the correct one. Only a *mutated* case may need the looser rule
+    /// its field dictates (`send_recv_spec`). Passing `self.field` here would
+    /// drop the pin on every point that does not preserve the transport
+    /// (`udp.length`, `ipv4.proto`, the fragmentation fields), and on a shared
+    /// interface an unrelated frame from another port of the same host could
+    /// then be read as a passing probe (review finding SEC4).
+    ///
     /// # Errors
     /// As [`PointRunner::send_spec`]; the probe is charged but is never a case.
     pub async fn liveness_probe(&self) -> Result<bool, HostError> {
@@ -410,7 +420,7 @@ impl PointRunner {
                 vec!["liveness".to_string()],
                 0,
                 Counted::Probe,
-                self.field,
+                FieldPath::Raw,
             )
             .await?;
         let baseline = *lock(&self.baseline);
@@ -823,6 +833,15 @@ impl PointRunner {
 
         // The baseline is the yardstick every case and every liveness probe is
         // read against. It is charged, but it is not a case.
+        //
+        // Its correlation pins `dst_port`, as the probes read against it do and
+        // whatever field this point fuzzes: the baseline sends seed 0, whose
+        // transport header is intact, so the strict pin is always possible and
+        // correct. Only a mutated case may need the looser rule its field
+        // dictates. With `self.field` a point that does not preserve the
+        // transport would take its yardstick from a loose correlation, and an
+        // unrelated frame from another port of the same host could become the
+        // baseline class (review finding SEC4).
         let seed = self.seed0.clone();
         match self
             .deliver(
@@ -831,7 +850,7 @@ impl PointRunner {
                 vec!["baseline".to_string()],
                 0,
                 Counted::Probe,
-                self.field,
+                FieldPath::Raw,
             )
             .await
         {
@@ -1757,10 +1776,13 @@ impl RunnerRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::net::IpAddr;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
-    use aitm_proto_l4::craft::PacketSpec;
+    use aitm_proto_l4::backend::{CaptureInjectBackend, CaptureSource, L4Error};
+    use aitm_proto_l4::craft::{Ipv4Spec, Layer, PacketSpec, UdpSpec};
     use aitm_proto_l4::flow::L4Packet;
     use aitm_proto_l4::icmp::transport_payload;
     use aitm_proto_l4::types::L4Direction;
@@ -1772,10 +1794,11 @@ mod tests {
     };
     use crate::codec::hex_encode;
     use crate::discover::max_payload_for;
-    use crate::fields::FieldPath;
+    use crate::fields::{FieldPath, UdpField};
     use crate::oracle::CaseClass;
-    use crate::plan::{SeedOrigin, SeedPayload};
+    use crate::plan::{send_recv_spec, SeedOrigin, SeedPayload};
     use crate::state::{Candidate, CaseNote, StopReason};
+    use crate::sync::lock;
     use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
         fields, l4_profile, tcp_target, udp_target, with_hex_seed, MockBackend, MockReply,
@@ -3741,5 +3764,149 @@ mod tests {
                 "{expected:?}: six cases cost milliseconds unpaced; the run took {elapsed:?}"
             );
         }
+    }
+
+    /// The stray same-host frame a shared interface carries: a UDP frame from
+    /// the target host but one port off the target's, addressed back at the
+    /// stimulus's source port. Pinned to the five-tuple it is not this
+    /// stimulus's reply and the oracle reads it as `ProtocolError`; correlated
+    /// on the host alone it is taken for the target's own answer (`Clean`).
+    fn stray_port_frame(stimulus: &[u8]) -> Option<Vec<u8>> {
+        let packet = as_packet(stimulus);
+        let ends = transport_payload(&packet)?;
+        let (IpAddr::V4(src), IpAddr::V4(dst)) = (ends.dst, ends.src) else {
+            return None;
+        };
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src),
+                    dst: Some(dst),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(ends.dst_port.wrapping_add(1)),
+                    dst_port: Some(ends.src_port),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"stray".to_vec()),
+            ],
+        }
+        .build()
+        .ok()
+    }
+
+    /// A host that answers every stimulus with a [`stray_port_frame`] and never
+    /// echoes the stimulus back, so the stray frame is the only thing a send
+    /// can read.
+    #[derive(Debug, Default)]
+    struct StrayPortHost {
+        queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    #[derive(Debug)]
+    struct StrayPortCapture {
+        queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    impl CaptureSource for StrayPortCapture {
+        fn next_frame(&mut self) -> Result<Option<Vec<u8>>, L4Error> {
+            if let Some(frame) = lock(&self.queue).pop_front() {
+                return Ok(Some(frame));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(None)
+        }
+    }
+
+    impl CaptureInjectBackend for StrayPortHost {
+        fn open_capture(
+            &self,
+            _iface: &str,
+            _filter: Option<&str>,
+            _read_timeout: Duration,
+        ) -> Result<Box<dyn CaptureSource>, L4Error> {
+            Ok(Box::new(StrayPortCapture {
+                queue: Arc::clone(&self.queue),
+            }))
+        }
+
+        fn inject(&self, _iface: &str, bytes: &[u8]) -> Result<(), L4Error> {
+            if let Some(frame) = stray_port_frame(bytes) {
+                lock(&self.queue).push_back(frame);
+            }
+            Ok(())
+        }
+    }
+
+    /// A runner on one field of `127.0.0.1:9`, talking to a [`StrayPortHost`].
+    /// One lane context per point, so one point's stop ladder never reaches
+    /// another's; discovery runs against a silent mock, since discovery is not
+    /// what this test drives.
+    fn stray_point(field: &str) -> Arc<PointRunner> {
+        let (shared, job, plans, disc) = setup(
+            MockBackend::new(MockReply::Silence),
+            l4_profile(vec![udp_target(9)], 2),
+            &fields(&[field]),
+            1000,
+        );
+        let shared = Arc::new(Shared {
+            backend: Arc::new(StrayPortHost::default()),
+            ..(*shared).clone()
+        });
+        runner_for(&shared, &job, &plans, &disc.points, field)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn baseline_and_liveness_probes_correlate_on_the_pinned_tuple_whatever_the_field() {
+        let length_point = stray_point("udp.length");
+
+        // The rule a *mutated* case follows: a case that garbles `udp.length`
+        // cannot present the port `send_recv`'s C3 check compares, so its reply
+        // is correlated on the host alone. The seed a baseline and a liveness
+        // probe send is unmutated, so the pin is always possible for it — and
+        // the looser rule must not leak onto it from the point's field.
+        let target = &length_point.plan.target;
+        let seed = length_point.seed0.spec.clone();
+        let window = Duration::from_millis(50);
+        assert_eq!(
+            send_recv_spec(target, seed.clone(), FieldPath::Raw, window).dst_port,
+            Some(9),
+            "an intact transport header pins the target's port"
+        );
+        assert_eq!(
+            send_recv_spec(target, seed, FieldPath::Udp(UdpField::Length), window).dst_port,
+            None,
+            "a garbled length cannot present a port to pin"
+        );
+
+        // The baseline: a frame from another port of the target host is not the
+        // seed's reply, on a `udp.length` point exactly as on a `raw` one.
+        // Which class a *rejected* frame earns is `send_recv`'s correlator to
+        // say and is pinned by its own tests; what this point fuzzes must not
+        // change it, and it is never `Clean` — `Clean` is the stray frame
+        // mistaken for the target's own answer.
+        let length_run = length_point.run_point().await;
+        let raw_point = stray_point("raw");
+        let raw_run = raw_point.run_point().await;
+        assert_ne!(
+            raw_run.baseline,
+            Some(CaseClass::Clean),
+            "the pinned correlation rejects the stray frame"
+        );
+        assert_eq!(
+            length_run.baseline, raw_run.baseline,
+            "the baseline is correlated the same way whatever this point fuzzes"
+        );
+
+        // Every liveness probe, too. Read against the baseline a pinned send
+        // measures, a probe correlating loosely reads the stray frame as
+        // `Clean` and so calls the target changed.
+        let probe_point = stray_point("udp.length");
+        *lock(&probe_point.baseline) = raw_run.baseline;
+        assert!(
+            probe_point.liveness_probe().await.expect("the probe sends"),
+            "the probe reads the stray frame as the baseline did"
+        );
     }
 }
