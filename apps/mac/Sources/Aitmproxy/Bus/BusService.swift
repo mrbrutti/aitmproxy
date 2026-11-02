@@ -229,6 +229,23 @@ final class BusService: FlowActions {
                     refetch.didFetch(id, summary: summary)
                 }
             }
+            // Raw-L4 flows (l4-parity spec §2, AC25): a core that advertises both `l4.flow.list` and
+            // `l4.flow.get` is listed every tick like `flow.list`, and each listed flow's fields are
+            // read with `limit: 0` when the core has the bounded window (never a packet in the list
+            // poll; only the inspector fetches a window). Nothing is cached between ticks beyond
+            // `session.l4Details`, so a flow the core dropped leaves the list on the next tick. One
+            // flow's failed read skips that flow, like the HTTP loop; a failed list is an empty list.
+            var l4Flows: [L4Flow] = []
+            if Self.pollsL4(tools) {
+                let l4IDs = (try? await client.call("l4.flow.list"))?.arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
+                guard owns() else { return }
+                let window = L4Wire.supportsWindow(tools)
+                for id in l4IDs {
+                    let json = try? await client.call("l4.flow.get", L4Wire.flowGetArgs(id: id, inspect: false, window: window))
+                    guard owns() else { return }
+                    if let json, let flow = L4Flow(json: json) { l4Flows.append(flow) }
+                }
+            }
             // Likewise the rows and rates this iteration publishes: no await from here to the sleep.
             guard owns() else { return }
             let known = Set(ids)
@@ -240,7 +257,20 @@ final class BusService: FlowActions {
                 row.inScope = session.scopeHosts.isEmpty || Scope.contains(row.authority, in: session.scopeHosts)
                 return row
             }
-            let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
+            let httpRows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
+            // The L4 details are exactly what the core listed this tick (a duplicate id keeps its last
+            // reply; never a trap on wire data), change-guarded like every per-tick session write.
+            let l4Details = Dictionary(l4Flows.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+            if l4Details != session.l4Details { session.l4Details = l4Details }
+            // An L4 row is in scope iff a capture entry of the core's L4 scope covers its interface and
+            // destination (the HTTP host scope says nothing about it). L4 rows number after the HTTP rows.
+            let captureScope = session.l4Scope.filter { $0.capability == "capture" }
+            let l4Rows = l4Flows.enumerated().map { index, flow in
+                flow.row(
+                    seq: ids.count + index + 1,
+                    inScope: captureScope.contains { $0.covers(interface: flow.interface, dst: flow.dst ?? "", port: flow.dstPort) })
+            }
+            let polled = httpRows + l4Rows
             // Rows an undone Clear put back stay ahead of the core's list and follow the live
             // scope like any other row; new flows number after them.
             let restored = session.restoredFlows.map(scoped)
@@ -351,6 +381,12 @@ final class BusService: FlowActions {
 
         let canAddScope = L4Wire.supportsOperatorScopeAdd(tools)
         if session.l4CanAddScope != canAddScope { session.l4CanAddScope = canAddScope }
+    }
+
+    /// True iff the core advertises both halves of the live L4 list poll, `l4.flow.list` and
+    /// `l4.flow.get` (feature-detected from `tools/list`; a core without the L4 family is never asked).
+    private static func pollsL4(_ tools: [ToolDescriptor]) -> Bool {
+        tools.contains { $0.name == "l4.flow.list" } && tools.contains { $0.name == "l4.flow.get" }
     }
 
     // MARK: FlowActions
