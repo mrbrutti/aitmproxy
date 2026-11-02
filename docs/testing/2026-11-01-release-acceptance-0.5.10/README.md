@@ -84,6 +84,9 @@ state are the MAC-3 words of the spec; MAC-3 is still to be read on the real win
 | CLI-6 `aitm scope add` with no core | SKIP | a core is running; the no-core case needs the app quit | — | — |
 | CLI-7 `aitm ca status` | PASS (with a note) | `stores.user {installed present, trusted yes}` — agrees with the keychain; but 49 log lines precede the JSON on stdout | `ca.status` over the bus: identical | log noise: PR #271 |
 | CLI-8 `aitm web` on a held 8082 | SKIP | needs the ports free | — | — |
+| CLI-0 brew upgrade | SKIP | release run only; superseded — the 0.5.10 core was replaced by the 0.5.11 relaunch before the runner had this step | — | — |
+| CLI-9 `aitm proxy system status/set/unset` | SKIP | superseded — see the 0.5.11 report (run 2: status read PASS-shape, set/unset need a yes) | — | — |
+| CLI-10 `aitm flow list` vs the running core | SKIP | superseded — on the 0.5.11 core (run 2) it is **FAIL**: `[]` from the one-shot's own core while the running core had 5 flows; the 0.5.10 CLI binary is the same, so the 0.5.10 result is the same FAIL | — | `claude/cli-oneshot-live-core` |
 | N4-CLI `aitm web` while 8080 is held | PASS | exit 1, stderr: `Error: cannot start: the proxy port 127.0.0.1:8080 is already in use.` / `It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program.` / `Free it, or set `listen:` to another address in …/config.yaml.` / `Find the holder with:  lsof -nP -iTCP:8080 -sTCP:LISTEN`; no card printed first; 98 log lines on stdout before it | — | log noise: PR #271 |
 
 CLI: PASS 2 · FAIL 3 · SKIP 3. Every FAIL has an owner; none is new.
@@ -92,6 +95,7 @@ CLI: PASS 2 · FAIL 3 · SKIP 3. Every FAIL has an owner; none is new.
 
 | # | Result | Observed | Bus truth | Explains |
 |---|---|---|---|---|
+| MAC-0 brew upgrade | SKIP | release run only; superseded by the 0.5.11 relaunch | — | — |
 | MAC-1 | PASS (already running) | app pid 16190; core pid 78375 | `listening true`, `version 0.5.10`, `start` marker present | — |
 | MAC-2 first-run sheet | SKIP needs the window | the sheet shows once per store; read whether it is still due from the window | `ca.status.user.trusted yes` → row 2 must read "CA trusted (user keychain)" | — |
 | MAC-3 Status words | SKIP needs the window | expected for this state: "system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core.", "All Apps is on", "Add a host to Scope (for now as example.com:443)", CA step done, "Set aitmproxy as the system proxy, or open the browser" | as above | — |
@@ -100,6 +104,7 @@ CLI: PASS 2 · FAIL 3 · SKIP 3. Every FAIL has an owner; none is new.
 | MAC-6 Set as System Proxy | SKIP needs Matt's yes | — | — | — |
 | MAC-7 Capture All Apps | already on (`capture.enabled 1`, provider attached) — the step becomes "verify the words for on, nothing in scope": lane "on, nothing in scope", remedy "Add a host to Scope (for now as example.com:443); nothing is captured until then" | SKIP needs the window to read | `capture.status enabled true, attached, 0 handed off` | — |
 | MAC-8 real browser rows | SKIP needs MAC-5/6 | — | — | — |
+| MAC-9a Apps sidebar, extension flows | BLOCKED at 02:06Z (Scope empty → the extension claimed nothing); **PASS** on the 02:25Z dry run once hosts were in Scope (9 rows with `source_app`), see the 0.5.11 report | — | `capture.status flows_handed_off 0` at 02:06Z | — |
 | MAC-9b Apps sidebar, proxied flows | **FAIL (missing feature), read from the bus** | every one of the 16 flows is proxied with `source_app: null`, so the sidebar can show no app; this is Matt's "NOTHING is there". With All Apps on, extension-captured flows would carry `source_app`, but nothing is in Scope so the extension claims nothing (`flows_handed_off 0`) | `flow.table`: `source_app null` ×16, `capture_interface null` ×16 | missing feature: attribution for proxied flows (session core-name-the-client-app); plus the empty Scope (operator state, words in MAC-3/7) |
 | MAC-10 arm intercept | BLOCKED MAC-8 | — | — | — |
 | MAC-11 resume | BLOCKED MAC-8 | — | — | — |
@@ -146,9 +151,12 @@ The startup refusal both surfaces would print on the held port is pinned by `N4-
 | # | Surface | Result | Observed | Explains |
 |---|---|---|---|---|
 | N1 core restarting during an add | MAC | SKIP needs the window | — | S-081 / PR #274 |
-| N2 no route, host in Scope | all | not reproducible without MAC-5 | the inverse state is live now: route (Firefox) without Scope → passthrough rows, `advice` set | — |
+| N2 no route, host in Scope | MAC | SKIP needs the window (judged from the MAC-3 read) | the inverse state was live: route (Firefox) without Scope → passthrough rows, `advice` set | — |
+| N2 | TUI, WEB | SKIP port held | — | — |
 | N3 untrusted CA | all | SKIP `CA stays trusted` (not requested) | words read from source in the spec | — |
 | N4 port held | CLI | PASS (above) | — | — |
+| N4 port held | TUI, WEB | PASS on the 0.5.11 core (run 2 of the 0.5.11 report: same panel before any screen, exit 1); the 0.5.10 CLI binary is the one tested | — | — |
+| N4 port held | MAC | SKIP needs a plain 8080 listener before launch (yes) | — | — |
 | N5 wrong token | TUI | PASS (02:25Z run, 0.5.11 core) | `aitm-tui --bus <app bus> --token-file <wrong>`: `bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)`; retries stop | — |
 | N5 wrong token | MAC, WEB, CLI | SKIP | hand (Settings ▸ Bus field); web needs `aitm web` up; CLI is CLI-6's refusal | — |
 

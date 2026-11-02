@@ -100,8 +100,10 @@ that fails blocks the release until it is fixed or Matt accepts it in writing in
   while it is frontmost (probe focus with one harmless character first; `pbcopy`+⌘V for text the
   keyboard cannot type; `screencapture -l <win>` in a background loop for transient states), the
   TUI through a Python pty with `TIOCSWINSZ` set before the first read and the cell-diff stream
-  replayed into a grid, the web UI through a real browser (Safari or Chrome by hand; Playwright
-  Chromium when automated). Never AppleScript `keystroke` without `set frontmost to true`.
+  replayed into a grid, the web UI through a real browser (Safari or Chrome by hand; Google Chrome
+  over CDP when automated). Never AppleScript `keystroke` without `set frontmost to true`. Window
+  frames for N1 come from `screencapture -x -o -R <window bounds>` (bounds read through
+  accessibility; System Events exposes no CGWindowID).
 - **Safari hosts:** a host that advertises Alt-Svc h3 may bypass TCP capture; the journey's host
   is plain `http://example.com/` for the first row and `https://httpbin.org/get` for the
   decrypted row (both non-h3 as of 2026-11-01). The host entered on the Scope page is written
@@ -131,10 +133,14 @@ that fails blocks the release until it is fixed or Matt accepts it in writing in
   MAC-8 ← MAC-5 and (MAC-6 or MAC-7); MAC-9a ← MAC-7 and MAC-8; MAC-9b ← MAC-6 and MAC-8;
   MAC-10/11/12 ← MAC-8; MAC-14 ← MAC-7; MAC-15 ← MAC-6; TUI-4/5 ← TUI-2 and TUI-3; TUI-7 ← TUI-3;
   WEB-5/6 ← WEB-3 and WEB-4; WEB-7 ← WEB-4; CLI-4/5/N4 ← a running core; CLI-3/6/8 ← free ports;
-  CLI-10 ← MAC-8. Neither `SKIP` nor `BLOCKED` is ever counted as green.
-- **Run verdict**: `pass` (every step PASS, or FAIL with Matt's written acceptance), `fail` (a
-  performed step FAILed without one), `incomplete` (no FAIL, but a step is SKIP or BLOCKED for
-  want of a yes, a hand or a free port). Only `pass` clears the tap bump; `run.sh` exits 0 / 1 / 77.
+  CLI-10 ← MAC-8. Neither `SKIP` nor `BLOCKED` is ever counted as green. A sixth result, `N/A`,
+  marks a step that does not exist on that surface or build (TUI-9/10, WEB-9/10, N1-TUI, N1-WEB,
+  N5-CLI); it is listed, never performed, and does not hold the verdict at `incomplete`.
+- **Run verdict**: `pass` (every step PASS or N/A, or FAIL with Matt's written acceptance), `fail`
+  (a performed step FAILed without one), `incomplete` (no FAIL, but a step is SKIP or BLOCKED for
+  want of a yes, a hand or a free port), `error` (a cell crashed or was killed by the watchdog; the
+  machine state is re-read and restored regardless). Only `pass` clears the tap bump; `run.sh`
+  exits 0 / 1 / 77 / 2.
 - **Bus truth**: the six readings taken beside every step that changes state and at every FAIL:
   `scope.list`, `proxy.status`, `capture.status`, `proxy.system.status`, `flow.table`, and the
   tail of the durable audit (`<data dir>/audit.jsonl`, plus `audit.agent.jsonl`; CA actions in
@@ -254,7 +260,7 @@ CLI-8) when the default ports are free (after MAC-16 / TUI-8 / WEB-8).
 | CLI-7 | auto | `aitm ca status` | JSON with `stores.user.trusted: "yes"` on Matt's Mac; `aitm ca install` (not run; `--yes` never passed) would prompt. | PASS expected (read-only). |
 | CLI-8 | auto (ports free) | `aitm web` with 8082 held by a **plain listener** (`python3 -m http.server 8082 --bind 127.0.0.1`; another `aitm web` would hold 8080 first and the proxy-port panel would be reached instead) | `cannot start: the web UI port 127.0.0.1:8082 is already in use.` + `It is most likely held by another running \`aitm\`, the aitmproxy macOS app's embedded core, or another program.` + the remedy line + `Find the holder with:  lsof -nP -iTCP:8082 -sTCP:LISTEN`, exit 1, no success line before it. The plain listener is the one socket the harness opens on a default port; it is not a core. | PASS expected. |
 | CLI-0 | **yes** (release run only) | `brew upgrade aitm`; `aitm --version` | the new version on one line | `proxy.status.version` of the next core started equals it. |
-| CLI-9 | **yes** | `aitm proxy system status`, then `set`, then `unset`, against the running core | `status` describes the running core's view (`state`, `managed_by_us`); `set` either acts on the running core (`scutil --proxy` points at 127.0.0.1:8080 with the bypass list) or refuses with the no-core / needs-running-core sentence (`proxy.system.set needs a running core: use the app, the TUI or the web UI, or start aitm with \`system_proxy.auto: true\`` is 0.5.10's one-shot refusal and is honest); `unset` restores the D2 state byte for byte. Never a success line while `scutil` is unchanged. | `proxy.system.status` over the bus before/after each; audit `proxy.system.set`/`unset` with `origin: cli`. 0.5.10: `set` refuses (honest), `unset` "works" in-process (restores nothing if nothing was set) — Explains for the live-core requirement: `claude/cli-oneshot-live-core`. |
+| CLI-9 | **yes** | `aitm proxy system status` (read, always), then `set`, then `unset` against the running core; `unset` is not run when `set` refused honestly (nothing was set) | `status` describes the running core's view (`state`, `managed_by_us`); `set` either acts on the running core (`scutil --proxy` points at 127.0.0.1:8080 with the bypass list) or refuses with the no-core / needs-running-core sentence (`proxy.system.set needs a running core: use the app, the TUI or the web UI, or start aitm with \`system_proxy.auto: true\`` is 0.5.10's one-shot refusal and is honest); `unset` restores the D2 state byte for byte. Never a success line while `scutil` is unchanged. | `proxy.system.status` over the bus before/after each; audit `proxy.system.set`/`unset` with `origin: cli`. 0.5.10: `set` refuses (honest), `unset` "works" in-process (restores nothing if nothing was set) — Explains for the live-core requirement: `claude/cli-oneshot-live-core`. |
 | CLI-10 | auto (after MAC-8) | `aitm flow list` / `aitm flow table` against the running core | the running core's rows (the MAC-8 hosts) | `flow.table` over the bus has the same ids. 0.5.10: prints `[]` from its own in-process core — expected FAIL, Explains `claude/cli-oneshot-live-core`. |
 
 ### D7. Negative paths, per surface
@@ -275,7 +281,7 @@ Where each negative is observed (its cell):
 | N2 | falls out of MAC-5 before MAC-6/7, TUI-2 before TUI-3, WEB-3 before WEB-4: the words are read at that moment | auto |
 | N3 | words read from source; SKIP `CA stays trusted` unless Matt asks for the un-trust (`yes`) | yes |
 | N4 | `cli-livecore` (N4-CLI) and the `tui`/`web` start while the app holds 8080; mac case needs a plain 8080 listener before launch (`yes`: it blocks his app's core) | auto / yes |
-| N5 | `n5` cell: `aitm-tui --bus <app bus> --token-file <wrong>`, a web tab opened with the agent token and `&expect=operator`, the mac Settings ▸ Bus field (hand) | auto / hand |
+| N5 | `n5` cell: `aitm-tui --bus <app bus> --token-file <wrong>` (N5-TUI) and the `aitm tui`/`aitm web` startup refusals on the held port (N4-TUI, N4-WEB); N5-WEB in the `web` cell after WEB-7 (a tab opened with the agent token and `&expect=operator`: it needs `aitm web` up, which the `n5` cell cannot have while the app holds 8080); N5-MAC the Settings ▸ Bus field (hand); N5-CLI is CLI-6's refusal (N/A) | auto / hand |
 
 ### D8. The report
 
@@ -324,8 +330,8 @@ Where each negative is observed (its cell):
   per-service state** (first `proxy.system.unset` over the bus; if `scutil --proxy` still differs
   from D2, `networksetup -setwebproxy <svc> <host> <port>` / `-setsecurewebproxy …` and
   `-set(secure)webproxystate <svc> on|off` exactly as recorded for `Wi-Fi` and `Display Ethernet`),
-  checks the bypass precondition before writing, and diffs after. Start steps (TUI-1, WEB-1,
-  CLI-3) refuse when their port is busy; MAC `yes` steps require that the holder of 8080 is the
+  checks the bypass precondition before writing (CLI-9 included), and diffs after. Start steps
+  (TUI-1, WEB-1, CLI-3) refuse when any of 8080/8081/8082 is busy; MAC `yes` steps require that the holder of 8080 is the
   app's embedded core (bundle-path `pgrep`). Windows are announced on stdout with timestamps.
 - mac driving: `lib/menu.sh "<Menu>" "<Item>"` (System Events, `set frontmost to true` first),
   `lib/keypress.swift` (CGEvent, refuses unless the app is frontmost), `screencapture -l <win>` loop
@@ -433,7 +439,9 @@ Only Matt can answer these; defaults in force until he does.
    startup (which fails on the port anyway, and that output is itself pinned as N4).
 3. ~~Should the Scope hosts added by the run be removed at the end?~~ Decided by the orchestrator
    2026-11-02: hosts the run adds are **removed at the end** through the same surface (the Scope
-   page's "Remove from Scope", the TUI's `d`, the web row's remove button), unless Matt says keep;
+   page's "Remove from Scope", the TUI's `:scope rm <host>` palette command — it names the host,
+   where `d` removes the row under a cursor the pty grid cannot see —, the web row's remove
+   button), unless Matt says keep;
    they are listed in the report either way. Hosts that were in Scope before the run are never
    touched.
 
@@ -467,3 +475,14 @@ Dispositions by the acceptance session under Matt's autonomous mode.
 | Q11 | quality | Minor | Strings duplicated across steps instead of a string table | Accepted as written: the step tables are the reading order an operator follows; the runner's assertion module is the single machine-readable table and cites step ids |
 | Q12–Q17 | quality | Minor | TUI-6 two key paths + `ca-audit.jsonl` path; window length twice; busy-port refusal attached to `yes` cells; helpers under `tools/`; WEB-6 bundled; PNGs in the repo | Fixed (all six) |
 | Q18 | quality | Minor | untracked `preflight.sh` | = S8 |
+
+Stage-6 panel 2 on the fix round `e1583c75..6765dee0` (security, quality, spec; 2026-11-02):
+
+| # | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|
+| Q2-1 | quality | Important | backgrounded cell gets `/dev/null` stdin: `--manual` pauses die | Fixed: `<&0` on the cell |
+| Q2-2 | quality | Important | watchdog SIGTERM skips Python `finally` (restore, cleanup) | Fixed: `exit_on_term()` turns SIGTERM into `SystemExit(2)` in every cell; node child killed in the outer `finally` |
+| S2-1 | spec | Important | CLI-9 `set` without the bypass precondition; substring bypass check | Fixed: `config_bypass` precondition, `bypass_applied`, FAIL `bypass not applied` |
+| S2-2 | spec | Important | secret values collected only at the end (app may have quit); web `#t=` never added | Fixed: collected at start and end; the web cell writes its bearer values to a 0600 `.secrets` file the grep reads and deletes |
+| S2-3 | spec | Important | 0.5.10 README lacks CLI-0/9/10, MAC-0, MAC-9a, per-surface N2/N4 rows | Fixed in the report |
+| Q2/S2 Minor | both | Minor | N5-WEB written by two cells; `N/A` result for n/a steps (spec gap); ERROR precedence; SKIP detail grep; report.py failure silent; watchdog sleep leftover; `tooling_mentioned` helper; `find_embedded_core` OSError; index run-2 row; `:scope rm` / `-R` frames / ax_press / N5-WEB placement need spec sentences; `mac_bypass_ok` key; CLI-3 checks 8080 only; AX label assumptions (Apps sidebar title, combined Scope row) to verify on the window | All fixed or amended above (D1 `N/A`, D7 N5 row, Open q3, Constraints, D9); AX labels verified on the window in run 3 |
