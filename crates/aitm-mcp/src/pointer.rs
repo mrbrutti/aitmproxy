@@ -268,6 +268,7 @@ pub fn write(dir: &Path, ptr: &CorePointer) -> io::Result<Published> {
 
     let path = dir.join(format!("{}.json", ptr.pid));
     let tmp = dir.join(format!("{}.json.tmp", ptr.pid));
+    remove_stale_tmp(&tmp, fs::metadata(dir)?.uid());
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -280,6 +281,28 @@ pub fn write(dir: &Path, ptr: &CorePointer) -> io::Result<Published> {
             Err(err)
         }
     }
+}
+
+/// A `<pid>.json.tmp` left by a writer that died between `create_new` and
+/// its rename, met again once the pid is reused: removed, so the core still
+/// publishes, when it is a regular file owned by `owner_uid` (the run dir's
+/// owner). `symlink_metadata` never follows a link; a link, a non-regular or
+/// a foreign file is left alone and `create_new` then reports it.
+fn remove_stale_tmp(tmp: &Path, owner_uid: u32) {
+    let meta = match fs::symlink_metadata(tmp) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::debug!(path = %tmp.display(), %err, "could not read a leftover core pointer temp file");
+            return;
+        }
+    };
+    if !meta.is_file() || meta.uid() != owner_uid {
+        tracing::debug!(path = %tmp.display(), "leaving a leftover core pointer temp file alone: not this user's regular file");
+        return;
+    }
+    tracing::debug!(path = %tmp.display(), "removing a leftover core pointer temp file from an earlier writer");
+    remove(tmp);
 }
 
 /// Write the line, take the exclusive lock, then rename over the final name,
@@ -486,6 +509,71 @@ mod tests {
 
         File::create(&path).expect("an unlocked file");
         assert_eq!(liveness(&path), Liveness::Dead);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Tester edge (2026-11-01): a `<pid>.json.tmp` left by a crash before
+    /// its rename, met again after pid reuse. Our own stale temp file is
+    /// removed before `create_new`, so the core still publishes: the final
+    /// pointer is `0600`, locked, the exact line, and no `.tmp` remains.
+    #[test]
+    fn write_removes_our_own_stale_tmp_first() {
+        let root = temp_root("stale-tmp");
+        let cores = root.join("run").join("cores");
+        fs::create_dir_all(&cores).expect("cores dir");
+        let ptr = sample();
+        let stale = cores.join("4821.json.tmp");
+        fs::write(&stale, "half a line from a crashed writer").expect("plant stale tmp");
+
+        let published = write(&cores, &ptr).expect("write over a stale tmp");
+        assert_eq!(published.path, cores.join("4821.json"));
+        let mode = fs::metadata(&published.path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(liveness(&published.path), Liveness::Alive);
+        assert_eq!(
+            fs::read_to_string(&published.path).expect("read pointer"),
+            ptr.to_json_line()
+        );
+        let names: Vec<String> = fs::read_dir(&cores)
+            .expect("read cores")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["4821.json".to_string()]);
+        assert!(!stale.exists(), "the stale tmp is gone");
+
+        drop(published);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A symlink at `<pid>.json.tmp` is never followed or removed: `write`
+    /// fails with `AlreadyExists`, the link survives, and its target is
+    /// untouched.
+    #[test]
+    fn write_leaves_a_symlinked_tmp_alone() {
+        let root = temp_root("symlink-tmp");
+        let cores = root.join("run").join("cores");
+        fs::create_dir_all(&cores).expect("cores dir");
+        let target = root.join("victim");
+        fs::write(&target, "untouched").expect("target");
+        let link = cores.join("4821.json.tmp");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let kind = match write(&cores, &sample()) {
+            Ok(_) => panic!("a symlinked tmp must refuse"),
+            Err(err) => err.kind(),
+        };
+        assert_eq!(kind, io::ErrorKind::AlreadyExists);
+        assert!(fs::symlink_metadata(&link)
+            .expect("link stays")
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&target).expect("target"), "untouched");
+        assert!(!cores.join("4821.json").exists());
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

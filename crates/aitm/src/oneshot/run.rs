@@ -127,7 +127,7 @@ async fn run_live(
     let resolver = Resolver {
         env: i.env,
         liveness: &pointer::liveness,
-        owner_uid: resolve::owner_uid(&run_dir),
+        owner_uid: &resolve::owner_uid,
         now_unix: now_unix(),
         run_dir,
     };

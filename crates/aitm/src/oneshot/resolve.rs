@@ -48,8 +48,11 @@ pub struct Resolver<'a> {
     /// Whether a pointer's writer still holds its lock.
     pub liveness: &'a dyn Fn(&Path) -> Liveness,
     /// The uid every trusted pointer and token-bearing config must be owned
-    /// by: the owner of the user's own run dir (plan rule 7).
-    pub owner_uid: u32,
+    /// by, as a function of the run dir: the owner of the user's own run dir
+    /// (plan rule 7). Called only when the pointer directory is consulted
+    /// (step 3), so an explicit address or a configured transport neither
+    /// creates nor reads it. Production passes [`owner_uid`].
+    pub owner_uid: &'a dyn Fn(&Path) -> u32,
     /// Epoch seconds now, for the ages the panels print.
     pub now_unix: u64,
     /// The pointer directory, `run/cores`.
@@ -213,8 +216,10 @@ pub fn resolve(
         ));
     }
 
-    // Step 3: the live pointers, preferring the effective config's own.
-    let live = live_pointers(r);
+    // Step 3: the live pointers, preferring the effective config's own. The
+    // run dir is consulted (created `0700` when absent) only from here on.
+    let owner_uid = (r.owner_uid)(&r.run_dir);
+    let live = live_pointers_owned_by(r, owner_uid);
     let wanted = canonical(effective_path);
     let preferred: Vec<&Found> = live
         .iter()
@@ -260,7 +265,7 @@ pub fn resolve(
             ptr.config.exists(),
         ));
     }
-    let (token, warning) = match read_operator_token(&ptr.config, r.owner_uid) {
+    let (token, warning) = match read_operator_token(&ptr.config, owner_uid) {
         Ok(read) => read,
         Err(TokenProblem::NotRegular | TokenProblem::Foreign) => {
             return Err(refuse::foreign_config(&ptr.config));
@@ -397,7 +402,13 @@ pub fn read_operator_token(
 /// plan C3). A pointer whose lock is free is deleted, with one `debug!`; an
 /// untrusted one is skipped, with one `debug!`, and never deleted.
 pub fn live_pointers(r: &Resolver<'_>) -> Vec<Found> {
-    pointer::scan(&r.run_dir, r.owner_uid)
+    live_pointers_owned_by(r, (r.owner_uid)(&r.run_dir))
+}
+
+/// [`live_pointers`] with the run dir's owner already known, so `resolve`
+/// consults the dir once for the scan and the token read alike.
+fn live_pointers_owned_by(r: &Resolver<'_>, owner_uid: u32) -> Vec<Found> {
+    pointer::scan(&r.run_dir, owner_uid)
         .into_iter()
         .filter_map(|entry| {
             let found = match entry {
@@ -446,6 +457,7 @@ pub fn owner_uid(run_dir: &Path) -> u32 {
 mod tests {
     use super::*;
     use aitm_term::error::{ErrorKind, FixCommand};
+    use std::cell::Cell;
     use std::fs::{self, File, Permissions};
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -499,7 +511,7 @@ mod tests {
         Resolver {
             env,
             liveness,
-            owner_uid: owner_uid(cores),
+            owner_uid: &owner_uid,
             now_unix: NOW,
             run_dir: cores.to_path_buf(),
         }
@@ -1378,8 +1390,9 @@ mod tests {
 
         // A valid, locked pointer owned by another uid is foreign: skipped, kept.
         let good = pointer::write(&cores, &ptr(400, 50514, &cfg_a)).expect("write good");
+        let foreign_uid = |dir: &Path| owner_uid(dir).wrapping_add(1);
         let foreign = Resolver {
-            owner_uid: owner_uid(&cores).wrapping_add(1),
+            owner_uid: &foreign_uid,
             ..resolver(&no_env, &never, &cores)
         };
         let report = what(resolve(
@@ -1655,6 +1668,85 @@ mod tests {
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
+    /// Tester edge (2026-11-01): an explicit `--bus` consults no pointer, so
+    /// the run dir is neither created nor read; a pointer-dir resolution over
+    /// the same absent dir creates it `0700`.
+    #[test]
+    fn explicit_bus_leaves_an_absent_run_dir_absent() {
+        let root = temp_root("lazy-run-dir");
+        let absent = root.join("run").join("cores");
+        let env = env_of(&[("AITM_BUS_TOKEN", "optoken-test-env")]);
+        let consulted = Cell::new(0u32);
+        let counting = |dir: &Path| {
+            consulted.set(consulted.get() + 1);
+            owner_uid(dir)
+        };
+        let r = Resolver {
+            env: &env,
+            liveness: &pointer::liveness,
+            owner_uid: &counting,
+            now_unix: NOW,
+            run_dir: absent.clone(),
+        };
+        let flag = BusArgs {
+            bus: Some("127.0.0.1:50512".to_string()),
+            token_file: None,
+        };
+        let argv = args(&["scope", "add", "--host", "example.com"]);
+        let config = root.join("config.yaml");
+        let (target, warnings) = resolve(
+            &r,
+            &flag,
+            &Config::default(),
+            &config,
+            false,
+            "scope.add",
+            &argv,
+        )
+        .expect("explicit flag resolves");
+        assert_eq!(target.addr, lo(50512));
+        assert_eq!(target.token, "optoken-test-env");
+        assert_eq!(target.source, Source::ExplicitFlag);
+        assert_eq!(target.config, None);
+        assert_eq!(warnings, Vec::<Warning>::new());
+        assert_eq!(
+            consulted.get(),
+            0,
+            "an explicit address never consults the run dir"
+        );
+        assert!(
+            !absent.exists(),
+            "an explicit address never creates the run dir"
+        );
+        assert!(!root.join("run").exists(), "nor its parent");
+
+        // The same resolver on the pointer path consults the dir: created 0700.
+        let report = what(resolve(
+            &r,
+            &BusArgs::default(),
+            &Config::default(),
+            &config,
+            false,
+            "scope.add",
+            &argv,
+        ));
+        assert_eq!(report.what, "no running core found");
+        assert_eq!(
+            consulted.get(),
+            1,
+            "the pointer path consults the run dir once"
+        );
+        assert_eq!(
+            fs::metadata(&absent)
+                .expect("the pointer path created the run dir")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
     /// Tester — `owner_uid` on a run dir that cannot be created (its parent
     /// is a file) is `u32::MAX`, so nothing passes trust and the resolution
     /// is R1 rather than a dial of someone else's pointer.
@@ -1668,7 +1760,7 @@ mod tests {
         let r = Resolver {
             env: &no_env,
             liveness: &pointer::liveness,
-            owner_uid: owner_uid(&impossible),
+            owner_uid: &owner_uid,
             now_unix: NOW,
             run_dir: impossible.clone(),
         };
@@ -1724,7 +1816,7 @@ mod tests {
             let r = Resolver {
                 env: &no_env,
                 liveness: &pointer::liveness,
-                owner_uid: uid,
+                owner_uid: &owner_uid,
                 now_unix: NOW,
                 run_dir: cores_t,
             };

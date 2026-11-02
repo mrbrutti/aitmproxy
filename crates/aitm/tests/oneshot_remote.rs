@@ -1225,9 +1225,10 @@ const READ_ONLY_LIVE_VERBS: &[&str] = &[
 /// keys and `null` for an optional field, while thirteen commands declare
 /// `Object(Vec::new())` as "some object" and many optional fields are
 /// answered `null`. The local path never rebuilds, so only the one-shot's
-/// remote path is affected. Un-ignore once the render boundary is fixed.
+/// remote path is affected. Fixed 2026-11-01: `render` treats an empty
+/// `Object` as "some object", keeps a `null` answered for an optional field,
+/// and shows an answer its schema cannot explain structurally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "DEFECT: remote::render rejects a healthy core's answer for proxy.status, config.get (result: Object([]) → `unknown param … for object`) and capture.status (optional field answered null → `expected an integer, got null`); see the test's doc comment and the tester report"]
 async fn tester_every_read_only_live_verb_renders_through_its_declared_schema() {
     let rig = rig("remote-schemas", Some(OP_TOKEN), Frontend::Operator);
     remote::handshake(&rig.client, HANDSHAKE)

@@ -26,10 +26,11 @@ use std::time::Duration;
 use aitm_bus_client::{BusClient, BusError, ServerInfo, TcpTransport};
 use aitm_cli::dispatch::parse_flags;
 use aitm_cli::Confirmer;
-use aitm_core::{Command, Params, Registry, TypeDesc};
+use aitm_core::{Command, Params, Registry, TypeDesc, Value};
 use aitm_mcp::json::from_json;
 use aitm_term::text::sanitize;
 use serde_json::{Map, Value as JsonValue};
+use tracing::debug;
 
 use super::refuse::verb_words;
 use crate::render::render_cli_value;
@@ -403,16 +404,161 @@ fn confirmation_request(result: &JsonValue) -> Option<(&str, &str)> {
 }
 
 /// The core's answer as the bytes the in-process path would print (spec D8
-/// step 10, decision (f)): `from_json` rebuilds the `Value` `ty` describes
-/// (bytes from base64), then [`render_cli_value`] prints it.
+/// step 10, decision (f)): the `Value` `ty` describes is rebuilt, then
+/// [`render_cli_value`] prints it. The declared result schema guides the
+/// rebuild and never gates it: the core already validated its own answer,
+/// and an incomplete declaration must not print an error against a healthy
+/// core. Three steps ([`rebuild_value`]):
+///
+/// 1. A declared `Object` with no fields means "some object" (fifteen
+///    commands declare `result: TypeDesc::Object(Vec::new())`); the answer
+///    is converted structurally, as `TypeDesc::Any`.
+/// 2. Otherwise the strict `from_json`, which is where the schema adds
+///    information (`Bytes` from base64). When it refuses, every `null`
+///    answered for a field the schema marks optional is set aside (through
+///    nested declared objects, and arrays and maps of them), the strict
+///    conversion runs once more, and the `null`s come back as `Value::Null`
+///    so the printed object keeps every key the core answered: the bytes
+///    stay identical to the local path's (G6).
+/// 3. When that still fails the answer is converted structurally so the
+///    operator sees it, with one `debug!` naming the strict refusal (the
+///    field path and the expectation, never what the core answered).
+///
+/// Never an `Err` today; the signature stays so the entry point's mapping is
+/// untouched.
 pub fn render(result: &JsonValue, ty: &TypeDesc) -> anyhow::Result<Vec<u8>> {
-    let value = from_json(result, ty)?;
-    Ok(render_cli_value(&value))
+    Ok(render_cli_value(&rebuild_value(result, ty)))
+}
+
+/// The three steps [`render`] documents, as the `Value` to print.
+fn rebuild_value(result: &JsonValue, ty: &TypeDesc) -> Value {
+    if matches!(ty, TypeDesc::Object(defs) if defs.is_empty()) {
+        return structural(result);
+    }
+    let refusal = match from_json(result, ty) {
+        Ok(value) => return value,
+        Err(err) => err,
+    };
+    let (stripped, stripped_any) = without_optional_nulls(result, ty);
+    if stripped_any {
+        if let Ok(mut value) = from_json(&stripped, ty) {
+            restore_optional_nulls(&mut value, result, ty);
+            return value;
+        }
+    }
+    debug!(
+        refusal = %refusal_words(&refusal),
+        "the core's answer does not fit the verb's declared result schema; showing it as is"
+    );
+    structural(result)
+}
+
+/// `from_json` as `TypeDesc::Any`: structural, and infallible for `Any`.
+fn structural(j: &JsonValue) -> Value {
+    from_json(j, &TypeDesc::Any).unwrap_or(Value::Null)
+}
+
+/// Step 2's first half: `j` without the `null`s answered for fields `ty`
+/// marks optional, and whether any was removed. A key the schema does not
+/// name is kept, so the strict retry still refuses it.
+fn without_optional_nulls(j: &JsonValue, ty: &TypeDesc) -> (JsonValue, bool) {
+    let mut any = false;
+    let out = match (ty, j) {
+        (TypeDesc::Object(defs), JsonValue::Object(fields)) => {
+            let mut out = Map::new();
+            for (k, v) in fields {
+                match defs.iter().find(|d| &d.name == k) {
+                    Some(def) if v.is_null() && !def.required => any = true,
+                    Some(def) => {
+                        let (inner, removed) = without_optional_nulls(v, &def.ty);
+                        any |= removed;
+                        out.insert(k.clone(), inner);
+                    }
+                    None => {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            JsonValue::Object(out)
+        }
+        (TypeDesc::Array(item), JsonValue::Array(items)) => JsonValue::Array(
+            items
+                .iter()
+                .map(|v| {
+                    let (inner, removed) = without_optional_nulls(v, item);
+                    any |= removed;
+                    inner
+                })
+                .collect(),
+        ),
+        (TypeDesc::Map(item), JsonValue::Object(fields)) => JsonValue::Object(
+            fields
+                .iter()
+                .map(|(k, v)| {
+                    let (inner, removed) = without_optional_nulls(v, item);
+                    any |= removed;
+                    (k.clone(), inner)
+                })
+                .collect(),
+        ),
+        _ => j.clone(),
+    };
+    (out, any)
+}
+
+/// Step 2's second half: every `null` the first half removed comes back as
+/// `Value::Null` at its place in `value`, walking `j` and `ty` together.
+fn restore_optional_nulls(value: &mut Value, j: &JsonValue, ty: &TypeDesc) {
+    match (ty, j, value) {
+        (TypeDesc::Object(defs), JsonValue::Object(fields), Value::Object(out)) => {
+            for (k, v) in fields {
+                let Some(def) = defs.iter().find(|d| &d.name == k) else {
+                    continue;
+                };
+                if v.is_null() && !def.required {
+                    out.insert(k.clone(), Value::Null);
+                } else if let Some(inner) = out.get_mut(k) {
+                    restore_optional_nulls(inner, v, &def.ty);
+                }
+            }
+        }
+        (TypeDesc::Array(item), JsonValue::Array(items), Value::Array(out)) => {
+            for (inner, v) in out.iter_mut().zip(items) {
+                restore_optional_nulls(inner, v, item);
+            }
+        }
+        (TypeDesc::Map(item), JsonValue::Object(fields), Value::Object(out)) => {
+            for (k, v) in fields {
+                if let Some(inner) = out.get_mut(k) {
+                    restore_optional_nulls(inner, v, item);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The strict refusal's words up to the offending value: the field path and
+/// the expectation (`param `provider`: param `attached_at`: expected an
+/// integer`), never what the core answered.
+fn refusal_words(err: &anyhow::Error) -> String {
+    let mut text = format!("{err:#}");
+    if let Some(at) = text.find(", got ") {
+        text.truncate(at);
+    }
+    if let Some(at) = text.find("not a valid flow id:") {
+        text.truncate(at + "not a valid flow id".len());
+    }
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeMap;
+
+    use aitm_core::ParamDef;
 
     /// The remote path sanitizes with the renderer's own function (plan C8),
     /// so the two cannot drift; these are its contract cases.
@@ -668,14 +814,28 @@ mod tests {
             render(&serde_json::json!("iVBORw=="), &TypeDesc::Bytes).expect("bytes"),
             [0x89, 0x50, 0x4e, 0x47]
         );
-        assert!(render(&serde_json::json!(5), &TypeDesc::Bytes).is_err());
-        assert!(render(&serde_json::json!("not base64!"), &TypeDesc::Bytes).is_err());
-        assert!(render(
-            &serde_json::json!({}),
-            &TypeDesc::Array(Box::new(TypeDesc::Str))
-        )
-        .is_err());
-        assert!(render(&serde_json::json!("x"), &TypeDesc::Int).is_err());
+        // Step 3: an answer the declared schema cannot explain is still
+        // shown, structurally, never as an error against a healthy core.
+        assert_eq!(
+            render(&serde_json::json!(5), &TypeDesc::Bytes).expect("int as bytes"),
+            b"5\n"
+        );
+        assert_eq!(
+            render(&serde_json::json!("not base64!"), &TypeDesc::Bytes).expect("text as bytes"),
+            b"not base64!\n"
+        );
+        assert_eq!(
+            render(
+                &serde_json::json!({}),
+                &TypeDesc::Array(Box::new(TypeDesc::Str))
+            )
+            .expect("object as array"),
+            b"{}\n"
+        );
+        assert_eq!(
+            render(&serde_json::json!("x"), &TypeDesc::Int).expect("text as int"),
+            b"x\n"
+        );
     }
 
     /// Tester — `prepare` edges: `--yes` anywhere is stripped from the flags
@@ -762,5 +922,93 @@ mod tests {
         }
         let confirm = RemoteError::Confirm(anyhow::anyhow!("inner").context("outer"));
         assert_eq!(confirm.to_string(), "outer: inner");
+    }
+
+    fn def(name: &str, ty: TypeDesc, required: bool) -> ParamDef {
+        ParamDef {
+            name: name.to_string(),
+            ty,
+            required,
+            description: String::new(),
+        }
+    }
+
+    /// Spec D8 step 10 against a healthy core (tester defect, 2026-11-01):
+    /// `proxy.status` and `config.get` declare `result: Object(Vec::new())`,
+    /// "some object", and answer keys the schema never names. Step 1 renders
+    /// the answer structurally, byte-identical to the local path.
+    #[test]
+    fn render_untyped_object_schema_accepts_undeclared_keys() {
+        let answer =
+            serde_json::json!({"address": "127.0.0.1:8080", "flows": 0, "capturing": true});
+        assert_eq!(
+            String::from_utf8(render(&answer, &TypeDesc::Object(Vec::new())).expect("render"))
+                .unwrap(),
+            "{\n  \"address\": \"127.0.0.1:8080\",\n  \"capturing\": true,\n  \"flows\": 0\n}\n"
+        );
+    }
+
+    /// The second recorded shape: `capture.status` declares
+    /// `provider.attached_at: Int, required: false` and the core answers
+    /// `null`, which the strict `from_json` refuses. Step 2 keeps the `null`
+    /// as `Value::Null`, so the line prints exactly as the local path prints
+    /// the core's own `Value` (G6 parity).
+    #[test]
+    fn render_keeps_a_null_answered_for_a_nested_optional_int() {
+        let schema = TypeDesc::Object(vec![
+            def("state", TypeDesc::Str, true),
+            def(
+                "provider",
+                TypeDesc::Object(vec![
+                    def("state", TypeDesc::Str, true),
+                    def("attached_at", TypeDesc::Int, false),
+                ]),
+                true,
+            ),
+        ]);
+        let answer = serde_json::json!({"provider": {"attached_at": null, "state": "detached"}, "state": "on"});
+        let remote = render(&answer, &schema).expect("render");
+        assert_eq!(
+            String::from_utf8(remote.clone()).unwrap(),
+            "{\n  \"provider\": {\n    \"attached_at\": null,\n    \"state\": \"detached\"\n  },\n  \"state\": \"on\"\n}\n"
+        );
+        let local = Value::Object(BTreeMap::from([
+            (
+                "provider".to_string(),
+                Value::Object(BTreeMap::from([
+                    ("attached_at".to_string(), Value::Null),
+                    ("state".to_string(), Value::Str("detached".to_string())),
+                ])),
+            ),
+            ("state".to_string(), Value::Str("on".to_string())),
+        ]));
+        assert_eq!(remote, render_cli_value(&local));
+    }
+
+    /// The strict path stays where it adds information: a `Bytes` result
+    /// decodes from base64 to the raw bytes (the structural fallback would
+    /// print the base64 text), and a `Bytes` field beside an optional `null`
+    /// still decodes once the `null` is tolerated.
+    #[test]
+    fn render_bytes_still_decode_on_the_strict_path() {
+        assert_eq!(
+            render(&serde_json::json!("iVBORw=="), &TypeDesc::Bytes).expect("bytes"),
+            [0x89, 0x50, 0x4e, 0x47]
+        );
+        let schema = TypeDesc::Object(vec![
+            def("png", TypeDesc::Bytes, true),
+            def("note", TypeDesc::Str, false),
+        ]);
+        let answer = serde_json::json!({"png": "iVBORw==", "note": null});
+        assert_eq!(
+            rebuild_value(&answer, &schema),
+            Value::Object(BTreeMap::from([
+                ("note".to_string(), Value::Null),
+                (
+                    "png".to_string(),
+                    Value::Bytes(vec![0x89, b'P', b'N', b'G'])
+                ),
+            ]))
+        );
     }
 }
