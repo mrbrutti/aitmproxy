@@ -116,8 +116,10 @@ describe('handleShortcut', () => {
     expect(s.kill).toHaveBeenCalledWith('p1');
     handleShortcut(key('1', { metaKey: true }), s);
     handleShortcut(key('4', { metaKey: true }), s);
+    handleShortcut(key('5', { metaKey: true }), s);
     handleShortcut(key('9', { metaKey: true }), s);
-    expect(s.setChip.mock.calls.map((c) => c[0])).toEqual(['all', 'ws', 'xml']);
+    // ⌘1…⌘9 follow the bar order (L4 parity spec §7(c)): ⌘5 is TCP and ⌘9 is h2 now that TCP UDP L4 sit after WebSocket.
+    expect(s.setChip.mock.calls.map((c) => c[0])).toEqual(['all', 'ws', 'tcp', 'h2']);
   });
 
   it('Esc collapses a multi-select to the primary row', () => {
