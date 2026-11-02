@@ -125,7 +125,23 @@ Leftovers: none (no host reached any core).
 the ports are free; log noise now), proxied-flow attribution (MAC-9b). Everything else `incomplete`
 pending the window half.
 
-## Run 3 — window half
+## Run 3 — read-only half on the panel-2-fixed runner, 2026-11-02 03:26Z (`run-3-readonly-84e22c4f/`)
+
+Same build and state as run 2 (core pid 16734, Scope empty, 8 proxied Firefox rows now). Same
+verdict **fail**: CLI-4, CLI-5, CLI-10, MAC-9b; N4-CLI/N4-TUI/N4-WEB/N5-TUI PASS; the n/a steps now
+read `N/A` (TUI-9/10, WEB-9/10, N1-TUI, N1-WEB, N5-CLI) and no longer hold the verdict; the
+negatives cell is PASS. Restore diff identical; secret grep knew 2 values (collected at start and
+end); `.secrets` shredded. This is the runner the PR ships.
+
+| Journey | PASS | FAIL | SKIP | BLOCKED | ERROR | N/A |
+|---|---|---|---|---|---|---|
+| CLI | 2 | 3 | 7 | 0 | 0 | 0 |
+| MAC | 1 | 1 | 16 | 5 | 0 | 0 |
+| NEGATIVES | 3 | 0 | 0 | 0 | 0 | 1 |
+| TUI | 0 | 0 | 11 | 0 | 0 | 3 |
+| WEB | 0 | 0 | 14 | 0 | 0 | 3 |
+
+## Run 4 — window half
 
 Pending: display lock after the attribution session's Task 8; yes-list requested from Matt
 (MAC-1/16 quit + relaunch, MAC-6/15, MAC-7/14 not needed while All Apps is on, Safari visits,
