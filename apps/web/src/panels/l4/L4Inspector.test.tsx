@@ -108,7 +108,7 @@ describe('L4Inspector: packet selection derives from the flow (I1; spec §2, pla
 
 describe('L4Inspector: agent role gates Inject and the verdicts (I3; spec §7(c) D12, AC24)', () => {
   it('Inject is disabled with the operator-only line beside it, a forced click calls no onInject, and Forward carries the reason', () => {
-    const { byId, handlers } = mount('agent', flow('F1', [pkt(1)]), { interceptModel: { kind: 'parked', id: 'P1' } });
+    const { byId, handlers } = mount('agent', flow('F1', [pkt(1)]), { interceptModel: { kind: 'parked', id: 'P1', state: 'parked' } });
     const inject = byId('l4-inject')!;
     expect(inject).not.toBeNull();
     expect(inject.disabled).toBe(true);
@@ -126,7 +126,7 @@ describe('L4Inspector: agent role gates Inject and the verdicts (I3; spec §7(c)
   });
 
   it('an operator connection in scope has Inject enabled, no operator-only line, and the verdicts live', () => {
-    const { byId, r } = mount('operator', flow('F1', [pkt(1)]), { interceptModel: { kind: 'parked', id: 'P1' } });
+    const { byId, r } = mount('operator', flow('F1', [pkt(1)]), { interceptModel: { kind: 'parked', id: 'P1', state: 'parked' } });
     expect(byId('l4-inject')!.disabled).toBe(false);
     expect(byId('l4-inject-operator-only')).toBeNull();
     expect(byId('l4-forward')!.disabled).toBe(false);

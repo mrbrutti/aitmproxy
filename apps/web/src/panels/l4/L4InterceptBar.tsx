@@ -1,16 +1,28 @@
 // The in-path intercept bar (ui-ext §3.2, L4OPS-AC12; parity spec §4, AC20): Forward / Mutate /
 // Drop / Revert on the selected flow's parked packet, mirroring the HTTP intercept bar's mental
-// model. It renders from `interceptBarModel`: when `l4.intercept.status` says the class is
-// unavailable on this core (or availability is still pending) it is exactly one documented-limited
-// line carrying the core's reason and NO verdict buttons — never a control that can only fail
-// (AC33). Every verdict reaches the wire through the same guarded confirm path as inject, and
-// every one takes the parked packet's id, never the flow id. Role (spec §7(c) D12, AC24): the
-// verdicts are operator-only; with `operatorOnly` set (the inspector reads the connection role) each
-// button renders disabled with that reason and its handler returns before calling out.
+// model. It renders from `interceptBarModel`: until the first `l4.intercept.status` reply it is
+// exactly the shared pending literal (spec §1); when the reply says the class is unavailable on this
+// core it is exactly one documented-limited line carrying the core's reason and NO verdict buttons
+// — never a control that can only fail (AC33). Revert is live only on a mutated parked packet (the
+// core answers `false`, a no-op, for an unmutated one). Every verdict reaches the wire through the
+// same guarded confirm path as inject, and every one takes the parked packet's id, never the flow
+// id. Role (spec §7(c) D12, AC24): the verdicts are operator-only; with `operatorOnly` set (the
+// inspector reads the connection role) each button renders disabled with that reason and its
+// handler returns before calling out.
 import { Show, Switch, Match, type Component } from 'solid-js';
 import { Button } from '~/components/Button';
-import type { InterceptBarModel } from './model';
+import { PENDING_AVAILABILITY, type InterceptBarModel } from './model';
 import css from './l4.module.css';
+
+/** Revert's tooltip while the parked packet has not been mutated: the verb would be a no-op. */
+export const NOTHING_TO_REVERT = 'Nothing staged to revert';
+
+/** The one pending line (spec §1 literal), shared by the inspector bar and the L4 focus view. */
+export const InterceptPendingLine: Component = () => (
+  <div class={css.interceptBar} data-limited="true" role="status" data-testid="l4-intercept-pending">
+    <span>{PENDING_AVAILABILITY.reason}</span>
+  </div>
+);
 
 /** The one documented-limited line, shared by the inspector bar and the L4 focus view. */
 export const InterceptLimitedLine: Component<{ reason: string }> = (props) => (
@@ -58,6 +70,9 @@ export const L4InterceptBar: Component<L4InterceptBarProps> = (props) => {
   };
   return (
     <Switch>
+      <Match when={props.model.kind === 'pending'}>
+        <InterceptPendingLine />
+      </Match>
       <Match when={props.model.kind === 'limited' && props.model}>{(m) => <InterceptLimitedLine reason={m().reason} />}</Match>
       <Match when={props.model.kind === 'idle'}>
         <div class={css.interceptBar} role="status" data-testid="l4-intercept-idle">
@@ -115,8 +130,8 @@ export const L4InterceptBar: Component<L4InterceptBarProps> = (props) => {
             <Button
               variant="ghost"
               data-testid="l4-revert"
-              disabled={gated() || !props.inScope}
-              title={scopeTitle()}
+              disabled={gated() || !props.inScope || m().state !== 'mutated'}
+              title={scopeTitle() ?? (m().state === 'mutated' ? undefined : NOTHING_TO_REVERT)}
               data-operator-only={forRole()}
               onClick={() => revert(m().id)}
             >

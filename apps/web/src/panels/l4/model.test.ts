@@ -238,14 +238,29 @@ describe('createOnceLog', () => {
     once.log('a');
     expect(seen).toEqual(['a', 'b', 'a']);
   });
+
+  it('forget(msg) lets exactly that message log again; the others stay suppressed (fix 3: per-label recovery)', () => {
+    const seen: string[] = [];
+    const once = createOnceLog((m) => seen.push(m));
+    once.log('l4.flow.list: boom');
+    once.log('l4.scope.list: closed');
+    once.forget('l4.flow.list: boom');
+    once.log('l4.scope.list: closed');
+    once.log('l4.flow.list: boom');
+    expect(seen).toEqual(['l4.flow.list: boom', 'l4.scope.list: closed', 'l4.flow.list: boom']);
+    // Forgetting a message never seen is a no-op.
+    once.forget('never');
+    once.log('l4.scope.list: closed');
+    expect(seen).toHaveLength(3);
+  });
 });
 
 // ---- intercept bar model (parity spec §4, AC20; task C5) -------------------------------------------
 
-const parkedWire = (id: string, flow: string): L4ParkedWire => ({
+const parkedWire = (id: string, flow: string, state: L4ParkedWire['state'] = 'parked'): L4ParkedWire => ({
   id,
   flow,
-  state: 'parked',
+  state,
   dir: 'inbound',
   length: 60,
   layers: ['IPv4', 'TCP'],
@@ -265,14 +280,23 @@ describe('interceptBarModel', () => {
     });
   });
 
-  it('pending availability is the shared pending literal as a limited line', () => {
-    expect(interceptBarModel(PENDING_AVAILABILITY, [], 'F')).toEqual({ kind: 'limited', reason: 'Reading L4 availability…' });
+  it('pending availability is its own pending kind, not a "not available on this core" conclusion (spec §1)', () => {
+    expect(interceptBarModel(PENDING_AVAILABILITY, [], 'F')).toEqual({ kind: 'pending' });
+    // The same shape built elsewhere (a copy, not the frozen constant) is pending too.
+    expect(interceptBarModel({ available: false, code: null, reason: 'Reading L4 availability…' }, [parkedWire('P1', 'F')], 'F')).toEqual({ kind: 'pending' });
+    // A real "unavailable, no code" answer with another reason is limited, not pending.
+    expect(interceptBarModel({ available: false, code: null, reason: 'OLD-CORE-REASON' }, [], 'F')).toEqual({ kind: 'limited', reason: 'OLD-CORE-REASON' });
   });
 
-  it('available with a packet parked for the flow names that parked id (never the flow id)', () => {
-    expect(interceptBarModel(AVAILABLE, [parkedWire('P1', 'F')], 'F')).toEqual({ kind: 'parked', id: 'P1' });
+  it('available with a packet parked for the flow names that parked id (never the flow id) and carries its state', () => {
+    expect(interceptBarModel(AVAILABLE, [parkedWire('P1', 'F')], 'F')).toEqual({ kind: 'parked', id: 'P1', state: 'parked' });
+    expect(interceptBarModel(AVAILABLE, [parkedWire('P1', 'F', 'mutated')], 'F')).toEqual({ kind: 'parked', id: 'P1', state: 'mutated' });
     // First listed (oldest) for the flow wins.
-    expect(interceptBarModel(AVAILABLE, [parkedWire('P0', 'G'), parkedWire('P1', 'F'), parkedWire('P2', 'F')], 'F')).toEqual({ kind: 'parked', id: 'P1' });
+    expect(interceptBarModel(AVAILABLE, [parkedWire('P0', 'G'), parkedWire('P1', 'F'), parkedWire('P2', 'F', 'mutated')], 'F')).toEqual({
+      kind: 'parked',
+      id: 'P1',
+      state: 'parked',
+    });
   });
 
   it('available with nothing parked for the flow is idle', () => {
@@ -321,16 +345,21 @@ describe('packetHeadline (spec §2 addresses)', () => {
 });
 
 describe('formatPacketTime (spec §2 timestamp)', () => {
-  it('renders local HH:MM:SS.mmm with padded fields', () => {
-    const shaped = formatPacketTime(1_761_900_000_007);
-    expect(shaped).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3}$/);
-    expect(shaped.endsWith('.007')).toBe(true);
-    // The hour/minute/second match what the local clock says for that instant.
-    const d = new Date(1_761_900_000_007);
-    const hh = String(d.getHours()).padStart(2, '0');
-    const mm = String(d.getMinutes()).padStart(2, '0');
-    const ss = String(d.getSeconds()).padStart(2, '0');
-    expect(shaped).toBe(`${hh}:${mm}:${ss}.007`);
+  // 1_761_904_800_007 ms is 2025-10-31T10:00:00.007Z.
+  const T = 1_761_904_800_007;
+
+  it('renders HH:MM:SS.mmm in the given zone, padded, 24-hour', () => {
+    expect(formatPacketTime(T, 'UTC')).toBe('10:00:00.007');
+    expect(formatPacketTime(T, 'America/Los_Angeles')).toBe('03:00:00.007');
+    expect(formatPacketTime(T, 'Asia/Tokyo')).toBe('19:00:00.007');
+    // Midnight is 00, never 24; single digits are padded.
+    expect(formatPacketTime(Date.UTC(2025, 9, 31, 0, 5, 9, 3), 'UTC')).toBe('00:05:09.003');
+  });
+
+  it('defaults to the local zone', () => {
+    const shaped = formatPacketTime(T);
+    expect(shaped).toMatch(/^\d{2}:\d{2}:\d{2}\.007$/);
+    expect(shaped).toBe(formatPacketTime(T, Intl.DateTimeFormat().resolvedOptions().timeZone));
   });
 });
 

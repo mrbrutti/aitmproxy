@@ -428,6 +428,11 @@ export const PENDING_AVAILABILITY: L4Availability = Object.freeze({
   reason: 'Reading L4 availability…',
 });
 
+/** True while `avail` is the pending placeholder (the frozen constant or an equal copy): no status reply yet. */
+export function isPendingAvailability(avail: L4Availability): boolean {
+  return avail === PENDING_AVAILABILITY || (avail.available === false && avail.code === null && avail.reason === PENDING_AVAILABILITY.reason);
+}
+
 const L4_UNAVAILABLE_MARKER = 'L4 unavailable: ';
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -575,11 +580,17 @@ function endpoint(addr: string, port: number | null | undefined): string {
   return port != null ? `${addr}:${port}` : addr;
 }
 
-/** A packet `timestamp` (epoch ms) as the local wall clock, `HH:MM:SS.mmm`. */
-export function formatPacketTime(ms: number): string {
-  const d = new Date(ms);
-  const pad2 = (n: number) => String(n).padStart(2, '0');
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+/**
+ * A packet `timestamp` (epoch ms) as a wall clock, `HH:MM:SS.mmm`, 24-hour. `timeZone` is an IANA
+ * zone name; omitted, the local zone (what the packet list shows the operator).
+ */
+export function formatPacketTime(ms: number, timeZone?: string): string {
+  const parts = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZone }).formatToParts(
+    new Date(ms),
+  );
+  const part = (type: 'hour' | 'minute' | 'second') => (parts.find((p) => p.type === type)?.value ?? '00').padStart(2, '0');
+  const millis = String(((ms % 1000) + 1000) % 1000).padStart(3, '0');
+  return `${part('hour')}:${part('minute')}:${part('second')}.${millis}`;
 }
 
 /** The printable-ASCII column of a hex dump: 0x20–0x7e as themselves, every other byte as `.` (spec §2.3). */
@@ -621,17 +632,25 @@ export function parkedFor(parked: readonly L4ParkedWire[], flowId: string): L4Pa
 
 // ---- intercept bar model (spec §4, AC20) ------------------------------------------------------------
 //
-// What the intercept bar renders for the selected flow. Intercept unavailable (including pending)
-// is one documented-limited line with the core's reason and no live buttons; available with a
-// packet parked for the flow carries that parked id (the verdicts' argument, never the flow id);
-// available with nothing parked is a quiet idle line.
+// What the intercept bar renders for the selected flow. Before the first `l4.intercept.status`
+// reply it is pending: exactly the shared `Reading L4 availability…` literal (spec §1), not a
+// conclusion the core has not given. Intercept unavailable is one documented-limited line with the
+// core's reason and no live buttons; available with a packet parked for the flow carries that
+// parked id (the verdicts' argument, never the flow id) and its `state`, because Revert on a packet
+// that was never mutated is a no-op on the core (`l4.intercept.revert` answers `false`) and so must
+// not be a live control; available with nothing parked is a quiet idle line.
 
-export type InterceptBarModel = { kind: 'limited'; reason: string } | { kind: 'idle' } | { kind: 'parked'; id: string };
+export type InterceptBarModel =
+  | { kind: 'pending' }
+  | { kind: 'limited'; reason: string }
+  | { kind: 'idle' }
+  | { kind: 'parked'; id: string; state: L4ParkedWire['state'] };
 
 export function interceptBarModel(avail: L4Availability, parked: readonly L4ParkedWire[], flowId: string): InterceptBarModel {
+  if (isPendingAvailability(avail)) return { kind: 'pending' };
   if (!avail.available) return { kind: 'limited', reason: avail.reason ?? '' };
   const p = parkedFor(parked, flowId);
-  return p ? { kind: 'parked', id: p.id } : { kind: 'idle' };
+  return p ? { kind: 'parked', id: p.id, state: p.state } : { kind: 'idle' };
 }
 
 // ---- tools/list feature detects -------------------------------------------------------------------
@@ -736,15 +755,19 @@ export function l4PollPlan(now: number, clock: Readonly<L4PollClock>, idle: bool
 // ---- once-per-message logging ---------------------------------------------------------------------
 
 export interface OnceLog {
-  /** Pass `msg` to the sink unless the same text was already logged since the last `clear()`. */
+  /** Pass `msg` to the sink unless the same text was already logged and not since forgotten. */
   log(msg: string): void;
-  /** Forget every message seen so far (e.g. after a successful read, so a recurrence logs again). */
+  /** Forget one message (the read it came from succeeded), so its recurrence logs again; unknown messages are a no-op. */
+  forget(msg: string): void;
+  /** Forget every message seen so far. */
   clear(): void;
 }
 
 /**
  * A read failure repeats on every poll; the activity log should carry each distinct message once
- * (spec §7(c)), so the store routes every read failure through one of these.
+ * (spec §7(c)), so the store routes every read failure through one of these. Recovery is per
+ * message (`forget`): a pass that ran only the slow group must not un-suppress a fast-group verb
+ * that is still failing.
  */
 export function createOnceLog(sink: (msg: string) => void): OnceLog {
   const seen = new Set<string>();
@@ -753,6 +776,9 @@ export function createOnceLog(sink: (msg: string) => void): OnceLog {
       if (seen.has(msg)) return;
       seen.add(msg);
       sink(msg);
+    },
+    forget(msg) {
+      seen.delete(msg);
     },
     clear() {
       seen.clear();

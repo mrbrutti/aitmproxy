@@ -4,10 +4,19 @@
 // model must be exactly one line and no verdict button (AC33: nothing that can only fail).
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render } from '@solidjs/testing-library';
+import type { BusClient } from '~/bus/types';
+import { AppProvider } from '~/state/context';
+import { createAppStore } from '~/state/app';
+import { memoryBus } from '~/state/bridgeBus.testkit';
 import { L4InterceptBar, InterceptLimitedLine } from './L4InterceptBar';
-import { OPERATOR_ONLY_REASON, type InterceptBarModel } from './model';
+import { L4CaptureBar } from './L4CaptureBar';
+import type { L4Store } from './store';
+import { OPERATOR_ONLY_REASON, PENDING_AVAILABILITY, type InterceptBarModel, type L4Availability } from './model';
 
 afterEach(cleanup);
+
+const PARKED: InterceptBarModel = { kind: 'parked', id: 'P1', state: 'parked' };
+const MUTATED: InterceptBarModel = { kind: 'parked', id: 'P1', state: 'mutated' };
 
 const VERDICTS = ['l4-forward', 'l4-mutate', 'l4-drop', 'l4-revert'] as const;
 
@@ -46,6 +55,18 @@ describe('L4InterceptBar: documented-limited line (AC20, AC33)', () => {
     expect(r.container.textContent).toContain('<b>x</b><img src=x onerror=alert(1)>');
   });
 
+  it('the pending model is exactly the shared literal "Reading L4 availability…", one status line, zero buttons (spec §1)', () => {
+    const { r, byId } = mount({ kind: 'pending' });
+    const pending = r.container.querySelectorAll('[data-testid="l4-intercept-pending"]');
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.textContent).toBe('Reading L4 availability…');
+    expect(pending[0]!.getAttribute('role')).toBe('status');
+    expect(r.container.querySelectorAll('button')).toHaveLength(0);
+    for (const id of VERDICTS) expect(byId(id), id).toBeNull();
+    expect(r.container.querySelector('[data-testid="l4-intercept-limited"]')).toBeNull();
+    expect(r.container.textContent).not.toContain('not available on this core');
+  });
+
   it('the idle model has no enabled verdict and no verdict testids (nothing can be clicked to fail)', () => {
     const { r, byId } = mount({ kind: 'idle' });
     expect(r.container.querySelector('[data-testid="l4-intercept-idle"]')).not.toBeNull();
@@ -58,7 +79,7 @@ describe('L4InterceptBar: documented-limited line (AC20, AC33)', () => {
 
 describe('L4InterceptBar: parked model sends the parked id (AC20)', () => {
   it('renders the four verdicts and Forward / Drop / Revert call back with the parked id, not the flow id', () => {
-    const { r, handlers, byId } = mount({ kind: 'parked', id: 'P1' });
+    const { r, handlers, byId } = mount(MUTATED);
     for (const id of VERDICTS) expect(byId(id), id).not.toBeNull();
     const bar = r.container.querySelector('[data-testid="l4-intercept-parked"]')!;
     expect(bar.getAttribute('data-parked-id')).toBe('P1');
@@ -75,13 +96,13 @@ describe('L4InterceptBar: parked model sends the parked id (AC20)', () => {
   });
 
   it('a different parked id goes through unchanged (the bar does not hard-code P1)', () => {
-    const { handlers, byId } = mount({ kind: 'parked', id: '9f3c-parked' });
+    const { handlers, byId } = mount({ kind: 'parked', id: '9f3c-parked', state: 'parked' });
     fireEvent.click(byId('l4-forward')!);
     expect(handlers.onForward).toHaveBeenCalledWith('9f3c-parked');
   });
 
   it('Mutate is disabled with the block reason until a spec is built, then calls back with the parked id', () => {
-    const blocked = mount({ kind: 'parked', id: 'P1' }, { mutateBlocked: 'Build a packet in the craft editor first' });
+    const blocked = mount(PARKED, { mutateBlocked: 'Build a packet in the craft editor first' });
     const mutate = blocked.byId('l4-mutate')!;
     expect(mutate.disabled).toBe(true);
     expect(mutate.getAttribute('title')).toBe('Build a packet in the craft editor first');
@@ -91,14 +112,14 @@ describe('L4InterceptBar: parked model sends the parked id (AC20)', () => {
     expect(blocked.byId('l4-forward')!.disabled).toBe(false);
     cleanup();
 
-    const ready = mount({ kind: 'parked', id: 'P1' }, { mutateBlocked: null });
+    const ready = mount(PARKED, { mutateBlocked: null });
     expect(ready.byId('l4-mutate')!.disabled).toBe(false);
     fireEvent.click(ready.byId('l4-mutate')!);
     expect(ready.handlers.onMutate).toHaveBeenCalledWith('P1');
   });
 
   it('out of scope: every verdict is disabled with the scope reason and a forced click calls nothing', () => {
-    const { handlers, byId, r } = mount({ kind: 'parked', id: 'P1' }, { inScope: false, scopeReason: 'eth1 is not in L4 scope' });
+    const { handlers, byId, r } = mount(MUTATED, { inScope: false, scopeReason: 'eth1 is not in L4 scope' });
     for (const id of VERDICTS) {
       const b = byId(id)!;
       expect(b.disabled, id).toBe(true);
@@ -108,11 +129,32 @@ describe('L4InterceptBar: parked model sends the parked id (AC20)', () => {
     expect(r.container.textContent).toContain('eth1 is not in L4 scope');
     for (const h of Object.values(handlers)) expect(h).not.toHaveBeenCalled();
   });
+
+  it('Revert is a no-op control on an unmutated parked packet, so it is disabled with "Nothing staged to revert" (anti-goal: a control that can only fail)', () => {
+    const { handlers, byId } = mount(PARKED);
+    const revert = byId('l4-revert')!;
+    expect(revert.disabled).toBe(true);
+    expect(revert.getAttribute('title')).toBe('Nothing staged to revert');
+    fireEvent.click(revert);
+    expect(handlers.onRevert).not.toHaveBeenCalled();
+    // The other three verdicts are not held back by the parked state.
+    expect(byId('l4-forward')!.disabled).toBe(false);
+    expect(byId('l4-drop')!.disabled).toBe(false);
+  });
+
+  it('Revert is live once the parked packet is mutated, with no tooltip, and sends the parked id', () => {
+    const { handlers, byId } = mount(MUTATED);
+    const revert = byId('l4-revert')!;
+    expect(revert.disabled).toBe(false);
+    expect(revert.hasAttribute('title')).toBe(false);
+    fireEvent.click(revert);
+    expect(handlers.onRevert).toHaveBeenCalledWith('P1');
+  });
 });
 
 describe('L4InterceptBar: agent role (D12, AC24)', () => {
   it('with operatorOnly set every verdict is disabled, titled with the reason, marked operator-only, and a forced click calls nothing', () => {
-    const { r, handlers, byId } = mount({ kind: 'parked', id: 'P1' }, { operatorOnly: OPERATOR_ONLY_REASON });
+    const { r, handlers, byId } = mount(MUTATED, { operatorOnly: OPERATOR_ONLY_REASON });
     for (const id of VERDICTS) {
       const b = byId(id)!;
       expect(b.disabled, id).toBe(true);
@@ -125,12 +167,12 @@ describe('L4InterceptBar: agent role (D12, AC24)', () => {
   });
 
   it('the operator-only reason outranks the scope reason in the tooltip', () => {
-    const { byId } = mount({ kind: 'parked', id: 'P1' }, { operatorOnly: OPERATOR_ONLY_REASON, inScope: false, scopeReason: 'scope' });
+    const { byId } = mount(PARKED, { operatorOnly: OPERATOR_ONLY_REASON, inScope: false, scopeReason: 'scope' });
     expect(byId('l4-forward')!.getAttribute('title')).toBe(OPERATOR_ONLY_REASON);
   });
 
   it('on an operator connection (operatorOnly null) nothing is marked operator-only', () => {
-    const { r } = mount({ kind: 'parked', id: 'P1' });
+    const { r } = mount(MUTATED);
     expect(r.container.querySelectorAll('[data-operator-only]')).toHaveLength(0);
   });
 
@@ -143,5 +185,68 @@ describe('L4InterceptBar: agent role (D12, AC24)', () => {
       expect(b.getAttribute('title')).toBe(OPERATOR_ONLY_REASON);
       expect(b.getAttribute('data-operator-only')).toBe('true');
     }
+  });
+});
+
+// ---- the L4 focus view's intercept line (L4CaptureBar) while availability is pending (spec §1) ----
+//
+// The capture bar renders the same line under the capture controls; until the first
+// `l4.intercept.status` reply it must be exactly the pending literal, not a sentence that concludes
+// "not available on this core". The store is stubbed with the accessors the bar reads.
+
+let bus: BusClient | null = null;
+afterEach(() => {
+  bus?.close();
+  bus = null;
+});
+
+function mountCaptureBar(intercept: L4Availability) {
+  const mem = memoryBus();
+  bus = { ...mem, role: () => 'operator' as const };
+  const app = createAppStore(bus);
+  const store = {
+    present: () => true,
+    captureAvailability: () => ({ available: false, code: 'needs_privilege', reason: 'X' }),
+    captureIds: () => [],
+    caps: () => ({ craft: true, inject: true, scope: true, interfaces: true, agentStatus: true, agentSet: true }),
+    scope: () => [],
+    tools: () => [],
+    interceptAvailability: () => intercept,
+    startCapture: vi.fn(),
+    stopCapture: vi.fn(),
+    addScope: vi.fn(),
+    confirmAddScope: vi.fn(),
+  } as unknown as L4Store;
+  return render(() => (
+    <AppProvider store={app}>
+      <L4CaptureBar store={store} />
+    </AppProvider>
+  ));
+}
+
+describe('L4CaptureBar intercept line (spec §1 pending literal, §4 limited line)', () => {
+  it('pending: exactly "Reading L4 availability…" as one status line, no limited sentence, no verdict buttons', () => {
+    const r = mountCaptureBar(PENDING_AVAILABILITY);
+    const pending = r.container.querySelectorAll('[data-testid="l4-intercept-pending"]');
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.textContent).toBe('Reading L4 availability…');
+    expect(pending[0]!.getAttribute('role')).toBe('status');
+    expect(r.container.querySelector('[data-testid="l4-intercept-limited"]')).toBeNull();
+    expect(r.container.textContent).not.toContain('not available on this core');
+    for (const id of VERDICTS) expect(r.container.querySelector(`[data-testid="${id}"]`), id).toBeNull();
+  });
+
+  it('unavailable: the documented-limited line with the core reason, and no pending line', () => {
+    const r = mountCaptureBar({ available: false, code: 'unsupported_platform', reason: 'in-path interception is unsupported on macOS' });
+    expect(r.container.querySelector('[data-testid="l4-intercept-pending"]')).toBeNull();
+    expect(r.container.querySelector('[data-testid="l4-intercept-limited"]')!.textContent).toBe(
+      'In-path intercept is not available on this core: in-path interception is unsupported on macOS',
+    );
+  });
+
+  it('available: neither line (the inspector owns the parked / idle bar)', () => {
+    const r = mountCaptureBar({ available: true, code: 'available', reason: null });
+    expect(r.container.querySelector('[data-testid="l4-intercept-pending"]')).toBeNull();
+    expect(r.container.querySelector('[data-testid="l4-intercept-limited"]')).toBeNull();
   });
 });

@@ -2,12 +2,14 @@
 // L4 sessions now live in the one unified list, so the retired L4Panel's capture controls move here
 // — reachable when the operator narrows to L4, out of the way otherwise. Honest degradation: when
 // `l4.*` is not advertised it says so in place instead of faking an L4 surface; when it is, the
-// controls follow the store's live `l4.capture.status` availability (parity spec §1), and an
-// unavailable in-path intercept is the same one documented-limited line the inspector shows (§4).
-import { Show, type Component } from 'solid-js';
+// controls follow the store's live `l4.capture.status` availability (parity spec §1), and the
+// intercept line is the inspector's own: exactly the pending literal until the first
+// `l4.intercept.status` reply (§1), then the one documented-limited line when unavailable (§4).
+import { Match, Show, Switch, type Component } from 'solid-js';
 import type { L4Store } from './store';
 import { CaptureControls } from './CaptureControls';
-import { InterceptLimitedLine } from './L4InterceptBar';
+import { InterceptLimitedLine, InterceptPendingLine } from './L4InterceptBar';
+import { isPendingAvailability } from './model';
 import css from './l4.module.css';
 
 export const L4CaptureBar: Component<{ store: L4Store }> = (props) => {
@@ -36,9 +38,14 @@ export const L4CaptureBar: Component<{ store: L4Store }> = (props) => {
           onAddScope={store.addScope}
           onConfirmAddScope={store.confirmAddScope}
         />
-        <Show when={!store.interceptAvailability().available}>
-          <InterceptLimitedLine reason={store.interceptAvailability().reason ?? ''} />
-        </Show>
+        <Switch>
+          <Match when={isPendingAvailability(store.interceptAvailability())}>
+            <InterceptPendingLine />
+          </Match>
+          <Match when={!store.interceptAvailability().available}>
+            <InterceptLimitedLine reason={store.interceptAvailability().reason ?? ''} />
+          </Match>
+        </Switch>
       </Show>
     </div>
   );
