@@ -1,6 +1,6 @@
 # L4 capture privilege implementation plan
 
-**Status:** Approved (Matt, 2026-11-01, defaults for the spec's forks); tasks P7.1 and the AC5 `all`-case half of P1b.17 blocked on Question 2; spikes first. Matt, 2026-11-01 (via the orchestrator): no third-party privilege daemon ever; phase 2 (our own component for capture and injection, the `serve` mode, carrier open to the architect) is the required end state; phase 1 stays the stepping stone. p1a merged as 61a35571 (#251).
+**Status:** Approved (Matt, 2026-11-01, defaults for the spec's forks); tasks P7.1 and the AC5 `all`-case half of P1b.17 blocked on Question 2; spikes first. S7 proven (PR #240, 2026-11-01): P1b.12–14 and P2.6–P2.8 unblocked; amendments folded (rows marked "(S7)"; write-up `docs/research/experiments/2026-11-01-l4-s7-pkexec-helper.md`, spec §5.7). Matt, 2026-11-01 (via the orchestrator): no third-party privilege daemon ever; phase 2 (our own component for capture and injection, the `serve` mode, carrier open to the architect) is the required end state; phase 1 stays the stepping stone. p1a merged as 61a35571 (#251).
 **Spec:** `docs/superpowers/specs/2026-10-31-l4-capture-privilege-design.md` (approved 2026-11-01, forks i–v on the
 recommended defaults; acceptance criteria L4PRIV-AC1 … L4PRIV-AC29). Still open: Matt's written acceptance of the
 headless `setcap` doc (spec open question; blocks Task P5.4 only).
@@ -34,8 +34,10 @@ are open.
    protocol, the frame parser and the guard checks. It cannot depend on code that is still sitting on an unmerged
    core branch, and a second copy of those types in the helper would drift. So (p1a) puts those shared contracts on
    `main` first. Then (p1b), the core, and (p2), the helper, fan out in parallel.
-2. **The three tool-contract pins move with p1b, not p7.** `EXPECTED_TOOLS`, `CORE_TOOLS`, `bus-fixture.json` and
-   the `tester_shell.rs` counts are exact-set tests over the live `tools/list`. The PR that registers the two verbs
+2. **The tool-contract pins move with p1b, not p7.** `EXPECTED_TOOLS` (`crates/aitm/tests/frontends.rs`) and
+   `CORE_TOOLS` (`crates/aitm-tui/src/lib.rs`) are exact-set tests over the live `tools/list`; `tui_live_bus.rs`
+   compares `CORE_TOOLS` to it. (Panel, 2026-11-01: two contracts, not three; `bus-fixture.json` and
+   `tester_shell.rs` were deleted on `main` by #244, the TUI is live-only.) The PR that registers the two verbs
    (p1b) is red without them, and a PR that bumps them before the verbs exist (p7) is red the other way. p7 keeps
    only the `is_operator_only` entry and its test. That entry is a name match and is safe to merge before or after
    p1b.
@@ -136,13 +138,23 @@ fresh Coder, is test-first, and ends in one commit. The independent sets are lis
 **Linux rig [linux-ci].** **(Architect's call:** "Linux CI" in this plan means the systemd container on the Lima VM
 `cis-lab`, driven from the Terminal; adding a GitHub Actions job is left to the orchestrator as a follow-up, so no
 task here edits `.github/workflows/`.)
-- Fedora and Debian trixie systemd containers in `cis-lab` with `dbus`, `polkitd`, and the `pkexec` package
-  (Debian) or `polkit` (Fedora).
+- (S7) `cis-lab` has **no container runtime** (no `nerdctl`, `docker` or `podman`). The rig script
+  (`linux-privilege-rig.sh`, P2.8) installs `podman` from Ubuntu's apt inside the VM, or the orchestrator keeps one
+  installed; the S7 spike purged it at revert.
+- Fedora 42 and Debian trixie systemd containers in `cis-lab`, run rootful as `podman run -d --systemd=always
+  --privileged` (S7: `polkitd`'s unit needs `CAP_SYS_ADMIN`; unprivileged it fails `status=217/USER` and every
+  `pkexec` dies after 25 s with `Error getting authority … Timeout was reached`, exit 127). Packages: Debian
+  `systemd dbus polkitd pkexec`; Fedora `systemd dbus-broker polkit` (plus `libpcap` at run time).
 - User `tester` with a password, in the admin group (`wheel` / `sudo`). No graphical agent.
+- (S7) On the Ubuntu 24.04 host (`cis-lab`), unload the `unix-chkpwd` AppArmor profile (`apparmor_parser -R
+  /etc/apparmor.d/unix-chkpwd`) before Fedora's PAM can authenticate inside a container, and reload it (`-r`) when
+  the rig comes down. Debian is unaffected.
 - The core is built inside the VM.
 - Scope: `lo`, `127.0.0.1/32`, `9000-9999`. Same targets.
 - For AC16 only, a test-only rule `/etc/polkit-1/rules.d/49-aitm-test.rules` returns `polkit.Result.YES` for
-  `tester` on `com.mrbrutti.aitmproxy.l4-helper.run`. It is removed for AC22 and AC21.
+  `tester` on `com.mrbrutti.aitmproxy.l4-helper.run` (S7: confirmed, the helper connects with no prompt at once). It
+  is removed for AC22 and AC21. `pkaction --verbose --action-id com.mrbrutti.aitmproxy.l4-helper.run` checks the
+  policy was read as written.
 
 **Linux desktop [linux-desk].** A GNOME VM in Lima (or UTM), by hand, with the `.deb` from P5.3 installed. Used for
 AC21 only.
@@ -152,6 +164,7 @@ AC21 only.
 | Unit | Gate (each must exit 0; output quoted) |
 |---|---|
 | p1a, p1b, p2, p7 | sandbox: `cargo fmt --check && cargo clippy --all-targets --offline -- -D warnings && cargo test --offline`; once per unit the same in the Terminal (for `tui_live_bus`) |
+| p1b (Panel 3, 2026-11-01) | the row above, plus `cargo test --offline -p aitm --bin aitm` in the per-stage (per-package) gate: the `main.rs` tests `tui_shutdown_arm_consults_the_prompt_hold` and `the_prompt_hold_handed_to_the_shutdown_arms_is_the_states` live in the binary target, and `cargo test -p aitm --lib` skips them. The full workspace `cargo test --offline` above already covers the binary target; only the `-p aitm --lib` shortcut misses it. |
 | p3 | Terminal: `DEV_TAG=l4priv apps/mac/tools/snap-dev.sh` (prints `Build complete`), `cd apps/mac && swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build`, `apps/mac/tools/check-packet-capture-ui.sh`, `apps/mac/tools/check-connection-words.sh`, `apps/mac/tools/grid-lint.sh` (P3.8, P3.10 change layout) |
 | p4 | `scripts/tests/run-notarize-dmg-stubbed.sh`, `apps/mac/tools/check-packet-helper.sh`, `shellcheck` on every changed script, plus the Rust gate if `package.sh` changed |
 | p5 | `scripts/tests/check-linux-packaging.sh`, `shellcheck scripts/package-linux.sh`, the Rust gate |
@@ -166,7 +179,7 @@ A file in two units is never open in both at once. The "after" column says why.
 | Unit | Creates | Modifies |
 |---|---|---|
 | p1a | `crates/aitm-proto-l4/src/privilege/{mod,contract}.rs`, `crates/aitm-proto-l4/src/helper/{mod,proto,frame,enforce}.rs` | `crates/aitm-proto-l4/src/lib.rs`, `crates/aitm-proto-l4/Cargo.toml` (none expected) |
-| p1b | `crates/aitm-proto-l4/src/privilege/{report,derive,availability,state,macos,linux}.rs`, `crates/aitm-proto-l4/src/commands/privilege.rs`, `crates/aitm-proto-l4/src/helper/client.rs`, `crates/aitm-proto-l4/src/backend/{helper,routed}.rs`, `crates/aitm-proto-l4/tests/privilege.rs`, `tests/e2e/l4/test_privilege_core.py` | `crates/aitm-proto-l4/src/{lib,module,config,guard,language}.rs`, `crates/aitm-proto-l4/src/privilege/mod.rs`, `crates/aitm-proto-l4/src/helper/mod.rs`, `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/commands/{mod,capture,intercept}.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing`, Linux `nix`), `crates/aitm/src/{wire,main}.rs` (after unit (a), merged), `crates/aitm/tests/frontends.rs`, `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` only), `crates/aitm-tui/fixtures/bus-fixture.json`, `crates/aitm-tui/tests/tester_shell.rs` (two count pins), `tests/e2e/l4/{test_l4_parity_core,test_l4_parity_priv}.py`, `docs/research/mcp-tool-catalog.txt`, `aitmproxy-plugin/docs/tool-reference.md`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md` |
+| p1b | `crates/aitm-proto-l4/src/privilege/{report,derive,availability,state,macos,linux}.rs`, `crates/aitm-proto-l4/src/commands/privilege.rs`, `crates/aitm-proto-l4/src/helper/client.rs`, `crates/aitm-proto-l4/src/backend/{helper,routed}.rs`, `crates/aitm-proto-l4/tests/privilege.rs`, `tests/e2e/l4/test_privilege_core.py` | `crates/aitm-proto-l4/src/{lib,module,config,guard,language}.rs`, `crates/aitm-proto-l4/src/privilege/mod.rs`, `crates/aitm-proto-l4/src/helper/mod.rs`, `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/commands/{mod,capture,intercept}.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing`, Linux `nix`), `crates/aitm/src/{wire,main}.rs` (after unit (a), merged), `crates/aitm/tests/frontends.rs`, `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` only; panel 2026-11-01: `bus-fixture.json` and `tester_shell.rs` dropped, deleted by #244), `Cargo.lock` (panel 2026-11-01: the derived line for the `Cargo.toml` change only; p2 owns the lock for the new crate), `crates/aitm/src/lib.rs` (panel 2026-11-01: `shutdown_signal` consults the prompt hold, P1b.14), `crates/aitm/src/tui.rs` (Panel 3, 2026-11-01: the `aitm tui` shutdown arm consults the hold, P1b.14; granted from P6.3), `crates/aitm/tests/l4_cua_tui.rs` (Panel 3, 2026-11-01: the AC27 branch and the bounded wait, P1b.16/P1b.17; taken verbatim from #263 at the 0c34e973 merge, so no p1b change remains in the file), `tests/e2e/l4/{test_l4_parity_core,test_l4_parity_priv}.py`, `docs/research/mcp-tool-catalog.txt`, `aitmproxy-plugin/docs/tool-reference.md`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md` |
 | p2 | `crates/aitm-l4-helper/{Cargo.toml,src/main.rs,src/cli.rs,src/bpf.rs,src/bpf_exec.rs,src/log.rs,src/probe.rs,src/serve.rs,src/serve_loop.rs}`, `tests/e2e/l4/test_privilege_helper_linux.py`, `tests/e2e/l4/linux-privilege-rig.sh` | root `Cargo.toml` (`members`, workspace dep), `Cargo.lock` |
 | p3 | `apps/mac/Sources/AitmproxyKit/{PacketCapture,L4Capture}.swift`, `apps/mac/Tests/AitmproxyKitTests/{PacketCaptureTests,L4CaptureTests}.swift`, `apps/mac/Sources/Aitmproxy/Privilege/PacketCaptureHelper.swift`, `apps/mac/Sources/Aitmproxy/Panels/{PacketCaptureCard,L4CaptureControls}.swift`, `apps/mac/tools/check-packet-capture-ui.sh`, `apps/mac/tools/cua-packet-capture.sh` | `apps/mac/Info.plist.in` (orchestrator first), `apps/mac/Sources/AitmproxyKit/{ConnectionSummary,EmbeddedCoreLaunch}.swift`, `apps/mac/Tests/AitmproxyKitTests/{ConnectionSummaryTests,EmbeddedCoreLaunchTests}.swift`, `apps/mac/Sources/Aitmproxy/{App,SettingsView,Session}.swift`, `apps/mac/Sources/Aitmproxy/Panels/{StatusPanel,ScopePanel}.swift`, `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (L4 empty state), `apps/mac/tools/check-connection-words.sh` (after parity (d)) |
 | p4 | `apps/mac/LaunchDaemons/com.mrbrutti.aitmproxy.l4-helper.plist`, `apps/mac/LaunchDaemons/com.mrbrutti.aitmproxy.l4-helper-revert.plist`, `apps/mac/tools/check-packet-helper.sh` | `scripts/notarize-dmg.sh`, `scripts/tests/run-notarize-dmg-stubbed.sh`, `scripts/package.sh`, `apps/mac/build.sh`, `docs/RELEASE.md`; the tap repo `mrbrutti/homebrew-aitmproxy` `Casks/aitmproxy.rb` (orchestrator executes) |
@@ -317,6 +330,15 @@ list, and it is announced anyway.
 - **Output:** the exact drop order that works, the pid answer (decides P1b.12's peer check), and the exit codes
   (decide P1b.14's mapping). If `CAP_NET_RAW` alone is not enough, stop: the spec's AC16 literals change, and that
   goes to Matt.
+- **Answered (S7, 2026-11-01, `docs/research/experiments/2026-11-01-l4-s7-pkexec-helper.md`, PR #240): PROVEN.**
+  1 yes (the agent opens `/dev/tty`, not stdin; no controlling terminal gives exit 127 with `Error creating textual
+  authentication agent`); 2 yes; 3 yes (`SO_PEERCRED.pid == Popen.pid` in all 17 pkexec runs); 4 `PKEXEC_UID` set,
+  but the textual agent **never exits 126**: wrong password, Ctrl-D and no-tty are all 127 with distinct stderr
+  texts and Ctrl-C is death by SIGINT that also reaches the core; 5 yes; 6 **`CAP_NET_RAW` alone**, the stop
+  condition did not fire, AC16's literals stand; 7 yes, byte for byte. New: a `pcap_inject` frame on `lo` is a
+  martian and never reaches a local socket; local destinations go through a raw IP socket with `IP_HDRINCL`. The
+  rig ran under `podman --systemd=always --privileged` (the revert steps above named `nerdctl`, which `cis-lab`
+  lacks). Folded into spec §5.7 and the rows below marked "(S7)".
 
 ### S8: inject on lo0 (macOS)
 
@@ -623,8 +645,13 @@ capability's reason.
     - `pub struct PathMeta { pub uid: u32, pub mode: u32, pub is_symlink: bool }`
     - `pub fn root_owned_chain(chain: &[PathMeta]) -> bool`: every element uid 0, no group or other write bits, and
       no symlink.
-    - `pub fn prompt_possible(display: Option<&str>, wayland: Option<&str>, stdin_tty: bool) -> bool`
-    - `fn gather_linux(cfg, session_connected) -> LinuxInputs` (I/O; runs `<helper> probe` for the file-caps row).
+    - `pub fn prompt_possible(display: Option<&str>, wayland: Option<&str>, tty_opens: bool) -> bool` (S7: the third
+      input is "a controlling terminal opens", i.e. `open("/dev/tty")` succeeded, **not** `isatty(stdin)`; pkexec's
+      textual agent uses `/dev/tty` and prompts fine with all three stdio fds redirected).
+    - `fn controlling_tty_opens() -> bool` (I/O): `OpenOptions::new().read(true).write(true).open("/dev/tty")`
+      succeeds; false under `setsid` or with no terminal.
+    - `fn gather_linux(cfg, session_connected) -> LinuxInputs` (I/O; runs `<helper> probe` for the file-caps row;
+      `prompt_possible` is fed `controlling_tty_opens()`).
 - **Test (first, failing):**
   - `macos::tests`:
     - `bundle_of_exe("/Applications/Aitmproxy.app/Contents/Resources/core/aitm") == Some("/Applications/Aitmproxy.app")`
@@ -641,14 +668,15 @@ capability's reason.
     - mode `0o775` is `false`
     - `prompt_possible(None, None, false) == false`
     - `prompt_possible(Some(":0"), None, false) == true`
-    - `prompt_possible(None, None, true) == true`
+    - `prompt_possible(None, Some("wayland-0"), false) == true`
+    - `prompt_possible(None, None, true) == true` (S7: a controlling terminal with stdin on `/dev/null` is a prompt)
 - **Done when:** the tests pass and the unit gate passes.
 
 ### Task P1b.6: `PrivilegeState`, config, re-probe and state-change logging
 
 - **Satisfies:** AC7 (unit half: no restart), AC24 (one `info` per change), spec §2.1, §2.4 config
 - **Depends on:** P1b.5
-- **Files:** `crates/aitm-proto-l4/src/privilege/state.rs` (create), `crates/aitm-proto-l4/src/privilege/mod.rs`, `crates/aitm-proto-l4/src/config.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing.workspace = true`)
+- **Files:** `crates/aitm-proto-l4/src/privilege/state.rs` (create), `crates/aitm-proto-l4/src/privilege/mod.rs`, `crates/aitm-proto-l4/src/config.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing.workspace = true`), `crates/aitm-proto-l4/src/privilege/linux.rs` and `macos.rs` (panel, 2026-11-01: the two `allow` removals only, lint allowances the state's consumers made dead)
 - **Change:**
   - Config: `L4Config` gains `pub privilege: L4PrivilegeConfig { pub helper_path: Option<PathBuf>, pub
     macos_app_path: PathBuf, pub request: RequestMode }`. The defaults are `None`,
@@ -701,9 +729,13 @@ capability's reason.
        not allowed yet (Allow packet capture in the Aitmproxy app)`.
     2. After the flip and 1.1 s on the injected clock, it reaches the inner command; the mock backend records an
        open.
-    3. For `l4.inject`, `l4.send_recv`, `l4.intercept.forward` and `l4.intercept.drop`,
-       `cmd.confirm_prompt(&Params::default()).is_some()` is `true` both before and after the flip. This is the
-       expression `aitm-mcp`'s `schema.rs` uses for `confirmable`. It fails today: `L4Gated` does not forward
+    3. (Reworded by the panel, 2026-11-01.) For `l4.inject`, `l4.send_recv`, `l4.intercept.forward` and
+       `l4.intercept.drop`, `cmd.confirm_prompt(params)` and `cmd.sensitivity()` answer identically before and after
+       the flip for every `params` tried: `Params::default()` (which gives `None` for all four, with or without
+       privilege, since inject/send_recv need `spec`/`dst`/`interface` and the verdict verbs a parked id) and in-scope
+       params; for `l4.inject` and `l4.send_recv` with in-scope params the answer is `Some` while still gated.
+       `confirm_prompt(&Params::default()).is_some()` is the expression `aitm-mcp`'s `schema.rs` uses for
+       `confirmable`, so `confirmable` never changes with privilege. It failed before P1b.7: `L4Gated` did not forward
        `confirm_prompt`.
   - `status_reason_equals_gated_text`: the `l4.capture.status` `reason` equals the start error's text after
     `L4 unavailable: `. This is L4PAR-AC3 kept.
@@ -714,7 +746,7 @@ capability's reason.
 - **Satisfies:** spec §2.1 (every production `PcapBackend::new()` caller takes `state.backend()`), AC8 (Linux via
   helper)
 - **Depends on:** P1b.7
-- **Files:** `crates/aitm-proto-l4/src/backend/routed.rs` (create), `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/commands/mod.rs` (`wire_commands` takes a backend), `crates/aitm-proto-l4/src/privilege/state.rs`, `crates/aitm-proto-l4/src/module.rs`
+- **Files:** `crates/aitm-proto-l4/src/backend/routed.rs` (create), `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/commands/mod.rs` (`wire_commands` takes a backend), `crates/aitm-proto-l4/src/privilege/state.rs`, `crates/aitm-proto-l4/src/module.rs`, `crates/aitm-proto-l4/src/commands/capture.rs` (test `wire_commands_registered` only: the fourth argument; added 2026-11-01 by the p1b orchestrator on the Coder's Rule 10 report, since the test call is `wire_commands`' second caller and P1b.9 touches the file only after P1b.8), `crates/aitm-proto-l4/tests/hard_gates.rs` (test `exactly_one_production_wire_write` only: the expected sites become `backend/routed.rs` ×1 and `wire.rs` ×1, each pinned to exactly one, with the doc sentence that the router site is `RoutedBackend::inject`'s backend-layer delegation, still reached only through `send_on_wire`; added 2026-11-01 by the p1b orchestrator on the Coder's second Rule 10 report; flagged for the security reviewer)
 - **Change:**
   - `pub struct RoutedBackend { state: Weak<…> or Arc<PrivilegeState> }` implements `CaptureInjectBackend`. Each
     `open_capture` / `inject` asks the state for its current backend: the in-process `PcapBackend` when
@@ -735,9 +767,11 @@ capability's reason.
 
 - **Satisfies:** AC4 (unit), parity contract unchanged
 - **Depends on:** P1b.8
-- **Files:** `crates/aitm-proto-l4/src/commands/capture.rs`, `crates/aitm-proto-l4/src/commands/intercept.rs`, `crates/aitm-proto-l4/src/module.rs`
+- **Files:** `crates/aitm-proto-l4/src/commands/capture.rs`, `crates/aitm-proto-l4/src/commands/intercept.rs`, `crates/aitm-proto-l4/src/module.rs`, `crates/aitm-proto-l4/src/commands/mod.rs` (panel, 2026-11-01: the `PrivilegeReportSource` alias, `with_privilege`, `privilege_field`, and the fifth `wire_commands` argument), `crates/aitm-proto-l4/src/backend/routed.rs` (panel, 2026-11-01: the test call to `wire_commands` only)
 - **Change:**
-  - `pub type PrivilegeSource = Arc<dyn Fn() -> Option<PrivilegeReport> + Send + Sync>;`
+  - `pub(crate) type PrivilegeReportSource = Arc<dyn Fn() -> Option<PrivilegeReport> + Send + Sync>;` (panel,
+    2026-11-01: named `PrivilegeReportSource`, not `PrivilegeSource`, because `PrivilegeSource` is `module.rs`'s gate
+    enum from P1b.7's recorded deviation).
   - The `l4.capture.status` and `l4.intercept.status` builders take it. When it returns `Some`, the reply gains
     `"privilege": report.to_value()`. The keys `available`, `code`, `reason` and `captures` / `sessions` are
     unchanged.
@@ -752,7 +786,7 @@ capability's reason.
 
 - **Satisfies:** AC1, AC2 (unit halves), AC5 (command half), spec §2.2, §2.3
 - **Depends on:** P1b.9
-- **Files:** `crates/aitm-proto-l4/src/commands/privilege.rs` (create), `crates/aitm-proto-l4/src/commands/mod.rs`
+- **Files:** `crates/aitm-proto-l4/src/commands/privilege.rs` (create), `crates/aitm-proto-l4/src/commands/mod.rs`, `crates/aitm-proto-l4/src/privilege/state.rs` (panel, 2026-11-01: `request`, `RequestOutcome`, `Outcome`, as the Change list below demands)
 - **Change:**
   - `pub struct PrivilegeRead { state: Arc<PrivilegeState> }`: name `l4.privilege`, `Sensitivity::Read`, no params,
     returns `report().to_value()`.
@@ -816,11 +850,17 @@ capability's reason.
 ### Task P1b.12: Linux helper session, core end (listener, peer checks, handshake)
 
 - **Satisfies:** AC16 (core half), AC18 (core-side protocol errors), spec §5.1 step 5, §5.2
-- **Depends on:** P1b.10; spike **S7** written up (the pid answer for the peer check)
-- **Files:** `crates/aitm-proto-l4/src/helper/client.rs` (create), `crates/aitm-proto-l4/src/helper/mod.rs`, `crates/aitm-proto-l4/Cargo.toml` (Linux-target `nix` with `socket,user`)
+- **Depends on:** P1b.10; spike **S7** written up (the pid answer for the peer check). (S7) Answered: pkexec execs
+  the helper in place, so `expected_pid` **is the pkexec child's pid** as returned by the spawner; the helper connects
+  about 0.4 s after the password, well inside the 10 s AC16 budget.
+- **Files:** `crates/aitm-proto-l4/src/helper/client.rs` (create), `crates/aitm-proto-l4/src/helper/mod.rs`, `crates/aitm-proto-l4/Cargo.toml` (Linux-target `nix` with `socket,user`), `Cargo.lock` (panel, 2026-11-01: the one derived edge for that `nix` change; p2 owns the lock for the new crate)
 - **Change:**
   - `pub fn socket_dir(xdg_runtime: Option<&Path>, uid: u32) -> PathBuf`: `$XDG_RUNTIME_DIR/aitm`, else
-    `/tmp/aitm-<uid>`. It creates the directory with mode 0700 and verifies owner and mode.
+    `/tmp/aitm-<uid>`. It creates the directory with mode 0700 and verifies owner and mode. (S7) The full socket
+    path appears on the helper's argv and therefore in the journal (`pkexec[…]: … [COMMAND=… --connect <path>]`),
+    readable by any journal reader: the name is `l4-helper-<core pid>.sock` and **never** carries a token, a
+    random secret or anything else that must stay private. The core resolves it to an absolute path before spawning
+    (the helper's `cwd` is `/root` and `XDG_RUNTIME_DIR` is not in its environment).
   - `pub struct HelperListener` with
     - `bind(dir: &Path) -> io::Result<Self>`, which creates `l4-helper-<core pid>.sock`, and
     - `accept_checked(&self, expected_pid: u32, timeout: Duration) -> Result<HelperSession, SessionError>`, which
@@ -843,7 +883,7 @@ capability's reason.
 
 - **Satisfies:** AC8 (Linux via helper), spec §5.2 ("`HelperBackend` implements `CaptureInjectBackend`")
 - **Depends on:** P1b.12
-- **Files:** `crates/aitm-proto-l4/src/backend/helper.rs` (create), `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/guard.rs` (`scope_generation`)
+- **Files:** `crates/aitm-proto-l4/src/backend/helper.rs` (create), `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/guard.rs` (`scope_generation`), `crates/aitm-proto-l4/tests/hard_gates.rs` (test `exactly_one_production_wire_write` only: `backend/helper.rs` ×1 joins `backend/routed.rs` ×1 and `wire.rs` ×1, each pinned to exactly one; added 2026-11-01 by the p1b orchestrator on the Coder's Rule 10 report, same disposition as P1b.8; flagged for the security reviewer)
 - **Change:**
   - `pub struct HelperBackend { session: Arc<HelperSession>, guard: Arc<L4Guard>, sent_gen: AtomicU64 }` implements
     `CaptureInjectBackend`.
@@ -866,37 +906,155 @@ capability's reason.
 ### Task P1b.14: Linux request: pkexec, the file-caps path, progress, one-shot refusal
 
 - **Satisfies:** AC16, AC17, AC20, AC22, AC23 (core halves), spec §2.3, §2.4 (one-shot), §5.1, §5.5
-- **Depends on:** P1b.13; spike **S7** (exit codes)
-- **Files:** `crates/aitm-proto-l4/src/privilege/linux.rs`, `crates/aitm-proto-l4/src/privilege/state.rs`
+- **Depends on:** P1b.13; spike **S7** (exit codes). (S7) Answered; the mapping and the tests below are the
+  corrected ones (spec §5.5 table). The original "126 dismissed, 127 failed" rule is wrong for the textual agent.
+- **Files:** `crates/aitm-proto-l4/src/privilege/linux.rs`, `crates/aitm-proto-l4/src/privilege/state.rs`, `crates/aitm/src/lib.rs` (panel, 2026-11-01: `shutdown_signal` consults the prompt hold; the fix task), `crates/aitm-proto-l4/src/privilege/derive.rs` (panel, 2026-11-01: the `last_session_error` row; the fix task), `crates/aitm/src/tui.rs` (panel 2, 2026-11-01: the `aitm tui` shutdown arm consults the hold, one line, plus threading the hold into `tui::run`; granted to p1b from P6.3)
 - **Change:**
   - `pub trait Spawner: Send + Sync { fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>>; }` and
-    `pub trait Child: Send { fn id(&self) -> u32; fn try_wait(&mut self) -> io::Result<Option<i32>>; fn kill(&mut
-    self); }`.
-  - `pub fn request_linux(cfg, inputs: &LinuxInputs, spawner: &dyn Spawner) -> (Outcome, String)`:
+    `pub trait Child: Send { fn id(&self) -> u32; fn try_wait(&mut self) -> io::Result<Option<ChildExit>>; fn
+    stderr_tail(&mut self) -> String; fn kill(&mut self); }` with `pub enum ChildExit { Exited(i32), Signaled(i32) }`
+    (S7: the watcher must tell "exit 127" from "killed by SIGINT"; the real implementation reads
+    `ExitStatus::code()` and `ExitStatusExt::signal()`). The real spawner gives the child **a pipe for stderr** and
+    leaves stdin and stdout inherited (S7: the textual prompt goes to the controlling terminal, not to stdio, so the
+    pipe costs nothing and lets the core classify the failure text); a drain thread copies the pipe into a bounded
+    tail buffer (last 4 KiB, **Architect's call**) for as long as the child lives, because the helper inherits that
+    stderr and must never block on a full pipe. `stderr_tail` returns the buffer.
+  - `pub struct HoldCount` (`Clone`; clones share one counter) with `pub fn hold(&self) -> HoldToken`, `pub fn
+    is_held(&self) -> bool` and `pub fn count(&self) -> usize`, and `pub struct HoldToken` whose `Drop` lowers the
+    count, both in `privilege/linux.rs` (Panel 3, 2026-11-01: replaces the `SignalGuard` trait and its `Box<dyn Any +
+    Send>` token, deleted in fix task C; the only operation is `hold`, so nothing can install an ignore through it)
+    (S7; corrected by the panel, 2026-11-01, replacing the `sigaction` design and the leaf-crate follow-up). **The Ctrl-C hold lives in the `aitm`
+    binary.** `aitm` already owns SIGINT through tokio's `ctrl_c` (`crates/aitm/src/lib.rs` `shutdown_signal`), so
+    the signal never kills the process; the shutdown future resolving is what stops the core. The `PrivilegeState`
+    owns a `HoldCount` that `hold()` raises (a `HoldToken`) while a pkexec child is alive and the dropped token lowers
+    when the child ends or the helper connects; `shutdown_signal` is given that count and, on Ctrl-C while it is non-zero, logs
+    `Ctrl-C cancelled the packet-capture prompt; the core keeps serving` and keeps waiting for the next signal. The
+    child has the default disposition after exec, dies of the SIGINT, and `classify_exit_full` records `dismissed`. Never
+    `SIG_IGN` (inherited across `execve`, it makes the prompt un-cancellable). No `sigaction`, no `unsafe`, no new
+    crate; the shape of the count is the builder's. **(Architect's call:** during that window Ctrl-C cancels the
+    prompt and does not shut the core down; see Questions, Q6 stays flagged for Matt.)
+    (Panel 2, 2026-11-01) Both serving shutdown futures consult the hold: `shutdown_signal` in `lib.rs` (`aitm`,
+    `aitm web`) and the `aitm tui` select arm in `tui.rs`, which receives the hold through `tui::run`. On a held
+    Ctrl-C each arm calls `pub fn PrivilegeState::cancel_prompt(&self)`, which kills the live launcher child (SIGINT,
+    so `classify_exit_full` records `dismissed`), so a Ctrl-C delivered to the core alone (no shared foreground process
+    group) still ends the prompt and never waits out the 300 s timeout; with no child alive it is a no-op. The
+    watcher thread carries an unwind guard (a drop guard) that moves a still-`pending` request to `failed` and
+    releases the hold if the thread panics, so a panic never leaves the request `pending` or the hold raised
+    (**Architect's call** on `failed` as the terminal state).
+    (Panel 3, 2026-11-01) The guard's `failed` message is exactly `The packet-capture request ended unexpectedly`
+    (`msg::ENDED_UNEXPECTEDLY`), and on a panic the guard also kills the launcher child best-effort.
+    `cancel_prompt()` signals only the request's own launcher child, never a serving helper and never a helper
+    started directly on the file-caps row; `Child::interrupt()` sends SIGINT on Linux and is a no-op off Linux (no
+    launcher exists there). The prompt-child slot `cancel_prompt()` reads is cleared only by the watch that set it
+    (`Arc::ptr_eq` on the child), and the `watching` flag is owned by a watch generation, so a watch that outlives a
+    newer request can neither unregister the newer child nor clear the newer watch's flag.
+  - `pub(crate) fn classify_exit_full(exit: ChildExit, stderr: &str) -> (ExitClass, RequestState, String)` (pure;
+    Panel 3, 2026-11-01: was `classify_exit(exit, stderr) -> (Progress, String)`; `ExitClass { Dismissed, AuthFailed,
+    NoAgent, TimedOut, Other }` names the §5.5 row the watcher branches on, never the message text), the spec §5.5
+    table:
+    - `Exited(126)` → `Dismissed`, `"Approval was cancelled"` (graphical agent's Cancel);
+    - `Exited(127)` with stderr containing `Got unexpected EOF while reading from controlling terminal` →
+      `Dismissed`, `"Approval was cancelled"` (Ctrl-D at the textual prompt);
+    - `Signaled(SIGINT)` → `Dismissed`, `"Approval was cancelled"` (Ctrl-C);
+    - `Exited(127)` with `Not authorized` → `Failed`, `"Administrator authentication failed (wrong password or not
+      authorized)"`;
+    - `Exited(127)` with `Error creating textual authentication agent` → `Failed`, `"No password prompt could be
+      shown here (no desktop session or terminal)"` (the request should have been `cannot_prompt`; this is the
+      safety net, and the watcher logs one `warn` that the predicate and pkexec disagreed);
+    - any other `Exited(n)` or `Signaled(_)` → `Failed`, `"The packet-capture helper did not start (pkexec exit
+      <n>)"` (for a signal, `signal <n>`).
+  - (Panel, 2026-11-01; the fix task.) `LinuxInputs` gains `last_session_error: Option<SessionError>`, set by the
+    watcher when the handshake fails after the child connected and cleared when a session connects. `derive_linux`
+    gains a row after the connected-session row (`running`) and before the file-caps row: no session connected and a
+    last error gives `helper.status` `version_mismatch` for `SessionError::VersionMismatch(peer)` with `detail` naming
+    both proto numbers (ours and the peer's), and `unknown` for any other `SessionError` with `detail` carrying its
+    text. The request's progress is `failed`; its message is the builder's wording (outside the P1b.3 tripwire) and
+    must name neither a command nor the socket path. `failed` is never a `Helper.status` value (spec §5.2).
+    (Panel 2, 2026-11-01) The carrier type is `pub enum SessionFailure { VersionMismatch(u32), Protocol(String) }`
+    in `privilege/derive.rs` (the name `SessionError` is taken by `helper::client`); the watcher maps
+    `SessionError::VersionMismatch(theirs)` to `VersionMismatch(theirs)` and every other `SessionError` to
+    `Protocol(<its text, bounded by TEXT_BOUND>)`. `Protocol(_)` reads `helper.status: unknown` with the text in
+    `detail`; only `VersionMismatch(_)` reads `version_mismatch`.
+  - `pub fn request_linux(cfg, inputs: &LinuxInputs, spawner: &dyn Spawner, hold: &HoldCount, socket: &Path,
+    display_set: bool) -> LinuxRequest` (panel, 2026-11-01: the signature as landed; Panel 3, 2026-11-01: `hold:
+    &HoldCount` replaces `signal: &dyn SignalGuard`; the checks run in this order):
     - `lifetime == OneShot` gives `CannotPrompt`, `"a one-shot command exits before the helper could serve it; set
       l4.privilege.request: at_start or use Allow in the TUI or web UI"`, and nothing is spawned.
+    - Not packaged (panel, 2026-11-01: evaluated before the prompt predicate): the helper is not at the policy path,
+      or its chain is not root-owned, or the policy file is missing, or `pkexec` is absent gives `CannotPrompt` with
+      the `package` install label.
     - `!prompt_possible` gives `CannotPrompt`, `"No password prompt can be shown here (no desktop session or
       terminal)"`. That message names no doc until P5.4 is unblocked.
-    - Not at the policy path, or not root-owned: `CannotPrompt` with the `package` label.
-    - Otherwise spawn exactly `["pkexec", LINUX_HELPER_PATH, "serve", "--connect", <socket>]` and return `Pending`.
+    - Otherwise spawn exactly `["/usr/bin/pkexec", LINUX_HELPER_PATH, "serve", "--connect", <socket>]` (panel,
+      2026-11-01: the launcher by absolute path, `PKEXEC_PATH`, never a `PATH` lookup) with the child's environment
+      cleared and only `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` passed through (no `SHELL`: pkexec refuses a value
+      absent from `/etc/shells`; no `LANG`/`LC_*`: the stderr literals `classify_exit_full` matches stay the English ones
+      S7 measured), and return `Pending`.
       The message is `"Waiting for administrator approval in the polkit dialog"` when `DISPLAY` or
       `WAYLAND_DISPLAY` is set, else `"Enter an administrator password in the terminal running aitm"`. The messages
       are the Architect's call.
-  - A watcher thread moves the progress:
-    - the session passes `accept_checked` (pid == child id): `Approved`;
-    - exit 126: `Dismissed`, `"Approval was cancelled"`;
-    - exit 127 or any other: `Failed`, `"The packet-capture helper did not start (pkexec exit <n>)"`;
+  - A watcher thread moves the progress (S7 mapping):
+    - the session passes `accept_checked` (pid == child id): `Approved`; the stderr drain keeps running for the
+      helper's lifetime, the prompt hold is released;
+    - the child ends before connecting: `classify_exit_full(exit, stderr_tail)` as above, then the hold is released;
+    - (panel, 2026-11-01) the handshake fails after connecting: `last_session_error` is set, the progress is
+      `failed`, the hold is released;
     - 300 s on the injected clock: kill and `Failed`, `"No approval within 5 minutes"`.
   - File-caps row: `state.backend()` spawns `[<helper path>, "serve", "--connect", <socket>]` directly, without
-    pkexec, on first use.
+    pkexec, on first use. (Panel, 2026-11-01) It requires `root_owned_chain` on the helper's path and is serving-only:
+    a one-shot on that row refuses (the helper is not wired) and spawns nothing. When any helper session ends, the
+    cache is marked dirty so the next `report()` re-probes and capture returns to `needs_approval` (spec §2.1).
+    (Panel 2, 2026-11-01) `probe` runs only for a candidate with `root_owned_chain`, and its result is cached per
+    path identity (device, inode, size, mtime, ctime) for the process lifetime (`linux::ProbeCache`).
   - `pkexec` is never given any path but `LINUX_HELPER_PATH`.
 - **Test (first, failing):** `linux::tests` with a fake spawner and clock:
   - `one_shot_refuses_and_spawns_nothing`
   - `no_prompt_is_cannot_prompt_and_spawns_nothing`
   - `pkexec_argv_is_policy_path_only`: with `helper_path: /home/u/aitm-l4-helper` configured, no spawned argv
     contains `/home/u`. The argv is the literal above.
-  - `exit_126_is_dismissed`
-  - `exit_127_is_failed`
+  - `exit_126_is_dismissed` (the graphical case; stderr `Error executing command as another user: Request
+    dismissed`)
+  - `exit_127_not_authorized_is_failed` (S7): stderr `polkit-agent-helper-1: pam_authenticate failed: Authentication
+    failure\n==== AUTHENTICATION FAILED ====\nError executing command as another user: Not authorized` gives
+    `Failed` and a message containing `wrong password`
+  - `exit_127_eof_is_dismissed` (S7): stderr containing `Got unexpected EOF while reading from controlling terminal`
+    followed by the same FAILED lines gives `Dismissed`, `"Approval was cancelled"`
+  - `no_agent_text_is_failed` (S7): exit 127 with `Error creating textual authentication agent: Error opening
+    current controlling terminal for the process (`/dev/tty'): No such device or address` gives `Failed` and a
+    message containing `No password prompt`
+  - `sigint_is_dismissed` (S7): `Signaled(2)` gives `Dismissed`, `"Approval was cancelled"`
+  - `other_exit_is_failed`: `Exited(2)` gives `"The packet-capture helper did not start (pkexec exit 2)"`
+  - `sigint_handler_installed_not_ignored` (S7; panel 2026-11-01: the name is kept, it now pins the hold count): with
+    a `HoldCount` (Panel 3, 2026-11-01: was "a counting `SignalGuard`"), `count()` is 1 from spawn until the child ends or connects, and 0 after; the fake
+    refuses (panics) on any `SIG_IGN`-style call. Nothing is spawned without a hold.
+  - `held_ctrl_c_keeps_serving` (panel, 2026-11-01; in `crates/aitm/src/lib.rs`, pure): the shutdown decision for a
+    Ctrl-C with the hold count at 1 is "keep serving" and its log line is exactly `Ctrl-C cancelled the
+    packet-capture prompt; the core keeps serving`; with the count at 0 it is "shut down". (Panel 2, 2026-11-01:
+    delivered by the Tester as `lib.rs::tests::held_ctrl_c_keeps_serving`; this is the Ctrl-C literal test.)
+  - `held_ctrl_c_alone_cancels_the_prompt` (panel 2, 2026-11-01; `state::tests`, fake spawner): with a child alive
+    and the hold at 1, `cancel_prompt()` kills the fake child, the progress reads `dismissed` with `"Approval was
+    cancelled"`, and the hold is 0; with no child it changes nothing. (Name the Architect's; the fix-task coder
+    reports the delivered name.)
+  - `watcher_panic_releases_hold_and_ends_pending` (panel 2, 2026-11-01; `state::tests`): a fake child whose
+    `try_wait` panics leaves the request `failed`, not `pending`, and the hold at 0. (Panel 3, 2026-11-01) The message is
+    exactly `The packet-capture request ended unexpectedly`; the prompt-child slot and `watching` are clear.
+  - `tui_shutdown_arm_consults_the_prompt_hold` (Panel 3, 2026-11-01; `crates/aitm/src/main.rs`): a source tripwire,
+    the `aitm tui` select arm in `crates/aitm/src/tui.rs` goes through `interrupt_unless_held` with the hold.
+  - `the_prompt_hold_handed_to_the_shutdown_arms_is_the_states` (Panel 3, 2026-11-01; `crates/aitm/src/main.rs`): the
+    `HoldCount` the binary hands both shutdown arms is a clone of the `PrivilegeState`'s own (`sigint_hold()`), so a
+    hold taken by a request is seen by the arms: `count()` reads 1 on both after one `hold()` on the state's.
+  - `linux_session_failure_is_version_mismatch_until_a_session_connects` (panel, 2026-11-01; `derive::tests`;
+    panel 2: the delivered name, was `version_mismatch_after_handshake_failure`): no session, `last_session_error =
+    Some(SessionFailure::VersionMismatch(2))` gives `helper.status == "version_mismatch"` and a `detail` containing
+    both `1` and `2`; a connected session gives `"running"` whatever the last error.
+  - `protocol_failure_is_unknown_with_detail` (panel 2, 2026-11-01; `derive::tests`): no session,
+    `last_session_error = Some(SessionFailure::Protocol(..))` gives `helper.status == "unknown"` with the error text
+    in `detail`.
+  - `pkexec_env_is_cleared_but_for_display` (panel, 2026-11-01): the spawned child's environment is exactly the
+    subset of `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` that is set in the core; `SHELL`, `LANG` and `LC_ALL` are
+    absent. Proven live only by the [linux-ci] run (P2.8).
+  - `stderr_pipe_is_drained_after_approval`: a fake child writing 64 KiB to stderr after `Approved` never blocks and
+    `stderr_tail` is at most 4 KiB.
   - `timeout_is_failed_after_300s`
   - `file_caps_helper_spawns_directly`: the argv starts with the candidate path, not `pkexec`.
 - **Done when:** the tests pass and the unit gate passes.
@@ -905,7 +1063,7 @@ capability's reason.
 
 - **Satisfies:** AC1, AC2, AC7, AC24 (wiring), spec §2.4 (`at_start`, warn line, one-shot)
 - **Depends on:** P1b.14
-- **Files:** `crates/aitm/src/wire.rs`, `crates/aitm/src/main.rs`, `crates/aitm-proto-l4/src/language.rs` (constructor callers only)
+- **Files:** `crates/aitm/src/wire.rs`, `crates/aitm/src/main.rs`, `crates/aitm-proto-l4/src/language.rs` (constructor callers only), `crates/aitm-proto-l4/src/lib.rs` (panel, 2026-11-01: two re-exports)
 - **Change:**
   - `Features` gains `l4_privilege_state: Option<Arc<PrivilegeState>>`. When `None`, `assemble_with` builds one
     from `features.l4`. The existing `l4_privilege` test override maps to a fixed prober.
@@ -920,20 +1078,26 @@ capability's reason.
 - **Test (first, failing):** in `wire.rs` tests:
   - `privilege_verbs_registered_with_l4_off`: with `l4.enabled: false`, the registry has `l4.privilege` and
     `l4.privilege.request` and no other `l4.*` name.
-  - `l4_on_registers_27_l4_names`: 25 parity names + 2.
+  - `l4_on_registers_24_l4_names`: 22 module names + 2 (panel, 2026-11-01: was "25 parity names + 2 = 27"; the
+    parity verbs are not on this branch. The 3 bundled Rhai `l4.*` commands make 27 names in `tools/list` on a core
+    with the catalogue, but they are not registry entries this test counts).
   - In `main.rs` tests, or the new `privilege::state` tests: `should_request_at_start(AtStart, row6) == true`,
     `(Manual, row6) == false`, `(AtStart, available) == false`.
 - **Done when:** the tests pass and the unit gate passes (sandbox). The Terminal full gate is deferred to P1b.16.
 
-### Task P1b.16: the three tool-contract pins
+### Task P1b.16: the two tool-contract pins
+
+(Panel, 2026-11-01: "three" became two. `bus-fixture.json` and `tester_shell.rs` were deleted on `main` by #244; the
+TUI is live-only, and `tui_live_bus.rs` compares `CORE_TOOLS` to the live `tools/list`.)
 
 - **Satisfies:** AC24 (contracts list both verbs)
 - **Depends on:** P1b.15
-- **Files:** `crates/aitm/tests/frontends.rs` (`EXPECTED_TOOLS` `[&str; 62]` → `[&str; 64]`, two names), `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` + `"l4.privilege"`, `"l4.privilege.request"` with a comment naming this spec), `crates/aitm-tui/fixtures/bus-fixture.json` (two tool entries, schemas from the live `tools/list`), `crates/aitm-tui/tests/tester_shell.rs` (both `65` pins → `67`)
+- **Files:** `crates/aitm/tests/frontends.rs` (`EXPECTED_TOOLS` `[&str; 62]` → `[&str; 64]`, two names), `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` + `"l4.privilege"`, `"l4.privilege.request"` with a comment naming this spec)
 - **Change:** pins only. The counts above are the values at branch cut. If `main` moved, add 2 to whatever they read.
 - **Test (first, failing):** before the edit, `cargo test --offline -p aitm --test frontends` fails on the set
-  difference (quote it). After the edit, it passes. In the Terminal: `cargo test -p aitm --test tui_live_bus` and
-  `cargo test -p aitm-tui --test tester_shell` pass.
+  difference (quote it). After the edit, it passes. In the Terminal: `cargo test -p aitm --test tui_live_bus` passes
+  (the TUI pin fails only there, since it binds a port). (Panel 2, 2026-11-01) The Terminal `cargo test -p aitm
+  --test l4_cua_tui` result (the AC27 branch fixed in e79aeab0) is quoted in the Review log at ready time.
 - **Done when:** the full gate passes in the Terminal.
 
 ### Task P1b.17: live core checks on the rig (e2e)
@@ -965,28 +1129,50 @@ capability's reason.
        (see Questions: the spec's `all` literal does not match the current gate text). `agent.activity` shows the
        agent caller.
     7. Linux only, AC20 and AC23 in the [linux-ci] container: the tarball helper under `$HOME` gives `how.kind ==
-       "package"` and the request gives `cannot_prompt`. With `DISPLAY` and `WAYLAND_DISPLAY` unset and stdin not a
-       tty, the request gives `cannot_prompt`. The one-shot `aitm l4.privilege.request` refuses with the §2.4 text.
-       In all three cases, `pgrep -x pkexec` finds nothing.
+       "package"` and the request gives `cannot_prompt`. With `DISPLAY` and `WAYLAND_DISPLAY` unset and **no
+       controlling terminal** (S7: the core is started under `setsid`, so `open("/dev/tty")` fails; stdin being a
+       pipe alone is not enough, the textual agent would still prompt on the terminal), the request gives
+       `cannot_prompt`. The one-shot `aitm l4.privilege.request` refuses with the §2.4 text. In all three cases,
+       `pgrep -x pkexec` finds nothing.
   - `test_l4_parity_core.py`: drop the literal `R_CAP`. Assert `reason == "packet capture is not allowed yet (" +
     privilege.capabilities.capture.how.label + ")"` and that the start error equals `L4 unavailable: ` + `reason`.
-    The intercept literal becomes `"in-path interception is Linux only"`. The `l4.*` count becomes 27.
+    The intercept literal becomes `"in-path interception is Linux only"`. The `l4.*` count becomes 24 module/binary
+    verbs (panel, 2026-11-01: was 27; 27 only with the 3 bundled Rhai `l4.*` commands on a core with the catalogue).
   - `test_l4_parity_priv.py`: its blocked line becomes `blocked: needs approval: <reason>`.
 - **Test first:** `python3 -m py_compile` all three. Against a rig built from `origin/main`, `test_privilege_core.py`
   exits 1 (no `l4.privilege`).
 - **Live check [mac-any], rig on this branch (Terminal):** `test_privilege_core.py` exits 0 (77 on the AC5 block
   until p7), `test_l4_parity_core.py` exits 0, `test_l4_parity_priv.py` exits 77. **[linux-ci]:** the same three in
-  the Fedora container, output quoted.
-- **Done when:** the checks pass with output quoted and the unit gate passes.
+  the Fedora container, output quoted. (Panel 2, 2026-11-01) The Terminal `l4_cua_tui` run result is quoted in the
+  Review log at ready time alongside these.
+  (Panel 3, 2026-11-01) The first gated invoke after the privilege cache's 1 s TTL (`REPROBE_MS`) can pay the probe cost
+  synchronously: on macOS that is `codesign --verify --strict` on the handoff bundle, bounded at 5 s (`TOOL_WAIT`).
+  (Superseded at the #263 merge 0c34e973: the test is #263's verbatim, 8 s `DEADLINE`, local refusal of `s` while unavailable.) The `l4_cua_tui` wait bound was 20 s for that reason, not because the drive itself is slow; a run that trips it
+  is a real failure. A background probe thread is the follow-up recorded after P1b.18.
+  (Panel 3, 2026-11-01) The AC3 scan in `test_privilege_core.py` exempts exactly the two pinned §5.5 forms of the generic
+  row, `The packet-capture helper did not start (pkexec exit <n>)` and `The packet-capture helper did not start
+  (killed by signal <n>)` with `<n>` an integer, and nothing wider (the row's message names `pkexec` because the
+  spec pins it verbatim; progress messages are otherwise outside the P1b.3 tripwire).
+- (Panel, 2026-11-01) The `[linux-ci]` half (AC20, AC23 and the Linux cells of `test_privilege_core.py`) is
+  re-scoped to P2.8 [linux-ci], the helper unit, which builds the container rig this needs (`cis-lab` has none yet:
+  podman, `--systemd=always --privileged`), pending Matt's acceptance (Review log row "P1b.17 [linux-ci]"). Until
+  accepted, the p1b PR body states that the Linux request path is unit-tested only.
+- **Done when:** the checks pass with output quoted and the unit gate passes (the [linux-ci] half per the line above).
 
 ### Task P1b.18: tool docs
 
-- **Satisfies:** L4PAR-AC32 kept true (27 names), G4 docs
+- **Satisfies:** L4PAR-AC32 kept true (24 verbs + 3 bundled scripts = 27 names; panel, 2026-11-01), G4 docs
 - **Depends on:** P1b.17
 - **Files:** `docs/research/mcp-tool-catalog.txt`, `aitmproxy-plugin/docs/tool-reference.md` (via `aitmproxy-plugin/scripts/gen-tool-reference.mjs` if it is the generator), `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md` (one line: an agent can read `l4.privilege`; only an operator can request it)
-- **Test:** the unit (e) AC32 diff script reports all 27 `l4.*` names in both files.
+- **Test:** the unit (e) AC32 diff script reports the 24 module/binary `l4.*` verbs and the 3 bundled Rhai `l4.*`
+  commands (27 names; panel, 2026-11-01) in both files.
 - **Done when:** the diff check passes. **Unit close:** a Tester run on the whole unit and the panel. AC5's live half is
   re-run after p7 merges (orchestrator re-dispatches P1b.17's AC5 block).
+
+**Follow-ups Panel 3, 2026-11-01, p1b, not blocking the unit):** a background probe thread, so no gated invoke pays the
+privilege probe synchronously after the 1 s TTL (today the first one after the TTL can wait up to the 5 s
+`codesign` bound on macOS; P1b.17 note). Orchestrator to schedule after p1b merges; a spec amendment to §2.1's
+cache sentence goes with it.
 
 ---
 
@@ -1109,24 +1295,40 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
 ### Task P2.6: `serve` start-up: invoking user, privilege drop, path and peer checks, death signal
 
 - **Satisfies:** AC16, AC18 (path refusals, `PKEXEC_UID`), AC19, spec §5.1, T3
-- **Depends on:** P2.1; spike **S7** written up (the drop order that keeps `pcap` working)
+- **Depends on:** P2.1; spike **S7** written up (the drop order that keeps `pcap` working). (S7) Answered: the spec
+  §5.1 order works as written and is necessary; details below.
 - **Files:** `crates/aitm-l4-helper/src/serve.rs` (create), `crates/aitm-l4-helper/Cargo.toml` (Linux-target `caps`, and `nix` with `user,process,prctl,socket,fs`)
 - **Change:**
   - `pub fn invoking_user(real_uid: u32, pkexec_uid: Option<&str>) -> Result<u32, String>` (pure).
     `PKEXEC_UID` is trusted only when `real_uid == 0`. Root without it is an `Err`.
   - `pub fn check_socket_path(sock: &PathMeta, dir: &PathMeta, invoking: u32) -> Result<(), String>` (pure): the
     socket is a socket and not a symlink; the directory is owned by the invoking user, mode 0700, and not a symlink.
-  - `fn drop_to(user: u32) -> Result<(), String>` (Linux) follows spec §5.1 step 3 in S7's working order, then sets
-    `no_new_privs`.
+  - `fn drop_to(user: u32, gid: u32) -> Result<(), String>` (Linux) follows spec §5.1 step 3 in S7's proven order,
+    then sets `no_new_privs`. (S7) In `caps`/`nix` terms, in this order: `caps::drop(None, CapSet::Bounding, cap)`
+    for every capability except `NET_RAW` (while `CAP_SETPCAP` is still held; all 40 succeed on 6.8);
+    `caps::clear(None, CapSet::Ambient)`; `prctl(PR_SET_KEEPCAPS, 1)` (**mandatory**: without it the `caps::set`
+    below fails `EPERM` and the helper has no capability left); `nix::unistd::setgroups(&[gid])` (**not**
+    `initgroups`, which keeps the admin group `sudo`/`wheel`); `setresgid(gid, gid, gid)`; `setresuid(uid, uid,
+    uid)`; `caps::set(None, CapSet::Permitted, {NET_RAW})` and `caps::set(None, CapSet::Effective, {NET_RAW})`;
+    `caps::clear(None, CapSet::Inheritable)`; `prctl(PR_SET_KEEPCAPS, 0)`; `prctl(PR_SET_NO_NEW_PRIVS, 1)`. `gid` is
+    the invoking user's primary gid from `getpwuid`. `CAP_NET_RAW` alone suffices for libpcap on `lo`; nothing asks
+    for `CAP_NET_ADMIN`.
+  - (S7) `PKEXEC_UID` is a decimal string; `invoking_user` parses it with `str::parse::<u32>` and any other form is
+    an `Err`.
   - `pub fn startup(args, env_pkexec_uid) -> Result<UnixStream, String>` follows steps 1–6 exactly:
     1. record `getppid`;
     2. determine the user;
     3. drop;
     4. check the path;
     5. connect, and check the peer uid equals the invoking user;
-    6. set `PR_SET_PDEATHSIG(SIGKILL)` and re-check `getppid`.
+    6. set `PR_SET_PDEATHSIG(SIGKILL)` and re-check `getppid`. (S7) **Strictly after step 3**: the kernel clears the
+       parent-death signal during the credential change (the task becomes non-dumpable), so a signal armed before
+       the drop reads back as 0 and the helper would outlive the core. A debug assertion reads
+       `PR_GET_PDEATHSIG` back and expects `SIGKILL`.
 
-    A failure exits non-zero before any other I/O. On non-Linux, `serve` exits non-zero with "serve is Linux only in
+    (S7) The helper starts with `cwd` `/root`, no `XDG_RUNTIME_DIR`, `TERM` or `DISPLAY` in its environment, and
+    every fd above 2 closed; it uses nothing but argv and `PKEXEC_UID`. A failure exits non-zero before any other
+    I/O. On non-Linux, `serve` exits non-zero with "serve is Linux only in
     Phase 1".
 - **Test (first, failing):** `serve::tests`:
   - `invoking_user(1000, Some("0")) == Ok(1000)`
@@ -1134,6 +1336,7 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
   - `invoking_user(0, None)` is an `Err`
   - `check_socket_path` with the directory owned by uid 1001 for invoking 1000 is an `Err`; mode 0755 is an `Err`; a
     symlinked socket is an `Err`; an owned 0700 directory is `Ok`
+  - `invoking_user(0, Some("1000x"))` and `invoking_user(0, Some(""))` are `Err` (S7: decimal string only)
 - **Done when:** the tests pass and the Rust gate passes.
 
 ### Task P2.7: `serve` loop: handshake, scope, capture, inject
@@ -1143,14 +1346,23 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
 - **Files:** `crates/aitm-l4-helper/src/serve_loop.rs` (create), `crates/aitm-l4-helper/src/main.rs`
 - **Change:**
   - `pub trait Wire: Send { fn open(&self, iface: &str, filter: Option<&str>, timeout: Duration) -> Result<Box<dyn
-    CaptureSource>, String>; fn inject(&self, iface: &str, bytes: &[u8]) -> Result<(), String>; fn link(&self, iface:
-    &str) -> LinkType; }`. The real implementation is `pcap`.
+    CaptureSource>, String>; fn inject(&self, iface: &str, bytes: &[u8]) -> Result<(), String>; fn inject_local(&self,
+    ipv4_packet: &[u8]) -> Result<(), String>; fn link(&self, iface: &str) -> LinkType; fn local_addrs(&self) ->
+    Vec<IpAddr>; }`. The real implementation is `pcap` for `open`/`inject`, and for `inject_local` (S7) a
+    `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` with `IP_HDRINCL` set, `sendto` the IPv4 packet (Ethernet header
+    stripped) to its own destination address; `local_addrs` lists the host's interface addresses (`nix::ifaddrs`)
+    plus 127/8.
+  - `pub fn inject_path(target: &InjectTarget, local: &[IpAddr]) -> InjectPath` (pure): `Local` when the IPv4
+    destination is in 127/8 or in `local`, else `Interface` (S7: a `pcap_inject` frame on `lo` has no route and is
+    dropped as a martian before any local socket sees it; the raw-IP path goes through `ip_output` with a route and
+    is still seen by the `lo` capture, so W3's `injected: true` holds).
   - `pub fn serve_loop(stream: impl Read + Write, wire: &dyn Wire, version: &str) -> Result<(), ServeExit>`:
     - `Hello` gives `HelloAck { caps: ["CAP_NET_RAW"] }`.
     - `ScopeSet` replaces the `HelperGuard`.
     - `CaptureOpen` gives `capture_filter(iface)?` then `wire.open(iface, filter)`, and streams `Frame`s from a
       reader thread.
-    - `Inject` gives `check_inject(..)` then `wire.inject`, and `InjectResult`.
+    - `Inject` gives `check_inject(..)` first (the guard precedes either path), then by `inject_path`: `Local` gives
+      `wire.inject_local(ipv4 bytes)`, `Interface` gives `wire.inject(iface, frame)`; then `InjectResult`. (S7)
     - EOF, any `ProtoError`, or an `Inject` before any `ScopeSet` ends the loop.
 - **Test (first, failing):** `serve_loop::tests` over an in-memory duplex with a recording fake `Wire`:
   - `inject_out_of_scope_is_refused_before_the_wire`: `ScopeSet 9000-9999`, then `Inject` to 8999, gives an
@@ -1159,6 +1371,17 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
   - `inject_before_scope_exits`
   - `capture_open_outside_scope_is_refused`
   - `filter_is_helper_built`: the filter `wire.open` receives equals `scope_filter` of the helper's guard.
+  - `loopback_inject_uses_raw_ip_not_pcap` (S7): `ScopeSet 9000-9999`, `Inject` of an Ethernet+IPv4+UDP frame to
+    127.0.0.1:9053 calls `wire.inject_local` once with the 45-byte IPv4 packet (Ethernet header stripped) and
+    `wire.inject` 0 times; a frame to an address outside `local_addrs` calls `wire.inject` once and `inject_local` 0
+    times.
+  - `out_of_scope_local_target_never_reaches_either_path`: `Inject` to 127.0.0.1:8999 calls neither.
+  - `loopback_inject_reaches_udp_socket` (S7, Linux, `#[ignore]`; **Architect's call:** it needs `CAP_NET_RAW`, so it
+    runs by name in P2.8 inside the container as the dropped helper's user with the file-caps copy, and the P2.8
+    script asserts it passes): bind a UDP socket on 127.0.0.1:0, send a crafted IPv4+UDP packet to it through the
+    real `inject_local`, and receive the payload `aitm-inject` within 1 s with `net.ipv4.conf.lo.route_localnet` read
+    back as `0` (the test skips with a message if the sysctl is not 0, so the martian path can never come back
+    unnoticed).
 - **Done when:** the tests pass and the Rust gate passes.
 
 ### Task P2.8: Linux live checks (helper)
@@ -1166,14 +1389,20 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
 - **Satisfies:** AC8 (Linux, both modes), AC16, AC17, AC18 (live), AC19
 - **Depends on:** P2.7; p1b merged (the core end). The helper is installed at the policy path by copying from the
   build into the container as root:root 0755, until p5's `.deb` exists. The policy file comes from p5 P5.1 if merged,
-  else is copied from that branch for the check only.
+  else is copied from that branch for the check only. (S7) The rig is the one in "The rigs": `podman` installed
+  in `cis-lab` by the script if absent, containers `--systemd=always --privileged`, Debian `polkitd pkexec dbus`,
+  Fedora `polkit dbus-broker`, the `unix-chkpwd` AppArmor profile unloaded on the host for the Fedora run and reloaded
+  after; `pkaction --verbose` on the action id as the first check. The test rule `49-aitm-test.rules` is installed
+  for AC16 and removed before anything that must prompt.
 - **Files:** `tests/e2e/l4/linux-privilege-rig.sh` (create; builds and starts the [linux-ci] container in `cis-lab`), `tests/e2e/l4/test_privilege_helper_linux.py` (create)
 - **Change:** the script checks, as operator, on `lo`:
   1. AC16: with the test polkit rule, `l4.privilege.request` gives `pending`, then `capture.state == "available"` and
      `via == "helper"` within 10 s. `/proc/<helper pid>/status` shows the four `Uid:` fields equal to the tester uid,
      `CapEff: 0000000000002000`, `CapPrm: 0000000000002000`, `CapBnd: 0000000000002000`,
      `CapAmb: 0000000000000000` and `NoNewPrivs: 1`.
-  2. Walk W (W1–W5) through the helper.
+  2. Walk W (W1–W5) through the helper. (S7) W3–W4 to 127.0.0.1:9053 pass with `sysctl net.ipv4.conf.lo.route_localnet`
+     printed and equal to `0` (the raw-IP path, P2.7); the script also runs `cargo test -p aitm-l4-helper --
+     --ignored loopback_inject_reaches_udp_socket` in the container and quotes it.
   3. AC17: a copy with `cap_net_raw+ep` in a root-owned 0750 directory, named by `helper_path`, gives
      `helper.kind == "linux_cap_helper"`, capture `available` with no pkexec process ever seen (`pgrep -x pkexec`
      polled), and walk W passes again. Setting `helper_path` to `/tmp/x/aitm-l4-helper` never yields a `pkexec`
@@ -1604,14 +1833,20 @@ sign order and waits for its go (Rule 4). The orchestrator reviews the diffs.
 - **Change:** the policy:
   - action `com.mrbrutti.aitmproxy.l4-helper.run`;
   - `org.freedesktop.policykit.exec.path` = `/usr/lib/aitmproxy/aitm-l4-helper`;
-  - `org.freedesktop.policykit.exec.allow_gui` = `true`;
+  - **no** `org.freedesktop.policykit.exec.allow_gui` annotation (S7: was `true`; the helper has no GUI and the
+    dialog is pkexec's agent's, so the annotation only leaked `DISPLAY`/`XAUTHORITY` into the root helper's
+    environment);
   - defaults `allow_any`, `allow_inactive` and `allow_active` all `auth_admin`;
   - the message `Allow aitmproxy to capture and send raw packets (only within the L4 scope you configured)`.
 - **Test (first, failing):** `check-linux-packaging.sh` exits 1 unless all of these hold:
   - the action id and the exec.path are exact;
   - every default is exactly `auth_admin`;
   - `auth_admin_keep` appears nowhere in the file;
+  - `allow_gui` appears nowhere in the file (S7);
   - `xmllint --noout` passes (when present).
+
+  (S7) The deb `recommends` entry `pkexec` in P5.2 stands and is deliberate: on Debian trixie `pkexec` is a separate
+  package from `polkitd`.
 
   It exits 1 before the file exists.
 - **Done when:** the check exits 0.
@@ -1715,12 +1950,19 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 
 - **Satisfies:** AC22
 - **Depends on:** P6.2
-- **Files:** `crates/aitm-tui/src/lib.rs` (terminal suspend and restore around the request), `crates/aitm/src/tui.rs` (passes `core_shares_tty: true` in `aitm tui` mode only)
+- **Files:** `crates/aitm-tui/src/lib.rs` (terminal suspend and restore around the request), `crates/aitm/src/tui.rs` (passes `core_shares_tty: true` in `aitm tui` mode only; panel 2, 2026-11-01: its shutdown arm's hold consult is p1b's, P1b.14, already landed)
 - **Change:**
   - `pub fn should_suspend(platform: &str, core_shares_tty: bool, outcome: &str) -> bool` is true iff `linux`,
     `core_shares_tty` and `pending`.
   - When true, the run loop calls `ratatui::restore()`, prints `Waiting for administrator approval…`, and
-    re-`init`s when the polled `request.state` leaves `pending`.
+    re-`init`s when the polled `request.state` leaves `pending`. (S7) Once raw mode is off, Ctrl-C at the password
+    is a SIGINT to the whole foreground process group, which in `aitm tui` is this process; the `aitm` binary's
+    prompt hold (P1b.14; panel 2026-11-01: a hold count the tokio `ctrl_c` shutdown future consults while the pkexec
+    child lives) is what keeps the TUI alive, and the TUI must not install `SIG_IGN` or its own exit-on-SIGINT during
+    this window. After the prompt ends with `dismissed`, the TUI redraws with the banner
+    "Approval was cancelled". (Panel 2, 2026-11-01) The `aitm tui` shutdown arm already consults the prompt hold
+    (p1b, P1b.14); P6.3 keeps only the raw-mode suspend and restore and the `core_shares_tty` flag, and adds no
+    signal or shutdown code.
 - **Test (first, failing):** `should_suspend("linux", true, "pending") == true`. The cases `("macos", true,
   "handed_to_app")`, `("linux", false, "pending")` and `("linux", true, "cannot_prompt")` are all `false`.
 - **Done when:** the tests pass and the Rust gate passes.
@@ -1818,9 +2060,12 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
   - With `macos_app_path: /nonexistent.app`, both show the `package` label and the download link and no shell
     command. The request gives `cannot_prompt`.
   - Screenshots are looked at.
-- **Live check [linux-ci] (AC22):** in the systemd container without the test polkit rule, `aitm tui` in a pty.
-  Allow plus confirm restores the normal screen. A prompt containing `com.mrbrutti.aitmproxy.l4-helper.run`
-  appears. The harness types the password. The TUI redraws, the banner is gone, and capture is `available`.
+- **Live check [linux-ci] (AC22):** in the systemd container without the test polkit rule (`49-aitm-test.rules`
+  removed), `aitm tui` in a pty. Allow plus confirm restores the normal screen. A prompt appears whose first line is
+  `==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====` (S7: the harness matches on this line; the
+  policy message, `Authenticating as: tester` and `Password: ` follow, with ANSI colour codes stripped). The harness
+  types the password. The TUI redraws, the banner is gone, and capture is `available`. A second run answers the prompt
+  with Ctrl-C: the TUI stays alive and redraws with "Approval was cancelled" (S7).
 - **Live check [linux-desk] (AC21):** on the GNOME VM, the web UI's Allow shows the graphical polkit dialog with the
   helper path and the policy message.
   - Approve: walk W passes.
@@ -1869,7 +2114,7 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 | AC5 | P1b.10, P7.1 | P1b.17 (after p7) |
 | AC6 | P1a.1, P2.2, P2.3, P3.3, P3.4, P3.6 | P3.13 [mac-signed] |
 | AC7 | P1b.6, P1b.7 | P3.13 [mac-signed] |
-| AC8 | P1b.8, P1b.13, P2.7 | P2.8 [linux-ci]; P3.13 [mac-signed] (W3–W4 per S8) |
+| AC8 | P1b.8, P1b.13, P2.7 (`inject_path`, `loopback_inject_uses_raw_ip_not_pcap`; S7) | P2.8 [linux-ci] (W3–W4 via raw IP with `route_localnet=0`, plus the ignored `loopback_inject_reaches_udp_socket`; S7); P3.13 [mac-signed] (W3–W4 per S8) |
 | AC9 | P3.2, P3.9, P6.2, P6.6 | P3.13 step 4 with P6.10's scripts [mac-signed] |
 | AC10 | P1b.5, P1b.11, P6.1, P6.5 | P1b.17, P6.10 [mac-any] |
 | AC11 | P3.1, P3.2, P3.7, P4.4, P4.5 | P3.13 [mac-any] |
@@ -1877,18 +2122,18 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 | AC13 | P3.6 | P3.13 [mac-signed] |
 | AC14 | P2.2, P2.3, P3.6 | P3.13 [mac-signed] |
 | AC15 | P5.1, P5.2 | P5.3 [linux-ci] |
-| AC16 | P1b.12, P2.6 | P2.8 [linux-ci] |
+| AC16 | P1b.12, P2.6 | P2.8 [linux-ci] (test rule `49-aitm-test.rules` present; literals confirmed by S7) |
 | AC17 | P1b.5, P1b.14 | P2.8 [linux-ci] |
 | AC18 | P1a.2, P1a.3, P1a.4, P2.6, P2.7 | P2.8 [linux-ci] |
 | AC19 | P2.6 | P2.8 [linux-ci] |
-| AC20 | P1b.2, P1b.14 | P1b.17 [linux-ci] |
+| AC20 | P1b.2, P1b.14 | P1b.17 [linux-ci] (panel 2026-11-01: re-scoped to P2.8 pending Matt) |
 | AC21 | P6.6 | P6.10 [linux-desk] |
-| AC22 | P6.3 | P6.10 [linux-ci] |
-| AC23 | P1b.5, P1b.14 | P1b.17 [linux-ci]; doc branch after P5.4 |
+| AC22 | P6.3, P1b.14 (`sigint_is_dismissed`, `sigint_handler_installed_not_ignored`; S7; panel 2, 2026-11-01: `held_ctrl_c_keeps_serving` in `crates/aitm/src/lib.rs`, Tester) | P6.10 [linux-ci] (test rule removed; harness matches `==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====`; S7) |
+| AC23 | P1b.5 (`prompt_possible` with `tty_opens`; S7), P1b.14 (`no_prompt_is_cannot_prompt_and_spawns_nothing`, `no_agent_text_is_failed`) | P1b.17 [linux-ci] (core under `setsid`; S7; panel 2026-11-01: re-scoped to P2.8 pending Matt); doc branch after P5.4 |
 | AC24 | P1b.6, P1b.16 | P1b.17 |
 | AC25 | P3.10, P6.1, P6.4, P6.5 | P3.13, P6.10 [mac-any, linux-ci] |
 | AC26 | P3.5, P3.10 | P3.13 [mac-any, mac-signed] |
-| AC27 | P1b.7 | — |
+| AC27 | P1b.7 (`gated_verbs_flip_live_and_stay_confirmable`: identical `confirm_prompt`/`sensitivity` before and after the flip for every params, `Some` for in-scope inject/send_recv while gated; reworded by the panel 2026-11-01) | — |
 | AC28 | S3 write-up | P3.13 step 7 [mac-signed] |
 | AC29 | P4.6 | P4.7 [mac-signed] |
 
@@ -1896,7 +2141,7 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 
 - **Now:** S3, S5 and S7 (S4 and S8 in a VM, or inside S3's window). p1a. p7.
 - **After p1a merges:** p1b P1b.1–P1b.10 run in parallel with p2 P2.1, P2.5 and P2.9, and with p5 P5.1. P2.2–P2.4
-  start once S4 is written up. P1b.11 starts once S5 is. P1b.12–P1b.14 and P2.6–P2.7 start once S7 is.
+  start once S4 is written up. P1b.11 starts once S5 is. P1b.12–P1b.14 and P2.6–P2.7 start once S7 is (S7 is written up, PR #240: they are unblocked).
 - **After S3 and the orchestrator's go:** p4 P4.1–P4.2 (in parallel with the above). P4.3–P4.5 wait for p2.
 - **After p2 merges:** p5 P5.2–P5.3, and p4 P4.3–P4.5.
 - **After parity (d), S3 and S5:** p3 P3.1–P3.10 (P3.5 is independent of P3.1–P3.4; P3.10 is independent of
@@ -1922,6 +2167,12 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
    shows. Keep that, or pick a free key?
 5. **Still open from the spec:** written acceptance of `docs/packet-capture.md` (headless `setcap` and the NixOS
    wrapper). P5.4 is blocked until then.
+6. **(S7) Ctrl-C while the password prompt is up.** The plan (P1b.14) makes Ctrl-C during a pkexec prompt cancel the
+   prompt only; the core keeps running, and a Ctrl-C after the prompt has ended behaves as before. The alternative is
+   "Ctrl-C always quits aitm, prompt or not". The Architect chose the first because the operator pressed it to
+   decline a password, not to stop the proxy. Confirm or reverse. (Panel, 2026-11-01: the mechanism is now a hold
+   count in the `aitm` binary's tokio `ctrl_c` shutdown future, spec §5.5; the question itself is unchanged and
+   still awaits your answer.)
 
 ## Amendment log
 
@@ -1950,10 +2201,39 @@ the current contract. The orchestrator (release driver) approved each row before
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Kept by the main session during stage 6. One row per finding. Rows are grouped by unit (p1b first, then p1a and p2), not strictly chronological.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| P1b.14 (S7 amendment) | Architect (e74b0b98) | Decision | Ctrl-C at the pkexec prompt: the core installs a SIGINT handler while a pkexec child is alive; Ctrl-C cancels the prompt only (`dismissed`) and does not shut the core down; the prior disposition returns once the child is gone. `aitm`'s shutdown future (`crates/aitm/src/lib.rs` `shutdown_signal`, tokio `ctrl_c`) must yield to this handler for the prompt window only. | Approved as written by the orchestrator 2026-11-01 under Matt's autonomous-approve mode (**flagged for Matt**): the operator-visible change is confined to the prompt window and is stated in spec §5.5; `aitm web` has no help text documenting Ctrl-C, so nothing else to update. |
+| P1b.7 | Coder (1d47a9bd) | Deviation | `L4Gated` holds a private `PrivilegeSource { Live(Arc<PrivilegeState>), Fixed(L4Privilege) }` instead of the plan's bare `Arc<PrivilegeState>`: production constructors (`new`, `with_state`, `with_shared_state`) are `Live`; the test constructors (`with_privilege`, `with_parts`, `with_shared(.., L4Privilege)`) stay `Fixed` because `tests/surface.rs`, `tests/inpath.rs` and `crates/aitm/tests/l4_operator_surfaces.rs` (outside p1b's files) pin the literal reason strings they pass in. | Open for the panel (spec reviewer). Follow-up if the plan-literal shape is wanted: migrate those three tests to a scripted `Prober` and drop `Fixed` (needs a Files-list amendment). |
+| P1b.7 / AC27 | Coder (1d47a9bd) | Spec gap | L4PRIV-AC27 assumes `tools/list` shows `confirmable: true` for `l4.inject`, `l4.send_recv`, `l4.intercept.forward`, `l4.intercept.drop`; their `confirm_prompt(&Params::default())` is `None` today even on a privileged core (inject.rs, sendrecv.rs need `spec`/`dst`/`interface`; the verdict verbs need a parked id), so `confirmable` was never true for them. `L4Gated` now forwards `confirm_prompt` (mutation-checked); the test pins `Some` for in-scope `l4.inject`/`l4.send_recv` params before and after the flip and identical answers for all four on empty params. | Open: AC27 wording needs an Architect amendment ("the gated and ungated `confirm_prompt` answers are identical for every params value"), orchestrator/Matt to accept. |
+| P1b.8 | Coder (Rule 10 report) | Tripwire change | `tests/hard_gates.rs::exactly_one_production_wire_write` counted `RoutedBackend::inject`'s delegation (`self.route(&report.inject)?.inject(iface, bytes)`) as a second production wire write. The router carries no permit and is reached only via `send_on_wire(permit, backend, ..)`; the tripwire now pins `backend/routed.rs` ×1 beside `wire.rs` ×1 so a second call in either file still fails. | Granted by the p1b orchestrator 2026-11-01; **security reviewer to confirm** the pin (the alternative, respelling the call to dodge the scan, was refused). |
+| P1b.13 | Coder (Rule 10 report) | Tripwire change | `hard_gates.rs::exactly_one_production_wire_write` also counts `HelperBackend::inject`'s one delegation to `HelperSession::inject`; pinned `backend/helper.rs` ×1 beside the P1b.8 pin. | Granted by the p1b orchestrator 2026-11-01; **security reviewer to confirm** (three pinned sites: helper.rs, routed.rs, wire.rs). |
+| P1b.13 | Coder | Spec gap | `CaptureInjectBackend::open_capture(iface, filter, read_timeout)` carries no direction, so `HelperBackend` sends `CaptureOpen { direction: Inbound }` as a constant; the helper's `capture_filter` is by interface today, so the field is informational on the wire. Also: the protocol has no `CaptureOpen` ack, so a helper refusal arrives as `CaptureClosed` and surfaces on the first `next_frame` (an empty capture flow, not a failed `l4.capture.start`). | Open for the Architect: add `direction` to the trait (touches backend/mod.rs, pcap.rs, routed.rs, capture.rs, mocks) and consider a `CaptureOpened`/ack frame in a proto 2; not Phase 1 blocking. |
+| P1b.15 | Coder (558ec344) | Interpretation | `request: at_start` fires only in serving modes (`aitm`, `aitm web`, `aitm tui`), after the one-shot `Cli` early return, so a one-shot `aitm flow list` never hands off to the app or spawns pkexec; spec §2.4 names serving cores and the Linux one-shot refusal. The module registers 22 `l4.*` names on this branch, so the wire pin is 24 (22 + 2), not the plan's 27 (parity verbs not landed here); P1b.17/P1b.18 use 24. | Open for the spec reviewer; p1b orchestrator accepts the serving-only reading. |
+| P1b.15 | Coder | Observation | `crates/aitm/tests/l4_cua_tui.rs` (outside p1b's files) runs over the live state now and asserts the pre-P1b.7 reason literal; it binds a port, so it shows only in the Terminal gate. | Red in the Terminal run (line 572: the test encoded the pre-AC27 suppressed confirm prompt). File claimed for p1b by the orchestrator 2026-11-01 (l4-parity unit (b) also edits it; whoever lands second re-merges); fixed in e79aeab0: the else-branch expects `Mode::L4Confirm`, presses `y`, then asserts the typed `L4 unavailable`. |
+| Spec Status (phase 2) | Matt via the orchestrator | Decision | No third-party privilege daemon on any operator machine, ever; ChmodBPF dead as idea, fallback and doc pointer (p2 recorded the same decision in its own row, merged here on 2026-11-01). Phase 2 (our own component in serve mode doing capture and injection for the core) is the REQUIRED end state; the Architect may revisit option A (frames in the system extension), which Matt allows expanding. Phase 1 (SMAppService bpf permissions) stays as the stepping stone for T5's Mac proof. | Matt, 2026-11-01 ("yes I think we need to build our own solutions and our network extension should handle it; if we need to expand it so be it"). Folded into the spec Status line; p1b code stays on phase 1; the phase-2 carrier is a spec amendment, not a p1b task. |
+| P1b.14 | Coder (8d185d1e) | Gap (Rule 8) | The real SIGINT handler install needs `nix::sys::signal::sigaction`, which is `unsafe fn`; under `unsafe_code = "forbid"` it cannot live in `aitm-proto-l4`. `SignalGuard` is a seam (`NoopSignalGuard` in production) pinned by `sigint_handler_installed_not_ignored`; spec §5.5's "Ctrl-C at the prompt does not shut the core down" is NOT delivered by p1b. | Open follow-up: a leaf crate (`aitm-peer-token` style) with a `// SAFETY:` comment and Security-reviewer sign-off, per spec Constraints; orchestrator to schedule. Until then Ctrl-C at a textual pkexec prompt reaches the core with its normal disposition. |
+| P1b.14 | Coder (8d185d1e) | Interpretation | A helper session's end marks the privilege cache dirty so the next `report()` re-probes (capture flips back to `needs_approval`); the lazy direct start of a file-caps helper is Serving-only (a one-shot on that row gets `HELPER_NOT_WIRED`); the generic failure message names `pkexec` because spec §5.5 pins "The packet-capture helper did not start (pkexec exit <n>)" verbatim (progress messages are outside the P1b.3 tripwire). `PrivilegeState::set_guard` must be called from the binary wiring. | Open for the panel (spec reviewer on the first two; Rule 2 reading on the third). `set_guard` fixed in 33c2e16d: `L4Module::from_parts` attaches the module's guard on every live constructor (`module::tests::live_constructors_attach_the_guard_to_the_privilege_state`). |
+| p1b panel (stage 6, range 1abac42a..048e0c03) | Tester / Security / Quality / Spec | Verdicts | Tester PASS (7 Minor); Security PASS (7 Minor; three-site `hard_gates` pin and `SignalGuard` seam confirmed acceptable); Quality FAIL (1 Important: `PrivilegeState::report()` holds the cache mutex across the subprocess-spawning probe, `request()` probes twice; 13 Minor); Spec FAIL (5 Important: SIGINT hold not delivered and the Rule-8 justification incomplete; `[linux-ci]` half of P1b.17 not run; `helper.status: version_mismatch` unreachable; six undeclared per-task files; unrecorded spawn-path deviations). | Fix task dispatched 2026-11-01 for every Important and the cheap Minors; the rest below. |
+| P1b.6/8/9/10/12/15 | Spec reviewer | Rule 10 (unrecorded files) | P1b.6 edited privilege/{linux,macos}.rs (allow removals); P1b.8 tests/privilege.rs (one comment); P1b.9 commands/mod.rs (`PrivilegeReportSource`, `with_privilege`, `privilege_field`, 5th `wire_commands` arg) and backend/routed.rs (test call); P1b.10 privilege/state.rs (`request`, `RequestOutcome`, `Outcome`: demanded by the task's own Change list); P1b.12 Cargo.lock (one derived edge); P1b.15 crates/aitm-proto-l4/src/lib.rs (two re-exports). | Granted retroactively by the p1b orchestrator 2026-11-01: all inside p1b's unit claims except `Cargo.lock`, whose edit is the derived lock line for the declared Cargo.toml change (p2 owns the lock for the new crate only). Files lists of P1b.9/P1b.10/P1b.15 amended by the Architect. |
+| P1b.13/P1b.14 | Spec reviewer | Unrecorded deviations | (a) argv is `/usr/bin/pkexec …` (absolute `PKEXEC_PATH`), not `"pkexec"`; (b) child env is `env_clear()` plus `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` only (no `SHELL`: pkexec refuses a value absent from /etc/shells; no `LANG`/`LC_*`: the S7 stderr literals stay English); (c) `request_linux` checks the packaged rows before `prompt_possible`; (d) `add_self_ports` also bumps `scope_generation`; (e) `L4Guard::scope_set()` is new public API. | (a), (d), (e) accepted by the p1b orchestrator 2026-11-01 (improvements the §5.2 `ScopeSet` needs). (b), (c): Architect sentence in §5.5 / P1b.14; (b) is proven only by the [linux-ci] run. |
+| P1b.14 (SIGINT) | Spec reviewer | Correction of the disposition above | `signal-hook` 0.3 is in Cargo.lock and safe, so the "needs unsafe sigaction" premise was incomplete. Better still, `aitm` already owns SIGINT through tokio's `ctrl_c` (`crates/aitm/src/lib.rs` `shutdown_signal`), so the process does not die from the signal; what shuts the core down is the shutdown future. The hold therefore belongs in the binary: a hold count the `PrivilegeState` raises around the pkexec child and `shutdown_signal` consults (Ctrl-C while held logs and keeps serving). No unsafe, no new crate. | Fix task 2026-11-01 (replaces the leaf-crate follow-up). Matt's Question 6 stays flagged. |
+| P1b.17 [linux-ci] | Spec reviewer | Evidence gap | The Linux live half (AC20, AC23 and the Linux cells of `test_privilege_core.py`) was not run: `cis-lab` has no container rig yet (S7 write-up: podman must be installed, containers need `--systemd=always --privileged`), and P2.8 builds exactly that rig. | Proposed re-scope to P2.8 [linux-ci] (the helper unit, which needs the same container), approved by the orchestrator 2026-11-01 under Matt's autonomous-approve mode, **flagged for Matt** (evidence rule): the Linux live half runs on the rig p2 builds (P2.8); the p1b PR states the Linux request path is unit-tested only until then. |
+| Minors accepted (fixed or carried) | Tester / Security / Quality | Minor | Carried as accepted follow-ups, not fixed in p1b: split `state.rs` into state/watch/request modules; one `privilege/text.rs` for the operator literals; lift the e2e soft-assert scaffolding into `aitm_e2e`; one shared poison-recovering `lock` helper; named derive row builders; `/tmp/aitm-<uid>` squat fallback (honest refusal today); `Mode → ProcessLifetime` unit test (main.rs has no test module); p7's `is_operator_only` entry (separate unit). | Accepted by the p1b orchestrator 2026-11-01 under Matt's autonomous-approve mode (**flagged for Matt**); everything else Minor is in the fix task. |
+| Fix task A (panel) | Coder (57adb301, 855b7a21, 9ee33e18) | Fixed + Rule 10 | All three Important items fixed (single-flight probe outside the cache lock; SIGINT hold count in the binary's shutdown future with the literal line "Ctrl-C cancelled the packet-capture prompt; the core keeps serving"; `helper.status: version_mismatch` from `LinuxInputs.last_session_error`), Security S1–S5 and Quality T2/Q2/Q4–Q7/Q9/Q10/Q12 fixed. Two one-line test-literal edits outside the task's list (`availability.rs:116`, `commands/intercept.rs:1316`: `last_session_error: None`) were required to compile. `Requester`, `LiveBackend`, `with_requester`, `set_helper_backend` became `pub`. `aitm tui`'s own `shutdown_signal` await (`crates/aitm/src/tui.rs`) does not consult the hold yet. | Rule 10 edits granted retroactively by the p1b orchestrator 2026-11-01 (both in p1b's unit files). The `pub` widening and the TUI shutdown arm go to the re-review panel; the TUI arm is p6's (P6.3) unless the panel rates it Important. Fix B e79aeab0 (e2e exemption, l4_cua_tui AC27 branch). |
+| p1b re-review (fix range 048e0c03..0661937b) | Security / Quality / Spec (Tester pending) | Verdicts | Security PASS (5 Minor: `aitm tui` shutdown arm without the hold; a held Ctrl-C delivered to the core alone kills nothing; no unwind guard on `watching`; probe cache keyed on settable mtime; bundle stamp misses an in-place executable overwrite). Quality PASS (13 Minor: vestigial `SignalGuard`/`Box<dyn Any>` hold token; `PlatformRequester` does not override `spawner()`; test-only `classify_exit` pair form; repeated watcher epilogue; file-caps rule spelled thrice; double `refuse_by_path`; duplicate `is_live`; `should_shut_down` trivial; sleep-poll loops; `bundle_stamp` positional options; env-dependent macOS test; self-referential expected message; `aitm tui` arm). Spec FAIL (3 Important: a protocol handshake error must read `helper.status: unknown` per amended §5.2; the `aitm tui` select arm must consult the hold; the plan's `pkexec_env_is_cleared_but_for_display` and `held_ctrl_c_keeps_serving` tests are absent from the committed range; plus Minors: stale "bus fixture" comment in wire.rs, e2e exemption wider than the pinned literal, `pub` surface wider than needed, `SessionFailure` name unrecorded, S1–S5/Q10 literals absent from the spec, §10 lacks lib.rs, test names differ from the AC map, `l4_cua_tui` Terminal result not yet quoted). | Fix task C dispatched 2026-11-01 for the three Important items, the Security Minors, and the cheap Quality/Spec Minors; Architect pass for the spec sentences. Accepted as follow-ups by the p1b orchestrator (**flagged for Matt**): the `Condvar` replacement of the two sleep-poll loops. `crates/aitm/src/tui.rs` one-line hold wiring granted to p1b by the orchestrator 2026-11-01 (p6's row amended: the hold is already wired). |
+| Fix task C (panel 2) | Coder (d6b2b42b, 2634ff00, 698eef43) | Fixed | C1 `Protocol` handshake failure → `helper.status: unknown` (`protocol_failure_is_unknown_with_detail`); C2 `aitm tui` shutdown arm consults the hold (`PromptHold` threaded into `tui::run`; `tui_shutdown_arm_consults_the_prompt_hold` tripwire); C3 `pkexec_env_is_cleared_but_for_display` (real `StdSpawner`, load-bearing: fails with `env_clear()` removed); C4 `PrivilegeState::cancel_prompt()` sends SIGINT via `Child::interrupt()` (nix `signal` feature on the Linux-target dep, no new crate), `interrupt_unless_held(.., on_held)` cancels on a held Ctrl-C (`held_ctrl_c_alone_cancels_the_prompt`); C5 watcher unwind guard `Watch` (`watcher_panic_releases_hold_and_ends_pending`) with the one `end_request` epilogue (C11); C6 `ProbeKey { dev, ino, size, mtime, ctime }`; C7 `BundleStamp::new` with the main executable's mtime+size; C8–C10, C12–C21 as listed (SignalGuard deleted, `pub(crate)`/`#[cfg(test)]` tightening, e2e regex exact, `l4_cua_tui` bounded wait). Fixed-first evidence for C1–C7; C8–C21 compile-driven. | Granted/accepted by the p1b orchestrator 2026-11-01; `crates/aitm-proto-l4/Cargo.toml` edit (one feature) granted. Third review round dispatched on bbd198cc..HEAD. |
+| p1b round 3 (fix C range bbd198cc..b2809361) | Tester / Security / Quality / Spec | Verdicts | All four PASS. Tester d2ef7a8d added S1-ordering tests for the accept-errors and panic arms, `cancel_prompt_never_signals_a_serving_helper`, a real-child `interrupt` test, and a stricter tui tripwire; 4 Minor. Security 3 Minor (predecessor watch clearing a successor's slot/flag during reap; panic path left the child alive; env test could print a value fragment). Quality 8 Minor. Spec 6 Minor (recording gaps; e2e `waitpid` alternative; new `pub` items; `l4_cua_tui.rs` not in the claims row). | Fix task D (ca0d2385, ade367a9) fixed: watch-owned prompt slot (`Arc::ptr_eq`) and `watching` generation (CAS); unwind kills the child; env test hygiene (first partial line dropped, keys-only messages, `RestoreEnv`); `cancel_prompt` via `try_lock`; `prompt = hold.is_some()`; `write_progress`; off-Linux `interrupt` no-op; `pub(crate)` + `cfg_attr(allow(dead_code))` on the per-OS cache types; `BundleStamp` plist `FileStamp`; e2e regex exactly the two pinned forms; `l4_cua_tui` bound 20 s (post-TTL probe cost: synchronous `codesign --verify --strict`, 5 s bound, when `/Applications/Aitmproxy.app` exists). Architect eb77bc13 recorded the literals, stamp wording, `HoldCount`/`classify_exit_full`, claims, `--bin aitm` gate line, probe-cost follow-up. Accepted as follow-ups by the p1b orchestrator (**flagged for Matt**): `Watch::serve` extraction (the live arm still pokes `Watch` fields; the `Err(Timeout)` branch in `accept` is unreachable); `cancel_prompt` `try_lock` may drop a Ctrl-C landing inside one 100 ms watcher slice (a second Ctrl-C cancels; the pid-signal alternative cannot be faked); background probe thread so a gated invoke never pays the probe synchronously. |
+| p1b round 4 (fix D range b2809361..550ee07a) | Tester / Security | Verdicts | Tester PASS (550ee07a adds `stop_watching_clears_only_its_own_id`, `unregister_prompt_child_leaves_another_watchs_child`, `cancel_prompt_skips_a_held_child_lock_and_lands_on_a_free_one`; D1/D2 shown load-bearing by mutation). Security PASS, no code change: the unwind kill applies to any child the watch owns (serving helper or direct start included), which is the safe direction; `watching` is a latest-id slot that assumes one live watch plus a reaping predecessor (the two spawn paths are mutually exclusive today). | Panel closed with no open Critical/Important findings. Spec §5.5 wording "launcher child" → "the child the watch owns" is a one-sentence Architect follow-up; a third spawn path would need `watching` as a count. Accepted by the p1b orchestrator 2026-11-01 (**flagged for Matt**). |
+| Terminal gate (`l4_cua_tui`) | p1b orchestrator (live diagnosis) | Pre-existing TUI defect | `crates/aitm-tui/src/bus.rs` `prune()` drops every argument the tool schema does not declare before `tools/call`; `_confirm` is the reserved undeclared handshake key, so the TUI's confirmed re-issue of `l4.inject` loses its token and the core answers `needs_confirmation` again (overlay reopens). Proven by a Python replay of the two calls over the bus (handshake then `L4 unavailable …` in ms) and an event trace in the test (second reply: fresh `needs_confirmation`). Exposed by AC27 (`L4Gated` forwards `confirm_prompt`); previously unreachable on an unprivileged core. | Not fixed in p1b: the orchestrator refused the claim because PR #263 (`fix/l4-parity-tui`, the L4 parity TUI unit, held by the Rust freeze) already carries exactly this fix (`prune` keeps the reserved `_confirm`) with a unit test and a live proof; a second copy would conflict. Post-freeze order #232 → #264 → #266 → #261 → #263 → p1b, so `l4_cua_tui` depends on #263 and the PR body says so. Proof: #263's branch (`origin/fix/l4-parity-tui`) merged into a scratch worktree of this branch at 6bee2377 (conflict on `crates/aitm/tests/l4_cua_tui.rs` resolved by taking #263's rewrite, which refuses inject locally while unavailable), `cargo test -p aitm --test l4_cua_tui` there: `test tui_l4_cua_against_a_live_core ... ok` (1 passed, 124.48 s, 2026-11-01). The scratch merge was not pushed; at ready the real merge takes #263's test version. The 20 s bound and the AC27 else-branch were superseded at the #263 merge 0c34e973 (the test is #263's verbatim, with its own 8 s `DEADLINE` and a local refusal of `s` while unavailable, parity task B10); the codesign-cost note in P1b.17 is withdrawn as the cause of that failure. |
+| PR #267 ready (Matt's direction) | p1b orchestrator | Status | Matt (2026-11-01, via the L4 parity session): "if you have anything pending commit PR and then merge and sync with the orchestrator to release a new binary." origin/main 7a5dd752 (#232, #274, #276) merged at e72ad1cf (conflicts: main.rs import unions; `EXPECTED_TOOLS` 92 + 2 = 94). #263 still open: `l4_cua_tui` stays the one known red until it merges (scratch-merge proof above); the PR is marked ready with that dependency stated and the orchestrator sequences the merge. Final full Terminal gate on e72ad1cf from a clean `target/`: `GATE5_EXIT=101`, 295 binaries, reds: `l4_cua_tui` (#263) plus four wall-clock tests under load 200+ (`web_bus_write_deadline` ×2, `audit_log` wedged-rotation from #259, TUI `perf` 5000 flows: 394 ms vs 250 ms); each re-run alone at load ~60 passes (6/1/2, exit 0). `l4_cua_tui` is #263's version since 0c34e973 (its 8 s `DEADLINE`; p1b's 20 s bound is gone). | Recorded 2026-11-01; **flagged for Matt** that ready-before-#263 is his call. |
+| Merge of origin/main f0a1f1cb (#261 helper crate, #232, #266, #282, #281) at 286c42c4 | Security / Spec (re-check) | Verdicts | Both PASS. Conflicts: `EXPECTED_TOOLS` 100 + 2 = 102 (counted, no duplicates); spec/plan Status lines sentence-unioned and the Review log row-unioned (85 rows, none lost). Wire contract between p1b's core and p2's helper verified consistent (peer checks both ways, resend-before-use vs scope-change closes, monotonic capture ids, interface allowlist, bounded texts); #232 reaches no L4 wire path (hard_gates 5/5). Minors: `HelloAck.caps` core-side test fixtures spell `cap_net_raw` where the helper and spec S3 say `CAP_NET_RAW` (the core never branches on it); the helper's 100 ms `read_timeout_ms` floor is stated only in plan A12; Status line carried Matt's decision twice and the Review log two Decision rows. | Status line collapsed and the two Decision rows merged by the p1b orchestrator 2026-11-01; the fixture spelling and the §5.2 floor sentence are accepted follow-ups (p6/p2 docs pass), **flagged for Matt**. Gate 6 on 286c42c4: 296 binaries, reds `l4_cua_tui` (#263) plus the two load flakes (audit-log rotation, TUI perf), re-run alone (see PR body). New locked crates from #261: `caps` 0.5.6 (Linux), `oslog` 0.2.0 (macOS), p2's reviewed surface. |
+| Merge of origin/main 0e64d7cf (#263 TUI parity (b), #283 attribution, #256, #264) at 0c34e973 | Security / Spec (re-check) | Verdicts | Both PASS. The only conflict, `crates/aitm/tests/l4_cua_tui.rs`, took #263's version verbatim (diff to origin/main empty): p1b's e79aeab0 AC27 else-branch and 20 s bound are gone; #263's local refusal of `s` while unavailable is parity task B10 / L4PAR-AC33, no contradiction of §2.4; AC27 [unit] stays proven by `gated_verbs_flip_live_and_stay_confirmable`. `EXPECTED_TOOLS` 102 (counted), `CORE_TOOLS` 105, both privilege verbs present. #263's `prune` keeps exactly `_confirm`; #283 touches no privilege path (its `unsafe` is in `aitm-peer-process/src/macos/ffi.rs`, signed off there); no new third-party crate. | The `l4_cua_tui` dependency on #263 in the rows above is CLOSED: final full Terminal gate 7 on 0c34e973 from a clean `target/` (load 23–47): `GATE7_EXIT=0`, 299 test binaries, zero failures; `test tui_l4_cua_against_a_live_core ... ok`. PR #267 ready at the commit after this row. |
+| PR #267 CI (Linux clippy) | CI, relayed by the orchestrator | Important (CI red) | `crates/aitm-proto-l4/src/privilege/linux.rs:325` `if let Some(mut pipe) = child.stdout.take()` — `unused_mut` under `-D warnings`, inside a `#[cfg(target_os = "linux")]` body the Mac gates never compile. | Fixed (the `mut` removed) 2026-11-01. **Lesson for the plan:** Linux-only code needs a Linux clippy pass before ready; this Mac has a Homebrew toolchain with no cross target, so the pass is CI or the cis-lab VM. The Gates table's p1b row should carry it for p2/p6 too. |
+| PR #267 CI (synopsis pin, #271) | CI, relayed by the orchestrator | Important (CI red) | `tests/synopsis_groups.rs` pins the static `aitm --help` Groups block (18 groups, no `l4`: plan C19 of the CLI spec assumed the `L4Module` registers only with `l4.enabled`). Since P1b.15 `l4.privilege` / `l4.privilege.request` register on every core (spec §2.2), so `l4` is a built-in group. | Fixed 2026-11-02: `GROUPS` and the `SYNOPSIS` Groups block list `l4` (19); `synopsis_groups.rs` pins 19 and that the default assembly's `l4.*` names are exactly the two privilege verbs; `synopsis_groups_l4.rs` now proves `l4.enabled` adds no group, only the module's verbs; the `startup::args` unit test's block literal updated. CLI spec plan C19 wording is the cli-ux unit's to amend (one sentence). |
+| P1b.14 (S7 amendment) | Architect (e74b0b98) | Decision | pkexec exit 127 with `Error creating textual authentication agent` after a `pending` reply maps to progress `failed` with the no-prompt message plus one `warn` line; `cannot_prompt` stays the outcome of the pre-spawn check. | Approved as written by the orchestrator 2026-11-01 under Matt's autonomous-approve mode (**flagged for Matt**): the two paths stay distinguishable in the audit line. |
 | p1a P1a.2 | tester | Minor (F1) | `encode` of an over-long interface name could be misread as a 65 535-byte name plus frame | fixed in aa2b58fc (marker only, always `BadBinary`) |
 | p1a P1a.2 | tester | Info (F2) | `ScopeSet` and control bodies accepted unknown JSON keys | fixed in aa2b58fc (`deny_unknown_fields`; handshake bodies re-exempted in e223712e, see SP-M1) |
 | p1a P1a.4 | spec | Important (SP-I1) | unit gate not evidenced on the reviewed head (shared-target race with `cargo clean -p`) | closed by evidence: quiesced Terminal gates on 09f6b860 and e223712e all 0 |
@@ -2014,7 +2294,6 @@ Kept by the main session during stage 6. One row per finding.
 | p2 tests | quality, spec | Minor (QR4-M5, SP4-M1, round 4) | brief-named non-regression test keeps a `tester_` prefix; its comment understates why it cannot fail | accepted: naming originated in the orchestrator's brief; rename and reword with the next change; A17 |
 | p2 docs | spec | Minor (SP4-M2, round 4) | the core-client id-reuse rule lived only in plan A16 | fixed in the docs commit after 79ab8372 (spec S4) |
 | p2 docs | spec | Minor (SP4-M3, round 4) | SP3-M2 row said "plan" where the Status line cites the spec | fixed in the docs commit after 79ab8372 |
-| spec | Matt (via the orchestrator) | Decision | no third-party privilege daemon ever (ChmodBPF dead, incl. fallback/doc pointer); phase 2 own capture+inject component required; phase 1 is the stepping stone | recorded 2026-11-01 in the spec Status line and the plan Status line; p2 PR stays phase 1 |
 
 ## Shipped
 

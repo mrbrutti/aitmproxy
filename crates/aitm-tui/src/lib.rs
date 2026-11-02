@@ -242,6 +242,12 @@ pub const CORE_TOOLS: &[&str] = &[
     "proxy.system.status",
     "proxy.system.set",
     "proxy.system.unset",
+    // l4.privilege / l4.privilege.request (spec 2026-10-31-l4-capture-privilege-design
+    // §2.2/§2.3): the packet-capture privilege read (Sensitivity::Read) and the
+    // operator-only, confirmed request (Sensitivity::Sensitive), registered on
+    // every core whether or not L4 is enabled.
+    "l4.privilege",
+    "l4.privilege.request",
     "browser.navigate",
     "browser.click",
     "browser.type",

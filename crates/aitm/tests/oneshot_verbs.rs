@@ -32,9 +32,10 @@ mod support;
 use Placement::{Live, Local};
 
 /// Every built-in verb and where a one-shot runs it (spec D6, the table
-/// expanded): the 114 of the default registry (73 before main's scanner v2
-/// track added the fifteen scan-job verbs and the 26 native `check.*`), then
-/// the 22 native `l4.*` verbs `l4.enabled` adds. Enumerated from the tree, in registration order.
+/// expanded): the 116 of the default registry (73 before main's scanner v2
+/// track added the fifteen scan-job verbs and the 26 native `check.*`, and
+/// p1b the two `l4.privilege.*`), then the 22 native `l4.*` verbs `l4.enabled`
+/// adds. Enumerated from the tree, in registration order.
 const EXPECTED: &[(&str, Placement)] = &[
     // flow.* — the core's flow store.
     ("flow.list", Live),
@@ -169,6 +170,12 @@ const EXPECTED: &[(&str, Placement)] = &[
     ("findings.get", Local),
     ("findings.record", Live),
     ("findings.remove", Local),
+    // l4.privilege.* — registered on every core since p1b (#267): the status
+    // verb reads the live privilege state; `request` hands the platform action
+    // off (macOS app) or spawns it (Linux pkexec) and returns at once, so both
+    // stay on the 30 s lane.
+    ("l4.privilege", Live),
+    ("l4.privilege.request", Live),
     // l4.* natives (`l4.enabled`) — the core's capture feeder and L4 state.
     ("l4.interfaces", Live),
     ("l4.scope.add", Live),

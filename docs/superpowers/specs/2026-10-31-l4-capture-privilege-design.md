@@ -1,10 +1,11 @@
 # L4 capture privilege, obtained by the product design
 
-**Status:** Approved (Matt, 2026-11-01: the recommended defaults for forks i–v). Decided: (i) macOS phase 1 ships B2, the SMAppService-registered permission daemon, with the single privileged helper (candidate 1) as phase 2; (ii) device group `access_bpf` (switch to `admin` only if spike S4 shows a re-login is needed); (iii) the Linux helper + polkit policy ship in deb/rpm only, no Homebrew cask pkg; (iv) "Allow packet capture" stays a separate switch from All Apps; (v) the first-run card keeps line 4 ("Any app you run can then capture and send raw packets"). Open: Matt's written acceptance of the headless `setcap` doc pointer. The orchestrator's bundle-layout conditions are folded into the body; the spikes run under the spike rule before phase 1 code. **Matt, 2026-11-01 (relayed by the orchestrator, recorded by the p2 session):** no third-party privilege daemon is ever used (ChmodBPF is dead, including as a fallback or a doc pointer); phase 2, our own component performing capture and injection for the core (the `serve` mode; the architect may revisit frames-in-the-sysex as its carrier), is the REQUIRED end state; phase 1 (bpf permissions via SMAppService and this helper) stays the stepping stone that the scanner-v2 L4 packet lane (track T5 of `docs/superpowers/specs/2026-10-31-aitmproxy-scanner-v2-design.md`) uses for its macOS live cells.
+**Status:** Approved (Matt, 2026-11-01: the recommended defaults for forks i–v). Decided: (i) macOS phase 1 ships B2, the SMAppService-registered permission daemon, with the single privileged helper (candidate 1) as phase 2; (ii) device group `access_bpf` (switch to `admin` only if spike S4 shows a re-login is needed); (iii) the Linux helper + polkit policy ship in deb/rpm only, no Homebrew cask pkg; (iv) "Allow packet capture" stays a separate switch from All Apps; (v) the first-run card keeps line 4 ("Any app you run can then capture and send raw packets"). Open: Matt's written acceptance of the headless `setcap` doc pointer. The orchestrator's bundle-layout conditions are folded into the body; the spikes run under the spike rule before phase 1 code. S7 proven 2026-11-01 (PR #240); amendments folded (§5.7, and the sentences marked "(S7)"). **Matt, 2026-11-01 (relayed by the orchestrator, recorded by the p2 session):** no third-party privilege daemon is ever used (ChmodBPF is dead, including as a fallback or a doc pointer); phase 2, our own component performing capture and injection for the core (the `serve` mode; the architect may revisit frames-in-the-sysex as its carrier), is the REQUIRED end state; phase 1 (bpf permissions via SMAppService and this helper) stays the stepping stone that the scanner-v2 L4 packet lane (track T5 of `docs/superpowers/specs/2026-10-31-aitmproxy-scanner-v2-design.md`) uses for its macOS live cells. Matt's words: "our network extension should handle it; if we need to expand it so be it" (the Architect may revisit option A, frames in the system extension); the phase-2 carrier decision is a spec amendment, not a p1b task.
 **Research inputs:** `docs/research/13-l4-capture-privilege-without-cli.md` (primary), `12-l4-parity-audit.md` (D0,
 D11a, the rig), `08-l4-packet-rust.md` (privilege model, candidate F), `10-macos-network-extension.md` and
 `experiments/2026-10-29-macos-ne-spike.md` (the sysex), `docs/RELEASE.md`, `scripts/notarize-dmg.sh`,
-`apps/mac/build.sh`, `apps/mac/tools/snap-dev.sh`.
+`apps/mac/build.sh`, `apps/mac/tools/snap-dev.sh`; spike write-up `experiments/2026-11-01-l4-s7-pkexec-helper.md` (S7,
+proven, PR #240; folded in §5.7).
 **Related specs:** `2026-10-31-l4-parity-fixes-design.md` (sibling, UI defects D1–D15; owns the status shape and the
 `AvailabilitySource` this spec extends, §2.4), `2026-10-31-capture-status-verb-design.md` (unrelated: NE flows vs raw
 frames), `2026-10-31-macos-status-page-and-first-run-design.md` (`ConnectionSummary`, Getting started),
@@ -37,7 +38,9 @@ app, TUI, web UI, CLI) able to show the state honestly and offer the one action 
 
 ## Non-goals
 
-- No change to the Network Extension or sysex (option A, frames-in-the-sysex, is out; §6).
+- No phase-1 change to the Network Extension or sysex. (Panel, 2026-11-01: option A, frames in the sysex, is back on
+  the table for phase 2 per Matt's 2026-11-01 decision in the Status line; phase 1 changes nothing in the sysex, and
+  the phase-2 carrier decision is a spec amendment; §6.)
 - No L4 UI parity work: live L4 rows in the mac app, intercept controls, L4 scope add, polling churn, `l4.flow.get`
   bytes. Those are the sibling parity spec's (D1–D15), except the seams named in §8.
 - No in-path interception through the helper (Linux NFQUEUE stays "core holds `CAP_NET_ADMIN` itself").
@@ -78,7 +81,10 @@ app, TUI, web UI, CLI) able to show the state honestly and offer the one action 
   may have no agent.
 - Quiet logs: one `warn` line at start when L4 is enabled and not available, one `info` line per state change. Never
   log the operator token or a frame's payload.
-- New bus verbs update the three contracts: `EXPECTED_TOOLS`, `CORE_TOOLS`, `bus-fixture.json`.
+- New bus verbs update the two contracts: `EXPECTED_TOOLS` (`crates/aitm/tests/frontends.rs`) and `CORE_TOOLS`
+  (`crates/aitm-tui/src/lib.rs`); `crates/aitm/tests/tui_live_bus.rs` compares `CORE_TOOLS` to the live `tools/list`.
+  (Panel, 2026-11-01: it read "three"; `bus-fixture.json` and `tester_shell.rs` were deleted on `main` by #244, the
+  TUI is live-only.)
 - macOS UI words follow the Status-page spec: "All Apps" is the extension. This feature is **Packet capture** in UI
   text; never "BPF", "L4 capture" or "daemon".
 - **Spike rule.** Any spike that changes system state on Matt's Mac (chmod `/dev/bpf*`, group creation or membership,
@@ -119,6 +125,9 @@ One shared `Arc<PrivilegeState>` replaces the cached `L4Privilege` as the source
 - `PrivilegeState::request(&self) -> RequestOutcome` (non-blocking; starts the platform action)
 - `PrivilegeState::backend(&self) -> Arc<dyn CaptureInjectBackend>` (in-process `PcapBackend` when the process itself
   is privileged; `HelperBackend` when a Linux helper session is up)
+- (Panel, 2026-11-01) When a helper session ends (the socket closes or the helper dies), the cached `available` via
+  `helper` is invalidated: the next `report()` re-probes at once, TTL or not, and on the pkexec row capture returns
+  to `needs_approval` with the `pkexec` remedy.
 - `fn derive(inputs: &ProbeInputs) -> PrivilegeReport` in `privilege/derive.rs`: pure, no I/O, the whole decision
   table below. Platform files gather `ProbeInputs`: `privilege/macos.rs`, `privilege/linux.rs`.
 
@@ -187,7 +196,7 @@ can read `SMAppService.status`, shows the finer states itself.)
 | a helper session is connected | `available`, via `helper` | `running` |
 | helper found and `aitm-l4-helper probe` reports `CAP_NET_RAW` effective (file caps) | `available`, via `helper` (session starts lazily on first use, no prompt) | `linux_cap_helper`, `installed` |
 | helper at the policy's exec path (§5.4), root-owned path, policy file present, `pkexec` present, a prompt is possible (§5.5) | `needs_approval` `pkexec`, label "Allow packet capture (asks for an administrator password)" | `linux_pkexec_helper`, `installed` |
-| helper at the policy's exec path, but no prompt is possible | `needs_approval` `package`, "No password prompt can be shown here (no desktop session or terminal)" | `installed` |
+| the row above minus the prompt predicate: policy path, root-owned chain, policy file, `pkexec` present, no prompt possible (panel, 2026-11-01) | `needs_approval` `package`, "No password prompt can be shown here (no desktop session or terminal)", `action: bus_verb` (the request then answers `cannot_prompt`) | `installed` |
 | helper found but its path or a parent is not root-owned, or is group/world-writable | `needs_approval` `package`, "Install the aitm .deb or .rpm to get the packet-capture helper" | `not_installed`, detail names the path |
 | otherwise | `needs_approval` `package`, same label, `open_url` | `not_installed` |
 
@@ -195,6 +204,14 @@ can read `SMAppService.status`, shows the finer states itself.)
 interception needs the core itself to hold CAP_NET_ADMIN; the packet-capture helper does not provide it yet". No `how`
 is offered because no Phase 1 helper provides it; `l4.intercept.status` still reports `code: needs_privilege` for it
 (§2.4).
+
+(Panel, 2026-11-01) Row readings. Row 6 is the fully packaged install minus the prompt predicate, so a policy-path
+helper with a missing policy file or no `pkexec` is the install row (row 8, `open_url`), not row 6. Row 6's `package`
+carries `action: bus_verb`, so a frontend renders `package` as a download link only when `action.type == "open_url"`
+and otherwise shows the label alone. Row 4's lazy direct start of a file-caps helper requires `root_owned_chain` on the
+helper's path and is serving-only: a one-shot command on that row refuses (no helper is wired) and spawns nothing.
+(Panel 2, 2026-11-01) Row 4's `probe` runs only for a candidate whose whole path chain is root-owned, and its result
+is cached per path identity (device, inode, size, mtime, ctime) for the process lifetime.
 
 Helper discovery order: `l4.privilege.helper_path` from config, then `<exe dir>/aitm-l4-helper`,
 `/usr/lib/aitmproxy/aitm-l4-helper`, `/run/wrappers/bin/aitm-l4-helper`. Discovery finds a helper to probe; only the
@@ -218,10 +235,22 @@ policy's exec path is ever run through `pkexec` (§5.1).
   path before using it: an existing `*.app` directory not under `/tmp`, `/private/tmp` or `/var/folders`;
   `CFBundleIdentifier` equal to `com.mrbrutti.aitmproxy`; and a valid code signature whose team is `995PCLM9KH`. Only
   then does it run `/usr/bin/open -a <path> aitmproxy://packet-capture/allow` (§3.4) and reply `handed_to_app`. A
-  missing or failing app is `cannot_prompt`.
-- Linux: `pending` after spawning `pkexec /usr/lib/aitmproxy/aitm-l4-helper serve --connect <socket>` (§5); the
-  progress moves to `approved` when the helper connects and passes peer checks, `dismissed` on pkexec exit 126,
-  `failed` on 127 or any other exit, or after 300 s. **(Architect's call** for the timeout.)
+  missing or failing app is `cannot_prompt`. (Panel 2, 2026-11-01) The configured or derived path is canonicalized
+  first, and a path that cannot be canonicalized is "missing"; the `plutil` and `codesign` facts are cached per
+  bundle stamp (device, inode, `Info.plist` mtime and size, main executable mtime and size; the executable is
+  `Contents/MacOS/Aitmproxy`, else `Contents/_CodeSignature/CodeResources`) (Panel 3, 2026-11-01: the size fields and
+  the executable fallback, so an in-place overwrite of the executable changes the stamp).
+- Linux: `pending` after spawning `/usr/bin/pkexec /usr/lib/aitmproxy/aitm-l4-helper serve --connect <socket>` (§5;
+  panel, 2026-11-01: the launcher by absolute path, environment per §5.5) with
+  pkexec's stderr on a pipe the core drains; the progress moves to `approved` when the helper connects and passes
+  peer checks, and otherwise follows the exit mapping of §5.5 (S7: pkexec's textual agent never exits 126, so the
+  old "126 dismissed / 127 failed" rule was wrong): `dismissed` on exit 126 (a graphical agent's Cancel), on exit 127
+  after `Got unexpected EOF while reading from controlling terminal` (Ctrl-D at the textual prompt), or on death by
+  SIGINT (Ctrl-C); `failed` on exit 127 with `Not authorized` (wrong password or not an admin), on exit 127 with
+  `Error creating textual authentication agent` (no terminal; the §5.5 predicate should have answered
+  `cannot_prompt` first, this is the safety net), on any other non-zero exit, or after 300 s. **(Architect's call**
+  for the timeout.) The spawn happens only when §5.5 says a prompt is possible, which (S7) means a controlling
+  terminal opens or a display is set, not that stdin is a tty.
 
 #### 2.4 The status verbs, `L4Gated`, config, CLI
 
@@ -245,13 +274,17 @@ policy's exec path is ever run through `pkexec` (§5.1).
 - **`L4Availability.resolve`** (the frontends' decoding of the status object) is the parity spec's; this spec's
   frontends layer the `privilege` decoding on top of it and change nothing in it.
 - `L4Gated` error text: `L4 unavailable: packet capture is not allowed yet (<how.label>)`. `L4Gated` forwards the
-  wrapped command's `confirm_prompt` and `sensitivity` unchanged, so after availability flips to available
-  `tools/list` still shows `confirmable: true` for `l4.inject`, `l4.send_recv`, `l4.intercept.forward` and
-  `l4.intercept.drop`.
+  wrapped command's `confirm_prompt(params)` and `sensitivity()` unchanged for every `params` value, before and after
+  availability flips, so `tools/list`'s `confirmable` never changes with privilege. (Panel, 2026-11-01: the four
+  verbs' `confirm_prompt(&Params::default())` is `None` with or without privilege, since `l4.inject` and
+  `l4.send_recv` need `spec`/`dst`/`interface` and the verdict verbs a parked id; AC27 states the forwarding
+  contract, not a `confirmable: true` premise.)
 - Config, under `l4.privilege` (**Architect's call** for names and defaults): `helper_path` (none), `macos_app_path`
   (`/Applications/Aitmproxy.app`), `request` (`manual` | `at_start`, default `manual`). `at_start` makes the core call
   the request itself once at start when capture needs approval: the operator wrote that config, so it is an operator
-  act. This is the CLI path for `aitm` and `aitm web` that needs no new command.
+  act. This is the CLI path for `aitm` and `aitm web` that needs no new command. (Panel, 2026-11-01) `at_start` fires
+  in serving modes (`aitm`, `aitm web`, `aitm tui`), after the one-shot early return; a one-shot command never hands
+  off or spawns.
 - The start-up `warn` line becomes `L4 enabled; packet capture needs approval: <how.label>`.
 - `aitm l4.privilege` works as a one-shot CLI verb through the registry on every OS. The one-shot `aitm
   l4.privilege.request` is macOS only (it hands off to the app, which outlives the command). On Linux it refuses with
@@ -472,21 +505,37 @@ helper signed after the app). It is a source tripwire, not evidence (AC section)
 
 Spawned by the core, through `pkexec` (default) or directly when the helper binary has file caps (the headless
 fallback). The core runs `pkexec` only on the installed policy's exec path, `/usr/lib/aitmproxy/aitm-l4-helper`, never
-on a configured or discovered path. Start-up, in this order; a failed step exits non-zero before any other I/O:
+on a configured or discovered path. What pkexec hands the helper (S7, measured on Debian trixie and Fedora 42):
+every fd above 2 is closed, so nothing can be passed by inheritance and the absolute socket path on argv is the only
+link to the core; the helper is exec'd in place, so its pid is the pid the core spawned; `cwd` is `/root`; the
+environment is reduced to `SHELL`, `LC_CTYPE`, `PATH`, `LOGNAME`, `USER`, `HOME`, `PKEXEC_UID` (a decimal string) and,
+only while the policy carries `allow_gui`, `XAUTHORITY`/`DISPLAY`; `XDG_RUNTIME_DIR` and `TERM` are absent. Start-up,
+in this order (S7: the order is a correctness requirement, each step below says what breaks without it); a failed
+step exits non-zero before any other I/O:
 
 1. Record `getppid()`. Validate argv: exactly `serve --connect <path>`, `<path>` absolute, at most 107 bytes.
 2. Determine the invoking user. `PKEXEC_UID` is trusted only when the real uid is 0 (started by pkexec); otherwise the
-   invoking user is `getuid()` and `PKEXEC_UID` is ignored.
-3. If root: while `CAP_SETPCAP` is still held, drop every capability except `CAP_NET_RAW` from the bounding set and
-   clear the ambient set; set `PR_SET_KEEPCAPS`; set groups, gid, then uid to the invoking user; reduce permitted and
-   effective to `CAP_NET_RAW`; clear keepcaps. Then, root or not, set `no_new_privs`.
+   invoking user is `getuid()` and `PKEXEC_UID` is ignored. (S7) `PKEXEC_UID` is parsed as a decimal string.
+3. If root: while `CAP_SETPCAP` is still held, drop every capability except `CAP_NET_RAW` from the bounding set
+   (`caps::drop(None, Bounding, cap)` per capability; S7: it works for all 40 capabilities on kernel 6.8, and is
+   defence in depth only) and clear the ambient set (`caps::clear(None, Ambient)`); set `PR_SET_KEEPCAPS` (S7:
+   **mandatory**, without it the `capset` below fails `EPERM` and the helper ends with no capability at all);
+   `setgroups([primary gid of the invoking user])`, **never `initgroups`** (S7: `initgroups` keeps the admin group
+   `sudo`/`wheel`, `Groups:` must read the primary gid only); then `setresgid`, then `setresuid` to the invoking user
+   (`nix`); reduce permitted and effective to `CAP_NET_RAW` (`caps::set(None, Permitted | Effective, {NET_RAW})`) and
+   clear inheritable (`caps::clear(None, Inheritable)`); clear keepcaps. Then, root or not, set `no_new_privs`. (S7)
+   `CAP_NET_RAW` alone is enough: libpcap opens `lo` in promiscuous mode through `PACKET_ADD_MEMBERSHIP`, not
+   `SIOCSIFFLAGS`, so `CAP_NET_ADMIN` is never asked for; capture, filter, inject and read-back all work after this
+   step, and `bind :80`, `setuid(0)`, `open /etc/shadow`, raising any other capability and re-exec'ing `pkexec` all
+   fail.
 4. Only now, as the invoking user, check the path: `lstat` reports a socket, not a symlink; its directory is owned by
    the invoking user, mode 0700, and not a symlink. This applies equally to the `XDG_RUNTIME_DIR` directory and to the
    fallback `/tmp/aitm-<uid>/`.
 5. Connect. The core checks `SO_PEERCRED`: uid equals the core's uid and pid equals the child it spawned. The helper
    checks that the peer uid equals the invoking user. A failed check closes the connection and the helper exits.
 6. Last, set `PR_SET_PDEATHSIG` (SIGKILL), then exit if `getppid()` differs from step 1 (the core died before the
-   signal was armed).
+   signal was armed). (S7) Strictly after step 3: the kernel clears the parent-death signal when the credential change
+   makes the task non-dumpable, so a signal armed earlier reads back as 0 and the helper would outlive the core.
 
 It exits on EOF, on any protocol error, or when the core dies. There is never an orphaned privileged process.
 
@@ -502,12 +551,22 @@ payloads are JSON; `Frame` and `Inject` carry a small binary header plus the raw
 | core → helper | `ScopeSet` | the guard's current scope entries and limits (`global_inject_pps`, `max_packet_bytes`, `max_packets_per_call`) and the core's self-exclusion ports (parity spec §2.1), resent on every change |
 | core → helper | `CaptureOpen` / `CaptureClose` | id, interface, direction, read timeout. No filter string |
 | helper → core | `Frame` / `CaptureClosed` | capture id, timestamp, bytes / reason |
-| core → helper | `Inject` | request id, interface, frame bytes |
+| core → helper | `Inject` | request id, interface, frame bytes. (S7) The helper picks the wire path by destination, §5.3 |
 | helper → core | `InjectResult` | request id, ok or the guard or wire error text |
 
-A proto mismatch, an unknown type, an oversized length or malformed JSON closes the session. The core then reports
-`helper.status: "version_mismatch"` or `failed`. `HelperBackend` implements the existing `CaptureInjectBackend` trait
+A proto mismatch, an unknown type, an oversized length or malformed JSON closes the session. (Panel, 2026-11-01)
+After such a handshake failure with no session connected, `helper.status` is `version_mismatch` (proto mismatch;
+`detail` names both proto numbers) or `unknown` (any other protocol error; `detail` carries the error text), and the
+request's progress is `failed`. `failed` is a `RequestProgress` state, never a `Helper.status` value. This reading
+sits between the connected-session row (`running`) and the file-caps row of the §2.2 Linux table and clears when a
+session connects. `HelperBackend` implements the existing `CaptureInjectBackend` trait
 over this session, so the commands do not change.
+
+(Panel 2, 2026-11-01) Every peer-supplied text the core shows an operator (the helper's `InjectResult` error,
+`CaptureClosed.reason`, a handshake defect text, and each entry of the macOS receipt's `errors`) is bounded to 512
+bytes with control characters replaced (`TEXT_BOUND`), and a blank entry falls back to the spec literal for that
+place. The listener watcher ends a request as `failed` after 10 consecutive `accept` errors (`ACCEPT_ERRORS_MAX`),
+logging one `warn` at the first.
 
 #### 5.3 The helper enforces the guard itself
 
@@ -519,24 +578,96 @@ its `ScopeSet` with the same `scope_filter` function; it never accepts, or strin
 crate, same functions, no re-implementation. **(Architect's call:** the helper links `aitm-proto-l4` for the guard and
 protocol and links nothing else of the product: no Rhai, no MCP, no HTTP.)
 
+(S7) **Two wire paths after the guard passes, chosen by destination.** An L2 frame injected through `pcap_inject` on
+`lo` carries no route, so the kernel drops it as a martian (`IPv4: martian destination 127.0.0.1 from 127.0.0.1, dev
+lo`) before any local socket sees it; making it deliverable needs the root-only sysctls `route_localnet=1` and
+`accept_local=1`, which the product never asks for. So, for a target address the host owns (127/8 in the default
+scope, or any address on a local interface) the helper strips the Ethernet header and sends the IPv4 packet through
+`socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` with `IP_HDRINCL`; it goes through `ip_output` with a route, reaches the
+local UDP or TCP socket with default sysctls, and is still seen by the capture on `lo` (so W3's `injected: true`
+holds). `pcap_inject` stays for frames leaving a real interface. Both paths need only `CAP_NET_RAW`, and the guard
+check precedes either; the destination decides the path, never the core.
+
 #### 5.4 Packaging (`scripts/nfpm.yaml`, `scripts/package-linux.sh`)
 
 - `/usr/lib/aitmproxy/aitm-l4-helper`, mode 0755, `root:root`. No `/usr/bin` symlink: it is not a user command.
 - `scripts/packaging/com.mrbrutti.aitmproxy.l4-helper.policy`, installed to `/usr/share/polkit-1/actions/`: action
   `com.mrbrutti.aitmproxy.l4-helper.run`, annotation `org.freedesktop.policykit.exec.path` =
-  `/usr/lib/aitmproxy/aitm-l4-helper`, `allow_gui` true, defaults `allow_any`, `allow_inactive` and `allow_active` all
+  `/usr/lib/aitmproxy/aitm-l4-helper`, **no `allow_gui` annotation** (S7: was `true`; the helper has no GUI and the
+  dialog belongs to pkexec's agent, so the only effect was leaking `DISPLAY` and `XAUTHORITY` into the root helper's
+  environment; a tripwire fails on `allow_gui`), defaults `allow_any`, `allow_inactive` and `allow_active` all
   `auth_admin` (no `auth_admin_keep`: every request is a fresh authentication; a tripwire fails on `_keep`). Message:
-  "Allow aitmproxy to capture and send raw packets (only within the L4 scope you configured)".
-- `recommends`: deb `pkexec`, rpm `polkit`. **No maintainer scripts, no setcap, no new group.** Both files arrive
-  through nfpm `contents`.
+  "Allow aitmproxy to capture and send raw packets (only within the L4 scope you configured)". `pkaction --verbose
+  --action-id com.mrbrutti.aitmproxy.l4-helper.run` is the cheap rig check that the file was read as written.
+- `recommends`: deb `pkexec` (S7: named explicitly because on Debian trixie `pkexec` is a separate package from
+  `polkitd`), rpm `polkit`. **No maintainer scripts, no setcap, no new group.** Both files arrive through nfpm
+  `contents`.
 - The tarball also carries `aitm-l4-helper`, but user-owned. The core never pkexecs it (§5.1), so it serves only the
   documented fallback.
 
 #### 5.5 Who sees the prompt
 
 The core decides "a prompt is possible" before spawning pkexec: `DISPLAY` or `WAYLAND_DISPLAY` is set (a graphical
-agent is likely), or the core's stdin is a tty (pkexec's textual agent). Otherwise the reply is `cannot_prompt` and
-pkexec is never run. **(Architect's call.)**
+agent is likely), or **a controlling terminal exists, tested by `open("/dev/tty")` succeeding** (pkexec's textual
+agent). (S7) It is **not** "stdin is a tty": the textual agent opens `/dev/tty`, so it prompts fine with stdin,
+stdout and stderr all redirected, and fails without a controlling terminal (`setsid`) however stdin looks, in 0.5 s
+with `Error creating textual authentication agent: Error opening current controlling terminal for the process
+(`/dev/tty'): No such device or address`, exit 127. Otherwise the reply is `cannot_prompt` and pkexec is never run.
+**(Architect's call.)**
+
+(S7) **How pkexec is run and how its end is read.** pkexec gets a **pipe for stderr**; stdin, stdout and the
+controlling terminal stay as they are, so the prompt still reaches the terminal while the core can classify the
+failure text. The core drains that pipe for as long as the child lives (the helper inherits it and must never block
+on a full pipe). Death of the child, read with a wait status that distinguishes an exit code from a signal, maps to
+`RequestProgress` as follows; the textual agent never returns 126, and all its failures are 127 with distinct texts:
+
+| pkexec ended with | stderr contains | progress | message |
+|---|---|---|---|
+| exit 126 | `Request dismissed` (graphical agent's Cancel) | `dismissed` | "Approval was cancelled" |
+| exit 127 | `Got unexpected EOF while reading from controlling terminal` (Ctrl-D at the textual prompt) | `dismissed` | "Approval was cancelled" |
+| killed by SIGINT | nothing more | `dismissed` | "Approval was cancelled" |
+| exit 127 | `Not authorized` (wrong password, or the caller is not an admin) | `failed` | "Administrator authentication failed (wrong password or not authorized)" |
+| exit 127 | `Error creating textual authentication agent` | `failed` | "No password prompt could be shown here (no desktop session or terminal)"; the request should have been `cannot_prompt`, this row is the safety net |
+| any other non-zero exit `n` | anything | `failed` | "The packet-capture helper did not start (pkexec exit `n`)" |
+| still running after 300 s | | `failed` | "No approval within 5 minutes" (the child is killed) |
+
+(Panel, 2026-11-01) **How the launcher is spawned.** The core runs the launcher by absolute path, `/usr/bin/pkexec`,
+never by `PATH` lookup. The child's environment is cleared and only `DISPLAY`, `WAYLAND_DISPLAY` and `XAUTHORITY` are
+passed through: no `SHELL` (pkexec refuses a value absent from `/etc/shells`), no `LANG`/`LC_*` (so the stderr
+literals the table matches stay the English ones S7 measured). `request_linux` evaluates the packaged rows (policy
+path, root-owned chain, policy file present, `pkexec` present) before the prompt predicate, so an unpackaged install
+answers with the install label even where no prompt is possible.
+
+(S7; corrected by the panel, 2026-11-01) **Ctrl-C at the prompt hits the core too.** The core and pkexec share the
+foreground process group, so Ctrl-C delivers SIGINT to both. `SIG_IGN` is ruled out: the ignore is inherited across
+`execve` and the prompt becomes un-cancellable (pkexec and its agent ignore Ctrl-C). The core needs no handler of its
+own either: the `aitm` binary already owns SIGINT through tokio's `ctrl_c` (`crates/aitm/src/lib.rs`
+`shutdown_signal`), so the signal never kills the process; what shuts the core down is the shutdown future resolving.
+**The hold therefore lives in the binary:** the `PrivilegeState` raises a hold count around a live pkexec child, and
+the shutdown future, seeing Ctrl-C while the count is non-zero, logs `Ctrl-C cancelled the packet-capture prompt; the
+core keeps serving` and keeps waiting. The child, which has the default disposition after exec, dies of the SIGINT and
+is recorded `dismissed` above. No `sigaction`, no `unsafe`, no new crate (the earlier "leaf crate" follow-up is
+withdrawn). **(Architect's call:** during that window Ctrl-C cancels the prompt and does not shut the core down; once
+the child is gone, Ctrl-C shuts the core down as before. Matt's Question 6 in the plan stays flagged.) The TUI leaves
+raw mode before the prompt (below), which is exactly when Ctrl-C turns from a key into a signal.
+
+(Panel 2, 2026-11-01) Both serving shutdown futures consult the hold: the one `aitm` and `aitm web` await
+(`crates/aitm/src/lib.rs` `shutdown_signal`) and the `aitm tui` select arm (`crates/aitm/src/tui.rs`). When a held
+Ctrl-C reaches the core alone (no shared foreground process group, so the child saw no signal), the core kills the
+launcher child itself, so the prompt is cancelled and the stop is never deferred to the 300 s timeout
+(**Architect's call:** the core sends the child SIGINT, so the table above records `dismissed`). The watcher thread
+carries an unwind guard, so a panic can never leave the request `pending` or the hold raised.
+
+(Panel 3, 2026-11-01) The `failed` message the unwind guard writes to a still-`pending` request is exactly
+`The packet-capture request ended unexpectedly`; on a panic the guard also kills the launcher child, best-effort (a
+child already gone, or one that refuses the signal, is left to its own exit). `cancel_prompt()` signals only the
+request's own launcher child: never a serving helper, and never a helper started directly on the file-caps row;
+with no launcher alive it does nothing. `Child::interrupt()` sends SIGINT on Linux; off Linux no launcher ever
+exists, so it is a no-op.
+
+(S7) The textual prompt names an **admin** identity (`Authenticating as: <admin>`); for an operator who is not in
+`sudo`/`wheel` that is another user's account, which is correct polkit behaviour and why the web banner says "Enter
+an administrator password in the terminal running aitm".
 
 - Web UI on a desktop: the graphical polkit dialog. From an SSH terminal: the textual prompt in that terminal, and the
   web banner says "Enter an administrator password in the terminal running aitm".
@@ -557,6 +688,33 @@ pkexec is never run. **(Architect's call.)**
 - Homebrew on Linux and tarball users: `needs_approval` `package`, "Install the aitm .deb or .rpm to get the
   packet-capture helper", with the download link. No root path exists for a formula.
 
+#### 5.7 Amendments (spike S7, 2026-11-01)
+
+Spike S7 (`docs/research/experiments/2026-11-01-l4-s7-pkexec-helper.md`, merged as PR #240) proved §5.1 and §5.4 as
+designed and corrected four assumptions. Each correction is folded in place above, marked "(S7)"; this list is the
+index. Forks (i)–(v) and the open item are untouched.
+
+1. **Prompt predicate (§5.5, §2.3, AC23).** "A prompt is possible" is a controlling terminal (`open("/dev/tty")`
+   succeeds) or `DISPLAY`/`WAYLAND_DISPLAY` set; it was "stdin is a tty". The textual agent opens `/dev/tty` and is
+   indifferent to where stdin, stdout and stderr point.
+2. **Exit mapping and SIGINT (§5.5, §2.3).** The textual agent never exits 126; wrong password, Ctrl-D and no-tty are
+   all 127 with distinct stderr texts, so pkexec gets a stderr pipe and the mapping table in §5.5 replaces "126
+   dismissed, 127 failed". Ctrl-C reaches the core too: never `SIG_IGN`; (panel, 2026-11-01) the hold is a count
+   consulted by the `aitm` binary's existing tokio `ctrl_c` shutdown future while a pkexec child is alive, no handler
+   of the core's own and no leaf crate, and death by SIGINT is `dismissed`.
+3. **Helper start-up details (§5.1).** `PR_SET_KEEPCAPS` is mandatory; the bounding drop happens while `CAP_SETPCAP`
+   is held; `setgroups([primary gid])`, not `initgroups`; `PR_SET_PDEATHSIG` strictly after the credential change;
+   `cwd` is `/root`, `XDG_RUNTIME_DIR` is absent, `PKEXEC_UID` is decimal; pkexec closes fds above 2 and execs in
+   place. `CAP_NET_RAW` alone suffices; AC16's literals stand byte for byte. Policy (§5.4): no `allow_gui`; deb
+   `recommends` names `pkexec`.
+4. **Loopback inject (§5.2, §5.3, AC8 W3–W4 on Linux).** A `pcap_inject` frame on `lo` is a martian; local
+   destinations go through `AF_INET`/`SOCK_RAW`/`IPPROTO_RAW` with `IP_HDRINCL`, `pcap_inject` stays for real
+   interfaces, the guard precedes both.
+5. **Rig and harness facts (AC16, AC22, the plan's [linux-ci] rig).** `expected_pid` is the pkexec child's pid; the
+   socket path appears in the journal and never carries a secret; the textual prompt's first line is
+   `==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====`; the test rule `49-aitm-test.rules` is the
+   AC16 mechanism and is removed for AC22; containers need `--systemd=always --privileged` for `polkitd` to start.
+
 ### 6. Phase 2 and option A
 
 - **Phase 2, candidate 1 on macOS:** `aitm-l4-helper serve` under the same SMAppService plist (plus a `Sockets` or
@@ -564,8 +722,11 @@ pkexec is never run. **(Architect's call.)**
   guard as in §5.3; `bpf-permissions` retires and the new helper runs the `bpf-revert` logic on first boot. In-path
   NFQUEUE through the helper lands here too. Frame streaming is the default; fd passing only if spike S2 works, in a
   leaf `unsafe` crate with a non-pcap backend (research 13 §3.6).
-- **Option A (frames in the sysex)** stays out unless spike S1 proves a network-entitled sysex opens `/dev/bpf*`; any
-  sysex change, including a frames lane, belongs to the NE session.
+- **Option A (frames in the sysex)** is back on the table for phase 2 (panel, 2026-11-01, per Matt's 2026-11-01
+  decision in the Status line: the extension may expand to do capture and injection for the core). Spike S1 (does a
+  network-entitled sysex open `/dev/bpf*`) informs the carrier choice between option A and candidate 1; that choice
+  is a phase-2 spec amendment. Phase 1 changes nothing in the sysex; any sysex change, including a frames lane,
+  belongs to the NE session.
 
 ### 7. Security
 
@@ -582,7 +743,11 @@ pkexec is never run. **(Architect's call.)**
   ways, re-runs the guard on every frame and builds its own capture filter (§5.3), and dies with the core. Only the
   policy's root-owned path is ever pkexec'd. Its limit: a compromised core can send a wider `ScopeSet`, so it is a
   boundary against everything except its parent core. The setcap fallback makes it an oracle for every user who can
-  execute it, which is why the doc restricts it to a group.
+  execute it, which is why the doc restricts it to a group. (Panel 2, 2026-11-01) Every text the helper or the
+  receipt hands the core for an operator (`InjectResult.error`, `CaptureClosed.reason`, handshake defect text, the
+  receipt's `errors` entries) is bounded to 512 bytes with control characters replaced (`TEXT_BOUND`), a blank entry
+  falling back to the spec literal; and a listener whose `accept` fails 10 times in a row (`ACCEPT_ERRORS_MAX`) ends
+  the request `failed` with one `warn` at the first error, so a broken or hostile socket cannot spin the watcher.
 - **T4, agent and remote triggers.** `l4.privilege.request` is operator-only at the policy gate and in the command,
   and is never parked; gated verbs never start a request. The macOS URL only brings the app forward (§3.4); the
   in-app click and the OS approval, or the polkit dialog on Linux, are the human gates. An agent with a shell could
@@ -615,7 +780,7 @@ touch the same files.
 | S3 | On macOS 27, what does `SMAppService.daemon.register()` show: a Login Items toggle only, or a toggle plus admin auth? Does re-register after an update re-prompt? Does registering the revert daemon from an approved app prompt? Is a `~/Applications` bundle refused? Does `AssociatedBundleIdentifiers` show the app name and icon? Which `SpawnConstraint` shape does launchd accept, and does it refuse a substituted helper (substitution test)? | 3 | §3.2 words, §4.2, Phase 1 macOS, AC6, AC13, AC14, AC28 |
 | S4 | After `dseditgroup` adds the console user to `access_bpf`, does an already-running process open a `0660 root:access_bpf` node without re-login? | 5 | fork (ii) default, AC7 |
 | S5 | Does `open -a /Applications/Aitmproxy.app aitmproxy://packet-capture/allow` deliver the URL both when the app is running and when it is not? Does `open --args` really drop arguments for a running app? | — (new) | §3.4, AC9 |
-| S7 | Linux: does pkexec's textual agent work while the core's stdio is redirected? Does pkexec close fds above 2? Does the §5.1 drop keep `CAP_NET_RAW` usable by `pcap` for open and inject on `lo`? Is `CAP_NET_RAW` alone enough? | 8 | §5.1, AC16, AC22 |
+| S7 | Linux: does pkexec's textual agent work while the core's stdio is redirected? Does pkexec close fds above 2? Does the §5.1 drop keep `CAP_NET_RAW` usable by `pcap` for open and inject on `lo`? Is `CAP_NET_RAW` alone enough? **Proven 2026-11-01** (`experiments/2026-11-01-l4-s7-pkexec-helper.md`, PR #240): yes, yes, yes, yes; corrections in §5.7 | 8 | §5.1, AC16, AC22 |
 | S8 | macOS 27: does a BPF write of a DLT_NULL frame on `lo0` reach a UDP socket on 127.0.0.1:9053, and is it read back by a capture? | 7 | AC8 steps W3–W4 on macOS |
 | S6 (optional) | Can an unprivileged process read `launchctl print system/com.mrbrutti.aitmproxy.l4-helper` to enrich `helper.status`? | 4 | nothing; enrichment only |
 | S1, S2 | Sysex `/dev/bpf*` open; `SCM_RIGHTS` of a bpf fd on macOS 27 | 1, 2 | Phase 2 / option A only |
@@ -635,6 +800,8 @@ Changed:
 
 - `crates/aitm-proto-l4/src/{module,capture,sendrecv,language,config}.rs`, `commands/{capture,intercept,mod}.rs`
 - `crates/aitm/src/{wire,main}.rs`; `crates/aitm-mcp/src/server.rs` (`is_operator_only` only)
+- `crates/aitm/src/lib.rs` and `crates/aitm/src/tui.rs` (panel 2, 2026-11-01: each shutdown arm consults the prompt
+  hold)
 - `apps/mac/Info.plist.in` (URL type), `ConnectionSummary.swift`, `EmbeddedCoreLaunch.swift`, `StatusPanel.swift`,
   `SettingsView.swift`, `App.swift` (URL handler), the L4 surface file that hosts the capture controls (named in the
   plan: `Panels/L4CaptureControls.swift`, new). Privilege decoding lives in the new `PacketCapture.swift` (plan
@@ -643,7 +810,8 @@ Changed:
   `scripts/package-linux.sh`, `docs/RELEASE.md`; the tap repo's `Casks/aitmproxy.rb`
 - `crates/aitm-tui/src/{app,l4,keys}.rs`, `ui/l4.rs`
 - `apps/web/src/panels/l4/L4PrivilegeBanner.tsx` (new) and the L4 store
-- the three tool contracts (`EXPECTED_TOOLS`, `CORE_TOOLS`, `bus-fixture.json`)
+- the two tool contracts (`EXPECTED_TOOLS`, `CORE_TOOLS`) (panel, 2026-11-01: `bus-fixture.json` and
+  `tester_shell.rs` are gone since #244)
 
 Also claimed by the plan (Architect's call, plan 2026-10-31), per unit; the files marked **behaviour surfaces, flagged
 for Matt** carry user-visible change this spec did not list:
@@ -653,7 +821,10 @@ for Matt** carry user-visible change this spec did not list:
 - (p1b) new `crates/aitm-proto-l4/src/privilege/{report,availability,state}.rs`, `backend/routed.rs`,
   `crates/aitm-proto-l4/tests/privilege.rs`; changed `crates/aitm-proto-l4/src/{lib,guard}.rs`, `helper/mod.rs`,
   `backend/mod.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing`, Linux `nix`), `crates/aitm/tests/frontends.rs`,
-  `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` only), `crates/aitm-tui/tests/tester_shell.rs` (two count pins),
+  `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` only; `tester_shell.rs` dropped, panel 2026-11-01, deleted by #244),
+  `Cargo.lock` (the derived line for the `Cargo.toml` change only, panel 2026-11-01),
+  `crates/aitm/src/{lib,tui}.rs` (panel 2, 2026-11-01: the shutdown arm consults the hold; `tui.rs` one line plus
+  threading the hold into `tui::run`),
   `tests/e2e/l4/{test_l4_parity_core,test_l4_parity_priv}.py`, `docs/research/mcp-tool-catalog.txt`,
   `aitmproxy-plugin/docs/tool-reference.md`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`
 - (p2) new `tests/e2e/l4/linux-privilege-rig.sh`; changed the root `Cargo.toml` (`members`, workspace dep),
@@ -729,7 +900,9 @@ these run on Matt's Mac via the Terminal and CUA recipe. **[linux-desk]** a Linu
    without a restart. A Homebrew or tarball `aitm l4.privilege` one-shot (not the bundle's binary) reports
    `available`.
 8. **L4PRIV-AC8 [mac-signed, linux-ci]** Walk W passes on the rig: macOS on `lo0` in process after AC6, Linux on `lo`
-   through the helper in both AC16 mode and AC17 mode. On macOS, W3–W4 depend on spike S8.
+   through the helper in both AC16 mode and AC17 mode. On macOS, W3–W4 depend on spike S8. (S7) On Linux, W3–W4
+   reach 127.0.0.1:9053 only through the helper's raw-IP loopback path (§5.3) with the default
+   `net.ipv4.conf.lo.route_localnet=0`; the rig never sets a sysctl.
 9. **L4PRIV-AC9 [mac-signed]** From the TUI (pty) and from the web UI (browser) against the rig on the Mac, with the
    app running and with it quit: the Allow action plus confirm brings Aitmproxy forward on Status with the Packets
    card highlighted and the §3.4 neutral line; Return does not press Allow; when quit, the URL launch starts no
@@ -788,14 +961,18 @@ these run on Matt's Mac via the Terminal and CUA recipe. **[linux-desk]** a Linu
     the banner says "Approval was cancelled". A second Allow prompts again (no cached grant).
 22. **L4PRIV-AC22 [linux-ci]** In a systemd container (polkitd running, user `tester` with a password and in the admin
     group, no graphical agent), with `aitm tui` in a pty: Allow plus confirm restores the normal screen, and a prompt
-    containing `com.mrbrutti.aitmproxy.l4-helper.run` appears. The harness types the password, the TUI redraws, and
-    the banner is gone with capture `available`.
-23. **L4PRIV-AC23 [linux-ci]** With `DISPLAY` and `WAYLAND_DISPLAY` unset and stdin not a tty, the request returns
+    appears whose first line is `==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====` (S7: the harness
+    matches on that line; the policy message, `Authenticating as: <admin>` and `Password: ` follow). The harness types
+    the password, the TUI redraws, and the banner is gone with capture `available`. The test rule
+    `49-aitm-test.rules` is absent for this check.
+23. **L4PRIV-AC23 [linux-ci]** With `DISPLAY` and `WAYLAND_DISPLAY` unset and no controlling terminal (S7: the core
+    runs under `setsid` so `open("/dev/tty")` fails; stdin being a pipe is not the condition), the request returns
     `cannot_prompt` and no pkexec runs. Its message names `docs/packet-capture.md` only if Matt accepted that doc
     (the open item, the headless `setcap` doc), and otherwise names no doc.
 24. **L4PRIV-AC24 [linux-ci, mac-any, trip]** With L4 enabled and capture not available, the start-up log has exactly
     one line `L4 enabled; packet capture needs approval: …`, matching neither the AC3 regex nor the operator token.
-    The three tool contracts list `l4.privilege` and `l4.privilege.request`.
+    The two tool contracts (`EXPECTED_TOOLS`, `CORE_TOOLS`) list `l4.privilege` and `l4.privilege.request`, and
+    `tui_live_bus.rs` sees both in the live `tools/list` (panel, 2026-11-01: read "three"; #244 removed the fixture).
 25. **L4PRIV-AC25 [mac-any, linux-ci]** With capture `needs_approval`, the L4 empty state in the mac app, the TUI and
     the web UI shows the "No packets?" nudge with its Allow action, and a failed `l4.capture.start` shows the same
     nudge.
@@ -803,9 +980,11 @@ these run on Matt's Mac via the Terminal and CUA recipe. **[linux-desk]** a Linu
     true` and no `l4.scope`. Against the privilege rig the mac L4 surface shows Start capture disabled with the core's
     reason [mac-any]; after AC6, Start on `lo0` returns an id and Stop ends it, both visible in the rig's audit ring
     from the mac connection [mac-signed].
-27. **L4PRIV-AC27 [unit]** A module whose `PrivilegeState` flips from `needs_approval` to `available`: `tools/list`
-    built from its registry shows `confirmable: true` for `l4.inject`, `l4.send_recv`, `l4.intercept.forward` and
-    `l4.intercept.drop` both before and after the flip.
+27. **L4PRIV-AC27 [unit]** (Reworded by the panel, 2026-11-01.) A module whose `PrivilegeState` flips from
+    `needs_approval` to `available`: for every gated verb, `confirm_prompt(params)` and `sensitivity()` answer
+    identically before and after the flip for every `params` value, and for `l4.inject`/`l4.send_recv` with in-scope
+    params the answer is `Some` while still gated (the gate forwards the prompt). `tools/list`'s `confirmable`
+    therefore never changes with privilege.
 28. **L4PRIV-AC28 [mac-signed]** Spike S3's substitution test is written up and passed: with the helper replaced by a
     binary that does not meet the `SpawnConstraint`, launchd refuses to run it and the receipt is not rewritten.
     Without this AC, Phase 1 macOS does not ship.
@@ -817,7 +996,7 @@ these run on Matt's Mac via the Terminal and CUA recipe. **[linux-desk]** a Linu
 
 - The JSON field order, exact Rust type names under `privilege/` and `helper/`, and how `ProbeInputs` is gathered,
   provided `derive` stays pure.
-- The privilege-drop crate (`caps`, `nix`, or both), the UDS directory layout under `XDG_RUNTIME_DIR` (fallback
+- The privilege-drop crate (S7 names the `caps` and `nix` calls in §5.1 step 3; the module structure is the builder's), the UDS directory layout under `XDG_RUNTIME_DIR` (fallback
   `/tmp/aitm-<uid>/`, verified per §5.1), and the frame-header byte layout within §5.2's limits.
 - Card layout, icon, and the exact spot of the TUI and web banners within the L4 view or page.
 - How the bundle's helper version reaches the app (a generated constant or a `version` call).

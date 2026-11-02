@@ -236,14 +236,16 @@ pub fn version_line() -> String {
 }
 
 /// The built-in command groups: the first segments of what the binary
-/// registers with a default config and no bundled catalogue (plan C19). The
-/// `l4` group's script verbs come from the bundled Rhai scripts, which the
-/// operator can turn off or replace, and the `L4Module`'s own verbs register
-/// only when `l4.enabled`, so `l4` is not listed; `check` is native since the
-/// scanner-v2 engine (#232, merged 2026-11-02) and is. Pinned to the live
-/// registry by `tests/synopsis_groups.rs` (AC-W1-2).
+/// registers with a default config and no bundled catalogue (plan C19). `check`
+/// is native since the scanner-v2 engine (#232, merged 2026-11-02). `l4` is
+/// listed since the L4 capture-privilege core (spec
+/// `2026-10-31-l4-capture-privilege-design` §2.2): `l4.privilege` and
+/// `l4.privilege.request` register on every core, `l4.enabled` or not, so an
+/// operator can always ask why raw capture is off; the rest of the `l4.*`
+/// verbs still need `l4.enabled` (or the bundled Rhai scripts). Pinned to the
+/// live registry by `tests/synopsis_groups.rs` (AC-W1-2).
 pub const GROUPS: &[&str] = &[
-    "agent", "browser", "ca", "capture", "check", "config", "findings", "flow", "map", "poc",
+    "agent", "browser", "ca", "capture", "check", "config", "findings", "flow", "l4", "map", "poc",
     "proxy", "request", "scan", "scope", "script", "session", "tls", "ws",
 ];
 
@@ -264,8 +266,8 @@ pub const SYNOPSIS: &str = concat!(
     "  aitm operator-token generate [--force]\n",
     "\n",
     "Groups:\n",
-    "  agent  browser  ca  capture  check  config  findings  flow  map  poc\n",
-    "  proxy  request  scan  scope  script  session  tls  ws\n",
+    "  agent  browser  ca  capture  check  config  findings  flow  l4  map\n",
+    "  poc  proxy  request  scan  scope  script  session  tls  ws\n",
     "\n",
     "Options:\n",
     "  --config <path>           config file (env AITM_CONFIG)\n",
@@ -515,7 +517,7 @@ mod tests {
         );
         assert_eq!(SYNOPSIS.lines().next(), Some(first.as_str()));
 
-        let block = "\nGroups:\n  agent  browser  ca  capture  check  config  findings  flow  map  poc\n  proxy  request  scan  scope  script  session  tls  ws\n";
+        let block = "\nGroups:\n  agent  browser  ca  capture  check  config  findings  flow  l4  map\n  poc  proxy  request  scan  scope  script  session  tls  ws\n";
         assert!(
             SYNOPSIS.contains(block),
             "the Groups block is not verbatim:\n{SYNOPSIS}"
@@ -525,7 +527,7 @@ mod tests {
             .split_whitespace()
             .collect();
         assert_eq!(words.as_slice(), GROUPS);
-        assert_eq!(GROUPS.len(), 18);
+        assert_eq!(GROUPS.len(), 19);
 
         assert!(
             SYNOPSIS.ends_with("  Trust the CA:  aitm ca install\n"),
@@ -735,8 +737,8 @@ mod tests {
             "  aitm operator-token generate [--force]\n",
             "\n",
             "Groups:\n",
-            "  agent  browser  ca  capture  check  config  findings  flow  map  poc\n",
-            "  proxy  request  scan  scope  script  session  tls  ws\n",
+            "  agent  browser  ca  capture  check  config  findings  flow  l4  map\n",
+            "  poc  proxy  request  scan  scope  script  session  tls  ws\n",
             "\n",
             "Options:\n",
             "  --config <path>           config file (env AITM_CONFIG)\n",

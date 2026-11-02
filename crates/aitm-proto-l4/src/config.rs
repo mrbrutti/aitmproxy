@@ -5,6 +5,7 @@
 //! `intercept` block is present. The binary (M5 Task 13) is the only constructor
 //! of the live module; here we define the shapes and their conservative defaults.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,10 @@ pub struct L4Config {
     /// (`l4.intercept.start` / `.mutate` / `.forward` / `.drop`). **Default false**
     /// (see [`allow_agent_inject`](Self::allow_agent_inject)).
     pub allow_agent_intercept: bool,
+    /// How this core finds and asks for packet-capture privilege (privilege
+    /// spec section 2.4). Every key has a default, so an existing config
+    /// without the block is unchanged.
+    pub privilege: L4PrivilegeConfig,
 }
 
 impl Default for L4Config {
@@ -85,8 +90,46 @@ impl Default for L4Config {
             allow_agent_inject: false,
             allow_agent_capture: false,
             allow_agent_intercept: false,
+            privilege: L4PrivilegeConfig::default(),
         }
     }
+}
+
+/// The `l4.privilege` block (privilege spec section 2.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct L4PrivilegeConfig {
+    /// Where the Linux helper is, when the operator put it somewhere other than
+    /// the places discovery looks (configured path first). `None` by default.
+    pub helper_path: Option<PathBuf>,
+    /// The macOS app `l4.privilege.request` hands off to when this core does
+    /// not run from a bundle itself. `/Applications/Aitmproxy.app` by default.
+    pub macos_app_path: PathBuf,
+    /// When the core asks for the privilege. `manual` by default: only an
+    /// explicit `l4.privilege.request` starts the platform action.
+    pub request: RequestMode,
+}
+
+impl Default for L4PrivilegeConfig {
+    fn default() -> Self {
+        Self {
+            helper_path: None,
+            macos_app_path: PathBuf::from("/Applications/Aitmproxy.app"),
+            request: RequestMode::Manual,
+        }
+    }
+}
+
+/// When the core starts the platform's permission flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestMode {
+    /// Only on an explicit `l4.privilege.request` (default).
+    #[default]
+    Manual,
+    /// Once at start-up, when capture needs approval. The operator wrote this
+    /// into the config, so it is an operator act.
+    AtStart,
 }
 
 /// Capture/inject backend selection.
@@ -139,6 +182,8 @@ pub enum Verdict {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::types::{L4Capability, L4Direction};
 
@@ -188,5 +233,59 @@ intercept:
         assert_eq!(intercept.on_timeout, Verdict::Forward);
         assert_eq!(intercept.on_overflow, Verdict::Forward);
         assert_eq!(intercept.queue_num, 100);
+    }
+
+    /// The `l4.privilege` block (privilege spec section 2.4): `request` parses
+    /// from snake_case, the other two keys keep their defaults when omitted, an
+    /// unknown key is refused, and `L4Config::default()` carries the documented
+    /// defaults so an existing config without the block changes nothing.
+    #[test]
+    fn privilege_block_parses_defaults_and_denies_unknown_keys() {
+        let cfg: L4Config =
+            serde_yaml::from_str("privilege: {request: at_start}\n").expect("config parses");
+        assert_eq!(cfg.privilege.request, RequestMode::AtStart);
+        assert_eq!(cfg.privilege.helper_path, None);
+        assert_eq!(
+            cfg.privilege.macos_app_path,
+            PathBuf::from("/Applications/Aitmproxy.app")
+        );
+
+        let cfg: L4Config = serde_yaml::from_str(
+            "privilege:\n  helper_path: /opt/aitm/aitm-l4-helper\n  macos_app_path: /Users/u/Dev.app\n",
+        )
+        .expect("config parses");
+        assert_eq!(
+            cfg.privilege.helper_path,
+            Some(PathBuf::from("/opt/aitm/aitm-l4-helper"))
+        );
+        assert_eq!(
+            cfg.privilege.macos_app_path,
+            PathBuf::from("/Users/u/Dev.app")
+        );
+        assert_eq!(cfg.privilege.request, RequestMode::Manual);
+
+        let err = serde_yaml::from_str::<L4Config>("privilege: {bogus: 1}\n")
+            .expect_err("an unknown privilege key is refused");
+        assert!(
+            err.to_string().contains("bogus"),
+            "the error names the key, got {err}"
+        );
+        assert!(
+            serde_yaml::from_str::<L4Config>("privilege: {request: sometimes}\n").is_err(),
+            "an unknown request mode is refused"
+        );
+
+        let defaults = L4Config::default().privilege;
+        assert_eq!(
+            defaults,
+            L4PrivilegeConfig {
+                helper_path: None,
+                macos_app_path: PathBuf::from("/Applications/Aitmproxy.app"),
+                request: RequestMode::Manual,
+            }
+        );
+        // An L4 config without the block is unchanged by its arrival.
+        let bare: L4Config = serde_yaml::from_str("enabled: true\n").expect("config parses");
+        assert_eq!(bare.privilege, defaults);
     }
 }

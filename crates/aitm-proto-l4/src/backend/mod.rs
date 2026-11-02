@@ -3,14 +3,20 @@
 //! [`CaptureInjectBackend`] abstracts the two raw-packet primitives — open a
 //! scoped capture and inject a link-layer frame — behind a trait so the wire
 //! choke point ([`crate::wire::send_on_wire`]) and the capture task (M5 Task 7)
-//! depend on behaviour, not on libpcap directly. The production implementation is
-//! [`pcap::PcapBackend`]; tests substitute an in-memory mock.
+//! depend on behaviour, not on libpcap directly. The libpcap implementation is
+//! [`pcap::PcapBackend`]; the privileged-helper implementation is
+//! [`helper::HelperBackend`] (privilege plan P1b.13); every production caller
+//! holds them behind [`routed::RoutedBackend`] (`PrivilegeState::backend()`,
+//! privilege plan P1b.8), which routes each call on the live privilege report;
+//! tests substitute an in-memory mock.
 //!
 //! **Fail-closed.** When libpcap or the capture/inject privilege is absent, a
 //! backend returns [`L4Error::Unavailable`] rather than panicking — the spec's
 //! `L4Unavailable` fail-closed contract (AC17, AC20).
 
+pub mod helper;
 pub mod pcap;
+pub mod routed;
 
 use std::fmt;
 use std::time::Duration;

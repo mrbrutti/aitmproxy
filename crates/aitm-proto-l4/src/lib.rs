@@ -28,5 +28,7 @@ pub mod types;
 pub mod wire;
 
 pub use backend::L4Error;
+pub use commands::privilege::PrivilegePlugin;
 pub use language::L4Language;
 pub use module::{L4Module, L4Privilege};
+pub use privilege::PrivilegeState;
