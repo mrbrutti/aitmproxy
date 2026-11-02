@@ -423,13 +423,19 @@ pub struct JobStats {
     pub stopped: Option<StopReason>,
 }
 
-/// The identity a job is begun under: the id the engine knows it by and the
-/// marker its points, seeds and runners are keyed by.
+/// The identity a job is begun under: the id the engine knows it by, which its
+/// state and its runners are keyed by, and the marker its discovery canary seed
+/// is built from.
+///
+/// The runner registry keys by [`JobKey::job_id`], never by the marker: the
+/// engine's `JobCtx::marker` mints a fresh token on every call, so it is no
+/// stable key (T5 live proof, 4b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobKey<'a> {
-    /// The engine's job id.
+    /// The engine's job id: stable and unique, so it keys the job's state and
+    /// its runners.
     pub job_id: &'a str,
-    /// The job's marker.
+    /// The job's marker, recorded for the discovery canary seed only.
     pub marker: &'a str,
 }
 
@@ -444,9 +450,6 @@ impl<'a> JobKey<'a> {
 /// One job's state. Private: everything outside reaches it through
 /// [`LaneState`], which keeps the locking in one place.
 struct JobState {
-    /// The job's marker: what its runners are keyed by, so evicting the job
-    /// can evict them too (review findings SEC2/Q4).
-    marker: String,
     plans: Vec<TargetPlan>,
     point_ids: HashSet<String>,
     retired: HashSet<String>,
@@ -461,7 +464,6 @@ struct JobState {
 
 impl JobState {
     fn new(
-        marker: &str,
         plans: Vec<TargetPlan>,
         point_ids: Vec<String>,
         cases_requested: u32,
@@ -470,7 +472,6 @@ impl JobState {
     ) -> Self {
         let points = u32::try_from(point_ids.len()).unwrap_or(u32::MAX);
         Self {
-            marker: marker.to_string(),
             plans,
             point_ids: point_ids.into_iter().collect(),
             retired: HashSet::new(),
@@ -539,11 +540,12 @@ impl LaneState {
     /// `cases_cap` is `min(cases_requested, CASES_CEILING)`. Re-beginning a
     /// known job replaces its state; beginning a ninth job evicts the oldest.
     ///
-    /// Returns the markers of every job whose state this call dropped — the
-    /// evicted ones and, when a known job is re-begun, its previous marker.
-    /// The caller forgets their runners, so the registry is bounded by the
-    /// same window this state is (review findings SEC2/Q4).
-    #[must_use = "forget the returned markers' runners"]
+    /// Returns the **job ids** of every job whose state this call dropped — the
+    /// evicted ones and, when a known job is re-begun, its own id. The caller
+    /// forgets those jobs' runners, which the registry keys by job id, so the
+    /// registry is bounded by the same window this state is (review findings
+    /// SEC2/Q4; keyed by job id, not marker, since T5 live proof 4b).
+    #[must_use = "forget the returned jobs' runners"]
     pub fn begin_job(
         &self,
         job: JobKey<'_>,
@@ -554,7 +556,6 @@ impl LaneState {
         dry_run: bool,
     ) -> Vec<String> {
         let state = JobState::new(
-            job.marker,
             plans,
             point_ids,
             cases_requested,
@@ -564,16 +565,17 @@ impl LaneState {
         let mut inner = lock(&self.inner);
         let mut forgotten = Vec::new();
         match inner.jobs.insert(job.job_id.to_string(), state) {
-            // A re-begun job's old runners hold its old plans and its old run.
-            Some(previous) => forgotten.push(previous.marker),
+            // A re-begun job's old runners hold its old plans and its old run,
+            // so the caller forgets this job id before the new host registers.
+            Some(_previous) => forgotten.push(job.job_id.to_string()),
             None => inner.order.push_back(job.job_id.to_string()),
         }
         while inner.order.len() > MAX_JOBS_REMEMBERED {
             let Some(oldest) = inner.order.pop_front() else {
                 break;
             };
-            if let Some(evicted) = inner.jobs.remove(&oldest) {
-                forgotten.push(evicted.marker);
+            if inner.jobs.remove(&oldest).is_some() {
+                forgotten.push(oldest);
             }
         }
         forgotten
@@ -1027,12 +1029,14 @@ mod tests {
         assert!(state.counters("j9").is_some());
     }
 
-    /// Review findings SEC2/Q4 (round-1 leftover): `begin_job` hands back the
-    /// markers of every job state it dropped, so the caller can forget their
-    /// runners. The ninth job returns the evicted first marker; re-beginning a
-    /// known job returns that job's previous marker and evicts nothing.
+    /// Review findings SEC2/Q4 (round-1 leftover), now keyed by job id (T5 live
+    /// proof, 4b): `begin_job` hands back the **job ids** of every job state it
+    /// dropped, so the caller can forget their runners. The ninth job returns
+    /// the evicted first job's id; re-beginning a known job returns its own id
+    /// and evicts nothing. The engine never reuses a job id in production — this
+    /// re-begin only exercises the window bookkeeping.
     #[test]
-    fn begin_job_returns_forgotten_markers() {
+    fn begin_job_returns_forgotten_job_ids() {
         let state = LaneState::new();
         let begin = |id: &str, marker: &str| {
             state.begin_job(
@@ -1051,11 +1055,12 @@ mod tests {
                 "job {i} evicted nothing"
             );
         }
-        // The ninth job evicts the oldest, so its marker comes back.
-        assert_eq!(begin("j9", "m-j9"), vec!["m-j1".to_string()]);
-        // Re-beginning a known job returns its previous marker, evicting
-        // nothing: the slot is reused, not taken a second time.
-        assert_eq!(begin("j9", "m-j9-again"), vec!["m-j9".to_string()]);
+        // The ninth job evicts the oldest, so its id comes back.
+        assert_eq!(begin("j9", "m-j9"), vec!["j1".to_string()]);
+        // Re-beginning a known job returns its own id, evicting nothing: the
+        // slot is reused, and the caller forgets that id's old runners before
+        // the new host registers.
+        assert_eq!(begin("j9", "m-j9-again"), vec!["j9".to_string()]);
     }
 
     #[test]
@@ -1579,13 +1584,14 @@ mod tests {
         assert_eq!(run.reactions(), vec![(CaseClass::Reset, 1)]);
     }
 
-    /// Tester (fix rounds, review findings SEC2/Q4): a re-begun job keeps its
-    /// eviction slot, so when the ninth job arrives the re-begun first job is
-    /// still the one evicted — and the marker handed back is its *current*
-    /// marker (the re-begin already returned the previous one), so the caller
-    /// forgets exactly the runners that exist, never a marker twice.
+    /// Tester (fix rounds, review findings SEC2/Q4; keyed by job id, T5 live
+    /// proof 4b): a re-begun job keeps its eviction slot, so when the ninth job
+    /// arrives the re-begun first job is still the one evicted. Every return is
+    /// a job id now; the engine never reuses a job id in production, so this
+    /// re-begin only exercises the window bookkeeping. Forgetting the same id
+    /// twice (once at re-begin, once at eviction) is idempotent.
     #[test]
-    fn ninth_job_evicts_a_re_begun_first_job_by_its_current_marker() {
+    fn ninth_job_evicts_a_re_begun_first_job_by_its_job_id() {
         let state = LaneState::new();
         let begin = |id: &str, marker: &str| {
             state.begin_job(
@@ -1600,22 +1606,22 @@ mod tests {
         for i in 1..=8 {
             assert!(begin(&format!("j{i}"), &format!("m-j{i}")).is_empty());
         }
-        // The first job is re-begun under a new marker: its old marker comes
-        // back, nothing is evicted, and all eight jobs are still known.
-        assert_eq!(begin("j1", "m-j1-again"), vec!["m-j1".to_string()]);
+        // The first job is re-begun under a new marker: its own id comes back,
+        // nothing is evicted, and all eight jobs are still known.
+        assert_eq!(begin("j1", "m-j1-again"), vec!["j1".to_string()]);
         for i in 1..=8 {
             assert!(state.counters(&format!("j{i}")).is_some(), "j{i} is known");
         }
-        // The ninth job evicts the oldest slot — still j1 — and returns the
-        // marker j1 now runs under, not the one already forgotten.
-        assert_eq!(begin("j9", "m-j9"), vec!["m-j1-again".to_string()]);
+        // The ninth job evicts the oldest slot — still j1 — and returns j1's
+        // id again; forgetting its runners a second time is a no-op.
+        assert_eq!(begin("j9", "m-j9"), vec!["j1".to_string()]);
         assert_eq!(state.counters("j1"), None);
         for i in 2..=9 {
             assert!(state.counters(&format!("j{i}")).is_some(), "j{i} survives");
         }
         // Re-beginning an evicted job is a new job: it takes a fresh slot at
         // the back and the window evicts the oldest survivor, j2.
-        assert_eq!(begin("j1", "m-j1-third"), vec!["m-j2".to_string()]);
+        assert_eq!(begin("j1", "m-j1-third"), vec!["j2".to_string()]);
         assert_eq!(state.counters("j2"), None, "j2 was the oldest by then");
         assert!(state.counters("j1").is_some());
     }

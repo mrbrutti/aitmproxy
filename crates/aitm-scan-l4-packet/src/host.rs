@@ -287,7 +287,10 @@ impl fmt::Debug for PointRunner {
 
 impl PointRunner {
     /// A runner for one `(point, field)` of one job. The point's PRNG seed is
-    /// derived from the job marker and the point id, so the run replays. Seed 0
+    /// derived from the job id and the point id, so the run replays — never
+    /// from the engine's `JobCtx::marker`, which mints a fresh token on every
+    /// call and so would seed the run differently each time (T5 live proof,
+    /// 4b). Seed 0
     /// is built here, once, so a seed that does not craft is refused at
     /// `probe_host_for` rather than at send time (review finding M8).
     ///
@@ -300,7 +303,7 @@ impl PointRunner {
         plan: TargetPlan,
         field: FieldPath,
     ) -> Result<Self, PlanError> {
-        let rng_seed = derive_seed(&job.marker(), &point.id);
+        let rng_seed = derive_seed(job.job_id(), &point.id);
         let seed0 = plan.seed_spec(0)?;
         Ok(Self {
             shared,
@@ -1391,8 +1394,18 @@ impl ProbeHost for PacketHost {
         Box::pin(async { Err(anyhow::anyhow!("the packet lane hosts no raw HTTP probes")) })
     }
 
+    /// The key the packet checks look this point's runner up by in the
+    /// [`RunnerRegistry`]: the engine's stable, unique **job id**, which is the
+    /// key `Lane::probe_host_for` registered the runner under. It is *not*
+    /// [`JobCtx::marker`] — the engine's `marker()` is a reflection canary that
+    /// mints a fresh token on every call (its trait doc and
+    /// `aitm_plugin_scanner::worker`), so keying by it would have a check look
+    /// the runner up under a different token than it was registered under and
+    /// read `missing_runner`: zero cases, nothing on the wire (T5 live proof,
+    /// 4b). `resolve_run` has only this `&dyn ProbeHost`, so this is the one
+    /// handle it has to the runner's key.
     fn marker(&self) -> String {
-        self.runner.job.marker()
+        self.runner.job.job_id().to_string()
     }
 
     fn budget_left(&self) -> u32 {
@@ -1418,9 +1431,12 @@ impl ProbeHost for PacketHost {
     }
 }
 
-/// The runners of every point the lane is driving, keyed by `(job marker,
-/// point id)` so a check finds the one run of a point without downcasting the
-/// `&dyn ProbeHost` it was handed (plan call C2).
+/// The runners of every point the lane is driving, keyed by `(job id, point
+/// id)` so a check finds the one run of a point without downcasting the
+/// `&dyn ProbeHost` it was handed (plan call C2). The job id is the engine's
+/// stable, unique [`JobCtx::job_id`], never its per-call [`JobCtx::marker`]
+/// canary — keying by the marker made every real-bus job send nothing
+/// (T5 live proof, 4b).
 #[derive(Default)]
 pub struct RunnerRegistry {
     runners: Mutex<HashMap<(String, String), Arc<PointRunner>>>,
@@ -1441,8 +1457,10 @@ impl RunnerRegistry {
         Self::default()
     }
 
-    /// Remember `runner` as the one runner for this marker and point, and
-    /// hand back the runner this point now has.
+    /// Remember `runner` as the one runner for this job and point, and hand
+    /// back the runner this point now has. `job_id` is the engine's stable
+    /// [`JobCtx::job_id`], never its per-call [`JobCtx::marker`] canary
+    /// (T5 live proof, 4b).
     ///
     /// Idempotent: a point already registered keeps its runner and `runner` is
     /// dropped, so two hosts for one point share one `PointRunner` and
@@ -1450,28 +1468,28 @@ impl RunnerRegistry {
     /// the same point against the same job (review finding Q3).
     pub fn register(
         &self,
-        marker: &str,
+        job_id: &str,
         point_id: &str,
         runner: Arc<PointRunner>,
     ) -> Arc<PointRunner> {
         Arc::clone(
             lock(&self.runners)
-                .entry((marker.to_string(), point_id.to_string()))
+                .entry((job_id.to_string(), point_id.to_string()))
                 .or_insert(runner),
         )
     }
 
-    /// The runner for this marker and point, if one was registered.
+    /// The runner for this job and point, if one was registered.
     #[must_use]
-    pub fn get(&self, marker: &str, point_id: &str) -> Option<Arc<PointRunner>> {
+    pub fn get(&self, job_id: &str, point_id: &str) -> Option<Arc<PointRunner>> {
         lock(&self.runners)
-            .get(&(marker.to_string(), point_id.to_string()))
+            .get(&(job_id.to_string(), point_id.to_string()))
             .map(Arc::clone)
     }
 
-    /// Drop every runner of one job, once its marker is done with.
-    pub fn forget_marker(&self, marker: &str) {
-        lock(&self.runners).retain(|(known, _), _| known != marker);
+    /// Drop every runner of one job, once its job id is done with.
+    pub fn forget_job(&self, job_id: &str) {
+        lock(&self.runners).retain(|(known, _), _| known != job_id);
     }
 
     /// How many runners are registered.
@@ -1971,7 +1989,10 @@ mod tests {
             .to_string()
             .contains("no raw HTTP probes"));
         assert!(host.held_flows().is_empty());
-        assert_eq!(host.marker(), "aitm7f3a");
+        // The host's `marker()` is the registry key: the stable job id, never
+        // the engine's per-call marker canary (T5 live proof, 4b).
+        assert_eq!(host.marker(), "scan-1a2b3c4d");
+        assert_eq!(host.marker(), job.job_id());
 
         let baseline = host.baseline().await.expect("the seed is sent once");
         assert!(baseline.l4.is_none(), "a clean reply carries no L4Reply");
@@ -2152,7 +2173,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn registry_keys_by_marker_and_point() {
+    async fn registry_keys_by_job_id_and_point() {
         let mock = MockBackend::new(MockReply::Echo);
         let profile = l4_profile(vec![udp_target(9)], 5);
         let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
@@ -2161,18 +2182,18 @@ mod tests {
         assert!(registry.is_empty());
 
         registry.register(
-            &job.marker(),
+            job.job_id(),
             runner.point().id.as_str(),
             Arc::clone(&runner),
         );
 
         assert_eq!(registry.len(), 1);
         let found = registry
-            .get(&job.marker(), runner.point().id.as_str())
+            .get(job.job_id(), runner.point().id.as_str())
             .expect("the registered runner");
         assert!(Arc::ptr_eq(&found, &runner));
         assert!(registry.get("other", runner.point().id.as_str()).is_none());
-        registry.forget_marker(&job.marker());
+        registry.forget_job(job.job_id());
         assert!(registry.is_empty());
     }
 
@@ -2622,7 +2643,7 @@ mod tests {
         let first = runner_for(&shared, &job, &plans, &disc.points, "raw");
         let registry = RunnerRegistry::new();
         let registered =
-            registry.register(&job.marker(), first.point().id.as_str(), Arc::clone(&first));
+            registry.register(job.job_id(), first.point().id.as_str(), Arc::clone(&first));
         assert!(Arc::ptr_eq(&registered, &first));
 
         let in_flight = {
@@ -2643,7 +2664,7 @@ mod tests {
         let second = runner_for(&shared, &job, &plans, &disc.points, "raw");
         assert!(!Arc::ptr_eq(&second, &first));
         let second_id = second.point().id.clone();
-        let shared_runner = registry.register(&job.marker(), &second_id, second);
+        let shared_runner = registry.register(job.job_id(), &second_id, second);
         assert!(
             Arc::ptr_eq(&shared_runner, &first),
             "the in-flight runner stays the point's one runner"

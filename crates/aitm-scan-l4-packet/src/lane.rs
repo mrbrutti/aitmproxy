@@ -4,7 +4,7 @@
 //! [`PacketLane`] is the assembly point: it owns the one [`Shared`] context
 //! (guard, backend, lane-private case store, seed store, timings and the
 //! per-job [`LaneState`]), the [`RunnerRegistry`] that maps
-//! `(job marker, point id)` to the single [`PointRunner`] that owns a point's
+//! `(job id, point id)` to the single [`PointRunner`] that owns a point's
 //! fuzz run, and the two native checks that read that run. Discovery mints the
 //! points; `probe_host_for` builds and registers the runner; whichever check
 //! reaches the point first drives the cases and the other sends nothing.
@@ -269,9 +269,10 @@ impl Lane for PacketLane {
             );
             // A job whose state is gone has no run left to drive, so its
             // runners go with it: the registry is bounded by the same window
-            // (review findings SEC2/Q4).
-            for marker in forgotten {
-                self.registry.forget_marker(&marker);
+            // (review findings SEC2/Q4). `begin_job` hands back the job ids it
+            // dropped, which are the registry's keys (T5 live proof, 4b).
+            for job_id in forgotten {
+                self.registry.forget_job(&job_id);
             }
             Ok(discovery)
         })
@@ -312,17 +313,20 @@ impl Lane for PacketLane {
             .find(|plan| plan.key() == key)
             .ok_or_else(|| anyhow!("no target plan for point {} in job {job_id}", point.id))?;
 
-        let marker = job.marker();
         // Seed 0 is built here, once, so a seed that does not craft is refused
         // with its D3 code rather than at send time (review finding M8); it was
         // already validated at discovery, so this is unreachable short of a
         // guard ceiling change mid-job.
         let runner = PointRunner::new(Arc::clone(shared), job, point.clone(), plan, field)
             .map_err(|err| anyhow!("{err}"))?;
-        // The registry owns the point's runner: a second host for the same
-        // point wraps the runner already registered, so both hosts drive one
-        // idempotent run (review finding Q3).
-        let runner = self.registry.register(&marker, &point.id, Arc::new(runner));
+        // The registry owns the point's runner, keyed by the engine's stable
+        // job id — never `JobCtx::marker`, which mints a fresh token on every
+        // call, so the crash and reaction checks (which look the runner up by
+        // the host's `marker()`, itself the job id) would read `missing_runner`
+        // and the job would send nothing (T5 live proof, 4b). A second host for
+        // the same point wraps the runner already registered, so both hosts
+        // drive one idempotent run (review finding Q3).
+        let runner = self.registry.register(&job_id, &point.id, Arc::new(runner));
         Ok(Box::new(PacketHost::new(runner)))
     }
 
@@ -629,6 +633,64 @@ mod tests {
         assert_eq!(mock.inject_count(), 105);
     }
 
+    /// Task 4b (T5 live proof): the engine's `JobCtx::marker()` is a reflection
+    /// canary that mints a *fresh* token on every call (its trait doc and
+    /// `aitm_plugin_scanner::worker`), so the lane must key a point's runner by
+    /// the stable, unique job id instead. Driven by an engine-shaped job — one
+    /// whose marker changes every call — the whole lane path still works:
+    /// `probe_host_for` registers the runner and the crash check finds it, so
+    /// the verdict is a real reading and not the `missing_runner` error, and
+    /// the mock answers every one of the profile's cases. Keyed by the marker
+    /// instead, this is exactly what every real-bus packet job did: the check
+    /// looked the runner up under a different token, read `missing_runner`, and
+    /// the job finished `done` with zero cases and nothing on the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checks_find_the_runner_when_the_job_marker_is_fresh_per_call() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let lane = lane_with(Arc::clone(&mock), &["raw"]);
+        let profile = l4_profile(vec![udp_target(9)], 100);
+        let job = TestJob::new(profile.clone()).fresh_markers();
+
+        // The double really is the engine's canary: no two asks agree.
+        assert_ne!(
+            job.marker(),
+            job.marker(),
+            "fresh-markers mode mints a new token every call"
+        );
+
+        let discovery = lane
+            .discover(&profile.target, job.as_ref())
+            .await
+            .expect("one raw point");
+        assert_eq!(discovery.points.len(), 1);
+        let point = discovery.points[0].clone();
+        let host = lane
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts the point it minted");
+
+        let crash = lane.checks()[0].run(&point, host.as_ref()).await;
+        assert_ne!(
+            crash.outcome,
+            Outcome::Error,
+            "the runner must be found, not reported missing: {}",
+            crash.detail
+        );
+        assert!(
+            !crash.detail.contains("no packet-lane runner"),
+            "the registry key must not depend on the marker: {}",
+            crash.detail
+        );
+        assert_eq!(
+            lane.counters(JOB_ID).map(|counters| counters.cases),
+            Some(u64::from(profile.l4.cases)),
+            "the mock answers every case through the full lane path"
+        );
+        assert!(
+            job.markers_asked() >= 1,
+            "the engine was asked for a fresh marker at least once"
+        );
+    }
+
     /// Review findings SEC2/Q4: the runner registry is bounded by the same
     /// eight-job window `LaneState` keeps. Each runner holds its target plan
     /// and its cached run (up to the case ceiling of records), so a long-lived
@@ -639,12 +701,12 @@ mod tests {
         let mock = MockBackend::new(MockReply::Echo);
         let lane = lane_with(Arc::clone(&mock), &["raw"]);
         let profile = l4_profile(vec![udp_target(9)], 1);
+        // The registry keys by job id (T5 live proof, 4b): each job gets a
+        // distinct one, as the engine mints them.
         let mut first: Option<(String, String)> = None;
 
         for n in 0..9u32 {
-            let job = TestJob::new(profile.clone())
-                .with_job_id(&format!("scan-{n:08x}"))
-                .with_marker(&format!("aitm000{n}"));
+            let job = TestJob::new(profile.clone()).with_job_id(&format!("scan-{n:08x}"));
             let discovery = lane
                 .discover(&profile.target, job.as_ref())
                 .await
@@ -653,7 +715,7 @@ mod tests {
             lane.probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
                 .expect("the lane hosts the point it minted");
             if first.is_none() {
-                first = Some((job.marker(), point.id.clone()));
+                first = Some((job.job_id().to_string(), point.id.clone()));
             }
             assert!(
                 lane.registry.len() <= 8,
@@ -662,9 +724,9 @@ mod tests {
             );
         }
 
-        let (marker, point_id) = first.expect("the first job ran");
+        let (job_id, point_id) = first.expect("the first job ran");
         assert!(
-            lane.registry.get(&marker, &point_id).is_none(),
+            lane.registry.get(&job_id, &point_id).is_none(),
             "the first job's runner outlived its state"
         );
         assert_eq!(lane.registry.len(), 8);
@@ -693,14 +755,14 @@ mod tests {
             .expect("the lane hosts the point it minted");
         let runner = lane
             .registry
-            .get(&job.marker(), &point.id)
+            .get(job.job_id(), &point.id)
             .expect("the first host registered the point's runner");
         let second = lane
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("a second host for the same point");
         let again = lane
             .registry
-            .get(&job.marker(), &point.id)
+            .get(job.job_id(), &point.id)
             .expect("the second host finds a runner too");
         assert!(
             Arc::ptr_eq(&runner, &again),
@@ -1063,26 +1125,24 @@ mod tests {
         assert_eq!(lane.counters(JOB_ID).expect("the job counted").cases, 0);
     }
 
-    /// Tester (fix rounds, review findings SEC2/Q4): the eviction window and
-    /// the registry move together through a *re-begun* job too. Re-discovering
-    /// the first job under a new marker forgets its previous runner at once;
-    /// the ninth job then evicts that re-begun job — the oldest slot — and its
-    /// current runner goes with it, so the registry never exceeds eight and
-    /// never keeps a runner whose job state is gone.
+    /// Tester (fix rounds, review findings SEC2/Q4; keyed by job id, T5 live
+    /// proof 4b): the eviction window and the registry move together through a
+    /// *re-begun* job too. The engine never reuses a job id in production, but
+    /// re-discovering one forgets its previous runner at once — before the new
+    /// host registers, so a fresh runner takes the slot — and the ninth job
+    /// then evicts the oldest slot, its runner going with it, so the registry
+    /// never exceeds eight and never keeps a runner whose job state is gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn re_discovering_a_job_forgets_its_previous_runners_and_keeps_its_slot() {
         let mock = MockBackend::new(MockReply::Echo);
         let lane = lane_with(Arc::clone(&mock), &["raw"]);
         let profile = l4_profile(vec![udp_target(9)], 1);
-        let host_job = |job_id: &str, marker: &str| {
+        let host_job = |job_id: &str| {
             let lane = &lane;
             let profile = profile.clone();
             let job_id = job_id.to_string();
-            let marker = marker.to_string();
             async move {
-                let job = TestJob::new(profile.clone())
-                    .with_job_id(&job_id)
-                    .with_marker(&marker);
+                let job = TestJob::new(profile.clone()).with_job_id(&job_id);
                 let discovery = lane
                     .discover(&profile.target, job.as_ref())
                     .await
@@ -1096,38 +1156,45 @@ mod tests {
 
         let mut point_id = String::new();
         for n in 0..8u32 {
-            point_id = host_job(&format!("scan-{n:08x}"), &format!("aitm000{n}")).await;
+            point_id = host_job(&format!("scan-{n:08x}")).await;
         }
         assert_eq!(lane.registry.len(), 8);
-        assert!(lane.registry.get("aitm0000", &point_id).is_some());
+        let first_runner = lane
+            .registry
+            .get("scan-00000000", &point_id)
+            .expect("job 0's runner");
 
-        // Job 0 again, under a new marker: its old runner is forgotten the
-        // moment the job is re-begun, before the new host registers.
-        host_job("scan-00000000", "aitm00re").await;
+        // Job 0's id again: its old runner is forgotten the moment the job is
+        // re-begun, before the new host registers, so a fresh runner takes the
+        // slot. The engine never reuses a job id — this only drives the window.
+        host_job("scan-00000000").await;
         assert_eq!(lane.registry.len(), 8, "one runner per live job");
+        let re_runner = lane
+            .registry
+            .get("scan-00000000", &point_id)
+            .expect("the re-begun job's new runner");
         assert!(
-            lane.registry.get("aitm0000", &point_id).is_none(),
-            "the re-begun job's previous runner is gone"
+            !Arc::ptr_eq(&first_runner, &re_runner),
+            "the re-begun job's previous runner is gone, replaced by a fresh one"
         );
-        assert!(lane.registry.get("aitm00re", &point_id).is_some());
         for n in 1..8u32 {
             assert!(
                 lane.registry
-                    .get(&format!("aitm000{n}"), &point_id)
+                    .get(&format!("scan-{n:08x}"), &point_id)
                     .is_some(),
                 "job {n} kept its runner"
             );
         }
 
         // The ninth job evicts the oldest slot, which is still job 0's.
-        host_job("scan-00000008", "aitm0008").await;
+        host_job("scan-00000008").await;
         assert_eq!(lane.registry.len(), 8);
         assert!(
-            lane.registry.get("aitm00re", &point_id).is_none(),
-            "the evicted job's current runner went with its state"
+            lane.registry.get("scan-00000000", &point_id).is_none(),
+            "the evicted job's runner went with its state"
         );
-        assert!(lane.registry.get("aitm0001", &point_id).is_some());
-        assert!(lane.registry.get("aitm0008", &point_id).is_some());
+        assert!(lane.registry.get("scan-00000001", &point_id).is_some());
+        assert!(lane.registry.get("scan-00000008", &point_id).is_some());
         assert_eq!(lane.counters("scan-00000000"), None);
         assert!(lane.counters("scan-00000001").is_some());
     }

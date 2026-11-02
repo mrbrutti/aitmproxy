@@ -586,6 +586,8 @@ pub struct TestJob {
     guard: Arc<dyn ScopeRateGuard>,
     job_id: OnceLock<String>,
     marker: OnceLock<String>,
+    fresh_markers: AtomicBool,
+    markers_asked: AtomicU32,
     budget: AtomicU32,
     charged: AtomicU32,
     deadline: Mutex<Instant>,
@@ -616,6 +618,8 @@ impl TestJob {
             guard: Arc::new(StdGuard::default()),
             job_id: OnceLock::new(),
             marker: OnceLock::new(),
+            fresh_markers: AtomicBool::new(false),
+            markers_asked: AtomicU32::new(0),
             budget: AtomicU32::new(DEFAULT_BUDGET),
             charged: AtomicU32::new(0),
             deadline: Mutex::new(Instant::now() + Duration::from_secs(60)),
@@ -637,6 +641,24 @@ impl TestJob {
     pub fn with_marker(self: Arc<Self>, marker: &str) -> Arc<Self> {
         let _ = self.marker.set(marker.to_string());
         self
+    }
+
+    /// Make this job's marker behave like the engine's `JobCtx::marker()`: a
+    /// reflection canary that returns a *fresh* token on every call. The
+    /// scanner worker mints `crate::util::marker(self.markers.fetch_add(1, ..))`
+    /// (`aitm_plugin_scanner::worker`), so no two calls agree; a test in this
+    /// mode proves the lane keys a point's runner by the stable job id, never
+    /// by the marker (T5 live proof, 4b).
+    #[must_use]
+    pub fn fresh_markers(self: Arc<Self>) -> Arc<Self> {
+        self.fresh_markers.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// How many times anything asked this job for its marker.
+    #[must_use]
+    pub fn markers_asked(&self) -> u32 {
+        self.markers_asked.load(Ordering::SeqCst)
     }
 
     /// Set the job's deadline.
@@ -744,6 +766,11 @@ impl JobCtx for TestJob {
     }
 
     fn marker(&self) -> String {
+        let n = self.markers_asked.fetch_add(1, Ordering::SeqCst);
+        if self.fresh_markers.load(Ordering::SeqCst) {
+            // The engine's canary: a fresh, never-reused token on every call.
+            return format!("aitm-canary-{n:08x}");
+        }
         self.marker
             .get()
             .cloned()
