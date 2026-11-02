@@ -33,6 +33,7 @@ fn http_flow(method: &str, path: &str, status: Option<u16>) -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: ConnInfo {
             peer: addr,
@@ -840,7 +841,7 @@ fn schemas_declare_source_app_and_capture_interface() {
             );
             assert!(
                 !field.required,
-                "{command}.{name} is optional (null for a proxied flow)"
+                "{command}.{name} is optional (null unless the core could name the client)"
             );
             assert!(
                 field.description.contains("proxied"),

@@ -240,6 +240,7 @@ mod tests {
                 trailers: HeaderMap::new(),
                 body: Body::Bytes(body.as_bytes().to_vec()),
                 timestamp: SystemTime::now(),
+                peer: None,
             }),
             client_conn: conn(),
             server_conn: None,

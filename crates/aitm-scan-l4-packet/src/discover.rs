@@ -35,7 +35,7 @@ use aitm_proto_l4::types::{
     IpCidr, L4Action, L4Capability, L4Direction, L4Proto, L4ScopeEntry, L4Target,
 };
 use aitm_scan_model::ids::FlowRef;
-use aitm_scan_model::point::InsertionPoint;
+use aitm_scan_model::point::{InsertionPoint, SiteNode};
 use aitm_scan_model::profile::{L4Options, L4Seed, L4TargetSpec, ProfileTarget, ScanProfile};
 use aitm_scan_model::traits::Discovery;
 use aitm_scan_model::vocab::{InsertionKind, L4Transport, LaneKind};
@@ -84,38 +84,25 @@ impl DiscoverError {
 
 impl fmt::Display for DiscoverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Every variant stores the bare message (the code is stripped once at
-        // construction, review finding M4), so `Display` is the one place the
-        // code is prepended and it is never doubled.
+        // Every variant stores the bare message — `FieldError`, `PlanError` and
+        // `CodecError` all render without a code of their own (quality panel
+        // Minor) — so `Display` is the one place the code is prepended and it
+        // is never doubled (review finding M4).
         write!(f, "{}: {}", self.code(), self.message())
     }
 }
 
 impl std::error::Error for DiscoverError {}
 
-/// Strip a leading `invalid_profile: ` from a message a source already rendered
-/// with it, so a `DiscoverError` stores the bare message and `Display` is the
-/// single place the code is added (review finding M4).
-fn bare_invalid_profile(message: String) -> String {
-    match message.strip_prefix("invalid_profile: ") {
-        Some(rest) => rest.to_string(),
-        None => message,
-    }
-}
-
 impl From<FieldError> for DiscoverError {
     fn from(err: FieldError) -> Self {
-        // `FieldError` renders with its own `invalid_profile: ` prefix; strip it
-        // once so the stored message is bare.
-        Self::InvalidProfile(bare_invalid_profile(err.to_string()))
+        Self::InvalidProfile(err.to_string())
     }
 }
 
 impl From<PlanError> for DiscoverError {
     fn from(err: PlanError) -> Self {
-        // `PlanError` renders with its own `invalid_profile: ` prefix; strip it
-        // once so the stored message is bare.
-        Self::InvalidProfile(bare_invalid_profile(err.to_string()))
+        Self::InvalidProfile(err.to_string())
     }
 }
 
@@ -370,15 +357,30 @@ pub fn resolve_target(
     })
 }
 
-/// The source port the lane claims for the target at `target_index`: the first
-/// of `40000 + index`, `+1`, `+2`, ... that is not one of the core's own
-/// listener ports, so the reply capture's self-exclusion never drops the lane's
-/// own replies (call C25).
+/// The source port the lane claims for `job_id`'s target at `target_index`:
+/// [`crate::plan::src_port_for`]'s job-id-derived port, then the first of that
+/// port, `+1`, `+2`, ... that is neither one of the core's own listener ports —
+/// so the reply capture's self-exclusion never drops the lane's own replies
+/// (call C25) — nor the target's own port `target_port`, so a stimulus's
+/// direction is never ambiguous: `send_recv` recognises its own looped-back
+/// frame by `src:src_port -> dst:dst_port`, and on loopback, where both
+/// addresses are the same host, equal ports would make the echo service's reply
+/// indistinguishable from the stimulus (T5 live proof).
+///
+/// Deriving the starting port from the job id (amendment 73 b) keeps two
+/// concurrent jobs against one target off the same five-tuple, so one job's
+/// `send_recv` can never consume the other's reply — a reply is the reversed
+/// five-tuple since amendment 66.
 #[must_use]
-pub fn choose_src_port(guard: &L4Guard, target_index: usize) -> u16 {
+pub fn choose_src_port(
+    guard: &L4Guard,
+    job_id: &str,
+    target_index: usize,
+    target_port: u16,
+) -> u16 {
     let self_ports = guard.self_ports();
-    let mut port = src_port_for(target_index);
-    while self_ports.contains(&port) {
+    let mut port = src_port_for(job_id, target_index);
+    while self_ports.contains(&port) || port == target_port {
         let Some(next) = port.checked_add(1) else {
             break;
         };
@@ -441,7 +443,7 @@ pub fn max_payload_for(target: &ResolvedTarget) -> usize {
 fn uncraftable_seed(id: &str, err: &PlanError) -> DiscoverError {
     let why = match err {
         PlanError::Craft(message) => message.clone(),
-        other => bare_invalid_profile(other.to_string()),
+        other => other.to_string(),
     };
     DiscoverError::InvalidProfile(format!("seed {id} cannot be crafted: {why}"))
 }
@@ -621,6 +623,79 @@ fn raw_example(seed: &SeedSpec, origin: SeedOrigin) -> String {
     }
 }
 
+/// The site-map node id of an L4 target: `"l4:<ip>:<port>/<proto>"`.
+///
+/// This is exactly the prefix every one of that target's point ids already
+/// carries ([`crate::plan::point_id`] appends `/<field>`), so a point and its
+/// node agree by construction and no third spelling of the target exists.
+#[must_use]
+pub fn node_id(target: &ResolvedTarget) -> String {
+    format!("l4:{}", target_key(target.ip, target.port, target.proto))
+}
+
+/// The one site-map node a target gets.
+///
+/// The engine places an L4 issue from the point's **site node**, never from the
+/// point itself: `aitm_plugin_scanner`'s `l4_location` reads `location.l4.ip`
+/// and `.port` from `host`/`port`, `.proto` from [`SiteNode::l4_transport`]
+/// over `scheme`, and `.grammar` from [`SiteNode::l4_grammar`] over
+/// `path_template`; `IssueTarget` comes from the same three. With no node a
+/// confirmed `l4-crash` reached the operator with `location.l4` null (live
+/// proof run 10, task 4b).
+///
+/// `method` is empty: an L4 target has no request method, and nothing reads one
+/// (an issue's `location.method` comes from the point, which carries `None`).
+/// `params` is empty as well — a packet-lane point is a frame field, not a
+/// parameter — but `points` is the real minted count, because the scheduler
+/// reads it for exposure.
+fn site_node_for(
+    target: &ResolvedTarget,
+    spec: &L4TargetSpec,
+    flows: Vec<FlowRef>,
+    points: usize,
+) -> SiteNode {
+    // `/` + the grammar, which `l4_grammar()` reads back; a bare `/` for a
+    // target that names none, which reads back `None` rather than "".
+    let path_template = match spec.grammar.as_deref().map(str::trim) {
+        Some(grammar) if !grammar.is_empty() => format!("/{grammar}"),
+        _ => "/".to_string(),
+    };
+    SiteNode {
+        id: node_id(target),
+        method: String::new(),
+        scheme: transport_name(target.proto).to_string(),
+        host: target.ip.to_string(),
+        port: target.port,
+        path_template,
+        flows,
+        params: Vec::new(),
+        auth: false,
+        points: u32::try_from(points).unwrap_or(u32::MAX),
+        audited: false,
+    }
+}
+
+/// The captured flows a profile's seeds name, in profile order, de-duplicated.
+///
+/// [`seed_payloads`] refuses a declared seed flow that carries no outbound
+/// packet to the target, so every flow named here really did seed every target
+/// that planned, and the target's node can link back to it. A seed the lane
+/// scavenged from the store on its own is **not** listed: [`SeedPayload`]
+/// carries no flow ref to list.
+fn seed_flows(options: &L4Options) -> Vec<FlowRef> {
+    let named = options.seeds.iter().filter_map(|seed| match seed {
+        L4Seed::Flow { flow } => Some(*flow),
+        L4Seed::Hex { .. } | L4Seed::Base64 { .. } => None,
+    });
+    let mut out: Vec<FlowRef> = Vec::new();
+    for flow in named {
+        if !out.contains(&flow) {
+            out.push(flow);
+        }
+    }
+    out
+}
+
 /// One insertion point per field of this target, in field order.
 ///
 /// `example` is the value the seed actually puts on the wire — decimal for a
@@ -628,8 +703,10 @@ fn raw_example(seed: &SeedSpec, origin: SeedOrigin) -> String {
 /// a case starts from. A captured seed's payload is operator plaintext, so the
 /// raw point shows only its byte count, never the bytes (spec D2 "`example`
 /// redacted"; review finding SEC3); a profile or default seed shows its hex, cut
-/// at [`crate::codec::DETAIL_HEX_CHARS`]. Every point is lane-local: no site node, no flow
-/// (call C6).
+/// at [`crate::codec::DETAIL_HEX_CHARS`]. Every point is lane-local: no flow
+/// (call C6). Each point names its target's site node ([`node_id`]), which is
+/// the only place the engine can read an L4 issue's target and `location.l4`
+/// from (see [`site_node_for`]).
 #[must_use]
 pub fn points_for(
     target: &ResolvedTarget,
@@ -643,6 +720,7 @@ pub fn points_for(
         transport_name(target.proto),
         host_port(target.ip, target.port)
     );
+    let node = node_id(target);
     fields
         .iter()
         .map(|field| {
@@ -659,7 +737,7 @@ pub fn points_for(
                 name,
                 example,
                 flow: None,
-                site_node: None,
+                site_node: Some(node.clone()),
                 traits: Vec::new(),
                 frequency: 1,
                 method: None,
@@ -702,10 +780,15 @@ pub fn probe_privilege(
 /// Plan every declared L4 target of a profile, and mint the points the engine
 /// schedules checks over.
 ///
-/// `requested` is the operator's field list, passed in by the lane rather than
-/// read here, so this function stays pure of the `L4Options.fields` integration
-/// shim (`crate::plan::requested_fields`, call C1). An empty list is the
-/// target's default field table.
+/// `requested` is the operator's field list (`L4Options.fields`, read by
+/// `crate::plan::requested_fields`), passed in by the lane rather than read
+/// here, so this function stays pure of the profile type. An empty list is
+/// the target's default field table.
+///
+/// `job_id` is the engine's stable job identifier (never `JobCtx::marker`,
+/// which mints a fresh token per call); the source port each target claims is
+/// derived from it so two concurrent jobs against one target never share a
+/// reply five-tuple (amendment 73 b, [`choose_src_port`]).
 ///
 /// # Errors
 ///
@@ -713,6 +796,10 @@ pub fn probe_privilege(
 /// validation, seeds, or the per-interface privilege probe — which runs
 /// **before** any point is minted, so a privilege-less host refuses the job
 /// rather than half-planning it.
+// The lane's whole input — guard, backend, two stores, the profile and its two
+// identity tokens (marker and job id) — is passed explicitly rather than boxed
+// into a context struct, so each caller sees exactly what discovery reads.
+#[allow(clippy::too_many_arguments)]
 pub fn discover_all(
     guard: &L4Guard,
     backend: &dyn CaptureInjectBackend,
@@ -721,17 +808,19 @@ pub fn discover_all(
     profile: &ScanProfile,
     requested: &[String],
     marker: &str,
+    job_id: &str,
 ) -> Result<(Vec<TargetPlan>, Discovery), DiscoverError> {
     let mut plans: Vec<TargetPlan> = Vec::with_capacity(target.l4.len());
     let mut points: Vec<InsertionPoint> = Vec::new();
+    let mut nodes: Vec<SiteNode> = Vec::with_capacity(target.l4.len());
     let mut probed: Vec<String> = Vec::new();
+    let flows = seed_flows(&profile.l4);
 
     for (index, spec) in target.l4.iter().enumerate() {
         let resolved = resolve_target(guard, spec)?;
-        let fields = validate_fields(ip_version(resolved.ip), resolved.proto, requested)
-            .map_err(|message| DiscoverError::InvalidProfile(bare_invalid_profile(message)))?;
+        let fields = validate_fields(ip_version(resolved.ip), resolved.proto, requested)?;
         let seeds = seed_payloads(&resolved, &profile.l4, seed_store, marker)?;
-        let src_port = choose_src_port(guard, index);
+        let src_port = choose_src_port(guard, job_id, index, resolved.port);
 
         if !probed.contains(&resolved.interface) {
             probe_privilege(guard, backend, &resolved.interface)?;
@@ -770,17 +859,20 @@ pub fn discover_all(
             .seeds
             .first()
             .map_or(SeedOrigin::Default, |payload| payload.origin);
-        points.extend(points_for(&plan.target, &plan.fields, &seed, origin));
+        let minted = points_for(&plan.target, &plan.fields, &seed, origin);
+        // One node per declared target, in profile order, so the engine can
+        // place every issue these points raise (task 4b).
+        nodes.push(site_node_for(
+            &plan.target,
+            spec,
+            flows.clone(),
+            minted.len(),
+        ));
+        points.extend(minted);
         plans.push(plan);
     }
 
-    Ok((
-        plans,
-        Discovery {
-            points,
-            nodes: Vec::new(),
-        },
-    ))
+    Ok((plans, Discovery { points, nodes }))
 }
 
 #[cfg(test)]
@@ -801,7 +893,7 @@ mod tests {
         RateCap,
     };
     use aitm_scan_model::ids::FlowRef;
-    use aitm_scan_model::profile::{L4Options, L4Seed};
+    use aitm_scan_model::profile::{L4Options, L4Seed, L4TargetSpec};
     use aitm_scan_model::vocab::{InsertionKind, L4Transport, LaneKind};
 
     use super::{
@@ -810,7 +902,10 @@ mod tests {
         MAX_SEED_BYTES,
     };
     use crate::fields::{default_fields, FieldPath, IpVersion};
-    use crate::plan::{link_framing, PlanError, SeedOrigin, SeedPayload, TargetPlan};
+    use crate::plan::{
+        link_framing, src_port_for, PlanError, SeedOrigin, SeedPayload, TargetPlan, SRC_PORT_BASE,
+        SRC_PORT_RANGE,
+    };
     use crate::testing::{
         fields, l4_profile, loopback_guard, tcp_target, udp_target, MockBackend, MockReply,
     };
@@ -1229,7 +1324,7 @@ mod tests {
             assert_eq!(point.url.as_deref(), Some("udp://127.0.0.1:9"));
             assert_eq!(point.frequency, 1);
             assert!(point.flow.is_none());
-            assert!(point.site_node.is_none());
+            assert_eq!(point.site_node.as_deref(), Some("l4:127.0.0.1:9/udp"));
             assert!(point.traits.is_empty());
             assert!(point.method.is_none());
         }
@@ -1273,14 +1368,157 @@ mod tests {
             &profile,
             &[],
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("both targets resolve");
 
         assert_eq!(plans.len(), 2);
         assert_eq!(discovery.points.len(), 14 + 19);
-        assert!(discovery.nodes.is_empty());
-        assert_eq!(plans[1].src_port, 40_001);
+        assert_eq!(discovery.nodes.len(), 2);
+        // Each target's source port is the job-id-derived port for its index
+        // (amendment 73 b); the two targets therefore differ.
+        assert_eq!(
+            plans[0].src_port,
+            choose_src_port(&guard, "scan-0000test", 0, 9)
+        );
+        assert_eq!(
+            plans[1].src_port,
+            choose_src_port(&guard, "scan-0000test", 1, 80)
+        );
+        assert_ne!(plans[0].src_port, plans[1].src_port);
         assert_eq!(guard.in_flight(), 0);
+    }
+
+    /// The engine places an L4 issue only from the point's site node
+    /// (`aitm-plugin-scanner`'s `l4_location`), so discovery emits exactly one
+    /// node per declared target and every point of that target names it. Run
+    /// 10 of the live proof shipped `location.l4 == null` because the lane
+    /// returned no node at all (task 4b).
+    #[test]
+    fn discovery_emits_one_site_node_per_target_and_points_reference_it() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9), tcp_target(80)], 100);
+
+        let (_plans, discovery) = discover_all(
+            &guard,
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &[],
+            "aitm7f3a",
+            "scan-0000test",
+        )
+        .expect("both targets resolve");
+
+        assert_eq!(discovery.nodes.len(), 2);
+
+        let udp = &discovery.nodes[0];
+        assert_eq!(udp.id, "l4:127.0.0.1:9/udp");
+        assert_eq!(udp.scheme, "udp");
+        assert_eq!(udp.host, "127.0.0.1");
+        assert_eq!(udp.port, 9);
+        assert_eq!(udp.l4_transport(), Some(L4Transport::Udp));
+        assert_eq!(udp.path_template, "/");
+        assert_eq!(udp.l4_grammar(), None);
+        assert_eq!(udp.method, "");
+        assert_eq!(udp.points, 14);
+        assert!(udp.flows.is_empty());
+        assert!(udp.params.is_empty());
+        assert!(!udp.auth);
+        assert!(!udp.audited);
+
+        let tcp = &discovery.nodes[1];
+        assert_eq!(tcp.id, "l4:127.0.0.1:80/tcp");
+        assert_eq!(tcp.scheme, "tcp");
+        assert_eq!(tcp.host, "127.0.0.1");
+        assert_eq!(tcp.port, 80);
+        assert_eq!(tcp.l4_transport(), Some(L4Transport::Tcp));
+        assert_eq!(tcp.points, 19);
+
+        // Every point names its own target's node, and the point ids are
+        // unchanged: a point id is still its node id plus `/<field>`.
+        assert_eq!(discovery.points.len(), 14 + 19);
+        let mut per_node = vec![0_u32; discovery.nodes.len()];
+        for point in &discovery.points {
+            let named = point.site_node.as_deref().expect("every point has a node");
+            let index = discovery
+                .nodes
+                .iter()
+                .position(|node| node.id == named)
+                .unwrap_or_else(|| panic!("point {} names an unknown node {named}", point.id));
+            assert!(
+                point.id.starts_with(&format!("{named}/")),
+                "point {} does not belong to node {named}",
+                point.id
+            );
+            per_node[index] += 1;
+        }
+        // `points` is what the scheduler reads for exposure, so it is the real
+        // count, not a guess.
+        assert_eq!(per_node, vec![udp.points, tcp.points]);
+    }
+
+    /// A target that names a grammar carries it in `path_template` as
+    /// `/<grammar>`, which is what `SiteNode::l4_grammar` (and so the issue's
+    /// `location.l4.grammar`) reads back; a target without one carries `/` and
+    /// reads back `None` rather than an empty grammar name.
+    #[test]
+    fn site_node_carries_the_grammar_in_path_template() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let with_grammar = L4TargetSpec {
+            grammar: Some("raw".to_string()),
+            ..udp_target(9)
+        };
+        let profile = l4_profile(vec![with_grammar, tcp_target(80)], 100);
+
+        let (_plans, discovery) = discover_all(
+            &guard,
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &[],
+            "aitm7f3a",
+            "scan-0000test",
+        )
+        .expect("both targets resolve");
+
+        assert_eq!(discovery.nodes[0].path_template, "/raw");
+        assert_eq!(discovery.nodes[0].l4_grammar(), Some("raw"));
+        assert_eq!(discovery.nodes[1].path_template, "/");
+        assert_eq!(discovery.nodes[1].l4_grammar(), None);
+    }
+
+    /// A node links back to the captured flow the operator seeded it from, so
+    /// the site map can say where the bytes came from. A flow named twice is
+    /// listed once.
+    #[test]
+    fn site_node_links_the_captured_seed_flow() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let (store, id) = store_with(vec![udp_packet(9, b"one", L4Direction::Outbound, false)]);
+        let mut profile = l4_profile(vec![udp_target(9)], 100);
+        profile.l4.seeds = vec![
+            L4Seed::Flow { flow: flow_ref(id) },
+            L4Seed::Flow { flow: flow_ref(id) },
+        ];
+
+        let (_plans, discovery) = discover_all(
+            &guard,
+            backend.as_ref(),
+            Some(&store as &dyn L4FlowStore),
+            &profile.target,
+            &profile,
+            &[],
+            "aitm7f3a",
+            "scan-0000test",
+        )
+        .expect("the target resolves");
+
+        assert_eq!(discovery.nodes[0].flows, vec![flow_ref(id)]);
     }
 
     #[test]
@@ -1298,6 +1536,7 @@ mod tests {
                 &profile,
                 &fields(&[pin]),
                 "aitm7f3a",
+                "scan-0000test",
             )
             .expect_err("a pinned field is refused");
             let DiscoverError::InvalidProfile(message) = &err else {
@@ -1323,6 +1562,7 @@ mod tests {
             &profile,
             &fields(&["raw"]),
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect("raw is fuzzable");
         assert_eq!(plans.len(), 2);
@@ -1331,8 +1571,10 @@ mod tests {
 
     #[test]
     fn self_port_target_is_refused_and_src_port_skips_self_ports() {
+        let job = "scan-0000test";
         let guard = loopback_guard("*", 100);
-        guard.set_self_ports([9, 40_000]);
+        let derived = src_port_for(job, 0);
+        guard.set_self_ports([9, derived]);
 
         let err = resolve_target(&guard, &udp_target(9)).expect_err("port 9 is a self port");
         let DiscoverError::InvalidProfile(message) = &err else {
@@ -1340,7 +1582,91 @@ mod tests {
         };
         assert!(message.contains("own listener ports"), "{message}");
 
-        assert_eq!(choose_src_port(&guard, 0), 40_001);
+        // The job's derived source port is a self port, so it is walked past.
+        assert_eq!(choose_src_port(&guard, job, 0, 9), derived + 1);
+    }
+
+    /// T5 live proof: the source port never equals the target's own port, so
+    /// the stimulus's direction (`src:src_port -> dst:dst_port`) is never
+    /// symmetric and `send_recv` can tell its looped-back frame from the
+    /// echo service's reply on loopback. A target on the job's derived source
+    /// port moves the source one past it; a self port and the target port are
+    /// both skipped; an unrelated target port leaves the derived port alone.
+    #[test]
+    fn src_port_skips_the_targets_own_port() {
+        let job = "scan-0000test";
+        let guard = loopback_guard("*", 100);
+        let derived0 = src_port_for(job, 0);
+        let derived1 = src_port_for(job, 1);
+
+        // Target on the derived port: source walks one forward.
+        assert_eq!(choose_src_port(&guard, job, 0, derived0), derived0 + 1);
+        // Target elsewhere: the derived port stands.
+        assert_eq!(choose_src_port(&guard, job, 0, 9), derived0);
+        // A second target index gets its own derived port, past its own port.
+        assert_eq!(choose_src_port(&guard, job, 1, derived1), derived1 + 1);
+
+        // The derived port is a self port and the target is the next one: both
+        // are walked past.
+        guard.set_self_ports([derived0]);
+        let chosen = choose_src_port(&guard, job, 0, derived0 + 1);
+        assert_ne!(chosen, derived0);
+        assert_ne!(chosen, derived0 + 1);
+
+        // Through discovery: a target on the job's derived source port is
+        // planned with the next one.
+        let disco_guard = loopback_guard("*", 100);
+        let target_port = src_port_for(job, 0);
+        let profile = l4_profile(vec![udp_target(target_port)], 10);
+        let backend = MockBackend::new(MockReply::Echo);
+        let (plans, _) = discover_all(
+            &disco_guard,
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &fields(&["raw"]),
+            "aitm7f3a",
+            "scan-0000test",
+        )
+        .expect("a loopback udp target discovers");
+        assert_eq!(plans[0].src_port, target_port + 1);
+        assert_eq!(plans[0].target.port, target_port);
+    }
+
+    /// Tester (T5 stage 5): the search walks past a run of excluded ports and
+    /// still never lands on the target's own, and it terminates — the loop is
+    /// bounded by `checked_add`, so an exhausted range breaks instead of
+    /// spinning. Every port the lane picks must also stay outside the core's
+    /// own listeners (call C25), both rules at once.
+    #[test]
+    fn src_port_walks_past_a_run_of_excluded_ports() {
+        let job = "scan-0000test";
+        let guard = loopback_guard("*", 100);
+        let base = src_port_for(job, 0);
+        guard.set_self_ports([base, base + 1, base + 2]);
+
+        assert_eq!(
+            choose_src_port(&guard, job, 0, base + 3),
+            base + 4,
+            "three self ports and the target's own are all skipped"
+        );
+        assert_eq!(
+            choose_src_port(&guard, job, 0, 9),
+            base + 3,
+            "without the target in the way the first free port wins"
+        );
+        for index in 0..8usize {
+            // The target sits on the index's own derived port, so the walk must
+            // move the source off it as well as off every self port.
+            let target_port = src_port_for(job, index);
+            let port = choose_src_port(&guard, job, index, target_port);
+            assert_ne!(port, target_port, "index {index}");
+            assert!(
+                !guard.self_ports().contains(&port),
+                "index {index}: {port} is a core listener"
+            );
+        }
     }
 
     #[test]
@@ -1364,6 +1690,7 @@ mod tests {
             &profile,
             &[],
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect_err("no pcap privilege");
         assert_eq!(through, direct);
@@ -1459,6 +1786,7 @@ mod tests {
                 &profile,
                 &fields(&["raw"]),
                 "aitm7f3a",
+                "scan-0000test",
             )
             .expect("an empty seed plans");
             assert_eq!(plans[0].seeds.len(), 1, "{hex:?}");
@@ -1594,6 +1922,72 @@ mod tests {
         assert_eq!(example("ipv6.payload_length").as_deref(), Some("24"));
         assert_eq!(example("ipv6.next_header").as_deref(), Some("17"));
         assert_eq!(example("udp.length").as_deref(), Some("24"));
+    }
+
+    /// Tester (stage 5), task 4b: the site node of an **IPv6** target. The node
+    /// id is the point-id prefix for v6 too, which means bracketed
+    /// (`l4:[::1]:53/udp`): the engine looks a point's node up by string
+    /// equality (`aitm_plugin_scanner::scheduler::plan` builds a map keyed by
+    /// `SiteNode::id`), so an unbracketed node id would leave every v6 point
+    /// nodeless — `location.l4` null again, and exposure 0 — while every id
+    /// still *looked* plausible. `host` carries the bare address, because
+    /// `l4_location` reads the IP from it.
+    ///
+    /// Mutation: build the node id from `format!("l4:{}:{}/{}", ip, port,
+    /// proto)` instead of `target_key` (so v4 is unchanged and v6 loses its
+    /// brackets) and the prefix assertion fails.
+    #[test]
+    fn the_site_node_of_an_ipv6_target_is_the_point_id_prefix() {
+        let guard = guard_over(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128, "*", &BOTH);
+        let backend = MockBackend::new(MockReply::Echo);
+        let v6 = L4TargetSpec {
+            ip: "::1".to_string(),
+            port: 53,
+            proto: L4Transport::Udp,
+            grammar: None,
+        };
+        let profile = l4_profile(vec![v6], 100);
+
+        let (_plans, discovery) = discover_all(
+            &guard,
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &[],
+            "aitm7f3a",
+            "scan-0000test",
+        )
+        .expect("::1 resolves against a v6 entry");
+
+        assert_eq!(discovery.nodes.len(), 1);
+        let node = &discovery.nodes[0];
+        assert_eq!(node.id, "l4:[::1]:53/udp", "the v6 node id is bracketed");
+        assert_eq!(
+            node.host, "::1",
+            "the issue's location.l4.ip is the bare address"
+        );
+        assert_eq!(node.port, 53);
+        assert_eq!(node.scheme, "udp");
+        assert_eq!(node.l4_transport(), Some(L4Transport::Udp));
+        assert_eq!(node.points, 9, "the v6 default table mints nine points");
+
+        assert_eq!(discovery.points.len(), 9);
+        for point in &discovery.points {
+            assert_eq!(
+                point.site_node.as_deref(),
+                Some(node.id.as_str()),
+                "point {} names the v6 node",
+                point.id
+            );
+            assert!(
+                point.id.starts_with(&format!("{}/", node.id)),
+                "point {} is not under node {}",
+                point.id,
+                node.id
+            );
+        }
+        assert_eq!(guard.in_flight(), 0);
     }
 
     /// Tester (stage 5): `cidr_contains` at the prefix extremes, in both
@@ -1864,6 +2258,7 @@ mod tests {
                 &profile,
                 &fields(&["raw"]),
                 "aitm7f3a",
+                "scan-0000test",
             );
             if fits {
                 let (plans, discovery) = planned.expect("the largest frame plans");
@@ -1918,6 +2313,7 @@ mod tests {
             &profile,
             &fields(&["raw"]),
             "aitm7f3a",
+            "scan-0000test",
         )
         .expect_err("seed 1 does not build");
 
@@ -2108,6 +2504,7 @@ mod tests {
                 profile,
                 &fields(&["raw"]),
                 "aitm7f3a",
+                "scan-0000test",
             )
         };
 
@@ -2157,5 +2554,103 @@ mod tests {
             "invalid_profile: seed 127.0.0.1:9/udp#2 cannot be crafted: crafted packet exceeds 65535 bytes"
         );
         assert_eq!(backend.inject_count(), 0);
+    }
+
+    /// Amendment 73 (b): two jobs against one target must not share a source
+    /// port. Since amendment 66 a reply is the reversed five-tuple, so a shared
+    /// tuple lets job A's `send_recv` consume job B's reply and mask A's
+    /// silence. The port is derived from the job id, so two distinct ids on one
+    /// target get distinct ports. The derivation is a hash, so a collision is
+    /// possible but rare: over ten distinct ids at least nine ports are
+    /// distinct (the forward walk only ever coincides when the hash itself
+    /// collides).
+    #[test]
+    fn two_jobs_on_one_target_get_different_source_ports() {
+        let guard = loopback_guard("*", 100);
+        let a = choose_src_port(&guard, "scan-0000aaaa", 0, 9);
+        let b = choose_src_port(&guard, "scan-0000bbbb", 0, 9);
+        assert_ne!(a, b, "two jobs on one target share a source port");
+
+        let ids = [
+            "scan-00000000",
+            "scan-00000001",
+            "scan-00000002",
+            "scan-00000003",
+            "scan-00000004",
+            "scan-00000005",
+            "scan-00000006",
+            "scan-00000007",
+            "scan-00000008",
+            "scan-00000009",
+        ];
+        let ports: std::collections::BTreeSet<u16> = ids
+            .iter()
+            .map(|id| choose_src_port(&guard, id, 0, 9))
+            .collect();
+        assert!(
+            ports.len() >= 9,
+            "at least nine of ten job ids get a distinct source port, got {}",
+            ports.len()
+        );
+    }
+
+    /// The derivation is deterministic: the same job id and target index always
+    /// yield the same source port, because a replay and `send_recv`'s reply
+    /// correlation both recompute it (amendment 73 b).
+    #[test]
+    fn the_source_port_is_stable_for_a_job() {
+        let guard = loopback_guard("*", 100);
+        assert_eq!(
+            choose_src_port(&guard, "scan-0000aaaa", 0, 9),
+            choose_src_port(&guard, "scan-0000aaaa", 0, 9)
+        );
+        assert_eq!(
+            choose_src_port(&guard, "scan-0000aaaa", 3, 9),
+            choose_src_port(&guard, "scan-0000aaaa", 3, 9)
+        );
+    }
+
+    /// The job-id-derived port still keeps task 7's exclusions: it is walked
+    /// forward past the target's own port and past a core self port, so the
+    /// reply capture never drops the lane's own replies (call C25) and the
+    /// stimulus direction stays unambiguous.
+    #[test]
+    fn the_derived_port_never_equals_the_target_or_a_self_port() {
+        let job = "scan-0000aaaa";
+        let derived = src_port_for(job, 0);
+
+        // Target on the derived port: the source is walked one past it.
+        let guard = loopback_guard("*", 100);
+        let chosen = choose_src_port(&guard, job, 0, derived);
+        assert_ne!(
+            chosen, derived,
+            "source must not equal the target's own port"
+        );
+        assert_eq!(chosen, derived + 1);
+
+        // A core self port equal to the derived port: also walked past.
+        let guard = loopback_guard("*", 100);
+        guard.set_self_ports([derived]);
+        let chosen = choose_src_port(&guard, job, 0, 9);
+        assert_ne!(chosen, derived, "source must not be a core listener");
+        assert!(!guard.self_ports().contains(&chosen));
+    }
+
+    /// Every job id in a sample derives a source port inside the lane's window
+    /// `SRC_PORT_BASE..SRC_PORT_BASE + SRC_PORT_RANGE`, before the exclusion
+    /// walk — the window ends at the Linux ephemeral floor 32768 and stays
+    /// below the macOS one (amendment 73 b, security delta).
+    #[test]
+    fn the_derived_port_stays_in_range() {
+        for n in 0..256u32 {
+            let id = format!("scan-{n:08x}");
+            for index in 0..4usize {
+                let port = src_port_for(&id, index);
+                assert!(
+                    (SRC_PORT_BASE..SRC_PORT_BASE + SRC_PORT_RANGE).contains(&port),
+                    "id {id} index {index}: {port} out of range"
+                );
+            }
+        }
     }
 }

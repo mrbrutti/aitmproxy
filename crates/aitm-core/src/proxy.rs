@@ -13,6 +13,7 @@ use crate::chain::Chain;
 use crate::config::Config;
 use crate::egress::EgressConfinement;
 use crate::guard::{ScopeRateGuard, StdGuard};
+use crate::peer::{self, PeerResolver};
 use crate::plugin::Plugin;
 use crate::protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 use crate::registry::Registry;
@@ -35,6 +36,10 @@ struct ProxyInner {
     /// Runtime egress-confinement posture for the browser-facing listener
     /// (scanner finding S2); shared with the command/host wiring.
     egress: Arc<EgressConfinement>,
+    /// Names the loopback client of a proxied connection (spec
+    /// 2026-11-01-proxied-client-attribution). `None` = today's behaviour:
+    /// `peer_identity` stays `None` on every proxied flow.
+    peer_resolver: Option<Arc<dyn PeerResolver>>,
 }
 
 impl Proxy {
@@ -221,6 +226,12 @@ async fn handle_conn(
     peer: SocketAddr,
     ssrf: bool,
 ) -> anyhow::Result<()> {
+    // Start naming the client process on a blocking thread now, so it runs
+    // concurrently with the peek (which itself waits for the client's first
+    // bytes). Only a loopback peer with a configured resolver spawns a task.
+    let local = stream.local_addr().ok();
+    let attribution = peer::start_attribution(inner.peer_resolver.as_ref(), peer, local);
+
     // Peek enough to carry a TLS ClientHello whole (so its SNI can pick a
     // passthrough module) as well as an HTTP/CONNECT request line. The bytes stay
     // in the stream — the module the acceptor picks re-reads them.
@@ -228,6 +239,12 @@ async fn handle_conn(
     let n = stream.peek(&mut buf).await.unwrap_or(0);
     let first = &buf[..n];
     let is_tls = first.first() == Some(&0x16); // TLS handshake record
+
+    // Wait at most the budget for the client's identity; a miss is `None` and
+    // the connection is served exactly as before. Presence only is logged —
+    // never the string (spec D9).
+    let peer_identity = peer::finish_attribution(attribution, peer::ATTRIBUTION_BUDGET).await;
+    tracing::debug!(%peer, resolved = peer_identity.is_some(), "client attribution");
     let hint = NextLayerHint {
         dst: peer,
         is_tls,
@@ -243,9 +260,12 @@ async fn handle_conn(
         alpn: Vec::new(),
         first_bytes: first.to_vec(),
         from_upgrade: false,
-        // The explicit-proxy path knows nothing about the client process or a
-        // capture backend: both stay `None` so a proxied flow reports null.
-        peer_identity: None,
+        // The core's own naming of the loopback client, `None` when it could not
+        // name it (spec D7). `capture_interface` MUST stay `None` here: no capture
+        // backend delivered this connection, and `tunnel_authority` reads a set
+        // `capture_interface` as "`dst` is the real destination" — on this path
+        // `dst` is the client's peer address.
+        peer_identity,
         capture_interface: None,
     };
 
@@ -410,6 +430,7 @@ pub struct ProxyBuilder {
     config: Option<Config>,
     modules: Vec<Arc<dyn ProtocolModule>>,
     plugins: Vec<Box<dyn Plugin>>,
+    peer_resolver: Option<Arc<dyn PeerResolver>>,
 }
 
 impl ProxyBuilder {
@@ -428,6 +449,14 @@ impl ProxyBuilder {
     /// Register a plugin into the ordered chain.
     pub fn register_plugin(mut self, p: Box<dyn Plugin>) -> Self {
         self.plugins.push(p);
+        self
+    }
+
+    /// Name the loopback client of every proxied connection through `resolver`
+    /// (spec 2026-11-01-proxied-client-attribution). Without this step the
+    /// acceptor never resolves and `peer_identity` stays `None`.
+    pub fn with_peer_resolver(mut self, resolver: Arc<dyn PeerResolver>) -> Self {
+        self.peer_resolver = Some(resolver);
         self
     }
 
@@ -464,6 +493,7 @@ impl ProxyBuilder {
                 modules: self.modules.into(),
                 browser_ssrf,
                 egress,
+                peer_resolver: self.peer_resolver,
             }),
         })
     }
@@ -474,12 +504,14 @@ mod tests {
     use super::{is_benign_disconnect, parse_client_hello_sni, Proxy};
     use crate::config::{Config, ScopeEntry};
     use crate::error::GuardError;
+    use crate::peer::PeerResolver;
     use crate::protocol::{ModuleCtx, NextLayerHint, ProtocolModule};
     use crate::stream::ByteStream;
     use futures::future::BoxFuture;
     use std::io;
+    use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
@@ -810,5 +842,153 @@ mod tests {
             Some(max.as_str()),
             "253 bytes is the DNS limit and parses"
         );
+    }
+
+    /// Claims everything and records the hint it was spawned with, then signals.
+    struct RecordingModule {
+        hint: Arc<Mutex<Option<NextLayerHint>>>,
+        spawned: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl RecordingModule {
+        fn new() -> (
+            Arc<Self>,
+            Arc<Mutex<Option<NextLayerHint>>>,
+            oneshot::Receiver<()>,
+        ) {
+            let hint = Arc::new(Mutex::new(None));
+            let (tx, rx) = oneshot::channel();
+            let module = Arc::new(RecordingModule {
+                hint: hint.clone(),
+                spawned: Mutex::new(Some(tx)),
+            });
+            (module, hint, rx)
+        }
+    }
+
+    impl ProtocolModule for RecordingModule {
+        fn id(&self) -> &str {
+            "recording"
+        }
+        fn matches(&self, _hint: &NextLayerHint) -> bool {
+            true
+        }
+        fn spawn(&self, _io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, anyhow::Result<()>> {
+            if let Ok(mut slot) = self.hint.lock() {
+                *slot = ctx.hint().cloned();
+            }
+            if let Some(tx) = self.spawned.lock().ok().and_then(|mut s| s.take()) {
+                let _ = tx.send(());
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A resolver that answers a fixed identity after an optional delay.
+    struct FixedResolver {
+        delay: Duration,
+        identity: Option<String>,
+    }
+
+    impl PeerResolver for FixedResolver {
+        fn resolve(&self, _peer: SocketAddr, _local: SocketAddr) -> Option<String> {
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            self.identity.clone()
+        }
+    }
+
+    /// Run `proxy` on a fresh loopback listener, connect one client that sends a
+    /// request line, and wait for the recording module to be spawned. Returns
+    /// the recorded hint and the time from connect to spawn.
+    /// Binds a loopback listener: run it from a shell that may bind sockets.
+    async fn drive_one_connection(
+        proxy: Proxy,
+        hint: Arc<Mutex<Option<NextLayerHint>>>,
+        spawned: oneshot::Receiver<()>,
+    ) -> (NextLayerHint, Duration) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move { proxy.run_on(listener).await });
+
+        let connected = Instant::now();
+        let mut client = TcpStream::connect(addr).await.expect("connect the proxy");
+        client
+            .write_all(b"GET / HTTP/1.1\r\n\r\n")
+            .await
+            .expect("send a request line for the peek");
+        tokio::time::timeout(Duration::from_secs(5), spawned)
+            .await
+            .expect("the recording module is spawned within 5s")
+            .expect("the module signals its spawn");
+        let elapsed = connected.elapsed();
+        server.abort();
+        let recorded = hint
+            .lock()
+            .expect("hint mutex")
+            .clone()
+            .expect("the module recorded its hint");
+        (recorded, elapsed)
+    }
+
+    /// AC2: the resolver's answer reaches the module's hint as `peer_identity`,
+    /// and `capture_interface` stays `None` on the proxied path.
+    #[tokio::test]
+    async fn resolver_result_reaches_the_hint() {
+        let (module, hint, spawned) = RecordingModule::new();
+        let proxy = Proxy::builder()
+            .with_config(Config::default())
+            .register_module(module)
+            .with_peer_resolver(Arc::new(FixedResolver {
+                delay: Duration::ZERO,
+                identity: Some("curl-test".to_string()),
+            }))
+            .build()
+            .expect("build proxy");
+        let (recorded, _) = drive_one_connection(proxy, hint, spawned).await;
+        assert_eq!(recorded.peer_identity.as_deref(), Some("curl-test"));
+        assert_eq!(recorded.capture_interface, None);
+    }
+
+    /// AC3: a resolver that outlives the budget costs the connection at most the
+    /// budget — the module gets `None` and is spawned well before the resolver
+    /// would have answered.
+    #[tokio::test]
+    async fn slow_resolver_yields_none_within_budget() {
+        let (module, hint, spawned) = RecordingModule::new();
+        let proxy = Proxy::builder()
+            .with_config(Config::default())
+            .register_module(module)
+            .with_peer_resolver(Arc::new(FixedResolver {
+                delay: Duration::from_millis(500),
+                identity: Some("too-late".to_string()),
+            }))
+            .build()
+            .expect("build proxy");
+        let (recorded, elapsed) = drive_one_connection(proxy, hint, spawned).await;
+        assert_eq!(recorded.peer_identity, None);
+        assert_eq!(recorded.capture_interface, None);
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "connect to module spawn took {elapsed:?}; the 500 ms resolver must not be waited for"
+        );
+    }
+
+    /// AC4: a proxy built without `with_peer_resolver` behaves as before —
+    /// `peer_identity` is `None`.
+    #[tokio::test]
+    async fn no_resolver_means_no_identity() {
+        let (module, hint, spawned) = RecordingModule::new();
+        let proxy = Proxy::builder()
+            .with_config(Config::default())
+            .register_module(module)
+            .build()
+            .expect("build proxy");
+        let (recorded, _) = drive_one_connection(proxy, hint, spawned).await;
+        assert_eq!(recorded.peer_identity, None);
+        assert_eq!(recorded.capture_interface, None);
     }
 }

@@ -1,0 +1,27 @@
+[package]
+name = "aitm-peer-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Leaf crate holding the audited unsafe libproc calls: name the process behind an accepted loopback TCP connection."
+
+# This crate exists so the rest of the workspace (notably `aitm`) can keep the
+# workspace `unsafe_code = "forbid"`. The workspace lint is `forbid`, which no
+# `#[allow]` can lift, and Cargo cannot combine `workspace = true` with a per-crate
+# override, so this crate restates the workspace lint set (today: `unsafe_code`
+# only) at `deny`: still a hard error everywhere except the one
+# `#![allow(unsafe_code)]` module `src/macos/ffi.rs`. If the workspace gains more
+# `[workspace.lints]`, mirror them here.
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+# `aitm_core::peer::PeerResolver` is the trait the resolver implements.
+aitm-core.workspace = true
+
+# libproc (`proc_listpids`, `proc_pidinfo`, `proc_pidfdinfo`, `proc_pidpath`,
+# `proc_name`) and `CFBundle` are macOS-only; nothing links elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+core-foundation = "0.10"

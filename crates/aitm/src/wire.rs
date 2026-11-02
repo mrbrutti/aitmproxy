@@ -21,7 +21,7 @@ use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
 use aitm_core::{
     ActionPermit, AgentState, AuditRing, Config, GuardError, JobBus, Plugin, ProtocolModule, Proxy,
-    Registry, ScopeEntry, ScopeRateGuard,
+    Registry, ScopeEntry, ScopeRateGuard, SsrfPolicy,
 };
 use aitm_plugin_maprules::MapRulesPlugin;
 use aitm_plugin_passthrough::{PassthroughList, PassthroughModule, PassthroughPlugin};
@@ -208,12 +208,22 @@ pub fn ws_tls_policy(cfg: &Config) -> TlsPolicy {
 /// The native (compiled-in) scanner v2 checks this build ships (spec D1).
 ///
 /// `aitm-scan-checks-http` contributes checks to the HTTP lane's catalogue rather
-/// than a second lane, so its slot is `checks()`, not `lane()`. It answers the
-/// checks track T3 has landed, which is none while that crate ships an empty
-/// catalogue.
+/// than a second lane, so its slot is `checks_with`, not `lane()`: the ten T3
+/// natives (spec D8.2) — `sqli-boolean`, `sqli-time`, `cmdi-time`,
+/// `xss-reflected`, `open-redirect` and the five observe-only `h2-*` checks.
+/// The five h2 checks open one raw HTTP/2 connection per origin, outside the
+/// job client, so they take the egress posture explicitly: `ssrf` is the
+/// operator's `browser.ssrf` policy (the one [`SsrfPolicy`] in `Config`, the
+/// same one the browser engine and `aitm browser confine` read) and `guard` is
+/// the proxy's live scope guard, handed in as a [`LateGuard`] and bound right
+/// after `Proxy::build` like Map Remote's. It is the crate's only slot: no
+/// constructor omits the gate.
 #[must_use]
-pub fn collect_native_checks() -> Vec<Arc<dyn aitm_scan_model::Check>> {
-    aitm_scan_checks_http::checks()
+pub fn collect_native_checks(
+    ssrf: SsrfPolicy,
+    guard: Arc<dyn ScopeRateGuard>,
+) -> Vec<Arc<dyn aitm_scan_model::Check>> {
+    aitm_scan_checks_http::checks_with(ssrf, guard)
 }
 
 /// A built proxy and the CA it serves with.
@@ -501,6 +511,9 @@ pub fn assemble_with_scripts(
     // served. Until bound it reports nothing in scope, so the module would tunnel
     // everything (deny-by-default) rather than decrypt it.
     let tunnel_guard = Arc::new(LateGuard::default());
+    // The scope guard the T3 raw-h2 observe checks gate their one connection per
+    // origin on; bound to the proxy's guard right after build, beside the others.
+    let native_guard = Arc::new(LateGuard::default());
 
     // The one job bus (spec D9.2). Every long-running command publishes on it
     // and every server is handed this exact `Arc`, so progress from a job
@@ -517,7 +530,7 @@ pub fn assemble_with_scripts(
     scanner_cfg.l4_allow_agent_inject = features.l4.allow_agent_inject;
     // Scanner v2 registration slots (spec D1, "Registration without shared
     // files"): the lanes each lane crate's `lane()` handed back, the native
-    // checks from `aitm_scan_checks_http::checks()`, and the scripting tier's
+    // checks from `aitm_scan_checks_http::checks_with(..)`, and the scripting tier's
     // check registry (call B9). `late` and `engine_cell` are taken before the
     // registry takes the plugin by value: `main.rs` binds the proxy's handles
     // into the first once the proxy exists, and the second is how the assembled
@@ -527,12 +540,20 @@ pub fn assemble_with_scripts(
             features.l4_shared.as_ref(),
             ws_tls_policy(cfg),
         ))
-        .with_native_checks(collect_native_checks())
+        .with_native_checks(collect_native_checks(
+            cfg.browser.ssrf.clone(),
+            native_guard.clone(),
+        ))
         .with_script_checks(scripts.script_checks.clone().unwrap_or_default());
     let scan_late = scanner.late();
     let scanner_engine = scanner.engine_cell();
 
-    let mut builder = Proxy::builder().with_config(cfg.clone());
+    // The peer resolver names the loopback client of every proxied connection
+    // (spec 2026-11-01-proxied-client-attribution); `capture_interface` stays null
+    // on this path.
+    let mut builder = Proxy::builder()
+        .with_config(cfg.clone())
+        .with_peer_resolver(Arc::new(aitm_peer_process::ProcessResolver::new()));
     // Protocol modules, in registration order (first match claims the connection):
     // PassthroughModule before HttpModule so a pinned or out-of-scope host tunnels
     // past MITM.
@@ -679,6 +700,7 @@ pub fn assemble_with_scripts(
     // same scope/rate guard the client path and every other command enforce.
     map_guard.bind(proxy.guard());
     tunnel_guard.bind(proxy.guard());
+    native_guard.bind(proxy.guard());
 
     // The protocol-general capture ingress (L4OPS-AC17). Its stream/TCP half is wired
     // for **every** build, from the live proxy's shared module list, flow store, event
@@ -1153,16 +1175,37 @@ mod tests {
     }
 
     /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
-    /// a skeleton slot returning `None` is skipped rather than collected. Two lanes
-    /// have landed: T4 (`aitm-scan-ws`) and T5 (`aitm-scan-l4-packet`, which returns
-    /// `Some` even without the L4 handles, call A18); the remaining slots are still
-    /// skeletons, and with the L4 handles present the stream slot is still called
-    /// and still contributes nothing. Each lane track's landing bumps these
-    /// literals; that track re-pins this test.
+    /// a skeleton slot returning `None` is skipped rather than collected. Four
+    /// lanes have landed: T2 (`aitm-scan-http`), T4 (`aitm-scan-ws`), T5
+    /// (`aitm-scan-l4-packet`, which returns `Some` even without the L4 handles,
+    /// call A18) and T6 (`aitm-scan-l4-stream`, `Some` with or without the L4
+    /// handles; it refuses at discovery when they are absent). Each lane track's
+    /// landing bumps these literals; that track re-pins this test.
     #[test]
     fn lane_slots_count_the_landed_lanes() {
-        assert_eq!(collect_lanes(None).len(), 2);
-        assert_eq!(collect_native_checks().len(), 0);
+        assert_eq!(collect_lanes(None).len(), 4);
+        // T3 (`aitm-scan-checks-http`): the ten D8.2 natives, built through the
+        // gated constructor with an unbound guard (deny-by-default until the
+        // proxy binds it).
+        let natives = collect_native_checks(SsrfPolicy::default(), Arc::new(LateGuard::default()));
+        assert_eq!(natives.len(), 10);
+        let mut ids: Vec<&str> = natives.iter().map(|c| c.meta().id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "cmdi-time",
+                "h2-cl-te-downgrade-indicator",
+                "h2-header-crlf-tolerance",
+                "h2-pseudo-header-validation",
+                "h2-rapid-reset-mitigation",
+                "h2-settings-observe",
+                "open-redirect",
+                "sqli-boolean",
+                "sqli-time",
+                "xss-reflected",
+            ]
+        );
 
         let shared = L4Shared {
             guard: Arc::new(L4Guard::new(&L4Config {
@@ -1171,7 +1214,7 @@ mod tests {
             })),
             store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
         };
-        assert_eq!(collect_lanes(Some(&shared)).len(), 2);
+        assert_eq!(collect_lanes(Some(&shared)).len(), 4);
     }
 
     /// Task 19 (T4 hand-off): the operator's `ssl_insecure` reaches the WS
@@ -1313,10 +1356,11 @@ mod tests {
 
     /// Task 15 and call B7: an ordinary assembly carries the whole scanner v2
     /// verb surface plus one `check.<id>` command per catalogue entry. Which
-    /// entries exist depends on the lanes this build links (the interim HTTP
-    /// lane's five while no lane crate supplies `http`; T2's once it does), so
-    /// the manual verbs are checked against the engine's own catalogue, and the
-    /// interim ids only while the `http` lane is the interim one.
+    /// entries exist depends on the lanes this build links, so the manual
+    /// verbs are checked against the engine's own catalogue; the three shipped
+    /// passive checks are engine-native (spec amendment 24) and are asserted
+    /// unconditionally, the two legacy active ids only while the `http` lane
+    /// is the interim one.
     #[test]
     fn scan_verbs_and_manual_checks_are_registered() {
         let mut cfg = Config::default();
@@ -1341,18 +1385,25 @@ mod tests {
                 "check.{id} is registered for catalogue entry {id}"
             );
         }
+        // Spec amendment 24 ("the passives stay"): the engine ships the three
+        // passive checks whatever lane holds the http slot, so their manual
+        // verbs are on every build.
+        for id in ["reflection", "security-header", "cookie-flag"] {
+            assert!(
+                ids.iter().any(|have| have == id),
+                "shipped passive check {id} is in the catalogue"
+            );
+            assert!(
+                reg.command(&format!("check.{id}")).is_some(),
+                "check.{id} is registered"
+            );
+        }
         let http_is_interim = engine.lane_entries().iter().any(|e| {
             e.lane == aitm_scan_model::LaneKind::Http
                 && e.source == aitm_scan_model::LaneSource::Interim
         });
         if http_is_interim {
-            for id in [
-                "xss-reflected",
-                "open-redirect",
-                "reflection",
-                "security-header",
-                "cookie-flag",
-            ] {
+            for id in ["xss-reflected", "open-redirect"] {
                 assert!(
                     ids.iter().any(|have| have == id),
                     "interim check {id} is in the catalogue"

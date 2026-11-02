@@ -17,6 +17,8 @@ export interface ConfirmInjectProps {
   args?: InjectArgs | undefined;
   /** A verbatim guard refusal surfaced after a failed confirm, if any. */
   refusal?: string | null | undefined;
+  /** Primary-button wording; defaults to the inject phrasing. */
+  confirmLabel?: string | undefined;
   busy?: boolean | undefined;
   onConfirm: () => void;
   onCancel: () => void;
@@ -56,7 +58,7 @@ export const ConfirmInject: Component<ConfirmInjectProps> = (props) => {
             Cancel
           </Button>
           <Button variant="primary" disabled={props.busy} onClick={() => props.onConfirm()}>
-            Send to wire
+            {props.confirmLabel ?? 'Send to wire'}
           </Button>
         </div>
       </div>

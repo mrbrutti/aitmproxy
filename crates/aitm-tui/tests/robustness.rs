@@ -50,7 +50,7 @@ fn failed(name: &str, message: &str) -> BusEvent {
     }
 }
 
-/// A real 1×1 PNG — the smallest well-formed image file — for the tests that
+/// A real 1×1 PNG (the smallest well-formed image file) for the tests that
 /// need a genuine image on disk.
 fn test_png() -> Vec<u8> {
     let png = aitm_tui::base64::decode(
@@ -258,7 +258,7 @@ fn a_five_megabyte_json_body_renders_without_panicking() {
     assert!(text_of(&app, 200, 50).contains("00000000  5b 7b 22 69"));
 
     eprintln!(
-        "tester: 5 MB JSON ({} bytes) — viewers::body {pretty:?} ({} lines), tree_with_paths {tree_time:?} ({} lines), hex::dump {hex_time:?} ({} rows)",
+        "tester: 5 MB JSON ({} bytes): viewers::body {pretty:?} ({} lines), tree_with_paths {tree_time:?} ({} lines), hex::dump {hex_time:?} ({} rows)",
         msg.body.len(),
         lines.len(),
         tree.len(),
@@ -274,8 +274,8 @@ fn a_five_megabyte_json_body_renders_without_panicking() {
 
 // ------------------------------------------------------- the random walk
 
-/// A seeded random walk through every mode — Browser, Ca and Confirm
-/// included — with bus events, resizes and every key the key map knows,
+/// A seeded random walk through every mode (Browser, Ca and Confirm
+/// included) with bus events, resizes and every key the key map knows,
 /// never panics.
 #[test]
 fn a_random_walk_through_every_mode_including_browser_ca_and_confirm_never_panics() {
@@ -445,7 +445,7 @@ fn key_codes() -> Vec<KeyCode> {
 
 /// I3 / S9: a `/re/` argument that would compile past the 1 MiB program
 /// limit is refused with the limit named, one under it compiles, an invalid
-/// one names the syntax error — at the parser and through `:filter`.
+/// one names the syntax error, at the parser and through `:filter`.
 #[test]
 fn regex_filters_name_the_size_limit_and_syntax_errors() {
     let err = filter::parse("~u /x{99999}/").unwrap_err();
@@ -794,8 +794,8 @@ fn status_bar_total_is_a_dash_until_a_size_is_known() {
         "no size is known without flow.detail: {status}"
     );
     assert!(!status.contains("0 B ↑"), "{status}");
-    // With details the total is the known body bytes — `f50`'s 68-byte
-    // request body plus `f41`'s 74-byte response body — in front of the F4
+    // With details the total is the known body bytes (`f50`'s 68-byte
+    // request body plus `f41`'s 74-byte response body) in front of the F4
     // throughput placeholder.
     let full = sample_app(200, 50);
     let status = text_of(&full, 200, 50).lines().last().unwrap().to_string();
@@ -880,7 +880,7 @@ fn detail_cap_and_detail_failed_marks_follow_the_flow_list() {
     assert_eq!(reqs, vec![BusRequest::Detail("f5".into())]);
 }
 
-/// §4.2 step 3: `tools/list` drives features — `flow.detail` fetches happen
+/// §4.2 step 3: `tools/list` drives features: `flow.detail` fetches happen
 /// only when the bus offers the tool, for new rows, on Enter, and when a
 /// row's state changes after its detail was loaded.
 #[test]
@@ -928,13 +928,14 @@ fn tools_list_drives_detail_fetching() {
     let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
     let _ = app.update(Action::Back);
     assert!(app.update(Action::Enter).is_empty());
-    // A bus notification (F4) triggers a refresh; CallOk too.
-    assert_eq!(
-        app.on_bus(BusEvent::Notification(
+    // A bus notification (F4) marks the list stale and the next tick
+    // refreshes it once (scanner v2 D5 coalescing); CallOk refreshes at once.
+    assert!(app
+        .on_bus(BusEvent::Notification(
             json!({"method":"notifications/aitm/state","params":{"paused":1}})
-        )),
-        vec![BusRequest::Refresh]
-    );
+        ))
+        .is_empty());
+    assert_eq!(app.update(Action::Tick), vec![BusRequest::Refresh]);
     assert_eq!(
         app.on_bus(BusEvent::CallOk {
             name: "flow.kill".into(),
@@ -954,6 +955,7 @@ fn tool_info_params_reads_the_input_schema() {
         name: "x".into(),
         description: String::new(),
         input_schema: json!({"type":"object","properties":{"id":{"type":"string","description":"The flow."},"n":{"type":"integer"}},"required":["id"]}),
+        confirmable: false,
     };
     assert_eq!(
         t.params(),
@@ -1057,7 +1059,11 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
     };
     expect_toast(&mut app, Action::Mark, "F6");
     expect_toast(&mut app, Action::Comment, "F6");
-    expect_toast(&mut app, Action::AgentSet(AgentPolicy::Paused), "F1");
+    expect_toast(
+        &mut app,
+        Action::AgentSet(AgentPolicy::Paused),
+        "agent.set is not on this bus",
+    );
     for (cmd, f) in [
         ("clear", "F7"),
         ("pause", "F7"),
@@ -1093,14 +1099,13 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
         "(core follow-up F7)",
         "F10│",
         "M3│",
-        "F1│",
-        "n/a (F1)",
+        "Agent · n/a",
         "↑ — ↓ — (F4)",
     ] {
         assert!(text.contains(label), "{label}: {text}");
     }
     // The Browser item's count is the tab count, which needs F14: a dash
-    // for "missing" (§2.8), not a "not built" label — the view is built.
+    // for "missing" (§2.8), not a "not built" label: the view is built.
     assert!(
         line_with(&text, "  Browser").is_some_and(|l| l.ends_with("—│")),
         "{:?}",
@@ -1188,7 +1193,7 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
 // ------------------------------------------------------------ prompts
 
 /// M1: a prompt returns to the mode it was opened from, not to a mode fixed
-/// by its kind — `:` from the Scope panel lands back in Scope, `/` from the
+/// by its kind: `:` from the Scope panel lands back in Scope, `/` from the
 /// inspector back in the inspector.
 #[test]
 fn a_prompt_returns_to_the_mode_it_was_opened_from() {
@@ -1290,6 +1295,23 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
                 let _ = app.update(Action::OpenBrowser);
                 let _ = app.update(Action::BrowserEvalPrompt);
             }
+            // The Profiles editor's prompts (scanner v2, plan task 10): all
+            // four need an open editor; `w` needs `scan.profile.save`, which
+            // `CORE_TOOLS` offers.
+            PromptKind::ScanOrigin
+            | PromptKind::ScanField
+            | PromptKind::ScanProfileName
+            | PromptKind::ScanL4Target => {
+                let _ = app.update(Action::OpenScan);
+                let _ = app.update(Action::ScanTab(aitm_tui::scan::ScanTab::Profiles));
+                let _ = app.update(Action::ScanNewProfile);
+                let _ = app.update(match kind {
+                    PromptKind::ScanOrigin => Action::ScanOriginPrompt,
+                    PromptKind::ScanField => Action::ScanEdit,
+                    PromptKind::ScanProfileName => Action::ScanSave,
+                    _ => Action::ScanL4TargetPrompt,
+                });
+            }
         }
         assert_eq!(app.mode, Mode::Prompt(kind), "{kind:?} opens");
     };
@@ -1306,6 +1328,10 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
         (PromptKind::Confirm, Mode::Ca),
         (PromptKind::BrowserUrl, Mode::Browser),
         (PromptKind::BrowserEval, Mode::Browser),
+        (PromptKind::ScanOrigin, Mode::Scan),
+        (PromptKind::ScanField, Mode::Scan),
+        (PromptKind::ScanProfileName, Mode::Scan),
+        (PromptKind::ScanL4Target, Mode::Scan),
     ];
     for (kind, home) in cases {
         let mut app = sample_app(200, 50);
@@ -1331,7 +1357,7 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
         let _ = app.update(Action::Submit);
         assert_eq!(app.mode, Mode::Prompt(next), "Enter from {kind:?}");
     }
-    // Confirm: Enter on the blank line is a "no", like Esc — nothing is sent.
+    // Confirm: Enter on the blank line is a "no", like Esc: nothing is sent.
     let mut app = sample_app(200, 50);
     open(&mut app, PromptKind::Confirm);
     assert!(app.update(Action::Submit).is_empty());
@@ -1359,6 +1385,7 @@ fn dry_run_bypasses_the_confirm_only_as_a_declared_boolean_true() {
         name: "ca.uninstall".into(),
         description: "Remove the CA (confirmed).".into(),
         input_schema: json!({"type":"object","properties":{"dry_run":{"type":"boolean","description":"Only report."}}}),
+        confirmable: false,
     });
     assert_eq!(
         app.run_command("ca.uninstall dry_run=true"),
@@ -1380,7 +1407,7 @@ fn dry_run_bypasses_the_confirm_only_as_a_declared_boolean_true() {
 
 // ------------------------------------------------------- findings on disk
 
-/// M3: a PoC path that names a directory with a `.yaml` name is not read —
+/// M3: a PoC path that names a directory with a `.yaml` name is not read:
 /// the entry's YAML stays empty and the error says it wants a regular file.
 #[test]
 fn finding_yaml_refuses_a_directory_handle_with_a_yaml_name() {
@@ -1509,7 +1536,7 @@ fn finding_yaml_is_read_only_from_small_regular_yaml_files_and_is_carried_forwar
 }
 
 /// SEC-2: Findings `o` opens the screenshot by its canonical path; a path
-/// that does not resolve here opens nothing locally — on a bus with
+/// that does not resolve here opens nothing locally: on a bus with
 /// `poc.artifact` (C10) it is fetched, on one without it the toast says why.
 #[test]
 fn findings_o_canonicalizes_the_screenshot_path_and_refuses_one_that_does_not_resolve() {
@@ -1562,7 +1589,7 @@ fn findings_o_canonicalizes_the_screenshot_path_and_refuses_one_that_does_not_re
 // ------------------------------------------------- browser calls in flight
 
 /// M2: only the `browser.*` calls the view tracks (those with a busy label)
-/// count as in flight — an answer for an untracked `browser.*` tool does
+/// count as in flight: an answer for an untracked `browser.*` tool does
 /// not settle a tracked call that is still waiting.
 #[test]
 fn an_untracked_browser_tool_answer_does_not_settle_a_tracked_call_in_flight() {
@@ -1604,7 +1631,7 @@ fn an_untracked_browser_tool_answer_does_not_settle_a_tracked_call_in_flight() {
 }
 
 /// QI-1: an error toast about something else while a `browser.*` call is in
-/// flight is not that call's answer — the view stays busy and shows no
+/// flight is not that call's answer: the view stays busy and shows no
 /// error; only a `CallFailed` naming a `browser.*` tool settles it.
 #[test]
 fn an_unrelated_error_toast_does_not_settle_an_in_flight_browser_call() {
@@ -1659,7 +1686,7 @@ fn an_unrelated_error_toast_does_not_settle_an_in_flight_browser_call() {
 }
 
 /// QI-1: a disconnect (and the reconnect that follows) forgets every
-/// `browser.*` call in flight — the bus will never answer them.
+/// `browser.*` call in flight: the bus will never answer them.
 #[test]
 fn a_disconnect_during_a_navigate_clears_the_browser_busy_state() {
     let mut app = connected_app(200, 50);
@@ -1750,14 +1777,14 @@ fn a_websocket_row_without_a_listed_handshake_makes_no_empty_domains_group() {
     assert!(app.update(Action::BuildPoc).is_empty());
     assert_eq!(
         toast(&app),
-        "Out of scope — unknown host (the WebSocket handshake is not listed)"
+        "Out of scope: unknown host (the WebSocket handshake is not listed)"
     );
 }
 
 // ------------------------------------------- tester: hostile tools/list
 
-/// Tester: a bus whose `tools/list` is empty — every plugin off, or a list
-/// that failed to parse — leaves every mode drawable at the design size and
+/// Tester: a bus whose `tools/list` is empty (every plugin off, or a list
+/// that failed to parse) leaves every mode drawable at the design size and
 /// in a small terminal, degrades each control to its follow-up label, sends
 /// nothing for a tool that is not there, and lists no tool in the palette.
 #[test]
@@ -1789,7 +1816,10 @@ fn a_bus_that_offers_no_tools_renders_every_mode_and_sends_nothing() {
     for (action, label) in [
         (Action::Mark, "F6"),
         (Action::Comment, "F6"),
-        (Action::AgentSet(AgentPolicy::Paused), "F1"),
+        (
+            Action::AgentSet(AgentPolicy::Paused),
+            "agent.set is not on this bus",
+        ),
     ] {
         assert!(
             app.update(action.clone()).is_empty(),
@@ -1865,8 +1895,8 @@ fn a_bus_that_offers_no_tools_renders_every_mode_and_sends_nothing() {
     );
 }
 
-/// Tester: a `tools/list` of ten thousand entries — long names, one empty
-/// name, one duplicate — is held whole, found by exact name only, drawn in
+/// Tester: a `tools/list` of ten thousand entries (long names, one empty
+/// name, one duplicate) is held whole, found by exact name only, drawn in
 /// the palette at every size without panicking, and the odd entries neither
 /// hide the real tools nor become something that is sent.
 #[test]
@@ -1948,7 +1978,7 @@ fn a_ten_thousand_entry_tools_list_with_an_empty_and_a_duplicate_name_still_rend
 /// itself sends nothing, the browser calls are forgotten, a late answer
 /// from the old connection is still folded in, and the reconnect is a new
 /// session: a fresh list, and the lost detail is asked for on `Enter`
-/// (a poll never re-asks for an existing row — the contract
+/// (a poll never re-asks for an existing row: the contract
 /// `tools_list_drives_detail_fetching` pins).
 #[test]
 fn a_bus_drop_after_the_list_landed_keeps_the_rows_and_recovers_on_reconnect() {
@@ -1990,7 +2020,7 @@ fn a_bus_drop_after_the_list_landed_keeps_the_rows_and_recovers_on_reconnect() {
     );
     assert!(text.contains("https://h.test/a"), "{text}");
     // Keys still work on what is there: moving onto `b`, which has no
-    // detail, asks for one as always — the reducer is plain data and the
+    // detail, asks for one as always: the reducer is plain data and the
     // bus task owns delivery; this request dies with the dead connection.
     assert_eq!(
         app.update(Action::Down),
@@ -2056,43 +2086,51 @@ fn discover_targets(reqs: &[BusRequest]) -> Vec<String> {
 }
 
 /// `:scan <target>` is scope-gated (deny-by-default): an out-of-scope host
-/// is refused with a toast that names it and nothing reaches the wire; an
-/// in-scope host — typed with a scheme, port, path and query — is reduced
-/// to its host and sent as exactly one `scan.discover`.
+/// is refused with a toast that names it and nothing reaches the wire,
+/// on a v2 bus (where `:scan <origin>` is `scan.start`) as on a legacy
+/// one; on a legacy bus an in-scope target typed with a scheme, port, path
+/// and query is sent as exactly one `scan.discover` keeping its scheme and
+/// port, the path dropped (scanner v2 spec D8, D12).
 #[test]
 fn scan_command_with_target_is_scope_gated() {
     let mut app = connected_app(200, 50);
     let _ = app.on_bus(BusEvent::Scope(vec!["api.shop-staging.test".into()]));
     let reqs = app.run_command("scan evil.example");
     assert_eq!(app.mode, Mode::Scan, "the view still opens");
-    assert!(!app.scan.running, "an out-of-scope target is not launched");
     assert!(
-        discover_targets(&reqs).is_empty(),
+        !app.scan.legacy.running,
+        "an out-of-scope target is not launched"
+    );
+    assert_eq!(app.scan.launch.pending, None, "no v2 launch either");
+    assert!(
+        discover_targets(&reqs).is_empty()
+            && !reqs
+                .iter()
+                .any(|r| matches!(r, BusRequest::CallTagged { name, .. } if name == "scan.start")),
         "nothing reaches the wire for an out-of-scope host: {reqs:?}"
     );
     assert_eq!(
         toast(&app),
-        "Out of scope — add `evil.example` to scope to scan it"
+        "Out of scope: add `evil.example` to scope to scan it"
     );
 
-    let mut app = connected_app(200, 50);
-    let _ = app.on_bus(BusEvent::Scope(vec!["api.shop-staging.test".into()]));
+    let mut app = legacy_app(200, 50);
     let reqs = app.run_command("scan https://api.shop-staging.test:8443/admin?x=1");
     assert_eq!(app.mode, Mode::Scan);
-    assert!(app.scan.running);
+    assert!(app.scan.legacy.running);
     assert_eq!(
         discover_targets(&reqs),
-        vec!["http://api.shop-staging.test/".to_string()],
-        "the typed target is reduced to its in-scope host: {reqs:?}"
+        vec!["https://api.shop-staging.test:8443".to_string()],
+        "the typed target keeps its scheme and port, authority only: {reqs:?}"
     );
     assert_eq!(
-        app.scan.target.as_deref(),
-        Some("http://api.shop-staging.test/")
+        app.scan.legacy.target.as_deref(),
+        Some("https://api.shop-staging.test:8443")
     );
 }
 
-/// A `browser.screenshot` reply that is not a PNG — other image magic, bytes
-/// that are no image, bad base64, a non-string — is labelled honestly with
+/// A `browser.screenshot` reply that is not a PNG (other image magic, bytes
+/// that are no image, bad base64, a non-string) is labelled honestly with
 /// a typed placeholder, never trusted as an image, and never panics; `o`
 /// still hands the real bytes over; a 4 MiB PNG puts no byte on screen.
 #[test]
@@ -2160,7 +2198,7 @@ fn browser_screenshot_of_non_png_bytes_is_labelled_not_trusted() {
         );
     }
     // A 1×1 PNG with a 4 MiB tail: dimensions read from the header, no copy
-    // of the bytes into the screen. The wall-clock is logged, not gated —
+    // of the bytes into the screen. The wall-clock is logged, not gated:
     // the timed tests live in `tests/perf.rs`.
     let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
     png.extend_from_slice(&1u32.to_be_bytes());
@@ -2205,6 +2243,15 @@ fn l4_inject_is_scope_gated_and_confirmed_over_the_wire() {
                      "layers": ["IPv4", "UDP", "Raw"]}]
     })]));
     app.selected = Some("l4-1".into());
+    // Capture/inject available (L4 parity B10 refuses `s` locally before the
+    // scope check while `l4.capture.status` says otherwise).
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: aitm_tui::l4::L4Availability::from_reply(
+            &json!({"available": true, "code": "available", "reason": null, "captures": []}),
+        ),
+        intercept: app.l4.intercept.clone(),
+        captures: vec![],
+    });
     // A capture-only scope entry: refused locally, nothing on the wire.
     let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
         "interface": "lo0", "capability": "capture", "cidr": "127.0.0.1/32",
@@ -2213,9 +2260,9 @@ fn l4_inject_is_scope_gated_and_confirmed_over_the_wire() {
     assert!(app.update(Action::L4Inject).is_empty());
     assert_eq!(
         toast(&app),
-        "Out of L4 scope — add an inject entry for `lo0` to inject"
+        "Out of L4 scope: add an inject entry for `lo0` to inject"
     );
-    assert_ne!(app.mode, Mode::L4Confirm);
+    assert_ne!(app.mode, Mode::WireConfirm);
     // An inject entry covering lo0: the probe goes out, once, without `_confirm`.
     let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
         "interface": "lo0", "capability": "inject", "cidr": "127.0.0.1/32",
@@ -2232,7 +2279,7 @@ fn l4_inject_is_scope_gated_and_confirmed_over_the_wire() {
     assert!(args.get("_confirm").is_none(), "{args}");
     assert_ne!(
         app.mode,
-        Mode::L4Confirm,
+        Mode::WireConfirm,
         "the overlay waits for the server's reply"
     );
     // The server asks for confirmation: the overlay opens, nothing is sent.
@@ -2242,7 +2289,7 @@ fn l4_inject_is_scope_gated_and_confirmed_over_the_wire() {
         "confirm_token": "tok-9"
     });
     assert!(app.on_bus(ok("l4.inject", reply)).is_empty());
-    assert_eq!(app.mode, Mode::L4Confirm);
+    assert_eq!(app.mode, Mode::WireConfirm);
     assert!(
         text_of(&app, 200, 50).contains("Inject 1 UDP to 127.0.0.1:7 on lo0?"),
         "{}",

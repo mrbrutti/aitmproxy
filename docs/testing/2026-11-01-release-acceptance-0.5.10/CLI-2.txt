@@ -1,0 +1,15 @@
+## CLI-2 exit 1
+## stdout (98 lines; Rhai loader lines dropped)
+## stderr (189 lines)
+expected a command before flags, got `--help`
+usage: aitm <command> [--flag value]...
+(a value that itself starts with `--` must be given as --flag=value;
+--yes answers a command's confirmation prompt without asking)
+
+commands:
+  flow list
+      List the ids of every captured flow, oldest first.
+  flow get --id <flow-id>
+      Summarize one captured flow: kind, request line, status, state.
+  flow table
+      Per-flow summaries for a flows table: method, URL, status, duration, state, and marks, oldest first. Read-only.

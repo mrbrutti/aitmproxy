@@ -3,7 +3,7 @@
 //!
 //! Neither check sends: both read the one cached [`crate::state::PointRun`] of
 //! the point they were handed, found through the
-//! [`RunnerRegistry`](crate::host::RunnerRegistry) by `(job marker, point id)`,
+//! [`RunnerRegistry`](crate::host::RunnerRegistry) by `(job id, point id)`,
 //! so whichever check reaches a point first drives its cases and the other
 //! renders a verdict over the same run (spec D8.4, plan call C2).
 //!
@@ -13,6 +13,7 @@
 //! reaction check is `info`: an ICMP error or a TCP reset is the target
 //! answering, so it is a protocol reaction and never a crash.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,10 +159,11 @@ impl Check for CrashCheck {
                 confidence: Confidence::Firm,
                 evidence: Evidence::default(),
                 detail: format!(
-                    "{} cases sent on {} field {}; no crash",
+                    "{} cases sent on {} field {}; no crash{}",
                     run.sent_count(),
                     run.target,
-                    run.field
+                    run.field,
+                    no_reply_note(&run)
                 ),
                 poc_hint: None,
                 location: None,
@@ -226,6 +228,11 @@ async fn resolve_run(
     point: &InsertionPoint,
     host: &dyn ProbeHost,
 ) -> Result<(Arc<PointRunner>, Arc<PointRun>), Verdict> {
+    // `host.marker()` is the packet host's job id — the stable key
+    // `Lane::probe_host_for` registered the runner under, not the engine's
+    // per-call `JobCtx::marker` canary (`PacketHost::marker`; T5 live proof,
+    // 4b). The `&dyn ProbeHost` is the only handle this preamble has to the
+    // runner's key, so the host must report the job id and nothing else here.
     let Some(runner) = registry.get(&host.marker(), &point.id) else {
         return Err(missing_runner(&point.id));
     };
@@ -458,11 +465,44 @@ pub fn reaction_detail(run: &PointRun) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "l4 reactions on {} field {}: {counts}; latency outliers {}",
+        "l4 reactions on {} field {}: {counts}; latency outliers {}{}",
         run.target,
         run.field,
-        run.outlier_count()
+        run.outlier_count(),
+        no_reply_note(run)
     )
+}
+
+/// The `; no_reply (icmp_ratelimit) x <n>` tail a run carries when some of its
+/// cases drew no reply on an ICMP-paced point (spec amendment 46), empty when
+/// none did. It is the operator's explanation for silence that is the target
+/// host's ICMP rate limiter and not a crash.
+///
+/// The cases' notes are tallied per label (tester F3), one `<label> x <n>` per
+/// label joined by `, `, so the tail stays right when
+/// [`crate::state::CaseNote`] grows a second variant.
+fn no_reply_note(run: &PointRun) -> String {
+    let tally = note_tally(run);
+    if tally.is_empty() {
+        return String::new();
+    }
+    let entries = tally
+        .iter()
+        .map(|(label, count)| format!("{label} x {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("; {entries}")
+}
+
+/// How many of a run's cases carry each note, keyed by the note's operator
+/// label (so the map is ordered and renders deterministically). Cases without
+/// a note are not counted.
+fn note_tally(run: &PointRun) -> BTreeMap<String, usize> {
+    let mut tally = BTreeMap::new();
+    for note in run.cases.iter().filter_map(|case| case.note) {
+        *tally.entry(note.label()).or_insert(0) += 1;
+    }
+    tally
 }
 
 /// The operator-facing line for a dry run: how many cases were rendered and
@@ -500,12 +540,14 @@ mod tests {
         Outcome, Technique, Verdict,
     };
 
-    use super::{checks, crash_meta, reaction_meta, CrashCheck, ReactionCheck};
+    use super::{
+        checks, crash_meta, no_reply_note, note_tally, reaction_meta, CrashCheck, ReactionCheck,
+    };
     use crate::codec::hex_encode;
     use crate::fields::FieldPath;
     use crate::host::{PacketHost, PointRunner, RunnerRegistry};
     use crate::oracle::CaseClass;
-    use crate::state::{Candidate, StopReason};
+    use crate::state::{Candidate, CaseNote, CaseOutcome, CaseRecord, PointRun, StopReason};
     use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
         fields, l4_profile, tcp_target, udp_target, with_hex_seed, MockBackend, MockReply, TestJob,
@@ -515,11 +557,7 @@ mod tests {
     /// `Lane::probe_host_for` registers it before a check ever runs.
     fn registry_with(job: &Arc<TestJob>, runner: &Arc<PointRunner>) -> Arc<RunnerRegistry> {
         let registry = Arc::new(RunnerRegistry::new());
-        registry.register(
-            &job.marker(),
-            runner.point().id.as_str(),
-            Arc::clone(runner),
-        );
+        registry.register(job.job_id(), runner.point().id.as_str(), Arc::clone(runner));
         registry
     }
 
@@ -845,6 +883,92 @@ mod tests {
         assert_eq!(mock.inject_count(), 11);
     }
 
+    /// Spec D8.4 and amendment 46: the kernel reactions of a closed port prove
+    /// classification, never a crash. Against a host whose kernel rate-limits
+    /// the ICMP errors it generates — so an unpaced run reads mostly silence —
+    /// the crash check still answers `Clean`, says how many cases were
+    /// `no_reply (icmp_ratelimit)`, and the reaction check reports the
+    /// port-unreachable as the Info-severity reaction it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_port_never_yields_l4_crash() {
+        let mock = MockBackend::new(MockReply::Icmp {
+            icmp_type: 3,
+            code: 3,
+        });
+        mock.icmp_ratelimit(Duration::from_millis(300));
+        let mut profile = l4_profile(vec![udp_target(9)], 20);
+        profile.l4.icmp_pace_ms = 0;
+        profile.l4.consecutive_timeouts = 50;
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = registry_with(&job, &runner);
+
+        let crash = run_check(&CrashCheck::new(Arc::clone(&registry)), &runner).await;
+        let reaction = run_check(&ReactionCheck::new(registry), &runner).await;
+
+        assert_eq!(crash.outcome, Outcome::Clean);
+        assert_eq!(crash.confidence, Confidence::Firm);
+        assert!(crash.evidence.l4.is_none());
+        assert!(
+            crash
+                .detail
+                .starts_with("20 cases sent on 127.0.0.1:9/udp field raw; no crash"),
+            "a closed port is never a crash: {}",
+            crash.detail
+        );
+        assert!(
+            crash.detail.contains("; no_reply (icmp_ratelimit) x "),
+            "the silence the rate limiter caused is named: {}",
+            crash.detail
+        );
+
+        assert_eq!(reaction_meta().severity, aitm_poc::Severity::Info);
+        assert_eq!(reaction.outcome, Outcome::Vulnerable);
+        assert_eq!(reaction.confidence, Confidence::Firm);
+        let l4 = reaction
+            .evidence
+            .l4
+            .as_ref()
+            .expect("the reaction evidence");
+        assert_eq!(
+            l4.oracle,
+            L4Oracle::Icmp {
+                icmp_type: 3,
+                code: 3
+            }
+        );
+        let matched = reaction
+            .evidence
+            .matched
+            .as_deref()
+            .expect("the matched line");
+        let (label, count) = matched.split_once(" x ").expect("`<label> x <count>`");
+        assert_eq!(label, "icmp(3,3)");
+        let count: u32 = count.parse().expect("a case count");
+        assert!(
+            (1..=20).contains(&count),
+            "the rate limiter lets some cases through: {matched}"
+        );
+        assert!(
+            reaction
+                .detail
+                .starts_with("l4 reactions on 127.0.0.1:9/udp field raw: icmp(3,3) x "),
+            "{}",
+            reaction.detail
+        );
+        assert!(
+            reaction.detail.contains("; no_reply (icmp_ratelimit) x "),
+            "{}",
+            reaction.detail
+        );
+
+        let counters = shared.state.counters(job.job_id()).expect("counters");
+        assert_eq!(counters.cases, 20);
+        assert_eq!(counters.crashes, 0);
+        assert_eq!(counters.liveness_failures, 0);
+        assert_eq!(counters.retired_elements, 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reaction_check_reports_reset() {
         let mock = MockBackend::new(MockReply::Rst);
@@ -958,7 +1082,7 @@ mod tests {
         let second = runner_for(&shared, &job, &plans, &disc.points, "udp.length");
         let registry = registry_with(&job, &first);
         registry.register(
-            &job.marker(),
+            job.job_id(),
             second.point().id.as_str(),
             Arc::clone(&second),
         );
@@ -1018,6 +1142,7 @@ mod tests {
                 latency_outlier: outlier,
             },
             candidate: Candidate::No,
+            note: None,
         };
         let icmp = CaseClass::Icmp {
             icmp_type: 3,
@@ -1219,7 +1344,7 @@ mod tests {
         let second = runner_for(&shared, &job, &plans, &disc.points, "ipv4.ttl");
         let registry = registry_with(&job, &first);
         registry.register(
-            &job.marker(),
+            job.job_id(),
             second.point().id.as_str(),
             Arc::clone(&second),
         );
@@ -1344,5 +1469,63 @@ mod tests {
         assert_eq!(verdict.evidence.payload, Some(hex_encode(&trigger)));
         assert!(verdict.evidence.l4.is_none(), "{:?}", verdict.evidence.l4);
         assert_eq!(mock.inject_count(), 6, "the check sent nothing");
+    }
+
+    /// Tester F3: the `no_reply` tail of a detail tallies the notes **per
+    /// label**, so it stays right when `CaseNote` grows a second variant; the
+    /// count of the first-seen label can never be attached to a different one.
+    /// With today's single variant the rendering is byte-identical to before:
+    /// `; no_reply (icmp_ratelimit) x <n>`, counting only the noted cases.
+    #[test]
+    fn no_reply_note_tallies_each_label() {
+        fn case(index: u32, note: Option<CaseNote>) -> CaseRecord {
+            CaseRecord {
+                index,
+                seed_id: "127.0.0.1:9/udp#0".to_string(),
+                chain: vec!["grow:8".to_string()],
+                sent_hex: "deadbeef".to_string(),
+                outcome: CaseOutcome::Sent {
+                    class: CaseClass::Silence,
+                    elapsed_ms: 1,
+                    latency_outlier: false,
+                },
+                candidate: Candidate::No,
+                note,
+            }
+        }
+        let noted = Some(CaseNote::IcmpRatelimit);
+        let run = PointRun {
+            point_id: "p0".to_string(),
+            target: "127.0.0.1:9/udp".to_string(),
+            field: FieldPath::Raw,
+            rng_seed: 1,
+            dry_run: false,
+            recovery_wait: Duration::from_secs(10),
+            baseline: Some(CaseClass::Icmp {
+                icmp_type: 3,
+                code: 3,
+            }),
+            cases: vec![case(0, noted), case(1, None), case(2, noted)],
+            crash: None,
+            stopped: None,
+        };
+
+        let tally = note_tally(&run);
+        assert_eq!(tally.len(), 1, "{tally:?}");
+        assert_eq!(tally.get("no_reply (icmp_ratelimit)"), Some(&2));
+        assert_eq!(no_reply_note(&run), "; no_reply (icmp_ratelimit) x 2");
+
+        let silent = PointRun {
+            cases: vec![case(0, None), case(1, None)],
+            ..run.clone()
+        };
+        assert!(note_tally(&silent).is_empty());
+        assert_eq!(no_reply_note(&silent), "", "no note, no tail");
+
+        let empty = PointRun {
+            cases: Vec::new(),
+            ..run
+        };
+        assert_eq!(no_reply_note(&empty), "");
     }
 }

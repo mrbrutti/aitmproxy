@@ -248,14 +248,21 @@ extension Session {
                            selectedPausedCount: chosen.filter { $0.state == .paused }.count)
     }
 
-    /// The verb table for a row (every surface's titles, keys and enabled rules).
+    /// The verb table for a row (every surface's titles, keys and enabled rules). An L4 row's
+    /// HTTP verbs come back disabled with `L4RowVerbs.disabledReason` (AC29).
     func verbItems(for id: FlowID?) -> [VerbItem] {
-        VerbTable.items(for: id.flatMap(verbContext(for:)))
+        let context = id.flatMap(verbContext(for:))
+        let items = VerbTable.items(for: context)
+        guard let row = context?.row else { return items }
+        return items.map { L4RowVerbs.gate($0, row: row) }
     }
 
-    /// One verb item for a row; with no row the default, disabled item.
+    /// One verb item for a row, through the same L4 gate; with no row the default, disabled item.
     func verbItem(_ verb: FlowVerb, for id: FlowID?) -> VerbItem {
-        VerbTable.item(verb, for: id.flatMap(verbContext(for:)))
+        let context = id.flatMap(verbContext(for:))
+        let item = VerbTable.item(verb, for: context)
+        guard let row = context?.row else { return item }
+        return L4RowVerbs.gate(item, row: row)
     }
 
     /// The only entry for a row verb, from the keyboard, the context menu, the Flow menu or the
@@ -263,7 +270,7 @@ extension Session {
     func perform(_ verb: FlowVerb, on id: FlowID) {
         guard let context = verbContext(for: id) else { return }
         let row = context.row
-        let item = VerbTable.item(verb, for: context)
+        let item = L4RowVerbs.gate(VerbTable.item(verb, for: context), row: row)
         guard item.enabled else {
             lastError = item.disabledReason
             return

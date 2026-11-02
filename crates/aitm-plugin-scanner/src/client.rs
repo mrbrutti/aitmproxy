@@ -10,9 +10,11 @@
 //!   job can never become a flood-shaped primitive (spec D5, anti-goals);
 //! * **pacing** — a [`GuardError::RateLimited`] is a wait, not an abort, and
 //!   each wait is counted in `rate_waits`;
-//! * **a per-host error ladder** — a host that answers with 5xx or transport
-//!   failures past the profile's `consecutive`/`ratio` rule is dropped for the
-//!   rest of the job (call B15);
+//! * **a per-host error ladder** — a host whose transport failures and timeouts
+//!   pass the profile's `consecutive`/`ratio` rule is dropped for the rest of
+//!   the job (call B15). Only probes that got no answer count: a 5xx is an
+//!   answer, handed to the check and counted nowhere on the ladder
+//!   (amendment 40);
 //! * **timing and marks** — every probe flow carries `scan:<job>` and the
 //!   elapsed time the sender does not measure;
 //! * **the record policy** — under `issues_only` a probe is sent with
@@ -54,8 +56,9 @@ const LADDER_WINDOW: usize = 50;
 /// B15 can trip it. Without a floor the ratio rule fires on a single failed
 /// probe (1 of 1 is over any ratio below 1.0) and the `consecutive` half could
 /// never be reached; ten is the smallest floor under which both of the plan's
-/// ladder cases hold (three 5xx trip on `consecutive: 3`, and ten alternating
-/// outcomes at exactly `ratio: 0.5` do not trip while the eleventh does).
+/// ladder cases hold (three transport errors trip on `consecutive: 3`, and ten
+/// alternating outcomes at exactly `ratio: 0.5` do not trip while the eleventh
+/// does).
 const LADDER_MIN_SAMPLE: usize = 10;
 
 /// Why a bounded await ended without a value.
@@ -199,7 +202,8 @@ pub enum LadderState {
 }
 
 /// One host's error ladder: its current run of failures and the last
-/// [`LADDER_WINDOW`] outcomes (`true` = usable answer).
+/// [`LADDER_WINDOW`] outcomes (`true` = the probe got an answer, of any
+/// status).
 ///
 /// `tripped` is sticky. A trip is a decision about the host for the rest of
 /// the job (call B15: "a trip ends the job with `stopped_reason: errors`"), and
@@ -245,6 +249,10 @@ pub struct ProbeMeter {
 
 impl ProbeMeter {
     /// Record one outcome for `host` and return the host's state afterwards.
+    ///
+    /// Amendment 40: `ok` is "the probe got an answer", so only connect and
+    /// transport errors, guard refusals other than a rate limit, and per-probe
+    /// timeouts are recorded as `false`; a 5xx answer is `true`.
     pub fn record(&self, host: &str, ok: bool, rules: &PerHostErrors) -> LadderState {
         let mut ladders = self.ladders.lock().unwrap_or_else(|e| e.into_inner());
         let ladder = ladders.entry(host.to_string()).or_default();
@@ -488,10 +496,13 @@ impl ProxyClient for JobClient {
             loop {
                 attempt += 1;
                 let started = Instant::now();
+                // A probe, not a reissue (spec amendment 80): the proxy's
+                // breaker charges its error budget for transport failures
+                // and timeouts only; a 5xx answer is what a probe is for.
                 let sent = bounded_await(
                     self.budget.deadline,
                     &self.budget.cancel,
-                    self.inner.send_opts(req.clone(), opts.clone()),
+                    self.inner.send_probe(req.clone(), opts.clone()),
                 )
                 .await;
                 let outcome = match sent {
@@ -504,8 +515,12 @@ impl ProxyClient for JobClient {
                         // The sender leaves `duration` `None`; this is the only
                         // place a probe's elapsed time is measured.
                         flow.metadata.duration = Some(started.elapsed());
-                        let usable = flow.response.as_ref().is_some_and(|r| r.status < 500);
-                        self.meter.record(&host, usable, &self.per_host);
+                        // Amendment 40: an answer of any status is an answer.
+                        // It resets the host's consecutive run and counts as
+                        // an `ok` in the ratio window, 5xx included — a server
+                        // erroring on a payload is a finding for the check to
+                        // read, not a reason to stop probing the host.
+                        self.meter.record(&host, true, &self.per_host);
                         return Ok(flow);
                     }
                     Err(err) => err,
@@ -604,6 +619,9 @@ mod tests {
     struct StubClient {
         queue: Mutex<VecDeque<Outcome>>,
         calls: AtomicUsize,
+        /// How many sends arrived through `send_probe` (amendment 80) rather
+        /// than `send_opts`.
+        probes: AtomicUsize,
         seen: Mutex<Vec<SendOptions>>,
     }
 
@@ -612,12 +630,17 @@ mod tests {
             Arc::new(Self {
                 queue: Mutex::new(outcomes.into_iter().collect()),
                 calls: AtomicUsize::new(0),
+                probes: AtomicUsize::new(0),
                 seen: Mutex::new(Vec::new()),
             })
         }
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn probes(&self) -> usize {
+            self.probes.load(Ordering::SeqCst)
         }
 
         fn seen(&self) -> Vec<SendOptions> {
@@ -632,6 +655,15 @@ mod tests {
     impl ProxyClient for StubClient {
         fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
             self.send_opts(req, SendOptions::default())
+        }
+
+        fn send_probe(
+            &self,
+            req: HttpRequest,
+            opts: SendOptions,
+        ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            self.send_opts(req, opts)
         }
 
         fn send_opts(
@@ -666,6 +698,7 @@ mod tests {
                 trailers: HeaderMap::new(),
                 body: Body::Empty,
                 timestamp: SystemTime::now(),
+                peer: None,
             }),
             client_conn: ConnInfo {
                 peer: "127.0.0.1:0".parse().expect("loopback"),
@@ -718,9 +751,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn probes_go_out_through_send_probe_not_send_opts() {
+        let stub = StubClient::new(vec![Outcome::Ok(500), Outcome::Ok(200)]);
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            loose_budget(10),
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            lenient_hosts(),
+        );
+        for _ in 0..2 {
+            client
+                .send(req_to("ex.test"))
+                .await
+                .expect("the stub answers");
+        }
+        assert_eq!(stub.calls(), 2);
+        assert_eq!(
+            stub.probes(),
+            2,
+            "every job-client send reaches the proxy client as a probe"
+        );
+    }
+
     /// Spec D5 "Budget and pacing": one `probes` budget per job, one unit per
     /// stimulus, and the probe that would overdraw it is refused before it
     /// reaches the sender.
+    /// Spec amendment 80: the job client sends every probe through
+    /// `ProxyClient::send_probe`, so the proxy's breaker does not count a 5xx
+    /// answer against the target's error budget (a probe is meant to provoke
+    /// one); it still charges transport failures and timeouts on that path.
     #[tokio::test]
     async fn charges_one_unit_per_send_and_stops_at_budget() {
         let stub = StubClient::new(vec![Outcome::Ok(200), Outcome::Ok(200), Outcome::Ok(200)]);
@@ -906,14 +969,66 @@ mod tests {
         assert_eq!(meter.errors.load(Ordering::SeqCst), 0);
     }
 
-    /// Spec D5 and call B15: consecutive 5xx trip the host's ladder and the
-    /// next probe to that host never leaves the engine.
+    /// Amendment 40 (spec D5 "Budget and pacing"): a 5xx is an **answer**. It
+    /// goes back to the check and is counted nowhere on the per-host ladder,
+    /// so a target that answers 500 to everything is scanned to the end
+    /// instead of being dropped after three checks (T3 live run, 2026-11-01).
     #[tokio::test]
-    async fn host_ladder_trips_on_consecutive_5xx() {
+    async fn ten_5xx_answers_never_trip_the_ladder() {
+        let stub = StubClient::new((0..10).map(|_| Outcome::Ok(500)).collect());
+        let meter = Arc::new(ProbeMeter::default());
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            loose_budget(20),
+            meter.clone(),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors {
+                consecutive: 3,
+                ratio: 0.5,
+            },
+        );
+
+        for i in 0..10 {
+            let flow = client
+                .send(req_to("ex.test"))
+                .await
+                .expect("a 5xx is an answer, returned to the check");
+            assert_eq!(flow.response.expect("response").status, 500);
+            assert_eq!(
+                meter.ladder_state(&key("ex.test")),
+                LadderState::Ok,
+                "{} answers of 500 tripped the ladder",
+                i + 1
+            );
+        }
+        assert_eq!(meter.sent.load(Ordering::SeqCst), 10);
+        assert_eq!(
+            meter.errors.load(Ordering::SeqCst),
+            0,
+            "an answered probe is not an error"
+        );
+
+        // The eleventh probe is still attempted: the host was never dropped.
+        let flow = client
+            .send(req_to("ex.test"))
+            .await
+            .expect("the eleventh probe is still attempted");
+        assert_eq!(flow.response.expect("response").status, 200);
+        assert_eq!(stub.calls(), 11);
+    }
+
+    /// Amendment 40's other half, and call B15: connect/transport errors are
+    /// what the ladder counts. Three in a row trip `consecutive: 3`, the third
+    /// error is still handed back to the check, and the next probe to that
+    /// host never leaves the engine.
+    #[tokio::test]
+    async fn three_transport_errors_trip_the_ladder() {
         let stub = StubClient::new(vec![
-            Outcome::Ok(500),
-            Outcome::Ok(500),
-            Outcome::Ok(500),
+            Outcome::Other("connect refused"),
+            Outcome::Other("connect refused"),
+            Outcome::Other("connect refused"),
             Outcome::Ok(200),
         ]);
         let meter = Arc::new(ProbeMeter::default());
@@ -926,35 +1041,141 @@ mod tests {
             HttpVersionPolicy::Auto,
             PerHostErrors {
                 consecutive: 3,
+                // Three outcomes are under `LADDER_MIN_SAMPLE`, so the ratio
+                // half cannot be what trips here whatever its value.
                 ratio: 0.5,
             },
         );
 
-        for _ in 0..3 {
-            client.send(req_to("ex.test")).await.expect("a 5xx is sent");
+        for i in 0..2 {
+            let err = client
+                .send(req_to("ex.test"))
+                .await
+                .expect_err("a transport error reaches the check");
+            assert!(err.to_string().contains("connect refused"), "{err}");
+            assert_eq!(
+                meter.ladder_state(&key("ex.test")),
+                LadderState::Ok,
+                "{} transport errors are not three",
+                i + 1
+            );
         }
+
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("the third transport error");
+        assert!(
+            err.to_string().contains("connect refused"),
+            "the trip swallowed the sender's error: {err}"
+        );
         assert_eq!(meter.ladder_state(&key("ex.test")), LadderState::Tripped);
 
         let err = client
             .send(req_to("ex.test"))
             .await
             .expect_err("the host is tripped");
-        assert!(
-            err.to_string().contains("ladder"),
-            "refusal does not name the ladder: {err}"
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::HostLadder(key("ex.test"))),
+            "{err}"
         );
         assert_eq!(stub.calls(), 3, "a tripped host was probed again");
+        assert_eq!(meter.errors.load(Ordering::SeqCst), 3);
+        assert_eq!(meter.sent.load(Ordering::SeqCst), 0);
+    }
+
+    /// Amendment 40 and call C5: an answer means the host is up, so a 5xx
+    /// resets the consecutive transport run. Five transport errors broken up
+    /// by two 5xx answers never reach `consecutive: 3`; the next three
+    /// unbroken ones do.
+    #[tokio::test]
+    async fn a_5xx_answer_resets_the_transport_run() {
+        let stub = StubClient::new(vec![
+            Outcome::Other("connect refused"),
+            Outcome::Other("connect refused"),
+            Outcome::Ok(503),
+            Outcome::Other("connect refused"),
+            Outcome::Other("connect refused"),
+            Outcome::Ok(500),
+            Outcome::Other("connect refused"),
+            Outcome::Other("connect refused"),
+            Outcome::Other("connect refused"),
+        ]);
+        let meter = Arc::new(ProbeMeter::default());
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            loose_budget(20),
+            meter.clone(),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors {
+                consecutive: 3,
+                // The ratio half has its own tests; `1.0` is unreachable, so
+                // the consecutive run is the only thing under test here.
+                ratio: 1.0,
+            },
+        );
+
+        for i in 0..7 {
+            let sent = client.send(req_to("ex.test")).await;
+            match i {
+                2 | 5 => {
+                    let status = sent
+                        .unwrap_or_else(|e| panic!("outcome {} is an answer: {e}", i + 1))
+                        .response
+                        .expect("response")
+                        .status;
+                    assert_eq!(status, if i == 2 { 503 } else { 500 });
+                }
+                _ => assert!(
+                    sent.is_err(),
+                    "outcome {} is a transport error, not an answer",
+                    i + 1
+                ),
+            }
+            assert_eq!(
+                meter.ladder_state(&key("ex.test")),
+                LadderState::Ok,
+                "tripped at outcome {}: a 5xx broke every run of three before it",
+                i + 1
+            );
+        }
+
+        // Nothing resets the run now: the eighth and ninth errors complete it.
+        assert!(client.send(req_to("ex.test")).await.is_err());
+        assert_eq!(
+            meter.ladder_state(&key("ex.test")),
+            LadderState::Ok,
+            "two consecutive transport errors are not three"
+        );
+        assert!(client.send(req_to("ex.test")).await.is_err());
+        assert_eq!(
+            meter.ladder_state(&key("ex.test")),
+            LadderState::Tripped,
+            "the ninth outcome is the third consecutive transport error"
+        );
+
+        assert_eq!(stub.calls(), 9);
+        assert_eq!(meter.sent.load(Ordering::SeqCst), 2);
+        assert_eq!(meter.errors.load(Ordering::SeqCst), 7);
     }
 
     /// Call B15's second rule: the 50-entry window's failure ratio trips the
-    /// ladder even when no run of failures ever reaches `consecutive`.
+    /// ladder even when no run of failures ever reaches `consecutive`. Since
+    /// amendment 40 the window's failures are transport errors, never a 5xx.
     #[tokio::test]
     async fn ratio_rule_trips_too() {
         let mut outcomes = Vec::new();
         for i in 0..10 {
-            outcomes.push(Outcome::Ok(if i % 2 == 0 { 200 } else { 500 }));
+            outcomes.push(if i % 2 == 0 {
+                Outcome::Ok(200)
+            } else {
+                Outcome::Other("connect refused")
+            });
         }
-        outcomes.push(Outcome::Ok(500));
+        outcomes.push(Outcome::Other("connect refused"));
         let stub = StubClient::new(outcomes);
         let meter = Arc::new(ProbeMeter::default());
         let client = JobClient::new(
@@ -970,8 +1191,14 @@ mod tests {
             },
         );
 
-        for _ in 0..10 {
-            client.send(req_to("ex.test")).await.expect("probe");
+        for i in 0..10 {
+            let sent = client.send(req_to("ex.test")).await;
+            assert_eq!(
+                sent.is_ok(),
+                i % 2 == 0,
+                "outcome {} went the wrong way",
+                i + 1
+            );
         }
         assert_eq!(
             meter.ladder_state(&key("ex.test")),
@@ -979,7 +1206,10 @@ mod tests {
             "five failures in ten is not over the 0.5 ratio"
         );
 
-        client.send(req_to("ex.test")).await.expect("probe");
+        client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("the sixth transport error");
         assert_eq!(meter.ladder_state(&key("ex.test")), LadderState::Tripped);
     }
 
@@ -1114,6 +1344,9 @@ mod tests {
     /// still has time is a typed [`ProbeRefused::Timeout`] naming the host: it
     /// is counted in `timeouts` and `errors` and marks the host's ladder. The
     /// ceiling itself is not waited for here; the mapping is exercised directly.
+    ///
+    /// Amendment 40 keeps the timeout on the ladder — it is a probe that got
+    /// no answer — so this one timeout trips a host under `consecutive: 1`.
     #[tokio::test]
     async fn a_probe_timeout_is_a_typed_refusal() {
         let meter = Arc::new(ProbeMeter::default());
@@ -1146,7 +1379,11 @@ mod tests {
         );
         assert_eq!(meter.timeouts.load(Ordering::SeqCst), 1);
         assert_eq!(meter.errors.load(Ordering::SeqCst), 1);
-        assert_eq!(meter.ladder_state(&key("ex.test")), LadderState::Tripped);
+        assert_eq!(
+            meter.ladder_state(&key("ex.test")),
+            LadderState::Tripped,
+            "amendment 40: the timeout counted as one ladder failure"
+        );
 
         let cancelled = client.await_end_error(AwaitEnd::Cancelled, "ex.test");
         assert_eq!(
@@ -1299,7 +1536,7 @@ mod tests {
     /// nine is not a ratio), and speaks at exactly the tenth.
     #[tokio::test]
     async fn ratio_rule_needs_ten_outcomes() {
-        let stub = StubClient::new((0..10).map(|_| Outcome::Ok(500)).collect());
+        let stub = StubClient::new((0..10).map(|_| Outcome::Other("connect refused")).collect());
         let meter = Arc::new(ProbeMeter::default());
         let client = JobClient::new(
             stub.clone(),
@@ -1318,7 +1555,7 @@ mod tests {
             client
                 .send(req_to("ex.test"))
                 .await
-                .expect("a 5xx is an answer");
+                .expect_err("a transport error");
             assert_eq!(
                 meter.ladder_state(&key("ex.test")),
                 LadderState::Ok,
@@ -1330,7 +1567,7 @@ mod tests {
         client
             .send(req_to("ex.test"))
             .await
-            .expect("the tenth answer");
+            .expect_err("the tenth transport error");
         assert_eq!(
             meter.ladder_state(&key("ex.test")),
             LadderState::Tripped,

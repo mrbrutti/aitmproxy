@@ -434,6 +434,7 @@ fn http_response(
         trailers: HeaderMap::new(),
         body: Body::Bytes(bytes),
         timestamp: SystemTime::now(),
+        peer: None,
     }
 }
 

@@ -9,9 +9,10 @@ use ratatui::text::{Line, Span};
 
 use crate::app::{App, SidebarItem};
 use crate::model::AgentPolicy;
+use crate::scan::ScanOffer;
+use crate::text::{fit, truncate};
 use crate::theme::Theme;
 use crate::tokens::glyph;
-use crate::ui::text::{fit, truncate};
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.surface());
@@ -182,18 +183,38 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let agent_count = match app.agent.policy {
         Some(AgentPolicy::Paused) => "paused".to_string(),
         Some(_) => format!("{}/min", app.agent.actions_last_minute),
-        None => "F1".to_string(),
+        // No policy reported by `agent.status`: missing is a dash (§2.8).
+        None => "—".to_string(),
     };
     line(buf, item(app, SidebarItem::Agent, Some(agent_count), true));
-    // The Scan surface appears only when the bus offers the scanner plugin
-    // (`scan.discover`); its count is the injection points found this session.
-    if app.has_tool("scan.discover") {
-        let scan_count = if !app.scan.points.is_empty() {
-            app.scan.points.len().to_string()
+    // The Scan surface appears only when the bus offers a scanner (spec D2).
+    // Its count is the open issues of the newest job still running on a v2
+    // bus, and the injection points found this session on a legacy one.
+    let offer = app.scan_offer();
+    if offer != ScanOffer::None {
+        let scan_count = match offer {
+            ScanOffer::V2 => app
+                .scan
+                .jobs
+                .newest_active()
+                .map(|s| s.issues.total.to_string()),
+            ScanOffer::Legacy => (!app.scan.legacy.points.is_empty())
+                .then(|| app.scan.legacy.points.len().to_string()),
+            ScanOffer::None => None,
+        }
+        .unwrap_or_else(|| "-".to_string());
+        line(buf, item(app, SidebarItem::Scan, Some(scan_count), false));
+    }
+    // The L4 panel row appears only when the bus offers `l4.capture.status`
+    // (L4 parity AC15); its count is the running captures, a dash when none.
+    if app.has_tool("l4.capture.status") {
+        let n = app.l4.captures.len();
+        let l4_count = if n > 0 {
+            n.to_string()
         } else {
             "—".to_string()
         };
-        line(buf, item(app, SidebarItem::Scan, Some(scan_count), false));
+        line(buf, item(app, SidebarItem::L4, Some(l4_count), false));
     }
 
     // Footer: the sidebar filter hint, pinned to the bottom.

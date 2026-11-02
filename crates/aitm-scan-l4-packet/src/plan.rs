@@ -82,17 +82,55 @@ pub fn link_framing(interface: &str) -> LinkFraming {
 }
 
 /// The first source port the lane claims.
-pub const SRC_PORT_BASE: u16 = 40000;
-
-/// The source port for the target at `target_index`, so two targets of one job
-/// never share a five-tuple and `send_recv`'s reply correlation stays unique.
 ///
-/// The guard's self-port exclusion (task 7) rejects a port that is one of the
-/// core's own listeners, so this is a starting point, not a guarantee.
+/// The window `16384..32768` lies below both kernels' default ephemeral
+/// ranges (Linux `ip_local_port_range` 32768-60999, macOS 49152-65535), so a
+/// reply addressed to our socketless source port is not handed to an
+/// unrelated local client that happened to bind it; the old `40000` window sat
+/// inside the Linux range (security delta review of amendment 73 b).
+pub const SRC_PORT_BASE: u16 = 16384;
+
+/// How many ports above [`SRC_PORT_BASE`] the lane's derived source ports span
+/// (amendment 73 b): the window ends at `32768`, the Linux ephemeral floor.
+pub const SRC_PORT_RANGE: u16 = 16384;
+
+/// FNV-1a 64-bit offset basis.
+const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+/// FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+/// A stable, dependency-free FNV-1a 64 hash of `job_id`'s bytes.
+///
+/// The source port a job claims is derived from this, so it is deterministic
+/// across runs: a replay and `send_recv`'s reply correlation both recompute the
+/// same port (amendment 73 b).
 #[must_use]
-pub fn src_port_for(target_index: usize) -> u16 {
-    // `target_index % 1000 < 1000`, so the conversion is exact.
-    let offset = (target_index % 1000) as u16;
+fn hash_job_id(job_id: &str) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in job_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The source port for `job_id`'s target at `target_index`, derived from the
+/// job id so two **jobs** against one target never share the five-tuple
+/// `send_recv` correlates a reply by: since amendment 66 a reply is the
+/// reversed five-tuple, so a shared tuple lets one job's `send_recv` consume
+/// another's reply and mask its silence (amendment 73 b). `target_index` is
+/// folded in so two **targets** of one job also differ.
+///
+/// The result is `SRC_PORT_BASE + (hash(job_id) + target_index) % SRC_PORT_RANGE`.
+/// The guard's self-port exclusion and the target-port exclusion (task 7,
+/// applied by [`crate::discover::choose_src_port`]) reject a port that is one of
+/// the core's own listeners or the target's own, so this is a starting point,
+/// not a guarantee.
+#[must_use]
+pub fn src_port_for(job_id: &str, target_index: usize) -> u16 {
+    let index = u64::try_from(target_index).unwrap_or(u64::MAX);
+    // The modulo is `< SRC_PORT_RANGE` (16384), so the conversion is exact.
+    let offset = (hash_job_id(job_id).wrapping_add(index) % u64::from(SRC_PORT_RANGE)) as u16;
     SRC_PORT_BASE + offset
 }
 
@@ -108,6 +146,11 @@ pub struct SeedSpec {
 }
 
 /// What went wrong building a plan or a seed.
+///
+/// Like [`FieldError`](crate::fields::FieldError) this renders bare: the
+/// `invalid_profile` code is added once by the reporter (`DiscoverError`'s
+/// `Display` at discovery, `PacketLane::probe_host_for` at host time), so no
+/// message carries it twice (quality panel Minor, T5 live proof 4b).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     /// The local address and the target address are different IP versions.
@@ -119,10 +162,10 @@ pub enum PlanError {
 impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IpVersionMismatch => f.write_str(
-                "invalid_profile: the local address and the target address are different IP versions",
-            ),
-            Self::Craft(message) => write!(f, "invalid_profile: cannot craft the seed packet: {message}"),
+            Self::IpVersionMismatch => {
+                f.write_str("the local address and the target address are different IP versions")
+            }
+            Self::Craft(message) => write!(f, "cannot craft the seed packet: {message}"),
         }
     }
 }
@@ -402,24 +445,27 @@ pub fn is_decodable(frame: &[u8]) -> bool {
 /// The field paths the profile asks for — the **only** place the lane reads
 /// the profile for field selection (plan call C1).
 ///
-/// T1b adds `L4Options.fields: Vec<String>`; task 13 flips this body to
-/// `profile.l4.fields.clone()` once `origin/main` carries it. Until then every
-/// job fuzzes the default table, because [`crate::fields::validate_fields`]
-/// reads an empty request as the defaults.
+/// The list is `L4Options.fields` verbatim (spec D2/D8.4): an empty list — the
+/// default — means the lane's own full default field table, because
+/// [`crate::fields::validate_fields`] reads an empty request as the defaults;
+/// a path the lane pins or does not know makes `Lane::discover` fail with
+/// `invalid_profile` before a point is minted.
 pub(crate) fn requested_fields(profile: &ScanProfile) -> Vec<String> {
-    let _ = profile;
-    Vec::new()
+    profile.l4.fields.clone()
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use aitm_proto_l4::backend::CaptureInjectBackend;
     use aitm_proto_l4::craft::{EtherSpec, Layer, PacketSpec};
     use aitm_proto_l4::sendrecv::ReplyMatch;
     use aitm_scan_model::profile::ScanProfile;
     use aitm_scan_model::vocab::L4Transport;
+    use aitm_scan_model::Lane;
 
     use super::{
         is_decodable, link_framing, parse_point_id, point_id, requested_fields, seed_spec,
@@ -427,6 +473,8 @@ mod tests {
         TargetPlan,
     };
     use crate::fields::{FieldPath, IpVersion, Ipv4Field, Ipv6Field};
+    use crate::lane::PacketLane;
+    use crate::testing::{l4_profile, loopback_guard, udp_target, MockBackend, MockReply, TestJob};
 
     const LOCAL_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     const LOCAL_V6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
@@ -455,9 +503,50 @@ mod tests {
         }
     }
 
+    /// Task 4a: the lane reads `L4Options.fields` and nothing else. An empty
+    /// list stays empty, so discovery still reads it as the default table.
     #[test]
-    fn requested_fields_shim_is_empty_until_integration() {
+    fn requested_fields_are_the_profiles_l4_fields() {
         assert!(requested_fields(&ScanProfile::default()).is_empty());
+
+        let mut profile = ScanProfile::default();
+        profile.l4.fields = vec!["raw".to_string(), "udp.src_port".to_string()];
+        assert_eq!(
+            requested_fields(&profile),
+            vec!["raw".to_string(), "udp.src_port".to_string()]
+        );
+    }
+
+    /// The profile's list reaches `Lane::discover`: `fields: ["raw"]` mints the
+    /// one `raw` point (the e2e cell's 105 frames ride on this), and a pinned
+    /// path the lane refuses is `invalid_profile` before any point exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discover_honours_the_profiles_fields_list() {
+        let backend: Arc<dyn CaptureInjectBackend> = MockBackend::new(MockReply::Echo);
+        let lane = PacketLane::with_backend(loopback_guard("*", 1000), None, Arc::clone(&backend))
+            .with_timing(crate::testing::harness::fast_timing());
+
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = vec!["raw".to_string()];
+        let job = TestJob::new(profile.clone());
+        let discovery = lane
+            .discover(&profile.target, job.as_ref())
+            .await
+            .expect("raw is fuzzable");
+        assert_eq!(discovery.points.len(), 1);
+        assert_eq!(discovery.points[0].id, "l4:127.0.0.1:9/udp/raw");
+
+        let mut pinned = l4_profile(vec![udp_target(9)], 10);
+        pinned.l4.fields = vec!["ipv4.src".to_string()];
+        let pinned_job = TestJob::new(pinned.clone());
+        let err = lane
+            .discover(&pinned.target, pinned_job.as_ref())
+            .await
+            .expect_err("a pinned field is refused");
+        assert!(
+            err.to_string().starts_with("invalid_profile:"),
+            "D3 code first: {err}"
+        );
     }
 
     #[test]

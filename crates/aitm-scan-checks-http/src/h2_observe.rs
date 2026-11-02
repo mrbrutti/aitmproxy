@@ -42,13 +42,45 @@
 //! # What the raw probe costs the job
 //!
 //! The streams a raw probe opens are requests the job made, but they do not
-//! go through [`ProbeHost`] and nothing charges them: the trait has no
-//! `charge`, so a check cannot spend the job's budget on them and the job's
-//! pacing does not apply to them. Until the engine grows that hook (raised
-//! with the coordinator as a T1b follow-up, plan amendment A5 item T3-6,
-//! which replaces this with `host.charge(streams.max(1))`), each check does
-//! the one thing it can from this side: it refuses to open a connection the
-//! remaining budget could not have paid for, one unit per stream.
+//! go through [`ProbeHost::probe`], so each check charges for them itself:
+//! [`ProbeHost::charge`] of one unit per stream the plan will open — and one
+//! for the stream-less settings probe, `max(1)` — **before** the origin is
+//! claimed and before the dial. The engine's host spends the job's budget
+//! (pacing is the dial permit's, below), so the streams are budgeted and counted in
+//! `scan.status.probes`; when it refuses, nothing is opened and the verdict
+//! is `Inconclusive` (plan amendment A5, T3-6). The connection is also paced
+//! and scope-checked at the dial by the driver's own `check_active` permit.
+//!
+//! # Where the raw probe goes
+//!
+//! To the address the guarded baseline answered from, whenever the host knows
+//! it: [`ProbeHost::baseline_peer_addr`] is read after the baseline succeeded
+//! and handed to the driver as [`RawH2Target::addr`], which dials it and
+//! **resolves nothing**. There is then no second name lookup that could answer
+//! differently from the baseline's — the acceptance criterion's "refuses when
+//! the address differs from the one the baseline reported" holds by
+//! construction — and the driver refuses outright an address whose port is not
+//! the authority's.
+//!
+//! A host that does **not** know the address is still probed, by name. No lane
+//! host can report a peer today: aitm-core's `ProxyClient` records
+//! `server_conn: None` for every flow it sends on a client's behalf, because
+//! `RequestSender::send_with` hands back an `HttpResponse` and no connection
+//! record at all. The strict dial above therefore turned all five checks
+//! `Inconclusive` on the live bus and the lane observed nothing (found
+//! 2026-11-01). So when the peer is `None` the check logs a warning, builds
+//! the plan with `addr: None`, and the driver resolves the authority's own
+//! name and puts **every** address it resolves to through the SSRF gate and
+//! the live scope permit, exactly as PR 2a shipped that path; the verdict's
+//! detail then ends with "(dialled by name: the host reported no baseline peer
+//! address)" so the operator reads which aim was used. On this branch the
+//! acceptance clause above does **not** hold: a name that answers the probe
+//! with a different address than it gave the baseline is caught only if the
+//! new address fails the SSRF gate or the scope permit, so a second public,
+//! in-scope address is dialled (observe-only frames, no session header, at
+//! most eight streams) — the cost amendment 59 accepted. The strict dial comes
+//! back by itself, with no change here, the day the core fills `server_conn`
+//! on client-sent flows (plan amendment A5, T3-7, amendment 59).
 //!
 //! # One connection per authority
 //!
@@ -59,6 +91,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -68,8 +101,8 @@ use aitm_proto_http::raw_h2::{
     TlsVerify, MAX_RAW_STREAMS,
 };
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
-    Intensity, LaneKind, Outcome, ProbeHost, Technique, Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, HttpVersionPolicy,
+    InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -270,15 +303,14 @@ impl Kind {
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
-            // Observe-only kinds (SETTINGS, CL.TE indicator, rapid-reset) probe
-            // the connection/origin once, not per insertion point (spec D8:
-            // h2 observe-only checks run once per origin); the malformed-header
-            // kinds still probe each point.
-            scope: if matches!(spec.technique, Technique::Observe) {
-                aitm_scan_model::CheckScope::Origin
-            } else {
-                aitm_scan_model::CheckScope::Point
-            },
+            // Every h2 check here probes the origin's connection once, never an
+            // insertion point: the malformed-header kinds send their variants
+            // on streams of that one connection too, and `OncePerAuthority`
+            // refuses a second connection to the same origin within its window.
+            // Origin scope says so to the scheduler, which then runs each check
+            // once per origin rather than once per point (coordinator decision 3;
+            // the T3-3 oracle counts exactly one connection per check).
+            scope: aitm_scan_model::CheckScope::Origin,
             cwe: spec.cwe,
             description: spec.description.to_string(),
             remediation: Some(spec.remediation.to_string()),
@@ -462,9 +494,12 @@ impl H2Check {
         }
     }
 
-    /// The plan this check sends to `target`, with the labels its verdict
-    /// will quote for a `Blocks` plan (empty for the other two modes).
-    fn plan(&self, target: &Target) -> Planned {
+    /// The plan this check sends to `target` at `addr` — the address the
+    /// guarded baseline answered from, or `None` when the host did not know
+    /// it and the driver is to resolve the authority's name itself — with the
+    /// labels its verdict will quote for a `Blocks` plan (empty for the other
+    /// two modes).
+    fn plan(&self, target: &Target, addr: Option<SocketAddr>) -> Planned {
         let (headers, mode, streams, labels) = match self.kind {
             Kind::Settings => (Vec::new(), RawH2Mode::SettingsOnly, 0, Vec::new()),
             Kind::RapidReset => (
@@ -487,6 +522,12 @@ impl H2Check {
                 target: RawH2Target {
                     scheme: target.scheme.clone(),
                     authority: target.wire_authority.clone(),
+                    // `Some`: the driver dials exactly this and resolves
+                    // nothing, so the connection can only go where the
+                    // baseline went (plan amendment A5, T3-7). `None`: it
+                    // resolves the authority above and gates every address
+                    // that name gives (amendment 59).
+                    addr,
                 },
                 headers,
                 mode,
@@ -519,36 +560,49 @@ impl Check for H2Check {
         &self.meta
     }
 
-    /// Nine gates stand between a point and the raw connection, in this
-    /// order, and each one that fails returns `Inconclusive` with nothing
-    /// sent:
+    /// Eleven steps stand between a point and the raw connection, in this
+    /// order. Each one that fails returns `Inconclusive` with nothing sent,
+    /// except step 8, which only decides how the probe is aimed and never
+    /// refuses:
     ///
     /// 1. **url** — the point's URL must name a dialable `http(s)` authority
     ///    ([`Target::parse`]);
-    /// 2. **stop gate** — not cancelled, budget for at least one stimulus,
+    /// 2. **version** — the profile does not force `http.version: h1`
+    ///    (an HTTP/2 probe would contradict it);
+    /// 3. **stop gate** — not cancelled, budget for at least one stimulus,
     ///    before the deadline ([`crate::gate::may_send`]);
-    /// 3. **profile origin** — the authority is one of the profile's own
+    /// 4. **profile origin** — the authority is one of the profile's own
     ///    `target.origins`, compared canonically ([`Target::is_a_profile_origin`]);
-    /// 4. **guard seen** — no live once-per-authority claim for this origin;
-    /// 5. **baseline** — `host.baseline()` succeeds through the lane's guarded
+    /// 5. **guard seen** — no live once-per-authority claim for this origin;
+    /// 6. **baseline** — `host.baseline()` succeeds through the lane's guarded
     ///    client, so scope has cleared the authority before a raw byte moves;
-    /// 6. **cancel/deadline re-check** — the baseline took time; a job that
+    /// 7. **cancel/deadline re-check** — the baseline took time; a job that
     ///    stopped meanwhile sends nothing;
-    /// 7. **budget** — the budget left covers one unit per stream the plan
-    ///    will open (the raw connection cannot charge the job itself);
-    /// 8. **guard claim** — the origin is claimed, atomically;
-    /// 9. **dial** — the runner opens the one connection.
+    /// 8. **address** — the baseline's peer when it is known
+    ///    ([`ProbeHost::baseline_peer_addr`]), which is then the only thing
+    ///    the probe dials and no name is looked up; else the authority's name
+    ///    through the driver's SSRF gate and the live scope permit, said so
+    ///    in the verdict's detail (T3-7, amendment 59);
+    /// 9. **charge** — [`ProbeHost::charge`] accepts one unit per stream the
+    ///    plan will open, `max(1)`; the job's budget pays for the connection
+    ///    before it exists (T3-6);
+    /// 10. **guard claim** — the origin is claimed, atomically;
+    /// 11. **dial** — the runner opens the one connection, behind the
+    ///     driver's own SSRF check and the scope guard's live permit.
     ///
-    /// `claim` is last because a claim lasts ten minutes and must not be
-    /// burnt by a refused baseline, a stopped job or a short budget: an
-    /// authority that was never actually probed stays probe-able. It is
-    /// still before the dial, and atomic, so two points of one origin that
-    /// race through gates 1–7 open one connection, not two.
+    /// `claim` is last before the dial because a claim lasts ten minutes and
+    /// must not be burnt by a refused baseline, a stopped job or a refused
+    /// charge: an authority that was never actually probed stays probe-able.
+    /// It is atomic, so two points of one origin that race through gates 1–9
+    /// open one connection, not two.
     ///
-    /// The re-check at 6 tests cancellation and the deadline but not the
-    /// budget, because gate 7 immediately tests the budget against the
-    /// plan's real stream count, which is at least the one unit gate 2
-    /// asked for; a `budget_left() >= 1` clause there would be subsumed.
+    /// The address at 8 is read before the charge at 9, so how the probe is
+    /// aimed is settled before the job pays for it.
+    ///
+    /// The re-check at 7 tests cancellation and the deadline but not the
+    /// budget, because gate 9 immediately charges the plan's real stream
+    /// count, which is at least the one unit gate 3 asked for; a
+    /// `budget_left() >= 1` clause there would be subsumed.
     fn run<'a>(
         &'a self,
         point: &'a InsertionPoint,
@@ -558,6 +612,14 @@ impl Check for H2Check {
             let Some(target) = point.url.as_deref().and_then(Target::parse) else {
                 return inconclusive("the point has no usable http(s) url");
             };
+            // The profile forced HTTP/1.1 (spec D8.2 `http.version`): an HTTP/2
+            // observe probe would contradict it, so none is sent — decided
+            // before the stop gate, since it costs nothing. Found live (T3-2
+            // cell, 2026-11-01): these checks were the only h2 traffic in a
+            // forced-h1 job.
+            if matches!(host.profile().http.version, HttpVersionPolicy::H1) {
+                return inconclusive(FORCED_H1);
+            }
             if !crate::gate::may_send(host, 1) {
                 return stopped();
             }
@@ -578,33 +640,80 @@ impl Check for H2Check {
             if host.cancelled() || Instant::now() >= host.deadline() {
                 return stopped();
             }
-            // The raw connection cannot charge the job — `ProbeHost` has no
-            // `charge` — so the check refuses to open one the budget could not
-            // have paid for, counting one unit per stream the plan will open
-            // (security review SEC-C2; see the module header).
-            let Planned { plan, labels } = self.plan(&target);
-            if host.budget_left() < u32::from(plan.streams).max(1) {
-                return inconclusive(BUDGET_TOO_LOW);
+            // Where the baseline actually came from. When the host knows it,
+            // the raw probe dials that address and nothing else, so a name
+            // that moved between the baseline and the probe cannot move the
+            // connection (plan amendment A5, T3-7).
+            //
+            // When it does not — which is every lane host on main, the core
+            // leaving `server_conn: None` on client-sent flows — the probe is
+            // still sent, aimed by name through the driver's SSRF gate and
+            // the live scope permit, and the verdict carries that fact
+            // (amendment 59). Read before the charge, so the aim is settled
+            // before the job pays.
+            let addr = host.baseline_peer_addr();
+            if addr.is_none() {
+                tracing::warn!(
+                    check = %self.meta.id,
+                    "{PEER_ADDR_UNKNOWN}; the raw h2 probe dials by name through the SSRF gate and the live scope permit"
+                );
+            }
+            // The streams a raw probe opens never pass through
+            // `ProbeHost::probe`, so the job is charged for them here, one
+            // unit per stream (`max(1)` for the stream-less settings probe):
+            // budgeted, paced and counted in `scan.status.probes` like any
+            // other stimulus. A refused charge sends nothing (plan amendment
+            // A5, T3-6; security review SEC-C2).
+            let Planned { plan, labels } = self.plan(&target, addr);
+            if !host.charge(u32::from(plan.streams).max(1)) {
+                return inconclusive(BUDGET_REFUSED);
             }
             // Claimed only now, so a refused baseline does not burn the
             // authority; atomic, so two concurrent points open one connection.
             if !self.guard.claim(&target.origin_key, Instant::now()) {
                 return inconclusive(ALREADY_OBSERVED);
             }
-            match self.runner.run(plan).await {
-                Ok(obs) => self.verdict(&labels, &obs),
+            let verdict = match self.runner.run(plan).await {
+                Ok(obs) => {
+                    // Shape only: stream outcomes, GOAWAY codes and the two
+                    // end flags. The observation carries no peer text.
+                    tracing::debug!(
+                        check = %self.meta.id,
+                        streams = ?obs.streams,
+                        goaway = ?obs.goaway,
+                        closed = obs.connection_closed,
+                        silent = obs.peer_silent,
+                        "raw h2 observation"
+                    );
+                    self.verdict(&labels, &obs)
+                }
                 Err(error) => {
                     tracing::debug!(%error, check = %self.meta.id, "raw h2 probe did not complete");
                     inconclusive(NO_H2)
                 }
+            };
+            // Only a verdict the probe itself produced carries the note: a
+            // gate that sent nothing has no dial to describe.
+            if addr.is_some() {
+                verdict
+            } else {
+                dialled_by_name(verdict)
             }
         })
     }
 }
 
 const ALREADY_OBSERVED: &str = "already observed for this authority";
+const FORCED_H1: &str = "skipped: the profile forces http.version h1, so no HTTP/2 probe is sent";
 const NOT_A_PROFILE_ORIGIN: &str = "raw probe target is not a profile origin";
-const BUDGET_TOO_LOW: &str = "budget too low for the raw probe";
+const BUDGET_REFUSED: &str = "budget refused the raw probe";
+/// The warning a probe logs when it has no baseline peer to aim at, and the
+/// first clause of that warning's message.
+const PEER_ADDR_UNKNOWN: &str = "baseline peer address unknown";
+
+/// What such a probe's verdict adds to its detail, so the operator reads how
+/// the connection was aimed (amendment 59).
+const DIALLED_BY_NAME: &str = " (dialled by name: the host reported no baseline peer address)";
 
 /// Where a raw probe goes, cut from a point's URL by [`crate::url`].
 ///
@@ -685,6 +794,13 @@ impl Target {
             .filter_map(|origin| origin.origin_key())
             .any(|origin| origin == self.origin_key)
     }
+}
+
+/// The same verdict, noting that the probe was aimed at the authority's name
+/// and not at the address the baseline answered from (amendment 59).
+fn dialled_by_name(mut verdict: Verdict) -> Verdict {
+    verdict.detail.push_str(DIALLED_BY_NAME);
+    verdict
 }
 
 /// The verdict for a probe that was not sent, with nothing to show for it.
@@ -783,29 +899,39 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
             ),
         );
     }
-    // Fewer than eight observed pairs is not the "complete repeated
-    // observation" the `firm` verdict below stands on (spec review SP-3).
-    if observed < usize::from(RESET_PAIRS) {
-        return inconclusive(format!(
-            "only {observed} of {RESET_PAIRS} reset pairs reached an outcome before the probe \
-             stopped"
-        ));
-    }
+    // The connection is still open after all eight pairs: no GOAWAY, no
+    // refused stream, no hang-up. A correct server discards a cancelled
+    // stream without a word, so the realistic shape of "no mitigation" is
+    // eight pairs written and then silence (live run against hyper,
+    // 2026-11-01); a server racing the cancel may answer or reset some of
+    // them, which is no mitigation either. All eight pairs were written —
+    // the batch mode writes every HEADERS before it reads, and a write
+    // error is a probe error, not an observation — and the peer had the
+    // whole read timeout to react, so this is the complete observation
+    // the meta's `firm` ceiling stands on (spec review SP-3). It is still
+    // not `certain`: a mitigation could exist above this threshold.
+    let detail = if obs.peer_silent {
+        format!(
+            "no reset-rate mitigation observed in {RESET_PAIRS} reset pairs: the peer \
+             neither reset, refused nor closed, and stayed silent with the connection \
+             open"
+        )
+    } else {
+        format!("no reset-rate mitigation observed in {RESET_PAIRS} reset pairs")
+    };
     Verdict {
         outcome: Outcome::Vulnerable,
-        // A complete repeated observation — all eight pairs sent, every one
-        // answered or reset, nothing at all from the peer and the connection
-        // still open — so the meta's `firm` ceiling is reachable (review
-        // SP-3). It is still not `certain`: a mitigation could exist above
-        // this threshold.
         confidence: Confidence::Firm,
         evidence: Evidence {
+            // The issue carries the evidence, not the detail, so the finding's
+            // name sits in `matched` for every reader of the issue.
             matched: Some(format!(
-                "{RESET_PAIRS} reset pairs, no GOAWAY, no refused stream"
+                "no reset-rate mitigation in {RESET_PAIRS} reset pairs: no GOAWAY, no refused \
+                 stream, connection still open"
             )),
             ..Evidence::default()
         },
-        detail: format!("no reset-rate mitigation observed in {RESET_PAIRS} reset pairs"),
+        detail,
         poc_hint: None,
         location: None,
         more: Vec::new(),
@@ -836,17 +962,38 @@ fn read_stream(outcome: &StreamOutcome) -> Reading {
     }
 }
 
+/// The GOAWAY error codes a conforming server uses to reject a malformed
+/// header block at the connection level (RFC 9113 section 7): a protocol
+/// violation, an oversized frame, an HPACK failure. Any other code — rate
+/// limiting (`ENHANCE_YOUR_CALM`, 11), an internal error (2), a graceful
+/// close (0) — says nothing about the variant in flight.
+const HEADER_BLOCK_REJECTION_CODES: [u32; 3] = [
+    1, // PROTOCOL_ERROR
+    6, // FRAME_SIZE_ERROR
+    9, // COMPRESSION_ERROR
+];
+
 /// The shared rule of the three malformed-header checks.
+///
+/// Every variant is read on its own stream: answered 2xx/3xx means tolerated,
+/// a reset, a refusal or an error status means rejected, nothing means
+/// unobserved. One connection-level case is read as well (live run against
+/// hyper, 2026-11-01): a GOAWAY with one of [`HEADER_BLOCK_REJECTION_CODES`]
+/// while the sequential blocks were in flight is the peer rejecting the
+/// variant it was reading — the strictest rejection there is — and the slots
+/// after it were never written, since the driver opens one connection per
+/// probe and the peer took it down.
 fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
     let mut tolerated = Vec::new();
-    let mut unobserved = labels.len().saturating_sub(obs.streams.len());
+    let mut unobserved: Vec<usize> = (obs.streams.len()..labels.len()).collect();
     for (index, outcome) in obs.streams.iter().enumerate().take(labels.len()) {
         match read_stream(outcome) {
             Reading::Rejected => {}
-            Reading::Unobserved => unobserved += 1,
+            Reading::Unobserved => unobserved.push(index),
             Reading::Tolerated(how) => tolerated.push((index, how)),
         }
     }
+    unobserved.sort_unstable();
     if !tolerated.is_empty() {
         let detail = tolerated
             .iter()
@@ -876,16 +1023,47 @@ fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
             more: Vec::new(),
         };
     }
-    if unobserved > 0 {
-        return inconclusive(format!(
-            "{unobserved} of {} variants did not reach an outcome before the probe stopped",
-            labels.len()
-        ));
+    let Some(&in_flight) = unobserved.first() else {
+        return no_finding(
+            Outcome::Clean,
+            format!("all {} variants were rejected", labels.len()),
+        );
+    };
+    // The peer took the connection down while `in_flight` was being read.
+    if let (true, Some((_, code))) = (obs.connection_closed, obs.goaway) {
+        let not_tried = unobserved.len() - 1;
+        if HEADER_BLOCK_REJECTION_CODES.contains(&code) {
+            return no_finding(
+                Outcome::Clean,
+                format!(
+                    "variant {in_flight} ({}) was rejected at the connection level (GOAWAY \
+                     error_code={code}); {not_tried} later variant(s) could not be tried on \
+                     that connection",
+                    labels[in_flight]
+                ),
+            );
+        }
+        if code != 0 {
+            return inconclusive(format!(
+                "the peer sent GOAWAY(error_code={code}) while variant {in_flight} ({}) was in \
+                 flight, which is not a header-block rejection; {} of {} variants did not \
+                 reach an outcome",
+                labels[in_flight],
+                unobserved.len(),
+                labels.len()
+            ));
+        }
     }
-    no_finding(
-        Outcome::Clean,
-        format!("all {} variants were rejected", labels.len()),
-    )
+    let why = if obs.peer_silent {
+        "were not answered within the read timeout; the peer stayed silent"
+    } else {
+        "did not reach an outcome before the probe stopped"
+    };
+    inconclusive(format!(
+        "{} of {} variants {why}",
+        unobserved.len(),
+        labels.len()
+    ))
 }
 
 #[cfg(test)]
@@ -989,7 +1167,9 @@ mod tests {
             }
 
             // The plan is cut from the same list, in the same order.
-            let planned = H2Check::new(kind, Arc::clone(&runner)).plan(&target);
+            let peer = "203.0.113.7:443".parse().expect("a literal address");
+            let planned = H2Check::new(kind, Arc::clone(&runner)).plan(&target, Some(peer));
+            assert_eq!(planned.plan.target.addr, Some(peer), "{kind:?}");
             let blocks: Vec<Vec<RawHeader>> = variants.iter().map(|(_, b)| b.clone()).collect();
             assert_eq!(planned.plan.mode, RawH2Mode::Blocks(blocks), "{kind:?}");
             assert_eq!(

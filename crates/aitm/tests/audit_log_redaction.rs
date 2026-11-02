@@ -3128,6 +3128,7 @@ fn poc_flow(secrets: &PocSecrets) -> HttpFlow {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: ConnInfo {
             peer: "127.0.0.1:0".parse().expect("a socket address"),

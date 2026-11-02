@@ -531,6 +531,20 @@ struct ScopeMatcher: Equatable {
     /// core cannot answer a DNS query, so claiming one could only break the client.
     static let neverClaimedDatagramPorts: Set<UInt16> = [53, 5353, 853]
 
+    /// The entries a datagram can be claimed through (claim rule D1-D3): `.ip` tokens
+    /// whose port is nil or not in `neverClaimedDatagramPorts`, in entry order. It is
+    /// also the set the provider builds its UDP `NENetworkRule`s from (spec
+    /// 2026-11-01-ne-tcp-only-catch-all-design, "Signal"): host and suffix tokens and
+    /// `ip:53` / `ip:5353` / `ip:853` tokens contribute nothing, so while this is
+    /// empty the provider's rule set is TCP-only and no datagram reaches it.
+    var udpClaimableIPEntries: [Entry] {
+        entries.filter { entry in
+            guard case .ip = entry.target else { return false }
+            guard let port = entry.port else { return true }
+            return !Self.neverClaimedDatagramPorts.contains(port)
+        }
+    }
+
     init(spec: String) {
         let separators = CharacterSet(charactersIn: ",;").union(.whitespacesAndNewlines)
         entries = spec.components(separatedBy: separators)
@@ -691,11 +705,34 @@ final class CoreLink: @unchecked Sendable {
     private var stopped = false
     private var running = false
     private var lastFailure = ""
+    private var scopeChangeHook: ((ScopeMatcher?) -> Void)?
 
     init(rendezvousPath: String = HandoffConfig.rendezvousPath,
          requirement: String = PeerAuth.coreRequirement) {
         self.rendezvousPath = rendezvousPath
         self.requirement = requirement
+    }
+
+    /// Observer of scope transitions, for the provider's rule reconcile (spec
+    /// 2026-11-01-ne-tcp-only-catch-all-design, "Hook"). Called with the new matcher
+    /// after a `Scope` frame is stored, and with nil when `serve` publishes a fresh
+    /// attachment (no Scope yet) and when the attachment detaches -- by then
+    /// `current()` already returns nil, so fail-open is decided before the observer
+    /// runs. NEVER invoked under `lock` (it is read into a local and called after the
+    /// unlock) and never on the claim path (`current()` / `claim()` do not read it).
+    /// Runs on the control thread; it must return promptly (the provider's
+    /// implementation is a single `queue.async`).
+    var onScopeChange: ((ScopeMatcher?) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return scopeChangeHook
+        }
+        set {
+            lock.lock()
+            scopeChangeHook = newValue
+            lock.unlock()
+        }
     }
 
     /// Begin looking for the core. Idempotent while running.
@@ -777,16 +814,20 @@ final class CoreLink: @unchecked Sendable {
         }
         lock.lock()
         let alreadyStopped = stopped
+        var hook: ((ScopeMatcher?) -> Void)?
         if !alreadyStopped {
             control = handle
             directory = dir
             scope = nil
+            hook = scopeChangeHook
         }
         lock.unlock()
         if alreadyStopped {
             handle.shutdownBoth()
             return false
         }
+        // A fresh attachment has no Scope yet: say so, outside `lock`.
+        hook?(nil)
         lock.lock()
         lastFailure = ""
         lock.unlock()
@@ -806,9 +847,11 @@ final class CoreLink: @unchecked Sendable {
                     let matcher = ScopeMatcher(spec: spec)
                     lock.lock()
                     scope = matcher
+                    let hook = scopeChangeHook
                     lock.unlock()
                     os_log("scope updated (%{public}d entries)", log: log, type: .default,
                            matcher.entries.count)
+                    hook?(matcher)
                 }
             } catch {
                 // Oversized/garbled frame or I/O error: stop trusting this channel.
@@ -819,15 +862,21 @@ final class CoreLink: @unchecked Sendable {
     }
 
     private func detach(_ handle: SocketHandle) {
+        // The hook is taken only inside the guard: a stale handle's detach must not
+        // reset the rules of a live attachment.
+        var hook: ((ScopeMatcher?) -> Void)?
         lock.lock()
         if control === handle {
             control = nil
             directory = nil
             scope = nil
+            hook = scopeChangeHook
         }
         lock.unlock()
         handle.shutdownBoth()
         os_log("detached from core; failing open", log: log, type: .default)
+        // `current()` is already nil here: fail-open is decided before any rule work.
+        hook?(nil)
     }
 
     private func run() {
@@ -1266,6 +1315,13 @@ final class FlowHandoff: @unchecked Sendable {
 
     func start() { link.start() }
 
+    /// Passthrough to `CoreLink.onScopeChange`: the provider installs its rule
+    /// reconcile here before `start()`.
+    var onScopeChange: ((ScopeMatcher?) -> Void)? {
+        get { link.onScopeChange }
+        set { link.onScopeChange = newValue }
+    }
+
     func stop() {
         link.stop()
         lock.lock()
@@ -1399,10 +1455,12 @@ final class FlowHandoff: @unchecked Sendable {
 // the real code over real socketpairs with a fake core and fake NE flows, and
 // asserts LITERAL expected wire bytes. It needs no root, no entitlement, no NE.
 //
-// Co-located deliberately: the Extension has no separate test target (it is built by
-// `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no DEBUG define, so this whole
-// block is excluded from the release binary). Splitting it into its own `#if DEBUG`
-// file is a tracked readability cleanup (plan Review log, Task 11 Minor).
+// Where the checks live: the wire, link and claim groups are in this `enum
+// HandoffSelfCheck`; the rule groups are `#if DEBUG extension HandoffSelfCheck` blocks
+// beside the code they test (`ProviderRules.swift`, `RuleReconciler.swift`). `run()`
+// lists every group. Co-located because the Extension has no separate test target (it
+// is built by `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no DEBUG define, so
+// none of this is in the release binary).
 #if DEBUG
 enum HandoffSelfCheck {
     private final class Box<T>: @unchecked Sendable {
@@ -1481,6 +1539,12 @@ enum HandoffSelfCheck {
         peerAuth(r)
         rendezvous(r)
         coreLinkAndClaim(r)
+        scopeChangeHook(r)
+        scopeChangeHookStaleHandle(r)
+        providerRules(r)
+        providerRulesEdges(r)
+        ruleReconciler(r)
+        ruleReconcilerStartupAndStop(r)
         pumps(r)
         inboundCap(r)
         return r.failures
@@ -1715,6 +1779,25 @@ enum HandoffSelfCheck {
         let none = ScopeMatcher(spec: "")
         r.check("empty spec claims no UDP", !none.matches(kind: .udp, hostname: nil, ip: "93.184.216.34", port: 443))
         r.check("empty spec claims no TCP", !none.matches(kind: .tcp, hostname: "example.com", ip: "93.184.216.34", port: 443))
+
+        // -- UDP-claimable IP entries (spec 2026-11-01-ne-tcp-only-catch-all, "Signal") --
+        // The derived set the provider builds its UDP rules from: `.ip` entries whose
+        // port is nil or not a never-claimed datagram port, in entry order. Host and
+        // suffix tokens, and ip:53 / ip:5353 / ip:853 tokens, contribute nothing.
+        let six = ScopeMatcher(spec: "198.51.100.7 203.0.113.9:4433 [2001:db8::3]:443 203.0.113.9:53 10.0.0.1:5353 example.com")
+        r.check("udpClaimableIPEntries spec parsed", six.entries.count == 6, "\(six.entries)")
+        r.check("udpClaimableIPEntries keeps claimable IP tokens in entry order",
+              six.udpClaimableIPEntries == [
+                  ScopeMatcher.Entry(target: .ip("198.51.100.7"), port: nil),
+                  ScopeMatcher.Entry(target: .ip("203.0.113.9"), port: 4433),
+                  ScopeMatcher.Entry(target: .ip("2001:db8::3"), port: 443),
+              ], "\(six.udpClaimableIPEntries)")
+        r.check("udpClaimableIPEntries: host and suffix tokens contribute none",
+              ScopeMatcher(spec: "example.com *.api.test:8443").udpClaimableIPEntries == [])
+        r.check("udpClaimableIPEntries: empty spec contributes none",
+              ScopeMatcher(spec: "").udpClaimableIPEntries == [])
+        r.check("udpClaimableIPEntries: ip:853 and ip:53 tokens contribute none",
+              ScopeMatcher(spec: "10.0.0.1:853 10.0.0.2:53").udpClaimableIPEntries == [])
     }
 
     // -- endpoints -----------------------------------------------------------
@@ -2025,6 +2108,154 @@ enum HandoffSelfCheck {
             _ = evil.withUnsafeMutableBytes { write(core2.fd, $0.baseAddress, 4) }
             r.check("hostile control frame detaches", done2.wait(timeout: .now() + 5) == .success && !link2.isAttached)
         }
+    }
+
+    // -- onScopeChange hook (spec 2026-11-01-ne-tcp-only-catch-all, TR-AC2) -----------
+
+    /// Poll `condition` every 20 ms for up to `polls` rounds (2 s by default). The
+    /// hook fires on the serve thread, so a check that reads its record must wait for
+    /// the record itself, not for the state change it follows.
+    private static func waitUntil(polls: Int = 100, _ condition: () -> Bool) -> Bool {
+        for _ in 0..<polls {
+            if condition() { return true }
+            usleep(20_000)
+        }
+        return condition()
+    }
+
+    /// The provider's rule reconcile hangs off `CoreLink.onScopeChange`, installed
+    /// through the `FlowHandoff` passthrough. Pin the sequence: nil once when `serve`
+    /// publishes a fresh attachment (no Scope yet), the matcher once per Scope frame,
+    /// nothing on the claim path, and nil once on detach with `current()` ALREADY nil
+    /// inside that call -- fail-open is decided before any rule work begins (NE-AC5).
+    private static func scopeChangeHook(_ r: Recorder) {
+        guard let own = ownIdentifierRequirement() else { return }
+        guard let (core, provider) = pair() else { return }
+        setRecvTimeout(core.fd, seconds: 5)
+        let link = CoreLink(requirement: own)
+        // Any dial here is a bug: the one claim below is out of scope.
+        let handoff = FlowHandoff(link: link, requirement: own,
+                                  dial: { _ in throw HandoffError.unavailable("never dialed") })
+        let calls = Box<(ScopeMatcher?, Bool)>()
+        r.check("hook unset by default", link.onScopeChange == nil && handoff.onScopeChange == nil)
+        // Installed through the passthrough, BEFORE serve, so the serve-start nil is seen.
+        handoff.onScopeChange = { matcher in calls.append((matcher, link.current() == nil)) }
+        r.check("passthrough installs the hook on the link", link.onScopeChange != nil)
+        r.check("passthrough reads the hook back", handoff.onScopeChange != nil)
+        let done = DispatchSemaphore(value: 0)
+        Thread { _ = link.serve(provider, directory: "/run/aitm"); done.signal() }.start()
+
+        let hello = (try? FDIO.readFrame(core.fd, max: 1 << 20)).flatMap { $0 }.map(string)
+        r.check("hook: hello on the wire", hello == #"{"Hello":{"protocol_version":1}}"#, hello ?? "nil")
+        // (c) serve start: one call with nil, current() nil inside it.
+        r.check("hook fires once at serve start", waitUntil { calls.all.count == 1 }, "\(calls.all.count) call(s)")
+        if let first = calls.all.first {
+            r.check("serve-start hook passes nil", first.0 == nil, "\(String(describing: first.0))")
+            r.check("serve-start hook sees current() == nil", first.1)
+        }
+        r.check("still fail-open until Scope", link.isAttached && link.current() == nil)
+
+        // (a) Scope: one call with the matcher, current() armed inside it. Wait for the
+        //     CALL, not for current() != nil, which is observable before the hook runs.
+        try? FDIO.writeFrame(core.fd, Data(#"{"Scope":{"spec":"example.com 198.51.100.7"}}"#.utf8), max: 1 << 20)
+        r.check("hook fires once per Scope", waitUntil { calls.all.count == 2 }, "\(calls.all.count) call(s)")
+        r.check("Scope arms the link", link.current() != nil)
+        let afterScope = calls.all
+        if afterScope.count == 2 {
+            r.check("Scope hook passes the frame's matcher",
+                  afterScope[1].0 == ScopeMatcher(spec: "example.com 198.51.100.7"),
+                  "\(String(describing: afterScope[1].0))")
+            r.check("Scope hook sees current() armed", afterScope[1].1 == false)
+        }
+
+        // Never on the claim path: an out-of-scope claim fails open and leaves the
+        // record untouched.
+        let outside = FlowDescriptor(kind: .tcp, remote: FlowEndpoint(ip: "8.8.8.8", port: 443),
+                                     remoteHostname: "other.org", sourceApp: nil, local: nil)
+        r.check("claim fails open out of scope", handoff.claim(outside) == nil)
+        r.check("claim never fires the hook", calls.all.count == 2, "\(calls.all.count) call(s)")
+
+        // (b) detach: one call with nil, current() already nil inside it.
+        core.shutdownBoth()
+        r.check("serve returned after core closed", done.wait(timeout: .now() + 5) == .success)
+        let afterDetach = calls.all
+        r.check("detach fires the hook once", afterDetach.count == 3, "\(afterDetach.count) call(s)")
+        if afterDetach.count == 3 {
+            r.check("detach hook passes nil", afterDetach[2].0 == nil, "\(String(describing: afterDetach[2].0))")
+            r.check("detach hook sees current() == nil already", afterDetach[2].1)
+        }
+        r.check("detached and fail-open", !link.isAttached && link.current() == nil)
+    }
+
+    /// Tester (stage 5): the negative case of hook (b) -- `detach` fires the hook "only
+    /// when the `control === handle` guard was true" (spec "Hook"). Two pairs are served
+    /// on ONE link: the second `serve` replaces the first attachment, so the first handle
+    /// is stale. Closing the stale core side runs `detach` for that handle, which must
+    /// neither fire the hook nor reset the live attachment; otherwise a stale detach
+    /// would re-apply TCP-only rules under a live scope and blank `current()`.
+    private static func scopeChangeHookStaleHandle(_ r: Recorder) {
+        guard let own = ownIdentifierRequirement() else { return }
+        guard let (coreA, providerA) = pair(), let (coreB, providerB) = pair() else { return }
+        setRecvTimeout(coreA.fd, seconds: 5)
+        setRecvTimeout(coreB.fd, seconds: 5)
+        let link = CoreLink(requirement: own)
+        let calls = Box<(ScopeMatcher?, Bool)>()
+        link.onScopeChange = { matcher in calls.append((matcher, link.current() == nil)) }
+        let hello = #"{"Hello":{"protocol_version":1}}"#
+
+        // A attaches: one nil at serve start.
+        let doneA = DispatchSemaphore(value: 0)
+        Thread { _ = link.serve(providerA, directory: "/run/aitm-a"); doneA.signal() }.start()
+        let helloA = (try? FDIO.readFrame(coreA.fd, max: 1 << 20)).flatMap { $0 }.map(string)
+        r.check("stale handle: hello on A", helloA == hello, helloA ?? "nil")
+        r.check("stale handle: A's serve start fires the hook once",
+              waitUntil { calls.all.count == 1 }, "\(calls.all.count) call(s)")
+
+        // B is served on the SAME link while A is still being read: B replaces A as
+        // `control` (A is now the stale handle) and, being a fresh attachment with no
+        // Scope, fires one nil of its own.
+        let doneB = DispatchSemaphore(value: 0)
+        Thread { _ = link.serve(providerB, directory: "/run/aitm-b"); doneB.signal() }.start()
+        let helloB = (try? FDIO.readFrame(coreB.fd, max: 1 << 20)).flatMap { $0 }.map(string)
+        r.check("stale handle: hello on B", helloB == hello, helloB ?? "nil")
+        r.check("stale handle: B's serve start fires the hook once more",
+              waitUntil { calls.all.count == 2 }, "\(calls.all.count) call(s)")
+        let afterB = calls.all
+        if afterB.count == 2 {
+            r.check("stale handle: B's serve-start hook passes nil with current() nil",
+                  afterB[1].0 == nil && afterB[1].1, "\(String(describing: afterB[1].0)), \(afterB[1].1)")
+        }
+
+        // Arm B: the hook fires with the matcher and current() names B's directory.
+        let armed = ScopeMatcher(spec: "example.com 198.51.100.7")
+        try? FDIO.writeFrame(coreB.fd, Data(#"{"Scope":{"spec":"example.com 198.51.100.7"}}"#.utf8), max: 1 << 20)
+        r.check("stale handle: B's Scope fires the hook once",
+              waitUntil { calls.all.count == 3 }, "\(calls.all.count) call(s)")
+        r.check("stale handle: B is the live attachment, armed",
+              link.current()?.directory == "/run/aitm-b" && link.current()?.scope == armed,
+              "\(String(describing: link.current()?.directory)) \(String(describing: link.current()?.scope.entries))")
+
+        // Close the STALE core side. A's readControl returns and detach(A) runs with the
+        // guard false: no hook call, no reset. A wrongly fired hook would run on A's
+        // serve thread BEFORE doneA is signalled, so the count is final once the wait
+        // returns.
+        coreA.shutdownBoth()
+        r.check("stale handle: A's serve returned", doneA.wait(timeout: .now() + 5) == .success)
+        r.check("stale handle: a stale detach fires no hook", calls.all.count == 3, "\(calls.all.count) call(s)")
+        r.check("stale handle: a stale detach leaves the live attachment armed",
+              link.isAttached && link.current()?.directory == "/run/aitm-b" && link.current()?.scope == armed,
+              "\(link.isAttached) \(String(describing: link.current()?.directory))")
+
+        // Close the LIVE core side: the real detach, one nil with current() already nil.
+        coreB.shutdownBoth()
+        r.check("stale handle: B's serve returned", doneB.wait(timeout: .now() + 5) == .success)
+        let afterDetach = calls.all
+        r.check("stale handle: the live detach fires the hook once", afterDetach.count == 4, "\(afterDetach.count) call(s)")
+        if afterDetach.count == 4 {
+            r.check("stale handle: the live detach passes nil with current() already nil",
+                  afterDetach[3].0 == nil && afterDetach[3].1, "\(String(describing: afterDetach[3].0)), \(afterDetach[3].1)")
+        }
+        r.check("stale handle: detached and fail-open", !link.isAttached && link.current() == nil)
     }
 
     // -- pumps ---------------------------------------------------------------

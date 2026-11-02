@@ -458,6 +458,11 @@ mod tests {
         let udp = {
             let mut m = BTreeMap::new();
             m.insert("dst_port".to_string(), Value::Int(dst_port));
+            // The port `udp_reply` answers to. Port 0 is a real port since amendment
+            // 66 (a stimulus sent from 0 is answered to 0), so the fixture names the
+            // source port the reply is addressed to instead of leaning on the old
+            // "0 means unset" relaxation.
+            m.insert("src_port".to_string(), Value::Int(40000));
             let mut l = BTreeMap::new();
             l.insert("udp".to_string(), Value::Object(m));
             Value::Object(l)

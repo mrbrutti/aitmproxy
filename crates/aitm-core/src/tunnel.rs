@@ -200,6 +200,7 @@ fn connection_established() -> HttpResponse {
         trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: SystemTime::now(),
+        peer: None,
     }
 }
 

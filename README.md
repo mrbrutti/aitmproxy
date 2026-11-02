@@ -11,7 +11,7 @@ Rust; runs on macOS and Linux.
 **Website: [mrbrutti.github.io/aitmproxy](https://mrbrutti.github.io/aitmproxy/)**
 — features, documentation, demos and downloads.
 
-![release](https://img.shields.io/badge/release-v0.5.11-555?style=flat-square)
+![release](https://img.shields.io/badge/release-v0.5.12-555?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-555?style=flat-square)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-555?style=flat-square)
 
@@ -147,8 +147,8 @@ then install it. Packages place `aitm` and `aitm-tui` on your `PATH` with obscur
 beside them.
 
 ```bash
-sudo apt install ./aitm-0.5.11-amd64.deb     # Debian / Ubuntu
-sudo dnf install ./aitm-0.5.11-x86_64.rpm    # Fedora / RHEL
+sudo apt install ./aitm-0.5.12-amd64.deb     # Debian / Ubuntu
+sudo dnf install ./aitm-0.5.12-x86_64.rpm    # Fedora / RHEL
 ```
 
 The release also ships `aitm-<version>-<target>.tar.gz` for Linux and macOS, and
@@ -474,7 +474,11 @@ machine; hosts that pin certificates can be excluded with TLS passthrough.
 `aitm` core, Linux first: capture and inject need `CAP_NET_RAW`, and in-path
 hold-and-edit uses NFQUEUE with `CAP_NET_ADMIN`. `l4.enabled` defaults to off, and
 without privilege the wire commands return a typed `L4Unavailable` rather than
-failing silently. The macOS app's embedded core degrades the same way; since
+failing silently. On a loopback interface Linux injection goes out at layer 3
+through a header-included raw socket, because a layer-2 frame written to `lo` is
+visible to sniffers but is never processed by the IP stack — the same workaround
+scapy documents as its `L3RawSocket` (prior art; the capability needed is still
+`CAP_NET_RAW`). The macOS app's embedded core degrades the same way; since
 v0.5.2 the app ships a Network Extension capture path, off by default behind an
 operator toggle.
 

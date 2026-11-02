@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aitm_core::{
-    ssrf_check, Authority, Body, HttpRequest, HttpResponse, RequestSender, ScopeRateGuard,
-    SsrfPolicy, VersionPolicy,
+    ssrf_check, ActionPermit, Authority, Body, HttpRequest, HttpResponse, RequestSender,
+    ScopeRateGuard, SsrfPolicy, VersionPolicy,
 };
 use anyhow::{anyhow, Context, Result};
 use futures::future::BoxFuture;
@@ -203,6 +203,29 @@ impl SsrfGate {
                 .map_err(|e| anyhow!("SSRF: refusing {what} to {host}: {e}"))?;
         }
         Ok(())
+    }
+
+    /// [`check`](Self::check), then the scope guard's own live permit for
+    /// `authority` (`host:port`): for a caller that has no guarded client upstream — the raw
+    /// HTTP/2 observe probe — this is the scope check and the pacing, taken
+    /// at the moment of the dial, so a `scope.remove` after the baseline
+    /// still stops the connection and the probe counts against the host's
+    /// active rate like any other egress. The permit must be held for the
+    /// life of the connection.
+    pub(crate) fn check_live(
+        &self,
+        what: &str,
+        authority: &str,
+        host: &str,
+        ips: &[IpAddr],
+    ) -> Result<ActionPermit> {
+        self.check(what, authority, host, ips)?;
+        // `host:port`, the form the engine's own gates ask the guard about
+        // (`guard_authority`): a ported scope entry matches on port equality,
+        // so a bare host would never be admitted by it.
+        self.scope
+            .check_active(authority)
+            .map_err(|e| anyhow!("scope: refusing {what} to {authority}: {e}"))
     }
 }
 
@@ -434,8 +457,14 @@ impl HttpSender {
             }
         }
 
+        // The exchange answers with the response AND the address that served
+        // it: a pooled connection's own dialled address, or `leg.addr` for a
+        // fresh dial. Under TLS that is the TCP peer — what `dialer.dial`
+        // connected — which is what `HttpResponse::peer` promises (amendment
+        // 59) and what `client.rs` copies into `flow.server_conn.peer`.
         let exchange = async {
             if let Some(checkout) = pooled {
+                let served = checkout.addr;
                 let result = crate::h2_sender::exchange_pooled(
                     &self.h2_pool,
                     checkout,
@@ -445,7 +474,7 @@ impl HttpSender {
                 )
                 .await;
                 match result {
-                    Ok(resp) => return Ok(resp),
+                    Ok(resp) => return Ok((served, resp)),
                     // The redial rule (plan amendment A7, review finding
                     // SEC-10): a POOLED connection is redialled, once, only
                     // when its failure PROVES the request was not processed —
@@ -477,18 +506,22 @@ impl HttpSender {
                     Err(failure) => return Err(failure.error),
                 }
             }
-            self.dial_and_exchange(&req, &leg).await
+            let resp = self.dial_and_exchange(&req, &leg).await?;
+            Ok((leg.addr, resp))
         };
         // The same `deadline` the h2 layer was handed, so the two caps are
         // one cap (review finding QM-3).
-        tokio::time::timeout_at(deadline, exchange)
+        let outcome = tokio::time::timeout_at(deadline, exchange)
             .await
             .map_err(|_| {
                 anyhow!(
                     "upstream response from {addr} timed out after {:?}",
                     self.response_timeout
                 )
-            })?
+            })?;
+        let (served, mut resp) = outcome?;
+        resp.peer = Some(served);
+        Ok(resp)
     }
 
     /// Dial `leg.addr`, negotiate (for `https`) and run the exchange on the
@@ -2305,5 +2338,193 @@ mod tests {
             .expect_err("with the literal unscoped the loopback answer is refused again");
         assert!(err.to_string().contains("SSRF"), "error was {err}");
         assert_eq!(dialer.calls(), 1, "a refused reissue never dials");
+    }
+
+    // ---- Amendment 59, sender half: the response names the socket it came from
+
+    /// A plaintext HTTP/1.1 send: the response's `peer` is the address the
+    /// dialer was asked to connect — the resolver's answer at the request's
+    /// port — so `client.rs` can fill `flow.server_conn` from it.
+    #[tokio::test]
+    async fn a_plaintext_h1_response_names_the_dialled_peer() {
+        let (client, server) = duplex(64 * 1024);
+        let origin = tokio::spawn(origin(server, vec![RESPONSE_200.as_bytes().to_vec()]));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = HttpSender::new()
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+        let mut req = get_x();
+        req.authority = "origin.test:8080".into();
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::Auto),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the plaintext exchange succeeds");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.peer,
+            Some("127.0.0.1:8080".parse().expect("socket address")),
+            "the response names the dialled address"
+        );
+        assert_eq!(dialer.calls(), 1);
+        let _ = origin.await.expect("origin task");
+    }
+
+    /// Under TLS the peer is the TCP peer — the address `dialer.dial(addr)`
+    /// connected — not anything the handshake said.
+    #[tokio::test]
+    async fn a_tls_h1_response_names_the_tcp_peer() {
+        let (client, server) = duplex(64 * 1024);
+        let origin =
+            tokio::spawn(async move { tls_origin(server, &[ALPN_HTTP11], RESPONSE_200).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&https_get(), VersionPolicy::Auto),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the TLS exchange succeeds");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.version, aitm_core::HttpVersion::Http11);
+        assert_eq!(
+            resp.peer,
+            Some("127.0.0.1:443".parse().expect("socket address")),
+            "the response names the TCP peer under TLS"
+        );
+        assert_eq!(dialer.calls(), 1);
+        let log = origin.await.expect("origin task");
+        assert_eq!(log.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
+    }
+
+    /// Three `Auto` sends to one h2 origin: the first dials and parks the
+    /// connection, the next two ride it from the pool (one dial in all). Every
+    /// response — fresh and pooled alike — names the pooled connection's
+    /// address.
+    #[tokio::test]
+    async fn a_pooled_h2_response_names_the_pooled_connections_peer() {
+        let (client, server) = duplex(64 * 1024);
+        let origin =
+            tokio::spawn(async move { tls_h2_origin(server, &[b"h2", b"http/1.1"]).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+        let req = https_get();
+        let want: SocketAddr = "127.0.0.1:443".parse().expect("socket address");
+
+        for n in 1..=3 {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(10),
+                sender.send_with(&req, VersionPolicy::Auto),
+            )
+            .await
+            .expect("the send finished within the guard")
+            .expect("the h2 exchange succeeds");
+            assert_eq!(resp.status, 200, "send {n}");
+            assert_eq!(resp.version, aitm_core::HttpVersion::H2, "send {n}");
+            assert_eq!(
+                resp.peer,
+                Some(want),
+                "send {n} names the pooled connection's address"
+            );
+        }
+        assert_eq!(
+            dialer.calls(),
+            1,
+            "the second and third sends were served by the pooled connection"
+        );
+        drop(sender);
+        let log = tokio::time::timeout(Duration::from_secs(10), origin)
+            .await
+            .expect("the origin finished within the guard")
+            .expect("origin task");
+        assert_eq!(String::from_utf8_lossy(&log.request), "GET /x");
+    }
+
+    /// A resolver whose answer moves between calls: the first resolve says
+    /// 127.0.0.1, every later one 127.0.0.2 — a name whose address changed
+    /// while a pooled connection to the old one was still open.
+    struct MovingResolver(AtomicUsize);
+
+    impl HostResolver for MovingResolver {
+        fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+            let call = self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            let ip = if call == 0 {
+                Ipv4Addr::LOCALHOST
+            } else {
+                Ipv4Addr::new(127, 0, 0, 2)
+            };
+            Box::pin(async move { Ok(vec![IpAddr::V4(ip)]) })
+        }
+    }
+
+    /// Tester (amendment 59): a pooled send reports the address the pooled
+    /// connection was dialled to — `checkout.addr` — not what this send's own
+    /// resolve answered. The two differ here on purpose: a `peer` read off
+    /// `leg.addr` on the pooled path would name 127.0.0.2, an address the
+    /// sender never connected to.
+    #[tokio::test]
+    async fn a_pooled_send_names_the_pooled_connections_peer_not_todays_resolution() {
+        let (client, server) = duplex(64 * 1024);
+        let origin =
+            tokio::spawn(async move { tls_h2_origin(server, &[b"h2", b"http/1.1"]).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(MovingResolver(AtomicUsize::new(0))))
+            .with_dialer(dialer.clone());
+        let req = https_get();
+        let dialled: SocketAddr = "127.0.0.1:443".parse().expect("socket address");
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::Auto),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the first exchange succeeds");
+        assert_eq!(first.version, aitm_core::HttpVersion::H2);
+        assert_eq!(
+            first.peer,
+            Some(dialled),
+            "the fresh dial names its address"
+        );
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::Auto),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the pooled exchange succeeds");
+        assert_eq!(second.version, aitm_core::HttpVersion::H2);
+        assert_eq!(
+            dialer.calls(),
+            1,
+            "the second send rode the pooled connection"
+        );
+        assert_eq!(
+            second.peer,
+            Some(dialled),
+            "the pooled send names the connection it rode, not the 127.0.0.2 the name now resolves to"
+        );
+
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_secs(10), origin)
+            .await
+            .expect("the origin finished within the guard")
+            .expect("origin task");
     }
 }

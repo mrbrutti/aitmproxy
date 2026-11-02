@@ -32,19 +32,24 @@ use std::time::{Duration, SystemTime};
 use aitm_core::{
     Body, CommandHost, Flow, FlowId, HeaderMap, HttpFlow, HttpRequest, RecordPolicy, SendOptions,
 };
+#[cfg(test)]
+use aitm_scan_model::PocHint;
 use aitm_scan_model::{
     Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Discovery, Evidence, FlowRef,
     InsertionKind, InsertionPoint, Intensity, JobCtx, Lane, LaneKind, NodeId, Outcome, ParamRef,
-    Payload, PayloadMode, PocHint, PointTrait, ProbeHost, ProbeResponse, ProfileTarget, RawProbe,
+    Payload, PayloadMode, PointTrait, ProbeHost, ProbeResponse, ProfileTarget, RawProbe,
     ScanProfile, SiteNode, Technique, UseBrowser, Verdict, MAX_MATCH_BODY,
 };
 use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
 
+#[cfg(test)]
 use crate::checks::CheckDefinition;
+#[cfg(test)]
 use crate::client::ProbeRefused;
 use crate::config::ScannerConfig;
 use crate::discover::{is_secret_name, InjectionPoint, Location};
+#[cfg(test)]
 use crate::scheduler::payload_cap;
 use crate::util::{default_port, normalize_origin, origin_key, scrub, split_authority, wire_token};
 
@@ -57,7 +62,26 @@ pub const MAX_HELD_FLOWS: usize = 16;
 /// The reflected-XSS check's **id**, spec D8.2's literal name — distinct from
 /// the issue **class** it emits (`crate::checks::CLASS_REFLECTED_XSS`), and so
 /// the manual verb is `check.xss-reflected`.
+#[cfg(test)]
 const CHECK_XSS_REFLECTED: &str = "xss-reflected";
+
+/// The two legacy active checks (`xss-reflected`, `open-redirect`) for this
+/// crate's tests, which hand them to the plugin's native slot the way the
+/// binary hands it the T3 natives that superseded them (T3 PR 2a). Not part of
+/// [`Lane::checks`] any more; retired with the lane.
+#[cfg(test)]
+pub(crate) fn legacy_active_checks() -> Vec<Arc<dyn Check>> {
+    vec![
+        Arc::new(LegacyActiveCheck {
+            def: CheckDefinition::reflected_xss(),
+            meta: reflected_xss_meta(),
+        }),
+        Arc::new(LegacyActiveCheck {
+            def: CheckDefinition::open_redirect(),
+            meta: open_redirect_meta(),
+        }),
+    ]
+}
 
 /// The interim HTTP [`Lane`]: the v1 scanner behind the v2 traits.
 pub struct InterimHttpLane {
@@ -177,6 +201,13 @@ impl InterimHttpLane {
         if crawled.forms_skipped > 0 {
             job.report_forms_skipped(u64::from(crawled.forms_skipped));
         }
+        // Amendment 53: the forms the crawl posted feed `crawl.forms_submitted`.
+        if crawled.forms_submitted > 0 {
+            job.report_forms_submitted(u64::from(crawled.forms_submitted));
+        }
+        // Amendment 39: each failed request was reported by the crawl where it
+        // failed, named by its own classified token (a token, so nothing to
+        // scrub); `failed`/`last_error` are its aggregate view.
         crawled.stopped
     }
 
@@ -337,9 +368,24 @@ impl Lane for InterimHttpLane {
         point: &InsertionPoint,
         job: Arc<dyn JobCtx>,
     ) -> anyhow::Result<Box<dyn ProbeHost>> {
-        let flow_ref = point
-            .flow
-            .ok_or_else(|| anyhow::anyhow!("interim lane: point `{}` carries no flow", point.id))?;
+        let Some(flow_ref) = point.flow else {
+            // Amendment 38: an origin item stands for a whole origin, not for
+            // anything a request carried, so it has no captured flow to host.
+            // The lane serves it over a synthesized `GET <origin>/` instead;
+            // any other flowless point is still an error.
+            let flow = origin_request(point).ok_or_else(|| {
+                anyhow::anyhow!("interim lane: point `{}` carries no flow", point.id)
+            })?;
+            return Ok(Box::new(InterimProbeHost {
+                point: point.clone(),
+                flow,
+                legacy: None,
+                job,
+                baseline: OnceCell::new(),
+                baseline_peer: Mutex::new(None),
+                held: Mutex::new(Vec::new()),
+            }));
+        };
         let Some(Flow::Http(flow)) = job.store().get(flow_ref.0) else {
             return Err(anyhow::anyhow!(
                 "interim lane: the captured flow behind point `{}` is no longer in the store",
@@ -363,7 +409,7 @@ impl Lane for InterimHttpLane {
         Ok(Box::new(InterimProbeHost {
             point: point.clone(),
             flow,
-            legacy,
+            legacy: Some(legacy),
             job,
             baseline: OnceCell::new(),
             baseline_peer: Mutex::new(None),
@@ -372,44 +418,110 @@ impl Lane for InterimHttpLane {
     }
 
     fn checks(&self) -> Vec<Arc<dyn Check>> {
-        vec![
-            Arc::new(LegacyActiveCheck {
-                def: CheckDefinition::reflected_xss(),
-                meta: reflected_xss_meta(),
-            }),
-            Arc::new(LegacyActiveCheck {
-                def: CheckDefinition::open_redirect(),
-                meta: open_redirect_meta(),
-            }),
-            Arc::new(LegacyPassiveCheck {
-                class: crate::passive::CLASS_REFLECTION,
-                meta: passive_meta(
-                    crate::passive::CLASS_REFLECTION,
-                    "Reflected parameter value",
-                    Confidence::Tentative,
-                    "A request parameter value is echoed in the response body.",
-                ),
-            }),
-            Arc::new(LegacyPassiveCheck {
-                class: crate::passive::CLASS_SECURITY_HEADER,
-                meta: passive_meta(
-                    crate::passive::CLASS_SECURITY_HEADER,
-                    "Missing security header",
-                    Confidence::Firm,
-                    "A response is missing a security header the browser relies on.",
-                ),
-            }),
-            Arc::new(LegacyPassiveCheck {
-                class: crate::passive::CLASS_COOKIE_FLAG,
-                meta: passive_meta(
-                    crate::passive::CLASS_COOKIE_FLAG,
-                    "Cookie without Secure or HttpOnly",
-                    Confidence::Firm,
-                    "A `Set-Cookie` is missing the `Secure` and/or `HttpOnly` attribute.",
-                ),
-            }),
-        ]
+        // This lane registers no check of its own. The two active ones it used
+        // to ship (`xss-reflected`, `open-redirect`) are owned by the T3 natives
+        // in `aitm-scan-checks-http` since T3 PR 2a: the catalogue gives lanes
+        // precedence over the native slot, so listing them here would refuse
+        // the natives as id conflicts. The three passive ones are engine-shipped
+        // since T2 ([`shipped_passive_checks`]): the engine puts them in the
+        // catalogue whatever lane holds the http slot, so listing them here too
+        // would make them id conflicts the moment a lane crate's HTTP lane
+        // displaces this one. `LegacyActiveCheck` stays as the test vehicle for
+        // this lane's probe host until T2 retires the lane.
+        Vec::new()
     }
+}
+
+/// The `GET <origin>/` flow an origin item is hosted over (amendment 38), or
+/// `None` when the point is not an origin item or its URL is not an origin.
+///
+/// The request is the bare minimum: no headers and no body. The job client
+/// applies the profile's version policy and the D7 session material to it on
+/// the way out, exactly as it does for a captured point's baseline. The flow
+/// has no response and no server connection: it describes a request that has
+/// not been sent yet.
+fn origin_request(point: &InsertionPoint) -> Option<HttpFlow> {
+    if !point.id.starts_with("origin:") {
+        return None;
+    }
+    let parsed = url::Url::parse(point.url.as_deref()?).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let authority = match parsed.port_or_known_default() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Some(HttpFlow {
+        id: FlowId::new(),
+        request: HttpRequest {
+            method: "GET".to_string(),
+            scheme: parsed.scheme().to_string(),
+            authority,
+            path: "/".to_string(),
+            version: aitm_core::HttpVersion::Http11,
+            headers: HeaderMap::new(),
+            body: aitm_core::Body::Empty,
+            timestamp: SystemTime::now(),
+        },
+        response: None,
+        client_conn: aitm_core::ConnInfo {
+            peer: std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            ),
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: aitm_core::FlowMeta::default(),
+        intercept: aitm_core::InterceptState::Observed,
+    })
+}
+
+/// The three shipped passive checks (`reflection`, `security-header`,
+/// `cookie-flag`; call B19), in the plan's order.
+///
+/// Spec amendment 24: "the interim lane drops its two legacy active checks,
+/// the passives stay". The **engine** ships these, whatever lane holds the
+/// http slot — the interim lane while no lane crate supplies one, T2's
+/// `aitm-scan-http` lane once it does — so they are part of every build's
+/// `scan.checks` and `check.<id>` surface. They read the captured flow a
+/// point came from through the host and never send (see
+/// [`LegacyPassiveCheck`]).
+pub fn shipped_passive_checks() -> Vec<Arc<dyn Check>> {
+    vec![
+        Arc::new(LegacyPassiveCheck {
+            class: crate::passive::CLASS_REFLECTION,
+            meta: passive_meta(
+                crate::passive::CLASS_REFLECTION,
+                "Reflected parameter value",
+                Confidence::Tentative,
+                "A request parameter value is echoed in the response body.",
+            ),
+        }),
+        Arc::new(LegacyPassiveCheck {
+            class: crate::passive::CLASS_SECURITY_HEADER,
+            meta: passive_meta(
+                crate::passive::CLASS_SECURITY_HEADER,
+                "Missing security header",
+                Confidence::Firm,
+                "A response is missing a security header the browser relies on.",
+            ),
+        }),
+        Arc::new(LegacyPassiveCheck {
+            class: crate::passive::CLASS_COOKIE_FLAG,
+            meta: passive_meta(
+                crate::passive::CLASS_COOKIE_FLAG,
+                "Cookie without Secure or HttpOnly",
+                Confidence::Firm,
+                "A `Set-Cookie` is missing the `Secure` and/or `HttpOnly` attribute.",
+            ),
+        }),
+    ]
 }
 
 /// The [`ProbeHost`] the interim lane builds for one insertion point.
@@ -419,7 +531,12 @@ impl Lane for InterimHttpLane {
 pub struct InterimProbeHost {
     point: InsertionPoint,
     flow: HttpFlow,
-    legacy: InjectionPoint,
+    /// The v1 point [`ProbeHost::probe`] injects into, or `None` for an origin
+    /// item (amendment 38), which has nothing to inject into. `None` also means
+    /// [`InterimProbeHost::flow`] was synthesized for the origin rather than
+    /// captured from the wire, so [`ProbeHost::captured`] does not offer it as
+    /// traffic that happened.
+    legacy: Option<InjectionPoint>,
     job: Arc<dyn JobCtx>,
     baseline: OnceCell<ProbeResponse>,
     baseline_peer: Mutex<Option<SocketAddr>>,
@@ -487,13 +604,19 @@ impl ProbeHost for InterimProbeHost {
 
     fn probe<'a>(&'a self, payload: &'a Payload) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
-            let example = self.legacy.example.as_str();
+            let Some(legacy) = self.legacy.as_ref() else {
+                return Err(anyhow::anyhow!(
+                    "interim lane: origin host `{}`: no insertion point to inject into",
+                    self.point.id
+                ));
+            };
+            let example = legacy.example.as_str();
             let value = match payload.mode {
                 PayloadMode::Replace => payload.value.clone(),
                 PayloadMode::Prefix => format!("{}{example}", payload.value),
                 PayloadMode::Suffix => format!("{example}{}", payload.value),
             };
-            let req = crate::inject::mutate_request(&self.flow.request, &self.legacy, &value)
+            let req = crate::inject::mutate_request(&self.flow.request, legacy, &value)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "interim lane: point `{}` cannot be mutated in its captured request",
@@ -550,6 +673,8 @@ impl ProbeHost for InterimProbeHost {
         })
     }
 
+    /// Fresh on every call, straight from the job context (amendment 57): a
+    /// canary value, never a key. `JobCtx::job_id` is the per-job key.
     fn marker(&self) -> String {
         self.job.marker()
     }
@@ -579,7 +704,10 @@ impl ProbeHost for InterimProbeHost {
     }
 
     fn captured(&self) -> Option<HttpFlow> {
-        Some(self.flow.clone())
+        // A synthesized origin request (no point to inject into) is not traffic
+        // the scan observed, so a passive check must not read it as a capture
+        // (amendment 38).
+        self.legacy.as_ref().map(|_| self.flow.clone())
     }
 
     fn charge(&self, units: u32) -> bool {
@@ -595,11 +723,17 @@ impl ProbeHost for InterimProbeHost {
 }
 
 /// One of the two shipped payload classes as a v2 [`Check`].
-pub struct LegacyActiveCheck {
+///
+/// No longer in [`Lane::checks`]: the T3 natives own `xss-reflected` and
+/// `open-redirect` (T3 PR 2a). Kept as the test vehicle for this lane's probe
+/// host (recording policy, held flows, budget) and retired with the lane.
+#[cfg(test)]
+pub(crate) struct LegacyActiveCheck {
     def: CheckDefinition,
     meta: CheckMeta,
 }
 
+#[cfg(test)]
 impl Check for LegacyActiveCheck {
     fn meta(&self) -> &CheckMeta {
         &self.meta
@@ -903,6 +1037,7 @@ fn bounded_body(body: &Body) -> Vec<u8> {
 /// Read from the typed [`ProbeRefused`] the job client raises, never from
 /// words in the message: an upstream error that happens to say "canceled" is
 /// one failed send, not the end of the run.
+#[cfg(test)]
 fn ends_the_run(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<ProbeRefused>(),
@@ -954,6 +1089,7 @@ fn http_kinds() -> Vec<InsertionKind> {
 /// The **id** is spec D8.2's literal check name (`xss-reflected`, so the
 /// manual verb is `check.xss-reflected`); the **class** stays the issue class
 /// the check emits (`reflected-xss`).
+#[cfg(test)]
 fn reflected_xss_meta() -> CheckMeta {
     CheckMeta {
         id: CHECK_XSS_REFLECTED.to_string(),
@@ -984,6 +1120,7 @@ fn reflected_xss_meta() -> CheckMeta {
 }
 
 /// The catalogue entry for the shipped open-redirect class.
+#[cfg(test)]
 fn open_redirect_meta() -> CheckMeta {
     CheckMeta {
         id: crate::checks::CLASS_OPEN_REDIRECT.to_string(),
@@ -1046,7 +1183,7 @@ fn passive_meta(
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -1103,6 +1240,7 @@ mod tests {
             trailers: HeaderMap::new(),
             body: Body::Bytes(body.as_bytes().to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         }
     }
 
@@ -1520,6 +1658,8 @@ mod tests {
         /// Every `(origin, reason)` the lane reported through
         /// [`JobCtx::report_crawl_error`].
         crawl_errors: Mutex<Vec<(String, String)>>,
+        /// Forms the lane reported through [`JobCtx::report_forms_submitted`].
+        forms_submitted: AtomicU64,
     }
 
     impl TestJob {
@@ -1539,7 +1679,12 @@ mod tests {
                 charged: AtomicU32::new(0),
                 cancelled: std::sync::atomic::AtomicBool::new(false),
                 crawl_errors: Mutex::new(Vec::new()),
+                forms_submitted: AtomicU64::new(0),
             }
+        }
+
+        fn forms_submitted(&self) -> u64 {
+            self.forms_submitted.load(Ordering::SeqCst)
         }
 
         fn charged(&self) -> u32 {
@@ -1593,13 +1738,16 @@ mod tests {
             self.cancelled.load(Ordering::SeqCst)
         }
         fn marker(&self) -> String {
-            "aitm7f3a".to_string()
+            "aitm7f3a0000".to_string()
         }
         fn report_crawl_error(&self, origin: &str, reason: &str) {
             self.crawl_errors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((origin.to_string(), reason.to_string()));
+        }
+        fn report_forms_submitted(&self, count: u64) {
+            self.forms_submitted.fetch_add(count, Ordering::SeqCst);
         }
     }
 
@@ -1614,6 +1762,19 @@ mod tests {
 
     fn lane() -> Arc<dyn Lane> {
         InterimHttpLane::new(ScannerConfig::default())
+    }
+
+    /// The one origin item [`crate::scheduler::plan`] builds for `origins` and
+    /// `points`, so these tests run against the real amendment-38 shape rather
+    /// than a hand-written copy of it.
+    fn origin_item(origins: &[&str], points: &[InsertionPoint]) -> InsertionPoint {
+        let profile = ScanProfile {
+            target: target(origins),
+            ..ScanProfile::default()
+        };
+        let mut items = crate::scheduler::plan(points, &[], &[], &profile).origin_points;
+        assert_eq!(items.len(), 1, "one origin in the set");
+        items.remove(0)
     }
 
     /// A job whose crawl is off (`max_pages: 0`, spec D2), for the tests that
@@ -1646,11 +1807,20 @@ mod tests {
     }
 
     fn check_named(id: &str) -> Arc<dyn aitm_scan_model::Check> {
-        lane()
-            .checks()
+        shipped_passive_checks()
             .into_iter()
             .find(|c| c.meta().id == id)
-            .unwrap_or_else(|| panic!("the lane ships the {id} check"))
+            .unwrap_or_else(|| legacy_active(id))
+    }
+
+    /// The two legacy active checks, no longer in `checks()` since the T3
+    /// natives own their ids (PR 2a); still the vehicle these tests drive the
+    /// lane's probe host with.
+    fn legacy_active(id: &str) -> Arc<dyn aitm_scan_model::Check> {
+        legacy_active_checks()
+            .into_iter()
+            .find(|c| c.meta().id == id)
+            .unwrap_or_else(|| panic!("the lane ships no {id} check"))
     }
 
     fn payload(value: &str) -> Payload {
@@ -2159,6 +2329,36 @@ mod tests {
         assert_eq!(point_named(&discovery, "q").kind, InsertionKind::Query);
     }
 
+    /// Amendment 53: the interim lane feeds `crawl.forms_submitted` too — the
+    /// one form its client crawl posted reaches the job through
+    /// `JobCtx::report_forms_submitted`, and the skipped one beside it does
+    /// not count there (`max_depth: 1` parses the seed page only).
+    #[tokio::test]
+    async fn the_client_crawl_reports_the_forms_it_submitted() {
+        const PAGE: &str = "<html><body>\
+             <form action=\"/comments\" method=\"post\"><input name=\"comment\"></form>\
+             <form action=\"/account/delete\" method=\"post\"><input name=\"id\"></form>\
+             </body></html>";
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(200, "text/html; charset=utf-8", PAGE));
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.profile.crawl.max_depth = 1;
+
+        let _ = discover_with(&job).await;
+
+        let trail: Vec<String> = client
+            .seen()
+            .iter()
+            .map(|(req, _)| format!("{} {}", req.method, req.path))
+            .collect();
+        assert_eq!(
+            trail,
+            vec!["GET /", "POST /comments"],
+            "one form posted, the delete form left alone"
+        );
+        assert_eq!(job.forms_submitted(), 1);
+    }
+
     // ---- wave-2/3 fix task ---------------------------------------------------
 
     /// Whether a probe error ends the run is read from the typed
@@ -2568,40 +2768,152 @@ mod tests {
         assert_eq!(client.calls(), 0);
     }
 
-    /// The lane's five checks carry the metadata the plan pins (call B19), in
-    /// the plan's order, with a native origin; the passive three cover every
-    /// HTTP kind and no WebSocket or L4 one.
+    /// Amendment 38: an origin item ([`crate::scheduler::SchedulePlan::origin_points`])
+    /// carries no captured flow, so the lane hosts it over a synthesized
+    /// `GET <origin>/`. That request is the baseline; there is no insertion
+    /// point behind it, so `probe` is refused; and nothing was captured, so
+    /// `captured` is empty.
+    #[tokio::test]
+    async fn an_origin_point_gets_a_host_whose_baseline_is_get_root() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let origin = origin_item(&[ORIGIN], &[]);
+        assert_eq!(origin.id, "origin:http://target.test:80");
+
+        let host = lane()
+            .probe_host_for(&origin, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("an origin item is hosted");
+
+        let baseline = host.baseline().await.expect("the stub answers");
+        assert_eq!(baseline.status, Some(200));
+        assert_eq!(client.calls(), 1, "the baseline is one request");
+        let (req, opts) = client.seen().last().cloned().expect("a send");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.scheme, "http");
+        assert_eq!(req.authority, "target.test:80");
+        assert_eq!(req.path, "/");
+        assert!(req.headers.get("cookie").is_none(), "no headers of its own");
+        assert!(
+            matches!(opts.record, RecordPolicy::Never),
+            "{:?}",
+            opts.record
+        );
+
+        let err = host
+            .probe(&payload("anything"))
+            .await
+            .expect_err("an origin host has nothing to inject into");
+        assert!(err.to_string().contains("no insertion point"), "{err}");
+        assert_eq!(client.calls(), 1, "the refused probe sent nothing");
+
+        assert!(
+            host.captured().is_none(),
+            "the flow was synthesized, not captured"
+        );
+    }
+
+    /// The degenerate origin key: a point with neither a site node nor a
+    /// parsable URL gives `point:<id>`, so the origin item's URL is not an
+    /// origin at all. It takes the same error path as any other flowless
+    /// point instead of being hosted over a nonsense request.
+    #[tokio::test]
+    async fn an_origin_item_whose_url_is_not_an_origin_cannot_be_hosted() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let nowhere = InsertionPoint {
+            id: "p9".to_string(),
+            lane: LaneKind::Http,
+            kind: InsertionKind::Query,
+            name: "q".to_string(),
+            path: None,
+            example: None,
+            flow: None,
+            site_node: None,
+            traits: Vec::new(),
+            frequency: 1,
+            method: Some("GET".to_string()),
+            url: None,
+        };
+        let origin = origin_item(&[], &[nowhere]);
+        assert_eq!(origin.id, "origin:point:p9");
+        assert_eq!(origin.url.as_deref(), Some("point:p9/"));
+
+        let err = lane()
+            .probe_host_for(&origin, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .err()
+            .expect("an origin item without an origin cannot be hosted");
+        assert!(err.to_string().contains("carries no flow"), "{err}");
+        assert_eq!(client.calls(), 0);
+    }
+
+    /// Amendment 38, call C3: the synthetic flow is built from the origin, so
+    /// an `https` target with no port written reaches the right authority, and
+    /// an origin of a scheme this lane does not speak is refused outright
+    /// rather than being probed over HTTP.
+    #[tokio::test]
+    async fn an_https_origin_item_keeps_its_scheme_and_a_foreign_scheme_is_refused() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let secure = origin_item(&["https://target.test"], &[]);
+        assert_eq!(secure.id, "origin:https://target.test:443");
+        let host = lane()
+            .probe_host_for(&secure, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("an https origin item is hosted");
+        host.baseline().await.expect("the stub answers");
+        let (req, _) = client.seen().last().cloned().expect("a send");
+        assert_eq!(req.scheme, "https");
+        assert_eq!(req.authority, "target.test:443", "the default port is used");
+        assert_eq!(req.path, "/");
+
+        let foreign = origin_item(&["ws://target.test:8080"], &[]);
+        assert_eq!(foreign.id, "origin:ws://target.test:8080");
+        let err = lane()
+            .probe_host_for(&foreign, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .err()
+            .expect("the HTTP lane does not host a `ws` origin");
+        assert!(err.to_string().contains("carries no flow"), "{err}");
+        assert_eq!(client.calls(), 1, "only the https baseline was sent");
+    }
+
+    /// The engine ships the three passive checks (call B19, spec amendment 24
+    /// "the passives stay") through [`shipped_passive_checks`], in the plan's
+    /// order, with a native origin, covering every HTTP kind and no WebSocket
+    /// or L4 one. The lane's own `checks()` is empty since T2: its two legacy
+    /// active checks left with T3 PR 2a (the natives in `aitm-scan-checks-http`
+    /// own `xss-reflected` and `open-redirect`) and the passives moved to the
+    /// engine so they survive the `aitm-scan-http` lane taking the http slot.
+    /// The legacy actives still carry the metadata the plan pinned.
     ///
     /// Coordinator ruling 2026-11-01: an **id** is spec D8.2's literal name
     /// (`xss-reflected`), a **class** is the issue class the check emits
     /// (`reflected-xss`), so the two differ for the reflected-XSS check and
     /// coincide for the other four.
     #[test]
-    fn the_five_interim_checks_carry_the_pinned_metadata() {
-        let checks = lane().checks();
+    fn the_three_interim_checks_carry_the_pinned_metadata() {
+        assert!(
+            lane().checks().is_empty(),
+            "the interim lane registers no check of its own: the passives are engine-shipped"
+        );
+        let checks = shipped_passive_checks();
         let ids: Vec<&str> = checks.iter().map(|c| c.meta().id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "xss-reflected",
-                "open-redirect",
-                "reflection",
-                "security-header",
-                "cookie-flag"
-            ]
-        );
+        assert_eq!(ids, ["reflection", "security-header", "cookie-flag"]);
         let classes: Vec<&str> = checks.iter().map(|c| c.meta().class.as_str()).collect();
-        assert_eq!(
-            classes,
-            [
-                "reflected-xss",
-                "open-redirect",
-                "reflection",
-                "security-header",
-                "cookie-flag"
-            ]
-        );
-        for check in &checks {
+        assert_eq!(classes, ["reflection", "security-header", "cookie-flag"]);
+        let legacy = [
+            legacy_active("xss-reflected"),
+            legacy_active("open-redirect"),
+        ];
+        assert_eq!(legacy[0].meta().id, "xss-reflected");
+        assert_eq!(legacy[0].meta().class, "reflected-xss");
+        assert_eq!(legacy[1].meta().id, "open-redirect");
+        assert_eq!(legacy[1].meta().class, "open-redirect");
+        for check in checks.iter().chain(legacy.iter()) {
             let meta = check.meta();
             assert_eq!(meta.origin, CheckOrigin::Native, "{}", meta.id);
             assert_eq!(meta.lanes, vec![LaneKind::Http], "{}", meta.id);
@@ -2609,7 +2921,7 @@ mod tests {
             assert_eq!(meta.scope, CheckScope::Point, "{}", meta.id);
         }
 
-        let xss = checks[0].meta();
+        let xss = legacy[0].meta();
         assert_eq!(
             xss.kinds,
             vec![InsertionKind::Query, InsertionKind::BodyParam]
@@ -2622,7 +2934,7 @@ mod tests {
         assert_eq!(xss.cwe, Some(79));
         assert!(xss.remediation.is_some());
 
-        let redirect = checks[1].meta();
+        let redirect = legacy[1].meta();
         assert_eq!(redirect.kinds, vec![InsertionKind::Query]);
         assert_eq!(redirect.cost, CheckCost::Light);
         assert_eq!(redirect.severity, aitm_poc::Severity::Low);
@@ -2630,7 +2942,7 @@ mod tests {
         assert_eq!(redirect.wants_traits, Some(vec![PointTrait::Url]));
 
         for (check, confidence) in
-            checks[2..]
+            checks
                 .iter()
                 .zip([Confidence::Tentative, Confidence::Firm, Confidence::Firm])
         {
@@ -2852,6 +3164,147 @@ mod tests {
         assert_eq!(client.calls(), 0, "{:?}", client.trail());
         assert_eq!(store.list().len(), 1, "the browser's capture, and only it");
     }
+    /// A `ProxyClient` keyed on request path: a path mapped to `None` fails the
+    /// send with the given message, any other path is a 200 page (HTML when a
+    /// body is given), so a crawl can lose one link and keep the rest.
+    struct FailingSite {
+        pages: std::collections::HashMap<&'static str, &'static str>,
+        failures: std::collections::HashMap<&'static str, &'static str>,
+        default_failure: Option<&'static str>,
+    }
+
+    impl FailingSite {
+        /// Every send fails with `message`.
+        fn all_failing(message: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                pages: std::collections::HashMap::new(),
+                failures: std::collections::HashMap::new(),
+                default_failure: Some(message),
+            })
+        }
+
+        /// Serve each `(path, html)` as a page; fail each `(path, message)`.
+        fn new(
+            pages: Vec<(&'static str, &'static str)>,
+            failures: Vec<(&'static str, &'static str)>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                pages: pages.into_iter().collect(),
+                failures: failures.into_iter().collect(),
+                default_failure: None,
+            })
+        }
+    }
+
+    impl ProxyClient for FailingSite {
+        fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            self.send_opts(req, SendOptions::default())
+        }
+
+        fn send_opts(
+            &self,
+            req: HttpRequest,
+            _opts: SendOptions,
+        ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async move {
+                let path = req.path.split('?').next().unwrap_or("/");
+                if let Some(message) = self.failures.get(path).or(self.default_failure.as_ref()) {
+                    return Err(anyhow::anyhow!(*message));
+                }
+                let (ctype, body) = match self.pages.get(path) {
+                    Some(html) => ("text/html; charset=utf-8", *html),
+                    None => ("text/plain", "ok"),
+                };
+                Ok(HttpFlow {
+                    id: FlowId::new(),
+                    request: req,
+                    response: Some(response(200, &[("content-type", ctype)], body)),
+                    client_conn: conn(),
+                    server_conn: None,
+                    metadata: FlowMeta::default(),
+                    intercept: InterceptState::Observed,
+                })
+            })
+        }
+    }
+
+    /// Amendment 39: the lane turns each failed client-crawl request into one
+    /// `report_crawl_error` call naming the origin and the classified token —
+    /// once per failure, not once per crawl.
+    #[tokio::test]
+    async fn a_failed_crawl_request_is_reported_once_each() {
+        // Every send fails: the seed is the one failed request.
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = FailingSite::all_failing("h2_not_negotiated: scan.test:80: alpn");
+        let job = TestJob::new(Arc::clone(&store), client as _);
+
+        let _ = discover_origins(&job, &["http://scan.test"]).await;
+
+        assert_eq!(
+            job.crawl_errors(),
+            vec![(
+                "http://scan.test".to_string(),
+                "h2_not_negotiated".to_string()
+            )],
+        );
+
+        // A seed with two links, one of which the client refuses.
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let seed = concat!(
+            "<html><body>",
+            "<a href=\"/a\">a</a>",
+            "<a href=\"/b\">b</a>",
+            "</body></html>",
+        );
+        let client = FailingSite::new(vec![("/", seed)], vec![("/a", "connection refused")]);
+        let job = TestJob::new(Arc::clone(&store), client as _);
+
+        let _ = discover_origins(&job, &["http://scan.test"]).await;
+
+        assert_eq!(
+            job.crawl_errors(),
+            vec![(
+                "http://scan.test".to_string(),
+                "connect_refused".to_string()
+            )],
+            "exactly one entry, for the one refused link",
+        );
+    }
+
+    /// Each failed client-crawl request is reported where it fails, with its
+    /// own classified token: a crawl that loses one link to `connect_refused`
+    /// and the next to `tls` reports those two tokens, in that order, not the
+    /// last kind twice.
+    #[tokio::test]
+    async fn each_failed_crawl_request_is_reported_with_its_own_kind() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let seed = concat!(
+            "<html><body>",
+            "<a href=\"/a\">a</a>",
+            "<a href=\"/b\">b</a>",
+            "</body></html>",
+        );
+        let client = FailingSite::new(
+            vec![("/", seed)],
+            vec![("/a", "connection refused"), ("/b", "tls handshake failed")],
+        );
+        let job = TestJob::new(Arc::clone(&store), client as _);
+
+        let _ = discover_origins(&job, &["http://scan.test"]).await;
+
+        assert_eq!(
+            job.crawl_errors(),
+            vec![
+                (
+                    "http://scan.test".to_string(),
+                    "connect_refused".to_string()
+                ),
+                ("http://scan.test".to_string(), "tls".to_string()),
+            ],
+            "one entry per failed link, each with the kind of that failure",
+        );
+    }
+
     /// Spec D3's `passive-only`: the built-in profile that asks for no crawl
     /// (`max_pages: 0`, `use_browser: never`) sends nothing at all, browser or
     /// no browser, and still maps what the proxy captured.

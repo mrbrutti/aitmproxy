@@ -313,11 +313,12 @@ fn headers(h: &HeaderMap) -> Value {
     )
 }
 
-/// `process` is `Some(..)` for the client side only: the source app the capture
-/// backend observed (`FlowMeta.source_app`, the same string `flow.get` emits), so the
-/// TUI and web Client columns, which read `client_conn.process`, agree with the mac
-/// app; `Some(None)` is a stable null for a proxied flow. The server side has no
-/// process and omits the key.
+/// `process` is `Some(..)` for the client side only: the source app a capture
+/// backend observed or the core resolved for a loopback client (`FlowMeta.source_app`,
+/// the same string `flow.get` emits), so the TUI and web Client columns, which read
+/// `client_conn.process`, agree with the mac app; `Some(None)` is a stable null
+/// unless the core could name the client. The server side has no process and omits
+/// the key.
 fn conn(c: &ConnInfo, process: Option<Option<&str>>) -> Value {
     let mut obj = BTreeMap::new();
     obj.insert("peer".into(), Value::Str(c.peer.to_string()));

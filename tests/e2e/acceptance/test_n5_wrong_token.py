@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+# e2e: tier=manual surface=acceptance
+"""Release acceptance, negatives N4 and N5 (spec §D7) while the installed app's embedded core
+holds the default ports.
+
+N5-TUI: the installed `aitm-tui --bus <app bus> --token-file <wrong>` must show
+`bus refused the token: it matched neither the agent nor the operator token (check the token you
+supplied)` and stop retrying. N4-TUI / N4-WEB: `aitm tui` / `aitm web` started for at most 5 s
+while 8080 is held must print `cannot start: the proxy port 127.0.0.1:8080 is already in use.`
+before any screen and exit by themselves (read-only: a refused start changes nothing; the only
+process touched is the child this cell started). N5-WEB is judged by the web cell when `aitm web`
+runs (it owns the agent URL; spec D7 places it there), so this cell writes no N5-WEB row. N5-CLI
+is CLI-6's one-shot refusal: `N/A` here (spec D1). SKIP when the app's core is not running.
+Steps → negatives-steps.tsv.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+E2E = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, E2E)
+from aitm_e2e.installed import INSTALLED_CLI, StepWriter, exit_on_term, find_embedded_core, port_holder  # noqa: E402
+from aitm_e2e.tui_pty import Terminal  # noqa: E402
+
+OUT = os.environ.get("ACCEPT_OUT", "/tmp/claude/acceptance/n5")
+os.makedirs(OUT, exist_ok=True)
+TUI = os.environ.get("AITM_TUI", "/opt/homebrew/bin/aitm-tui")
+AITM = os.environ.get("AITM", INSTALLED_CLI)
+REFUSAL = "bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)"
+N4_PANEL = "cannot start: the proxy port 127.0.0.1:8080 is already in use."
+N4_HOLDER_LINE = "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program."
+N4_LSOF = "Find the holder with:  lsof -nP -iTCP:8080 -sTCP:LISTEN"
+EXPECTED_STEPS = ("N5-TUI", "N5-CLI", "N4-TUI", "N4-WEB")
+
+w = StepWriter(os.path.join(OUT, "negatives-steps.tsv"), EXPECTED_STEPS)
+step = w.step
+
+
+def strip_ansi(s: str) -> str:
+    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", s)
+
+
+def n4_words(text: str) -> tuple[bool, list[str]]:
+    miss = [x for x in (N4_PANEL, N4_HOLDER_LINE, N4_LSOF) if x not in text]
+    return N4_PANEL in text, miss
+
+
+def n5_tui(core) -> None:
+    if not os.path.isfile(TUI):
+        step("N5-TUI", "SKIP", f"installed aitm-tui not found at {TUI}")
+        return
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".tok") as f:
+        f.write("not-the-token\n")
+        wrong = f.name
+    env = dict(os.environ)
+    env.setdefault("LANG", "en_US.UTF-8")
+    term = Terminal([TUI, "--bus", core.bus_addr, "--token-file", wrong], env)
+    try:
+        seen = term.wait_for("bus refused the token", 15)
+        screen = term.text()
+        exact = REFUSAL in screen or REFUSAL in bytes(term.raw).decode("utf-8", "replace")
+        time.sleep(2)
+        still = term.proc.poll() is None
+        with open(os.path.join(OUT, "N5-TUI.txt"), "w", encoding="utf-8") as fh:
+            fh.write(screen)
+        if seen and exact:
+            step("N5-TUI", "PASS", "exact refusal sentence shown; " + ("TUI stays open with the message" if still else f"process exited {term.proc.returncode}"), f"core {core.bus_addr} refused the token line (unauthorized)")
+        else:
+            step("N5-TUI", "FAIL", f"refusal seen {seen}, exact {exact}; screen head: {screen.splitlines()[0][:100] if screen else ''}")
+    finally:
+        term.stop()
+        os.unlink(wrong)
+
+
+def n4_tui() -> None:
+    env = dict(os.environ)
+    env.setdefault("LANG", "en_US.UTF-8")
+    term = Terminal([AITM, "tui"], env)
+    try:
+        term.wait_for(re.escape(N4_PANEL), 5)
+        rc = term.wait_exit(5)
+        raw = strip_ansi(bytes(term.raw).decode("utf-8", "replace"))
+        with open(os.path.join(OUT, "N4-TUI.txt"), "w", encoding="utf-8") as fh:
+            fh.write(raw)
+        panel, miss = n4_words(raw)
+        alt_screen = "\x1b[?1049h" in bytes(term.raw).decode("utf-8", "replace")
+        if panel and rc not in (None, 0) and not alt_screen:
+            step("N4-TUI", "PASS", f"panel before any screen, exit {rc}" + (f"; missing follow-up lines {miss}" if miss else ""), f"8080 held by {port_holder(8080)}")
+        else:
+            step("N4-TUI", "FAIL", f"panel {panel}; exit {rc} (None = still running after 5 s, stopped by the cell); alternate screen entered {alt_screen}; missing {miss}")
+    finally:
+        term.stop()
+
+
+def n4_web() -> None:
+    try:
+        r = subprocess.run([AITM, "web"], capture_output=True, text=True, timeout=5, env=dict(os.environ, LANG=os.environ.get("LANG", "en_US.UTF-8")))
+        out, err, rc = r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:  # subprocess.run killed our own child at the 5 s cap
+        out, err, rc = (e.stdout or ""), (e.stderr or ""), None
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+    text = strip_ansi(out + "\n" + err)
+    with open(os.path.join(OUT, "N4-WEB.txt"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    panel, miss = n4_words(text)
+    card = re.search(r"Web UI\s+http", out) is not None
+    if panel and rc not in (None, 0) and not card:
+        step("N4-WEB", "PASS", f"panel, exit {rc}, no card first" + (f"; missing follow-up lines {miss}" if miss else ""), f"8080 held by {port_holder(8080)}")
+    else:
+        step("N4-WEB", "FAIL", f"panel {panel}; exit {rc} (None = still running after 5 s, killed by the cell); card printed {card}; missing {miss}")
+
+
+def main() -> int:
+    exit_on_term()
+    step("N5-CLI", "N/A", "the one-shot refusal is CLI-6's row (no separate step on this surface)")
+    try:
+        core = find_embedded_core()
+    except RuntimeError as e:
+        for sid in ("N5-TUI", "N4-TUI", "N4-WEB"):
+            step(sid, "SKIP", str(e))
+        w.finish()
+        return w.exit_code()
+    if core is None:
+        for sid in ("N5-TUI", "N4-TUI", "N4-WEB"):
+            step(sid, "SKIP", "the app's embedded core is not running (8080 not held by it)")
+        w.finish()
+        return w.exit_code()
+    n5_tui(core)
+    if not os.path.isfile(AITM):
+        for sid in ("N4-TUI", "N4-WEB"):
+            step(sid, "SKIP", f"installed aitm not found at {AITM}")
+    else:
+        n4_tui()
+        n4_web()
+    w.finish()
+    return w.exit_code()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -34,11 +34,20 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Ca => ca(key),
         Mode::Browser => browser(key),
         Mode::Scan => scan(key),
-        // Read-only: back, palette, help.
-        Mode::Config => panel(key),
-        Mode::L4Confirm => l4_confirm(key),
-        // Any key closes help (README); `:` goes straight to the palette.
+        // Read-only: back, palette, help. The L4 panel's verbs are the `:l4`
+        // commands (L4 parity AC15), so it is a read-only panel too.
+        Mode::Config | Mode::L4 => panel(key),
+        Mode::WireConfirm => wire_confirm(key),
+        // The arrow, page and Home/End keys scroll the help (fix round G,
+        // G85), `:` goes straight to the palette, any other key closes it
+        // (README).
         Mode::Help => Some(match key.code {
+            KeyCode::Up => Action::Up,
+            KeyCode::Down => Action::Down,
+            KeyCode::PageUp => Action::PageUp,
+            KeyCode::PageDown => Action::PageDown,
+            KeyCode::Home => Action::Home,
+            KeyCode::End => Action::End,
             KeyCode::Char(':') => Action::PaletteOpen,
             _ => Action::Back,
         }),
@@ -87,10 +96,17 @@ fn browser(key: KeyEvent) -> Option<Action> {
     })
 }
 
-/// The Scan view (scanner-integration Stage 1): ↑↓ walk the focused list, Tab
-/// switches focus between the endpoints and the injection points, `r` launches
-/// the scope-bound crawl (the only key that does), `F` jumps to the findings
-/// pane, `:` palette, `?` help, Esc/`q` back.
+/// The Scan view's shared keys (spec D11): `1`..`4` pick a tab, Tab/BackTab
+/// walk the active tab's panes, ↑↓ walk the focused pane, ⏎ opens or acts,
+/// `r` launches the legacy scope-bound crawl, `x` cancels the Jobs cursor's
+/// job, `F` jumps to the findings pane, `:` palette, `?` help, Esc/`q` closes
+/// the focused pane or leaves the view. Each tab's own keys are added to this
+/// one function by its task. Profiles (plan task 10): `e` edit, Space
+/// toggle, `w` save, `D` delete, `N` new, `o` typed origin, `a`/`d` add or
+/// remove the picker row, `t` L4 target, `h`/`l`/← collapse or expand a
+/// tree node; → stays ⏎ (it opens the Site map's row and the legacy point's
+/// flow, which `tests/scan_v2_legacy.rs` pins), and ⏎ expands a collapsed
+/// node too.
 fn scan(key: KeyEvent) -> Option<Action> {
     if let Some(a) = nav(key) {
         return Some(a);
@@ -98,9 +114,44 @@ fn scan(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Char('r') => Action::ScanLaunch,
-        // Switch the cursor between the endpoints and injection-points lists.
-        KeyCode::Tab | KeyCode::BackTab => Action::ScanFocusToggle,
-        // Open the focused list's selected flow in the inspector.
+        KeyCode::Char('x') => Action::ScanCancel,
+        // Launch (D7, D11, plan task 12): `s` start, `m` map.
+        KeyCode::Char('s') => Action::ScanStart,
+        KeyCode::Char('m') => Action::ScanMap,
+        // Profiles (D11, plan task 10).
+        KeyCode::Char('e') => Action::ScanEdit,
+        KeyCode::Char(' ') => Action::ScanToggle,
+        KeyCode::Char('w') => Action::ScanSave,
+        KeyCode::Char('D') => Action::ScanDelete,
+        KeyCode::Char('N') => Action::ScanNewProfile,
+        KeyCode::Char('o') => Action::ScanOriginPrompt,
+        KeyCode::Char('a') => Action::ScanOriginAdd,
+        KeyCode::Char('d') => Action::ScanOriginRemove,
+        KeyCode::Char('t') => Action::ScanL4TargetPrompt,
+        KeyCode::Left | KeyCode::Char('h') => Action::Left,
+        KeyCode::Char('l') => Action::Right,
+        // Issues filters (D11): one key per filter, `R` resets them all.
+        KeyCode::Char('S') => Action::ScanFilter(crate::scan::IssueFilterKey::Severity),
+        KeyCode::Char('C') => Action::ScanFilter(crate::scan::IssueFilterKey::Confidence),
+        KeyCode::Char('L') => Action::ScanFilter(crate::scan::IssueFilterKey::Lane),
+        KeyCode::Char('T') => Action::ScanFilter(crate::scan::IssueFilterKey::Status),
+        KeyCode::Char('J') => Action::ScanFilter(crate::scan::IssueFilterKey::Job),
+        KeyCode::Char('R') => Action::ScanFilterReset,
+        // Issues status controls and the PoC jump (D11).
+        KeyCode::Char('c') => Action::ScanIssueStatus(aitm_scan_model::IssueStatus::Confirmed),
+        KeyCode::Char('f') => Action::ScanIssueStatus(aitm_scan_model::IssueStatus::FalsePositive),
+        KeyCode::Char('u') => Action::ScanIssueStatus(aitm_scan_model::IssueStatus::Open),
+        KeyCode::Char('P') => Action::ScanOpenPoc,
+        // Site map paging (D11).
+        KeyCode::Char('n') => Action::ScanNextPage,
+        KeyCode::Char('1') => Action::ScanTab(crate::scan::ScanTab::Profiles),
+        KeyCode::Char('2') => Action::ScanTab(crate::scan::ScanTab::Jobs),
+        KeyCode::Char('3') => Action::ScanTab(crate::scan::ScanTab::SiteMap),
+        KeyCode::Char('4') => Action::ScanTab(crate::scan::ScanTab::Issues),
+        // Move the cursor between the active tab's panes.
+        KeyCode::Tab => Action::ScanPaneNext,
+        KeyCode::BackTab => Action::ScanPanePrev,
+        // Open the focused pane's selected row.
         KeyCode::Enter | KeyCode::Right => Action::Enter,
         KeyCode::Char('F') => Action::OpenFindings,
         KeyCode::Char(':') => Action::PaletteOpen,
@@ -157,6 +208,7 @@ fn flows(key: KeyEvent, ctrl: bool) -> Option<Action> {
         KeyCode::Char('S') => Action::OpenScope,
         KeyCode::Char('s') => Action::ToggleSysProxy,
         KeyCode::Char('@') => Action::OpenAgent,
+        KeyCode::Char('L') => Action::OpenL4,
         KeyCode::Char('l') => Action::ToggleLayout,
         KeyCode::Char('t') => Action::ToggleAutoSelect,
         KeyCode::Char('y') => Action::CopyUrl,
@@ -192,9 +244,12 @@ fn inspector(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Action::CopyUrl,
         KeyCode::Char('o') => Action::OpenExternally,
         KeyCode::Char('i') => Action::ToggleIntercept,
-        // L4 inspector (a no-op on a non-L4 flow): b build craft, s inject.
+        // L4 inspector (a no-op on a non-L4 flow): b build craft, s inject,
+        // m apply the craft spec to the parked packet, u revert that edit.
         KeyCode::Char('b') => Action::L4Build,
         KeyCode::Char('s') => Action::L4Inject,
+        KeyCode::Char('m') => Action::L4MutateParked,
+        KeyCode::Char('u') => Action::L4RevertParked,
         KeyCode::Char(':') => Action::PaletteOpen,
         KeyCode::Char('/') => Action::FilterOpen,
         KeyCode::Char('?') => Action::Help,
@@ -202,12 +257,12 @@ fn inspector(key: KeyEvent) -> Option<Action> {
     })
 }
 
-/// The L4 inject confirm overlay: `y` confirms (re-issues with `_confirm`),
+/// The wire-confirm overlay: `y` confirms (re-issues with `_confirm`),
 /// `n` / Esc cancels.
-fn l4_confirm(key: KeyEvent) -> Option<Action> {
+fn wire_confirm(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => Action::L4Confirm(true),
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::L4Confirm(false),
+        KeyCode::Char('y') | KeyCode::Char('Y') => Action::WireConfirm(true),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::WireConfirm(false),
         _ => return None,
     })
 }

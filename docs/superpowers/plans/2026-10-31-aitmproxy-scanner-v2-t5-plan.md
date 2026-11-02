@@ -482,6 +482,9 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
+**Live proof (2026-11-01, plan `2026-11-01-t5-live-proof-plan.md`):** applied on Linux at lane level (cis-lab, kernel 6.8, `c4a4d610`, 2026-11-01 21:30 UTC: reset x 20, icmp(3,3) x 20 paced at 1.1 s, clean x 100, counters crashes 0 / liveness_failures 0, tcpdump witness 105 datagrams each way on the echo port); real-bus cells pending the T1b engine (#232), then a follow-up PR flips the two shims and runs them on the rig; macOS blocked on the `aitm-l4-helper` bundle (units p3/p4), cells SKIP 77 with `packet-capture permission not granted (aitm-l4-helper phase 1 pending)`. Two pre-existing Critical transport defects fixed in that PR (self-echo correlation; Linux loopback layer-2 injection inert) and amendments 46/49 recorded there.
+
+
 **Status at PR time (2026-11-01, branch `claude/scanner-v2-t5-9ffa6b`, PR against `main`; merged by the orchestrator merge point, not by this session).**
 
 What landed (Tasks 1-13 plus four panel fix rounds):

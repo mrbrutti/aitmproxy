@@ -16,7 +16,9 @@ use aitm_scan_model::ScanProfile;
 /// A profile is the operator's dial; a ceiling is the administrator's wall. A
 /// profile value above a ceiling is clamped by the engine and reported in
 /// `scan.start`'s `clamped` list rather than refused, so a generous profile
-/// still runs — bounded.
+/// still runs — bounded. One ceiling, [`l4_icmp_pace_ms_min`](Self::l4_icmp_pace_ms_min),
+/// is a floor instead: a profile value *below* it is raised and reported the
+/// same way (amendment 46).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ceilings {
     /// Maximum stimuli (probes, crawl requests, L4 cases) one job may send.
@@ -27,6 +29,11 @@ pub struct Ceilings {
     pub l4_cases: u32,
     /// Maximum L4 send rate, in bytes per second.
     pub l4_bytes_per_s: u32,
+    /// Minimum spacing, in milliseconds, of a profile's `l4.icmp_pace_ms`
+    /// (amendment 46): a floor, not a cap; a lower profile value is raised to
+    /// it and reported in `clamped`. The packet lane applies the same floor
+    /// itself as defence in depth.
+    pub l4_icmp_pace_ms_min: u32,
     /// Maximum WebSocket frame payload one job may send, in bytes.
     pub ws_frame_bytes: u32,
     /// Maximum issues one job may record; the job stops at the ceiling.
@@ -40,6 +47,7 @@ impl Default for Ceilings {
             time_s: 7_200,
             l4_cases: 5_000,
             l4_bytes_per_s: 1_048_576,
+            l4_icmp_pace_ms_min: 1_000,
             ws_frame_bytes: 4_194_304,
             max_issues: 4_096,
         }
@@ -159,6 +167,7 @@ mod tests {
                 time_s: 7_200,
                 l4_cases: 5_000,
                 l4_bytes_per_s: 1_048_576,
+                l4_icmp_pace_ms_min: 1_000,
                 ws_frame_bytes: 4_194_304,
                 max_issues: 4_096,
             }
