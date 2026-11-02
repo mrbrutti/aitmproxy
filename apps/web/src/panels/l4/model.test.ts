@@ -34,6 +34,7 @@ import {
   type L4ParkedWire,
   type L4PollClock,
   type L4ScopeEntryWire,
+  isPendingAvailability,
 } from './model';
 import { CHIPS } from '~/shell/chips';
 
@@ -344,6 +345,21 @@ describe('packetHeadline (spec §2 addresses)', () => {
   });
 });
 
+describe('isPendingAvailability (spec §1 pending literal; tester pass 2)', () => {
+  it('is true for the frozen constant and for an equal copy, false for anything the core actually answered', () => {
+    expect(isPendingAvailability(PENDING_AVAILABILITY)).toBe(true);
+    expect(isPendingAvailability({ available: false, code: null, reason: 'Reading L4 availability…' })).toBe(true);
+    // The pending reason text with any real answer shape is not pending: the core said something.
+    expect(isPendingAvailability({ available: true, code: 'available', reason: 'Reading L4 availability…' })).toBe(false);
+    expect(isPendingAvailability({ available: true, code: null, reason: 'Reading L4 availability…' })).toBe(false);
+    expect(isPendingAvailability({ available: false, code: 'needs_privilege', reason: 'Reading L4 availability…' })).toBe(false);
+    // An old-core "unavailable, no code" answer with its own reason is a real answer.
+    expect(isPendingAvailability({ available: false, code: null, reason: 'OLD-CORE-REASON' })).toBe(false);
+    expect(isPendingAvailability({ available: false, code: null, reason: null })).toBe(false);
+    expect(isPendingAvailability({ available: false, code: null, reason: '' })).toBe(false);
+  });
+});
+
 describe('formatPacketTime (spec §2 timestamp)', () => {
   // 1_761_904_800_007 ms is 2025-10-31T10:00:00.007Z.
   const T = 1_761_904_800_007;
@@ -354,6 +370,24 @@ describe('formatPacketTime (spec §2 timestamp)', () => {
     expect(formatPacketTime(T, 'Asia/Tokyo')).toBe('19:00:00.007');
     // Midnight is 00, never 24; single digits are padded.
     expect(formatPacketTime(Date.UTC(2025, 9, 31, 0, 5, 9, 3), 'UTC')).toBe('00:05:09.003');
+  });
+
+  it('a negative epoch and the last millisecond before midnight stay well-formed', () => {
+    expect(formatPacketTime(-1, 'UTC')).toBe('23:59:59.999');
+    expect(formatPacketTime(Date.UTC(2025, 9, 31, 23, 59, 59, 999), 'UTC')).toBe('23:59:59.999');
+  });
+
+  // DEFECT (tester pass 2, reported to the Coder): the fix-3 `Intl.DateTimeFormat` path throws
+  // `RangeError: Invalid time value` for a non-finite or out-of-range epoch (`new Date(9e15)` is an
+  // Invalid Date), where the pre-fix getters returned a harmless `NaN:NaN:NaN.NaN`. `PacketList.tsx`
+  // guards `timestamp != null` only, and `9000000000000000` or `1e400` are valid JSON numbers a core
+  // can put in a packet, so one bad timestamp throws out of the packet list render. Pinned with
+  // `it.fails` so the gate stays green while the defect is open: once `formatPacketTime` stops
+  // throwing, this test goes red — drop the `.fails` then.
+  it.fails('DEFECT: a non-finite or out-of-range timestamp must not throw out of the packet list render', () => {
+    for (const bad of [9_000_000_000_000_000, Number.POSITIVE_INFINITY, Number.NaN]) {
+      expect(() => formatPacketTime(bad, 'UTC'), String(bad)).not.toThrow();
+    }
   });
 
   it('defaults to the local zone', () => {

@@ -380,15 +380,46 @@ const CAPTURE_START_LITERAL = /['"]l4\.capture\.start\b/;
 const FILTER_IN_USE = /(?<![.\w])filter\s*[:=(]/;
 /** The signal setter a `filter` input would need. */
 const SET_FILTER = /\bsetFilter\b/;
-/** Whether one line of source uses `filter` as a key, prop, signal or setter. */
-const mentionsFilter = (line: string): boolean => FILTER_IN_USE.test(line) || SET_FILTER.test(line);
+/** A `filter` key written as object shorthand — `{ iface, filter }` / `{ filter, direction }` (tester pass 2). */
+const FILTER_SHORTHAND = /[{,]\s*filter\s*[,}]/;
+/** A `filter` key written quoted — `'filter': x` / `"filter": x` (tester pass 2). */
+const FILTER_QUOTED_KEY = /['"]filter['"]\s*:/;
+/** Whether one line of source uses `filter` as a key (bare, shorthand or quoted), prop, signal or setter. */
+const mentionsFilter = (line: string): boolean => FILTER_IN_USE.test(line) || SET_FILTER.test(line) || FILTER_SHORTHAND.test(line) || FILTER_QUOTED_KEY.test(line);
 
 describe('no_filter_on_capture_start (C4 tripwire, AC18)', () => {
   it('mentionsFilter matches a filter key, prop, call or setter, and not the word in prose or another identifier', () => {
-    for (const hit of ["filter: bpf()", 'filter={props.filter}', 'value={filter()}', "const [filter, setFilter] = createSignal('')", '  filter : "udp"', 'setFilter(x)']) {
+    for (const hit of [
+      "filter: bpf()",
+      'filter={props.filter}',
+      'value={filter()}',
+      "const [filter, setFilter] = createSignal('')",
+      '  filter : "udp"',
+      'setFilter(x)',
+      // Tester pass 2: a key smuggled as object shorthand or a quoted key is still a filter key.
+      "app.call('l4.capture.start', { interface: iface, direction, filter })",
+      '{ filter, direction }',
+      "{interface: iface,filter}",
+      "'filter': bpf",
+      '"filter": bpf()',
+      "{ 'filter' : x }",
+    ]) {
       expect(mentionsFilter(hit), hit).toBe(true);
     }
-    for (const miss of ['// the core derives the BPF filter from scope', "const filterMode = 'and'", 'rows.filter((r) => r.ok)', 'aria-label="Capture filter"', 'quickFilter']) {
+    for (const miss of [
+      '// the core derives the BPF filter from scope',
+      "const filterMode = 'and'",
+      'rows.filter((r) => r.ok)',
+      'aria-label="Capture filter"',
+      'quickFilter',
+      // Tester pass 2: prose with a comma, a property read, a label, an unrelated quoted word.
+      '// one filter, derived from scope, per capture',
+      'if (flow.filter) parts.push(flow.filter);',
+      "const f = flow.filter ?? ''",
+      '<span>filter</span>',
+      "'filtered': true",
+      'prefilter: x',
+    ]) {
       expect(mentionsFilter(miss), miss).toBe(false);
     }
   });

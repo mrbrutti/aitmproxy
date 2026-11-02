@@ -350,6 +350,33 @@ describe('L4 store: windowed reads (spec §2)', () => {
     expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2, 3]);
     expect(h.store.inspected()?.truncated).toBe(false);
   });
+
+  it('loadMore releases its guard after a failed read, so the next click reads the same window again (tester pass 2)', async () => {
+    const pkt = (n: number) => ({ dir: 'inbound' as const, length: n, injected: false, layers: ['IPv4', 'UDP'] });
+    let tailReads = 0;
+    h = harness({
+      replies: {
+        'l4.flow.list': ['F1'],
+        'l4.flow.get': (a: Record<string, unknown>) => {
+          if (a.limit === 0) return flowWire('F1', { packet_count: 3 });
+          if (a.offset === 0) return flowWire('F1', { packet_count: 3, packets: [pkt(1), pkt(2)], offset: 0, truncated: true, next_offset: 2 });
+          if (++tailReads === 1) throw new BusError('tail boom');
+          return flowWire('F1', { packet_count: 3, packets: [pkt(3)], offset: 2, truncated: false, next_offset: null });
+        },
+      },
+    });
+    await h.store.refresh();
+    await h.store.inspect('F1');
+    await h.store.loadMore();
+    expect(h.notices).toEqual([['l4.flow.get: tail boom', 'error']]);
+    expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2]);
+    expect(h.store.inspected()?.truncated).toBe(true);
+    // The failed read must not leave the guard armed: the retry goes to the wire and lands.
+    await h.store.loadMore();
+    expect(h.argsOf('l4.flow.get').filter((a) => a.offset === 2)).toHaveLength(2);
+    expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2, 3]);
+    expect(h.store.inspected()?.truncated).toBe(false);
+  });
 });
 
 describe('L4 store: refresh(force) while a pass is in flight (fix 3)', () => {
@@ -368,6 +395,39 @@ describe('L4 store: refresh(force) while a pass is in flight (fix 3)', () => {
     expect(h.count('l4.flow.list')).toBe(2);
     expect(h.count('l4.capture.status')).toBe(2);
     expect(h.count('l4.scope.list')).toBe(2);
+  });
+
+  it('two forced refreshes arriving mid-pass collapse into one extra pass, not two (tester pass 2)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    let listCalls = 0;
+    h = harness({ replies: { 'l4.flow.list': () => (++listCalls === 1 ? gate.then(() => []) : []) } });
+    const timerPass = h.store.refresh();
+    const forcedA = h.store.refresh(true);
+    const forcedB = h.store.refresh(true);
+    expect(h.count('l4.flow.list')).toBe(1);
+    release();
+    await Promise.all([timerPass, forcedA, forcedB]);
+    expect(h.count('l4.flow.list')).toBe(2);
+    expect(h.count('l4.scope.list')).toBe(2);
+    // The queued force is consumed: a later ordinary tick inside the idle 10 s window reads nothing more.
+    await h.store.refresh();
+    expect(h.count('l4.flow.list')).toBe(2);
+  });
+
+  it('a forced refresh queued behind a pass that failed still runs, and the failure is noticed once (tester pass 2)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    let listCalls = 0;
+    h = harness({ replies: { 'l4.flow.list': () => (++listCalls === 1 ? gate.then(() => Promise.reject(new BusError('boom'))) : []) } });
+    const timerPass = h.store.refresh();
+    const forced = h.store.refresh(true);
+    release();
+    await Promise.all([timerPass, forced]);
+    expect(h.count('l4.flow.list')).toBe(2);
+    expect(h.notices).toEqual([['l4.flow.list: boom', 'error']]);
+    // The forced pass read the list clean, so the store's error is clear again.
+    expect(h.store.error()).toBeNull();
   });
 
   it('a plain timer call arriving mid-pass is still dropped (no queueing of ordinary ticks)', async () => {
