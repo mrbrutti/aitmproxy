@@ -415,6 +415,25 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 3 | orchestrator (Terminal live run) | Critical | F1 `socket_fdinfo` mirror used `soi_kind`/`soi_proto` at 232/240 (offsets inside `socket_info`); every socket read `soi_kind == 0`, nothing matched | fixed in 5b7971d0 (absolute 256/264, C `offsetof` probe; spec AC8 + research 24 corrected) |
+| 2, 5 | orchestrator (Terminal live run) | Important | F2 20 rapid sequential GETs named only 14 rows: every connection paid a full, token-limited scan | fixed in 28ff96f4 (warm-pid MRU probe first, full scan only on miss, bucket 20/20; e2e asserts all 20 rows named) |
+| 2 | quality, tester | Important | Q1 / T-F1 a panicking scanner leaves `scanning = true` forever; JoinError swallowed silently | fixed in d3e949fc (`ScanGuard` drop guard, `catch_unwind` + `warn!` in the blocking task; two tests) |
+| 6 | security | Minor | S1 one `spawn_blocking` per loopback connection, no in-flight cap; non-leader waits the 250 ms deadline | fixed in d3e949fc (`MAX_IN_FLIGHT = 64` semaphore, `try_acquire_owned` → `None`) |
+| 1 | security | Minor | S2 sanitiser passed whitespace-only / Zl / Zp / non-ASCII Zs identities | fixed in 8a6e3960 |
+| 3, 4 | security | Minor | S3 scan deadline checked between pids only | fixed in 8a6e3960 (`FD_DEADLINE_STRIDE = 64`) |
+| 3 | security | Minor | S4 ffi module doc overstated the pin test; unsafe count is 10 (coder said 8) | fixed in 8a6e3960; 10 blocks signed off in the security report |
+| 2, 3, 4, 5, 8 | quality | Minor | Q2 `Probe::gone` platform mismatch; Q3 ffi over-visibility; Q4 `len` allow; Q5 duplicated `Limits`; Q6 `walk_pids(report_gone)`; Q7 warm-order comment; Q8 test hygiene; Q9 e2e scratch dir | fixed in 7aab1f88 + e28dcb4d |
+| 7 | spec | Important | P1 AC16 grep hit in `crates/aitm-plugins/tests/capture.rs:843` | fixed in faad7ee9 (tester) |
+| plan | spec | Important | P2 F2 amendment swallowed the `### Task 6` heading | fixed in 8015c9e2 |
+| 4 | spec | Important | P3 Linux glue is `cfg(any(linux, test))` + root-path fixture tests, plan said `cfg(linux)` and no fixture test | accepted by the orchestrator 2026-11-01 (autonomous mode): fixture tests are real coverage of the walk and the test-only build does not ship; plan Task 4 + spec Constraints amended in 8015c9e2; Linux cross-check "unverified on this Mac" quoted there |
+| spec | spec | Minor | P4 stale 10/10 bucket sentences; P7 D9 five-signal telemetry never emitted | fixed in 8015c9e2 (20/20; D9 presence-only) |
+| 2, 5 | spec | Minor | P5 attribute-only edits outside declared files; P6 fix 5b7971d0 edited spec AC8 + research 24; P8 Task 8 passes `"body": "none"` | accepted by the orchestrator 2026-11-01 (expected consequence of staged scaffolding allows; orchestrator-directed AC correction; documented parameter) |
+| whole | tester | Minor | T-F2 AC16 literal grep hits archival 2026-10-31 spec/plan and this spec quoting the phrase | accepted by the orchestrator 2026-11-01; AC16 scope set to `crates docs/design` in 11c1b107 |
+| 2, 3, 4, 5 | quality (re-check) | Minor | Q10 `with_limits` routed through `for_tests`; Q11 `ScanGuard::drop` duplicated the scan tail; Q12 guard safety rests on declaration order; Q13 two `Arc` scanner impls; Q14 `PanickingScanner::panics` one-valued; Q15 `FD_DEADLINE_STRIDE` twice | fixed in 4e158b1a (Q12: the proposed `try_lock` variant was shown unsound by a contention test; blocking `lock()` kept, invariant documented and pinned) |
+| 4, 6 | security (re-check) | Minor | S5 Linux `socket_inodes` readlink walk had no deadline stride; S6 panic `warn!` unbounded per connection | fixed in 4e158b1a |
+| spec, plan | spec (re-check) | Important | P9 spec D3/D5/D9/AC9 described pre-fix behaviour (S1 cap, ScanGuard, stride, S2 whitespace, panic logging, `for_tests`) | fixed in 11c1b107 |
+| plan | spec (re-check) | Minor | P10-P12 plan Tasks 2-6 stale signatures; P13 AC16 self-contradictory | fixed in 11c1b107 |
+| gate | orchestrator | Minor | Full-gate noise under load avg 150-250 (sibling worktrees building): `aitm audit_log::tests::a_wedged_rotation_holds_the_file_to_twice_its_cap` red once (3/3 green alone, file untouched); `aitm tests/web_bus_write_deadline` pair and `aitm-plugin-rhai engine::each_run_gets_a_fresh_budget_and_exposes_its_deadline` (known flakes, memory `aitmproxy-load-flaky-tests`); `aitm-core tests/redact_strict` rows "no result within 60 s" (HOSTILE_SECS budget at load ~200; redaction untouched) | accepted as load noise by the orchestrator 2026-11-01; gate 1 (28ff96f4) exit 0 clean; final gate quoted in the PR |
 
 ## Shipped
 
