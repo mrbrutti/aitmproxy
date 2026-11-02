@@ -432,6 +432,14 @@ Also found on the merged build, not PR 2's, reported to the coordinator:
 
 **Files:** `crates/aitm-plugin-scanner/src/worker.rs` (one test). `cancel_moves_to_cancelled_and_keeps_issues` asserted `Cancelling` on the status `registry.cancel()` returns; the finaliser can have moved it to `Cancelled` first (CI on #229). Either state says the cancel took; terminal facts stay asserted after the signal. ×5 green.
 
+### Task 13c: two more loud SKIPs for aitm-scan-http gaps surfaced by the 09108b51 merge (e2e-only)
+
+**Files:** `tests/e2e/scan/test_t3_version_override.py`, `tests/e2e/scan/test_t1_record_policy.py` — orchestrator; coordinator's rule: a red cell that is a T2 gap SKIPs 77 naming the amendment, never fails and never reads green.
+
+- `test_t3_version_override.py`: with T2's hook wired, the cell runs to the 39b assertions and the lane crate's `crawl_error_token` names the forced-h2 failure `connect_refused` (io-kind and `starts_with("h2_not_negotiated:")` passes before the text pass; the sender's error reaches it as a "refused" text first); the interim lane answers `h2_not_negotiated`. SKIP names the token and amendment 68; the assertion stays.
+- `test_t1_record_policy.py`: `aitm-scan-http` (#295 "seeds are not pages") fetches `/robots.txt` and `/sitemap.xml` through the recording client without the `crawl` mark, so they land in the store as probe rows with no `issue:<id>` — a record-policy gap in the lane (the interim lane marks every crawl fetch). SKIP only when the offenders are exactly those seed paths on a lane crate.
+- `test_t2_session_reuse.py` ("job 2 (session none) has issues on /account"): under measurement (`/tmp/claude/t1b/proof/session_dump.py`): whether job 2's `/account` requests carry a cookie decides between a T2 session-mode gap and an engine attribution issue.
+
 ### Task 6: bookkeeping and docs wording
 
 - **Satisfies:** workflow stage-7 record keeping; amendment 39/40 operator docs.
