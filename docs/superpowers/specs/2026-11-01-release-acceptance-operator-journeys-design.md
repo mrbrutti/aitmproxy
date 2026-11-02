@@ -136,7 +136,7 @@ that fails blocks the release until it is fixed or Matt accepts it in writing in
   CLI-10 ← MAC-8. Neither `SKIP` nor `BLOCKED` is ever counted as green. A sixth result, `N/A`,
   marks a step that does not exist on that surface or build (TUI-9/10, WEB-9/10, N1-TUI, N1-WEB,
   N5-CLI); it is listed, never performed, and does not hold the verdict at `incomplete`.
-- **Run verdict**: `pass` (every step PASS or N/A, or FAIL with Matt's written acceptance), `fail`
+- **Run verdict**: `pass` (every step PASS or N/A with at least one performed PASS, or FAIL with Matt's written acceptance), `fail`
   (a performed step FAILed without one), `incomplete` (no FAIL, but a step is SKIP or BLOCKED for
   want of a yes, a hand or a free port), `error` (a cell crashed or was killed by the watchdog; the
   machine state is re-read and restored regardless). Only `pass` clears the tap bump; `run.sh`
@@ -485,4 +485,8 @@ Stage-6 panel 2 on the fix round `e1583c75..6765dee0` (security, quality, spec; 
 | S2-1 | spec | Important | CLI-9 `set` without the bypass precondition; substring bypass check | Fixed: `config_bypass` precondition, `bypass_applied`, FAIL `bypass not applied` |
 | S2-2 | spec | Important | secret values collected only at the end (app may have quit); web `#t=` never added | Fixed: collected at start and end; the web cell writes its bearer values to a 0600 `.secrets` file the grep reads and deletes |
 | S2-3 | spec | Important | 0.5.10 README lacks CLI-0/9/10, MAC-0, MAC-9a, per-surface N2/N4 rows | Fixed in the report |
-| Q2/S2 Minor | both | Minor | N5-WEB written by two cells; `N/A` result for n/a steps (spec gap); ERROR precedence; SKIP detail grep; report.py failure silent; watchdog sleep leftover; `tooling_mentioned` helper; `find_embedded_core` OSError; index run-2 row; `:scope rm` / `-R` frames / ax_press / N5-WEB placement need spec sentences; `mac_bypass_ok` key; CLI-3 checks 8080 only; AX label assumptions (Apps sidebar title, combined Scope row) to verify on the window | All fixed or amended above (D1 `N/A`, D7 N5 row, Open q3, Constraints, D9); AX labels verified on the window in run 3 |
+| Q2/S2 Minor | both | Minor | N5-WEB written by two cells; `N/A` result for n/a steps (spec gap); ERROR precedence; SKIP detail grep; report.py failure silent; watchdog sleep leftover; `tooling_mentioned` helper; `find_embedded_core` OSError; index run-2 row; `:scope rm` / `-R` frames / ax_press / N5-WEB placement need spec sentences; `mac_bypass_ok` key; CLI-3 checks 8080 only; AX label assumptions (Apps sidebar title, combined Scope row) to verify on the window | All fixed or amended above (D1 `N/A`, D7 N5 row, Open q3, Constraints, D9); AX labels: `ax_press --prefix` fallback implemented, verification deferred to the window half (run 4) |
+
+Stage-6 panel 3 on the fix round `6765dee0..84e22c4f` (2026-11-02): spec PASS with three Minors (Review-log
+wording about AX verification; stale "300 ms" strings in the mac cell; `pass` needs one performed PASS) — all
+fixed in the same commit; security and quality verdicts recorded on the PR.

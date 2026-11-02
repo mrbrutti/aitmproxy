@@ -401,10 +401,10 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             step("MAC-12", "PASS" if bus.call("proxy.status", {}).get("intercept_armed") is False else "FAIL", "disarmed", "intercept_armed false")
 
         # MAC-13 — Restart Core (window only: it restarts his core, changes nothing on the Mac);
-        # N1-MAC rides the same restart when a hand is present (add within 300 ms, frames captured).
+        # N1-MAC rides the same restart when a hand is present (add within ~1 s after a focus re-probe, frames captured).
         if not WINDOW:
             step("MAC-13", "SKIP", "needs the window (ACCEPT_WINDOW=1): Proxy ▸ Restart Core; Scope must survive")
-            step("N1-MAC", "SKIP", "needs the window and --manual (Restart Core, then an add within 300 ms)")
+            step("N1-MAC", "SKIP", "needs the window and --manual (Restart Core, then an add within ~1 s after a focus re-probe)")
         else:
             sc_before = bus.call("scope.list", {})
             n1 = is_manual() and open_scope_sheet() and field_focused()

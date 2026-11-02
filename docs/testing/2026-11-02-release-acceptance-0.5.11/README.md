@@ -145,5 +145,5 @@ end); `.secrets` shredded. This is the runner the PR ships.
 
 Pending: display lock after the attribution session's Task 8; yes-list requested from Matt
 (MAC-1/16 quit + relaunch, MAC-6/15, MAC-7/14 not needed while All Apps is on, Safari visits,
-TUI-3/7 and WEB-4/7 system-proxy flips). Scope hosts added by run 2 are removed at its end
+TUI-3/7 and WEB-4/7 system-proxy flips). Scope hosts added by run 4 are removed at its end
 unless Matt says keep, and listed either way.
