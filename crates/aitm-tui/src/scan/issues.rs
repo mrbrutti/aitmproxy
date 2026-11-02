@@ -8,8 +8,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
-    BySeverity, Confidence, FlowRef, Issue, IssueId, IssueStatus, IssueSummary, IssuesResult,
-    JobId, L4Evidence, L4Location, L4Oracle, L4Transport, LaneKind, Timing,
+    BySeverity, Confidence, FlowRef, Issue, IssueId, IssueLocation, IssueStatus, IssueSummary,
+    IssueTarget, IssuesResult, JobId, L4Evidence, L4Location, L4Oracle, L4Transport, LaneKind,
+    Timing,
 };
 use serde_json::{json, Map, Value};
 
@@ -691,28 +692,39 @@ impl DetailLayout {
 /// the target, the location and its L4 point, `poc_ref`, `finding_id`);
 /// `id` was matched by the fold and is left alone, as are the enums and
 /// numbers the contract bounds. The truncated `jobs` gives its capacity
-/// back.
+/// back. The fields both shapes carry are listed once, in the helpers
+/// [`location_strings`], [`target_strings`] and [`bound_jobs`] this and
+/// [`bound_issue`] share (fix round I, I1).
 fn bound_summary(summary: &mut IssueSummary) {
-    let cut = |s: &mut String| cut_to(s, DETAIL_VALUE_MAX);
-    summary.jobs.truncate(DETAIL_LIST_MAX);
-    summary.jobs.shrink_to_fit();
-    let loc = &mut summary.location;
+    bound_jobs(&mut summary.jobs);
     let mut fields: Vec<&mut String> = vec![
         &mut summary.job,
         &mut summary.name,
         &mut summary.class,
         &mut summary.check_id,
-        &mut summary.target.scheme,
-        &mut summary.target.host,
-        &mut loc.path,
-        &mut loc.path_template,
-        &mut loc.name,
     ];
+    fields.extend(target_strings(&mut summary.target));
+    fields.extend(location_strings(&mut summary.location));
     fields.extend(summary.jobs.iter_mut());
     fields.extend(
+        [summary.poc_ref.as_mut(), summary.finding_id.as_mut()]
+            .into_iter()
+            .flatten(),
+    );
+    for field in fields {
+        cut_to(field, DETAIL_VALUE_MAX);
+    }
+}
+
+/// Every string an [`IssueLocation`] carries (the path, its template, the
+/// point's name, then the method, field path and WS path when present, and
+/// the L4 point's ip, grammar, field path and mutation when it has one), as
+/// the mutable borrows the fold cuts (fix round I, I1: listed once for
+/// [`bound_summary`] and [`bound_issue`]).
+fn location_strings(loc: &mut IssueLocation) -> Vec<&mut String> {
+    let mut fields: Vec<&mut String> = vec![&mut loc.path, &mut loc.path_template, &mut loc.name];
+    fields.extend(
         [
-            summary.poc_ref.as_mut(),
-            summary.finding_id.as_mut(),
             loc.method.as_mut(),
             loc.field_path.as_mut(),
             loc.ws_path.as_mut(),
@@ -732,9 +744,27 @@ fn bound_summary(summary: &mut IssueSummary) {
             .flatten(),
         );
     }
-    for field in fields {
-        cut(field);
-    }
+    fields
+}
+
+/// The two strings an [`IssueTarget`] carries, the scheme and the host (the
+/// port is a number the contract bounds).
+fn target_strings(target: &mut IssueTarget) -> [&mut String; 2] {
+    [&mut target.scheme, &mut target.host]
+}
+
+/// Bound a `jobs` list at fold (fix round H, H84, H86; fix round I, I1):
+/// a finder listed twice is kept once, at its first place, then the list
+/// is cut to [`DETAIL_LIST_MAX`] and gives its capacity back. Returns how
+/// many distinct finders the cut dropped (the `+n` of the `job` line); a
+/// collapsed duplicate is the same finder, not a dropped one.
+fn bound_jobs(jobs: &mut Vec<JobId>) -> usize {
+    let mut seen: BTreeSet<JobId> = BTreeSet::new();
+    jobs.retain(|j| seen.insert(j.clone()));
+    let dropped = jobs.len().saturating_sub(DETAIL_LIST_MAX);
+    jobs.truncate(DETAIL_LIST_MAX);
+    jobs.shrink_to_fit();
+    dropped
 }
 
 /// Cut every string [`issue_detail_lines`], [`issue_head`] and [`flow_at`]
@@ -757,22 +787,16 @@ fn bound_summary(summary: &mut IssueSummary) {
 /// only.
 fn bound_issue(issue: &mut Issue) -> Dropped {
     let cut = |s: &mut String| cut_to(s, DETAIL_VALUE_MAX);
-    let dropped_jobs = issue.jobs.len().saturating_sub(DETAIL_LIST_MAX);
-    issue.jobs.truncate(DETAIL_LIST_MAX);
-    issue.jobs.shrink_to_fit();
-    let loc = &mut issue.location;
+    let dropped_jobs = bound_jobs(&mut issue.jobs);
     let mut fields: Vec<&mut String> = vec![
         &mut issue.description,
         &mut issue.job,
         &mut issue.name,
         &mut issue.class,
         &mut issue.check_id,
-        &mut issue.target.scheme,
-        &mut issue.target.host,
-        &mut loc.path,
-        &mut loc.path_template,
-        &mut loc.name,
     ];
+    fields.extend(target_strings(&mut issue.target));
+    fields.extend(location_strings(&mut issue.location));
     fields.extend(issue.jobs.iter_mut());
     fields.extend(
         [
@@ -782,25 +806,10 @@ fn bound_issue(issue: &mut Issue) -> Dropped {
             issue.note.as_mut(),
             issue.poc_ref.as_mut(),
             issue.finding_id.as_mut(),
-            loc.method.as_mut(),
-            loc.field_path.as_mut(),
-            loc.ws_path.as_mut(),
         ]
         .into_iter()
         .flatten(),
     );
-    if let Some(l4) = &mut loc.l4 {
-        fields.push(&mut l4.ip);
-        fields.extend(
-            [
-                l4.grammar.as_mut(),
-                l4.field_path.as_mut(),
-                l4.mutation.as_mut(),
-            ]
-            .into_iter()
-            .flatten(),
-        );
-    }
     let mut dropped_mutations = 0;
     if let Some(l4) = &mut issue.evidence.l4 {
         dropped_mutations = l4.mutation_chain.len().saturating_sub(MUTATIONS_MAX + 1);
