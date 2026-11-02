@@ -21,7 +21,7 @@
 
 use std::fmt::Write as _;
 
-use aitm_cli::dispatch::{group_usage_line, placeholder, spaced, type_hint, usage_form};
+use aitm_cli::dispatch::{group_of, group_usage_line, placeholder, spaced, type_hint, usage_form};
 use aitm_core::{Command, Registry};
 use aitm_term::caps::Caps;
 use aitm_term::help::{help_page, Block, HelpPage, HelpRow, HelpSection};
@@ -281,11 +281,6 @@ pub fn render(caps: &Caps, page: &HelpPage) -> String {
     help_page(caps, page)
 }
 
-/// The group of a dotted command name: its first segment.
-fn group_of(name: &str) -> &str {
-    name.split('.').next().unwrap_or(name)
-}
-
 /// The verb of a dotted command name: everything after its first segment
 /// (`passthrough.add` for `tls.passthrough.add`); the whole name when it has
 /// no dot.
@@ -340,7 +335,7 @@ mod tests {
     use aitm_proto_l4::config::L4Config;
     use aitm_sysproxy::SystemProxyConfig;
     use aitm_term::caps::Caps;
-    use aitm_term::help::{Block, HelpRow};
+    use aitm_term::help::{Block, HelpRow, DESC_COL};
     use aitm_term::text;
 
     use super::*;
@@ -844,8 +839,6 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
 
     // ---- tester, wave-2 pass 1 (AC-W2-1/2; plan C40–C45, C50) ----
 
-    use aitm_term::help::DESC_COL;
-
     /// The schema-only registry with `l4.enabled` for `env` (the widest set
     /// help can show), built in-process (plan rule 13).
     fn registry_with_l4(tag: &str, env: &[(&str, &str)]) -> Described {
@@ -969,9 +962,11 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
     }
 
     /// An example wider than the terminal is printed whole (plan C40/C45):
-    /// `map.add`'s 124-column line in an 80-column page is one line, at 40 too.
+    /// `map.add`'s catalogue line is wider than an 80-column page (its two
+    /// JSON values cannot fit 76) and renders as one `  $ ` line at 80, at 40
+    /// and at 200, at its own width plus the prompt.
     #[test]
-    fn verb_page_prints_a_124_column_example_whole_at_80() {
+    fn verb_page_prints_an_over_wide_example_whole_at_every_width() {
         let described = registry_with("map-add", NO_CATALOGUE_ENV);
         let cmd = described
             .registry
@@ -979,7 +974,8 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
             .expect("map.add is registered");
         let page = verb(cmd.as_ref());
         let example = examples_for("map.add")[0];
-        assert_eq!(example.chars().count(), 124);
+        let example_width = text::width(example);
+        assert!(example_width > 80, "{example_width}: {example}");
         for width in [40u16, 80, 200] {
             let out = render(
                 &Caps {
@@ -992,6 +988,11 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
                 out.contains(&format!("\nExamples:\n  $ {example}\n")),
                 "{width}: {out}"
             );
+            let line = out
+                .lines()
+                .find(|line| line.starts_with("  $ aitm map add "))
+                .unwrap_or_else(|| panic!("{width}: {out}"));
+            assert_eq!(text::width(line), 4 + example_width, "{width}: {line}");
         }
     }
 
@@ -1124,7 +1125,8 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
     }
 
     /// AC-W2-2 in-process over the widest registry (the catalogue and
-    /// `l4.enabled`: 19 groups, 113 commands): every group page opens with
+    /// `l4.enabled`: 19 groups; the command count is pinned once, in
+    /// `tests/describe_registry.rs`): every group page opens with
     /// its title and usage form and has one row per verb — `verb_row` and the
     /// first sentence — and an example; every verb page opens with its
     /// description, has `Usage: aitm <spaced>`, a `Flags:` row per parameter
@@ -1137,7 +1139,6 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
         let reg = &described.registry;
         let groups = describe::groups(reg);
         assert_eq!(groups.len(), 19);
-        assert_eq!(reg.commands().count(), 113);
         let mut verbs_seen = 0;
         for (name, cmds) in &groups {
             let group_page = group(reg, name).unwrap_or_else(|| panic!("{name}"));
@@ -1214,6 +1215,6 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
                 }
             }
         }
-        assert_eq!(verbs_seen, 113);
+        assert_eq!(verbs_seen, reg.commands().count());
     }
 }

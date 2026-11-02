@@ -2,20 +2,21 @@
 //! (plan Task 14; C31, C33): the mode topics render without a registry;
 //! everything else reads the config (read-only; defaults plus one warning when
 //! it cannot be read), builds `describe::registry` and locates the topic
-//! through `aitm_cli::Cli::locate`. An implicit request that names nothing is
-//! `NotHelp` and the invocation continues as `Mode::Cli`; an explicit one is
-//! an error pre-boot.
+//! through the free `aitm_cli::dispatch::locate`. An implicit request that
+//! names nothing is `NotHelp` and the invocation continues as `Mode::Cli`; an
+//! explicit one is an error pre-boot.
 //!
 //! Nothing here creates a file or directory, opens a log, installs a tracing
 //! subscriber, spawns a process or binds (plan rule 12): the config is read
 //! through `config_file::load_settings`, the environment through the caller's
-//! closure, and the registry is `describe::registry`'s inert one.
+//! closure, and the registry is `describe::registry`'s inert one. Nothing
+//! here probes a terminal either: the topic is resolved over the registry
+//! alone, and no `Cli` (whose constructor builds a stdin confirmer and
+//! measures stderr) exists on the help path (fix Q1).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use aitm_cli::dispatch::Located;
-use aitm_cli::Cli;
+use aitm_cli::dispatch::{locate, Located};
 use aitm_core::Config;
 use aitm_plugin_rhai::RhaiConfig;
 use aitm_proto_l4::config::L4Config;
@@ -95,7 +96,7 @@ pub fn settings_for_help(config_path: Option<&Path>, reporter: &Reporter) -> Set
 ///   [`settings_for_help`]; a registry that cannot be built (the scripting
 ///   engine or its runtime, never a script) is `Answer::Error` as a failure;
 /// - topic `[]`: the top page;
-/// - else `Cli::locate(topic)`: a group is its group page; a command is its
+/// - else `locate(registry, topic)`: a group is its group page; a command is its
 ///   verb page for an explicit request only (anything after the verb is
 ///   ignored, so `aitm scope add --host --help` is `scope add`'s page); a
 ///   usage error is `Error` for an explicit request. An implicit request (a
@@ -119,15 +120,14 @@ pub fn answer(req: &HelpRequest, inputs: &HelpInputs, reporter: &Reporter) -> An
         env: inputs.env,
     }) {
         Ok(described) => described,
-        Err(err) => return Answer::Error(ErrorReport::failure(err.to_string())),
+        Err(err) => return Answer::Error(registry_failure(&err)),
     };
     let registry = &described.registry;
     if req.topic.is_empty() {
         return page(inputs.caps, &pages::top_level(registry, inputs.version));
     }
 
-    let cli = Cli::new(Arc::clone(registry));
-    match cli.locate(&req.topic) {
+    match locate(registry, &req.topic) {
         Ok(Located::Group { name, .. }) => match pages::group(registry, &name) {
             Some(group_page) => page(inputs.caps, &group_page),
             // `locate` found the group in this same registry, so its page
@@ -152,6 +152,14 @@ pub fn answer(req: &HelpRequest, inputs: &HelpInputs, reporter: &Reporter) -> An
 /// `page` rendered for `caps` (plan C49: stdout's).
 fn page(caps: &Caps, page: &HelpPage) -> Answer {
     Answer::Page(pages::render(caps, page))
+}
+
+/// A `describe::registry` failure as a report: the top of the `anyhow` chain
+/// is the headline and every cause under it a `why` line, so nothing the
+/// engine said is lost (fix Q2). Pre-boot, so no log footer.
+fn registry_failure(err: &anyhow::Error) -> ErrorReport {
+    ErrorReport::failure(err.to_string())
+        .with_why(err.chain().skip(1).map(ToString::to_string).collect())
 }
 
 /// The first line of the error's root cause: `load_settings`'s context
@@ -190,7 +198,7 @@ mod tests {
 
     use super::*;
     use crate::help::pages::{OPERATOR_TOKEN_USAGE_LINE, TUI_USAGE_LINE, WEB_USAGE_LINE};
-    use crate::help::request::HelpRequest;
+    use crate::help::request::{self, HelpRequest};
 
     /// The shipped catalogue, reached through the injected env (plan rule 13).
     const BUNDLED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/bundled");
@@ -592,8 +600,6 @@ mod tests {
 
     // ---- tester, wave-2 pass 1 (AC-W2-2/3/7; plan C29, C31, C33) ----
 
-    use crate::help::request;
-
     /// A help flag in a value position (`aitm scope add --host --help`) is
     /// the verb's page: `request::parse` keeps the leading tokens and
     /// `answer` ignores the rest (plan Task 14); with an unknown verb before
@@ -727,7 +733,25 @@ mod tests {
             "{text}"
         );
         let verbs = verb_rows(text);
-        assert_eq!(verbs.len(), 25, "3 scripts + 22 natives: {verbs:?}");
+        // One row per `l4` command of the same registry (3 scripts, then the
+        // module's natives); the absolute count is pinned once, in
+        // `tests/describe_registry.rs`.
+        let (reporter, _) = reporter();
+        let settings = settings_for_help(Some(&config.path), &reporter);
+        let env = env_map(CATALOGUE_ENV);
+        let lookup = |key: &str| env.get(key).cloned();
+        let described = describe::registry(&DescribeInputs {
+            settings: &settings,
+            script_args: &[],
+            env: &lookup,
+        })
+        .expect("the schema-only registry builds");
+        let l4_commands = describe::groups(&described.registry)
+            .into_iter()
+            .find(|(group, _)| group == "l4")
+            .map_or(0, |(_, cmds)| cmds.len());
+        assert!(l4_commands > 3, "{l4_commands}");
+        assert_eq!(verbs.len(), l4_commands, "{verbs:?}");
         assert!(verbs[0].starts_with("  recon "), "{}", verbs[0]);
         assert!(verbs[1].starts_with("  tcp_probe "), "{}", verbs[1]);
         assert!(verbs[2].starts_with("  udp_probe "), "{}", verbs[2]);
@@ -749,5 +773,97 @@ mod tests {
             std::fs::read_to_string(&config.path).expect("still there"),
             "l4:\n  enabled: true\n"
         );
+    }
+
+    // ---- fixes Q1, Q2 (panel pass 1) ----
+
+    /// Fix Q1: the help path resolves its topic through the free
+    /// `aitm_cli::dispatch::locate` and constructs no `Cli`, so neither
+    /// `TtyConfirmer::from_stdin()` nor `Caps::detect_stderr` runs to print
+    /// `aitm scope`. A terminal probe is not observable from a test, so two
+    /// proxies stand in: the env closure refuses every key but the eleven
+    /// `describe` documents (the `env::apply*` and `bundled` keys `run()`
+    /// reads), and this file names no `Cli` constructor.
+    #[test]
+    fn group_page_builds_no_cli_and_reads_only_the_documented_env_keys() {
+        const READ_BY_DESCRIBE: &[&str] = &[
+            crate::env::CA_ALLOW_AGENT_INSTALL,
+            crate::env::SCOPE_ALLOW_AGENT_WIDEN,
+            crate::env::AUDIT_LOG,
+            crate::env::SCRIPTS,
+            crate::env::SCRIPTS_STRICT,
+            crate::env::L4_ALLOW_AGENT_WIDEN,
+            crate::env::L4_ALLOW_AGENT_INJECT,
+            crate::env::L4_ALLOW_AGENT_CAPTURE,
+            crate::env::L4_ALLOW_AGENT_INTERCEPT,
+            crate::bundled::BUNDLED_DIR,
+            crate::bundled::NO_BUNDLED,
+        ];
+        let strict = |key: &str| -> Option<String> {
+            assert!(
+                READ_BY_DESCRIBE.contains(&key),
+                "help asked the environment for {key}"
+            );
+            (key == crate::bundled::NO_BUNDLED).then(|| "1".to_string())
+        };
+        let config = TempConfig::new("no-cli", VALID_CONFIG);
+        let caps = piped_utf8();
+        let (reporter, sink) = reporter();
+        let answer = answer(
+            &implicit("scope"),
+            &HelpInputs {
+                config_path: Some(&config.path),
+                script_args: &[],
+                env: &strict,
+                caps: &caps,
+                version: VERSION,
+            },
+            &reporter,
+        );
+        reporter.finish();
+        assert!(
+            page(&answer).starts_with("aitm scope — which hosts are decrypted\n"),
+            "{answer:?}"
+        );
+        assert_eq!(sink.text(), "");
+        // The needles are assembled so this test's own text does not match.
+        let source = include_str!("answer.rs");
+        let cli_new = concat!("Cli", "::new(");
+        let cli_path = concat!("aitm_cli", "::Cli");
+        assert!(
+            !source.contains(cli_new),
+            "the help path constructs a Cli (and with it a confirmer and a terminal probe)"
+        );
+        assert!(
+            !source.contains(cli_path),
+            "the help path names aitm_cli's Cli; it should use dispatch::locate"
+        );
+    }
+
+    /// Fix Q2: when `describe::registry` fails, the report keeps the whole
+    /// `anyhow` chain — the top as `what`, every cause under it as a `why`
+    /// line — rather than the top line alone.
+    #[test]
+    fn registry_failure_keeps_the_cause_chain() {
+        let err = anyhow::anyhow!("the pcap backend is missing")
+            .context("installing the l4 language")
+            .context("the scripting engine could not be built");
+        let report = registry_failure(&err);
+        assert_eq!(report.kind, ErrorKind::Failure);
+        assert_eq!(report.what, "the scripting engine could not be built");
+        assert_eq!(
+            report.why,
+            vec![
+                "installing the l4 language".to_string(),
+                "the pcap backend is missing".to_string()
+            ]
+        );
+        assert_eq!(report.exit_code(), 1);
+        assert_eq!(report.command, None);
+        assert_eq!(report.log, None, "pre-boot: no log footer");
+        // A bare error has no causes to list.
+        let bare = registry_failure(&anyhow::anyhow!("no runtime"));
+        assert_eq!(bare.what, "no runtime");
+        assert_eq!(bare.why, Vec::<String>::new());
     }
 }

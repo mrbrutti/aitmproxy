@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
-use aitm_cli::dispatch::type_hint;
+use aitm_cli::dispatch::{group_of, type_hint};
 use aitm_core::{AgentState, AuditRing, Command, ParamSchema, Plugin, Registry, StdGuard};
 use aitm_findings::FindingsPlugin;
 use aitm_plugin::language::ProtocolLanguage;
@@ -84,8 +84,7 @@ pub struct Described {
     /// The private current-thread runtime whose `Handle` the tier's host verbs
     /// hold. Owned here so the handle outlives the registry; never driven,
     /// because nothing on the help path invokes a command.
-    #[allow(dead_code)]
-    runtime: tokio::runtime::Runtime,
+    _runtime: tokio::runtime::Runtime,
 }
 
 /// Build the schema-only registry: the Rhai tier as `run()` composes it, then
@@ -148,7 +147,6 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
         languages.push(lang.as_ref());
     }
     let tier = build_with_languages(rhai, services, &languages)?;
-    drop(languages);
     let script_errors: Vec<String> = tier.errors.iter().map(ToString::to_string).collect();
     // The `l4:` / `ws:` PoC-step handlers from the same language instances the
     // engine installed, as `run()` builds them.
@@ -159,8 +157,6 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
     if let Some(handler) = ws_language.as_deref().and_then(ProtocolLanguage::poc_step) {
         step_handlers.register(Arc::from(handler));
     }
-    drop(l4_language);
-    drop(ws_language);
 
     // Inert handles for the plugins that take one in `wire.rs`.
     let intercept = InterceptPlugin::new();
@@ -241,13 +237,14 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
     Ok(Described {
         registry: Arc::new(reg),
         script_errors,
-        runtime,
+        _runtime: runtime,
     })
 }
 
-/// The commands by group — the first dotted segment of the name — with the
-/// groups in alphabetical order and each group's verbs in registration order
-/// (plan C50: the order `wire.rs` registers them).
+/// The commands by group (`aitm_cli::dispatch::group_of`: the first dotted
+/// segment of the name) with the groups in alphabetical order and each
+/// group's verbs in registration order (plan C50: the order `wire.rs`
+/// registers them).
 pub fn groups(registry: &Registry) -> Vec<(String, Vec<Arc<dyn Command>>)> {
     let mut by_group: BTreeMap<String, Vec<Arc<dyn Command>>> = BTreeMap::new();
     for cmd in registry.commands() {
@@ -283,11 +280,6 @@ pub fn fingerprint(schema: &ParamSchema) -> String {
         params.join(";"),
         type_hint(&schema.result)
     )
-}
-
-/// The group of a dotted command name: its first segment.
-fn group_of(name: &str) -> &str {
-    name.split('.').next().unwrap_or(name)
 }
 
 /// The twin of the frozen `wire.rs`'s private `PocCommands` (plan Task 9's

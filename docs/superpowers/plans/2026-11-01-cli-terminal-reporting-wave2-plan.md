@@ -579,24 +579,25 @@ Kept by the main session during stage 6. One row per finding.
 |---|---|---|---|---|
 | T1–T14 | tester pass 1 | Important | C33: an implicit single DOTTED token (`aitm flow.list`) locates a `Command` and `answer` printed the verb page (exit 0) instead of `NotHelp`, so the dotted compatibility form would stop running the verb once T15 wires `Mode::Help` (`answer.rs:135`; test `implicit_dotted_verb_token_is_not_help`, left `#[ignore]`d) | fixed: for an implicit request only `Located::Group` answers; `Located::Command` → `NotHelp`; test un-ignored (fix coder, committed with this row) |
 | T1–T14 | tester pass 1 | Minor | Observations pinned as current behaviour, not defects: `aitm help help` → `unknown command \`help\``; a dotted typo echoes the token with no did-you-mean; CRLF prompt text demotes the final ask (unreachable, `\r` sanitised); `aitm --yes ca install` → `expected a command before flags` (pre-W2 behaviour kept) | accepted by the session lead 2026-11-01 under autonomous mode: none changes an AC; `aitm help help` → top page is a W3 nicety |
-| T1–T14 | security pass 1 | Minor | S1 `suggest::distance` allocates a full (m+1)×(n+1) table per candidate with no length pre-filter (1 MiB argv token → ~650 ms, ~100 MB; self-inflicted, sub-second) | fix round A: length-difference pre-filter + three-row DP |
-| T1–T14 | quality pass 1 | Minor | Q1 `answer` builds a `Cli` (probing the terminal and the real env) only to call `locate` | fix round A: free `locate(&Registry, argv)` in `aitm_cli::dispatch`, `Cli::locate` delegates |
-| T1–T14 | quality pass 1 | Minor | Q2 a failed registry build drops its cause chain | fix round A: `.with_why(chain)` |
-| T1–T14 | quality pass 1 | Minor | Q3 `group_of` defined three times | fix round A: one `pub fn group_of` in `aitm_cli::dispatch` |
+| T1–T14 | security pass 1 | Minor | S1 `suggest::distance` allocates a full (m+1)×(n+1) table per candidate with no length pre-filter (1 MiB argv token → ~650 ms, ~100 MB; self-inflicted, sub-second) | fixed in fix round A (this commit): length-difference pre-filter + three-row DP; 100k-char input test |
+| T1–T14 | quality pass 1 | Minor | Q1 `answer` builds a `Cli` (probing the terminal and the real env) only to call `locate` | fixed in fix round A: free `locate(&Registry, argv)`; `answer` builds no `Cli`; env-allowlist + source-guard test |
+| T1–T14 | quality pass 1 | Minor | Q2 a failed registry build drops its cause chain | fixed in fix round A: `registry_failure` keeps the cause chain |
+| T1–T14 | quality pass 1 | Minor | Q3 `group_of` defined three times | fixed in fix round A |
 | T1–T14 | quality pass 1 | Minor | Q4 `piped_utf8()`/`tty80()` fixtures, registry helpers and the `Settings` literal repeated per test module | accepted by the session lead 2026-11-01 (autonomous mode): `testing.rs` and `help/mod.rs` were frozen this wave; follow-up 6 |
 | T1–T14 | quality pass 1 | Minor | Q5 `answer::default_settings` duplicates `load_settings`'s NotFound arm | accepted 2026-11-01: `Settings::defaults()` in `config_file.rs` is a file R14 edits on the sibling branch; follow-up 7 |
-| T1–T14 | quality pass 1 | Minor | Q6 `prepare`'s `Cow` always `into_owned()`'d; the `·`/`…` substitution lives in three renderers | fix round A for the `Cow`; shared `Glyphs::asciify` is follow-up 8 |
-| T1–T14 | quality pass 1 | Minor | Q7 `catalog::EXAMPLES` layout survives rustfmt only because two literals are over-wide | fix round A: `#[rustfmt::skip]` |
-| T1–T14 | quality pass 1 | Minor | Q8 `#[allow(clippy::result_large_err)]` and `#[allow(dead_code)]` on `runtime` not self-policing | fix round A: `#[expect(.., reason)]`; `_runtime` |
-| T1–T14 | quality pass 1 | Minor | Q9 a renderer test pins the 124-column catalogue literal; command counts pinned in four files | fix round A: build the wide example in the test; one absolute pin, the rest relative |
-| T1–T14 | quality pass 1 | Minor | Q10 the pin's live side composes the tier with no languages (an approximation of `run()`) | fix round A: compose the languages and poc step handlers as `run()` does |
-| T1–T14 | quality pass 1 | Minor | Q11 nits: `why` Vec extend, `tail.clone()`, three no-op `drop`s, test `use` placement, two flag predicates undocumented | fix round A |
+| T1–T14 | quality pass 1 | Minor | Q6 `prepare`'s `Cow` always `into_owned()`'d; the `·`/`…` substitution lives in three renderers | fixed in fix round A (`prepare` returns `String`); shared `Glyphs::asciify` is follow-up 8 |
+| T1–T14 | quality pass 1 | Minor | Q7 `catalog::EXAMPLES` layout survives rustfmt only because two literals are over-wide | fixed in fix round A |
+| T1–T14 | quality pass 1 | Minor | Q8 `#[allow(clippy::result_large_err)]` and `#[allow(dead_code)]` on `runtime` not self-policing | fixed in fix round A |
+| T1–T14 | quality pass 1 | Minor | Q9 a renderer test pins the 124-column catalogue literal; command counts pinned in four files | fixed in fix round A |
+| T1–T14 | quality pass 1 | Minor | Q10 the pin's live side composes the tier with no languages (an approximation of `run()`) | fixed in fix round A: `live_commands` installs the ws and L4 languages and the poc step handlers as `run()` does |
+| T1–T14 | quality pass 1 | Minor | Q11 nits: `why` Vec extend, `tail.clone()`, three no-op `drop`s, test `use` placement, two flag predicates undocumented | fixed in fix round A |
 | T1–T14 | quality pass 1 | Minor | Q12 `HelpRow` with an empty `left` is reserved and unused | accepted 2026-11-01: Task 2 reserved it deliberately (C40) |
 | T1–T14 | spec pass 1 | Minor | Sp1 the W1 spec's G3/Constraints/D8/D15/M3 were not amended for C28/C31/C32/C41 | fixed in this commit: dated amendments to G3, Constraints and a wave-2 amendments paragraph under D15; M3's W2 block marked illustrative |
 | T1–T14 | spec pass 1 | Minor | Sp2 plan text inconsistent with the tree after recorded deviations (T12 `SYNOPSIS`, rule-4 flip; T13 files; T14 implicit command; T15 item 10 undated) | fixed in this commit: five dated sentence amendments |
-| T1–T14 | spec pass 1 | Minor | Sp3 `every_example_is_a_runnable_aitm_line` does not validate flag names or required flags against the schema | fix round A: quote-aware split, flag membership and required presence; any bad example corrected |
+| T1–T14 | spec pass 1 | Minor | Sp3 `every_example_is_a_runnable_aitm_line` does not validate flag names or required flags against the schema | fixed in fix round A: `example_problem` checker (quote-aware; flags in schema, given once, valued unless Bool; required present; no stray argument) + a 10-defect negative test; all 114 keys passed, no example needed correcting |
 | T1–T14 | spec pass 1 | Minor | Sp4 `startup/errors.rs` and `startup/mod.rs` module docs describe T15's end state early | accepted 2026-11-01: T15 item 10 now says to re-read them; no code change |
 | T1–T14 | tester pass 1 | — | +30 tests, 14 mutation probes killed (P2 `LEFT_MAX` and P6 `MAX_DISTANCE` were killed only by tester tests); per-package gates green; 60 bind-denied integration tests outside W2 run from the Terminal | tests committed |
+| T1–T14 | fix round A | — | `audit_log::tests::a_wedged_rotation_holds_the_file_to_twice_its_cap` failed once at load average 276 and passed alone (not a wave-2 file) | known load flake (memory: red above load 60); re-run on a quiet machine |
 
 ## Shipped
 

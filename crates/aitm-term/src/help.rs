@@ -20,8 +20,6 @@
 //! (spec T1, plan C41). Nothing here touches a terminal or the environment;
 //! the caller passes the [`Caps`] it measured for stdout (plan C49).
 
-use std::borrow::Cow;
-
 use crate::caps::Caps;
 use crate::card::INDENT;
 use crate::glyphs::Glyphs;
@@ -229,13 +227,15 @@ pub fn wrap_usage(line: &str, width: usize) -> Vec<String> {
 /// sequence into the operator's terminal) and, when the caps select ASCII
 /// glyphs, with `·` and `…` replaced by the set's `sep` and `ellipsis` (spec
 /// T1). Done before layout, so a substituted `...` is measured at its real
-/// width.
-fn prepare<'a>(caps: &Caps, glyphs: &Glyphs, s: &'a str) -> Cow<'a, str> {
+/// width. Returns an owned `String`: every caller keeps the prepared text
+/// past the borrow (a title it edits, a line it pushes), so a borrowed form
+/// was a `Cow` that was always `into_owned()` (fix Q6).
+fn prepare(caps: &Caps, glyphs: &Glyphs, s: &str) -> String {
     let s = text::sanitize(s);
     if caps.unicode || !s.contains(['·', '…']) {
-        return s;
+        return s.into_owned();
     }
-    Cow::Owned(s.replace('·', glyphs.sep).replace('…', glyphs.ellipsis))
+    s.replace('·', glyphs.sep).replace('…', glyphs.ellipsis)
 }
 
 /// Renders `page` for `caps` (spec D15, AC-W2-1/2/7).
@@ -261,7 +261,7 @@ pub fn help_page(caps: &Caps, page: &HelpPage) -> String {
     let width = usize::from(caps.width);
     let rich = caps.animate && caps.color;
     let glyphs = Glyphs::for_caps(caps);
-    let prep = |s: &str| prepare(caps, glyphs, s).into_owned();
+    let prep = |s: &str| prepare(caps, glyphs, s);
     let painted = |role: Role, s: &str| {
         if rich {
             paint(caps, role, s)

@@ -97,14 +97,20 @@ pub fn render_confirm(caps: &Caps, prompt: &ConfirmPrompt) -> String {
 
     let mut lines = text::wrap(&clean(&prompt.question), width, "");
     let tail = format!(" {YES_NO} ");
-    if prompt.ask.is_empty() {
+    // With no ask the tail joins the question's last line now; with one it
+    // closes the prompt after the details and notes. Either way `tail` is
+    // moved once (fix Q11).
+    let ask = if prompt.ask.is_empty() {
         match lines.last_mut() {
             Some(last) => last.push_str(&tail),
             // An empty prompt is a caller bug; the operator still gets a
             // tail to answer, and nothing panics.
-            None => lines.push(tail.clone()),
+            None => lines.push(tail),
         }
-    }
+        None
+    } else {
+        Some(format!("{}{tail}", clean(&prompt.ask)))
+    };
     for detail in &prompt.details {
         let detail = clean(detail);
         let detail = if rich {
@@ -117,9 +123,7 @@ pub fn render_confirm(caps: &Caps, prompt: &ConfirmPrompt) -> String {
     for note in &prompt.notes {
         lines.extend(text::wrap(&clean(note), width, INDENT));
     }
-    if !prompt.ask.is_empty() {
-        lines.push(format!("{}{tail}", clean(&prompt.ask)));
-    }
+    lines.extend(ask);
     lines.join("\n")
 }
 

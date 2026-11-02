@@ -89,7 +89,10 @@ pub fn parse(argv: &[String]) -> Option<HelpRequest> {
 /// parser answers every argument shape, `--help` included.
 const WATCHDOG: &str = "sysproxy-watchdog";
 
-/// A token that starts a flag: `--host`, `-h`, a bare `-` or `--`.
+/// A token that starts a flag: `--host`, `-h`, a bare `-` or `--`. Wider
+/// than the dispatcher's predicate on purpose: here a single dash (`-h`,
+/// `-x`) is help-flag-shaped and ends the topic, while
+/// `aitm_cli::dispatch` counts only `--` plus a name as a flag.
 fn is_flag(token: &str) -> bool {
     token.starts_with('-')
 }

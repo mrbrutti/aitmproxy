@@ -18,8 +18,10 @@
 //! [`spaced`] (`scope add`, not `scope.add`; spec T6, AC-W2-4).
 //!
 //! The dispatcher only resolves argv; the help pages themselves are built by
-//! the `aitm` binary over [`Cli::locate`], which returns the located command
-//! or the group it names without running anything.
+//! the `aitm` binary over the free [`locate`], which returns the located
+//! command or the group it names over the registry alone — no `Cli`, so no
+//! confirmer and no terminal probe on the help path (fix Q1). [`Cli::locate`]
+//! is the same resolver over the `Cli`'s registry.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -51,6 +53,13 @@ pub const TOP_HELP: &str = "aitm --help";
 /// (spec T6: dotted names never appear in an error string).
 pub fn spaced(dotted: &str) -> String {
     dotted.replace('.', " ")
+}
+
+/// The group of a dotted command name: its first segment (`scope` for
+/// `scope.add` and for `scope`). The one definition the dispatcher, the
+/// schema-only registry and the help pages share (fix Q3).
+pub fn group_of(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
 }
 
 /// The help pointer for a group: `aitm <group>`.
@@ -319,100 +328,116 @@ impl Cli {
         out
     }
 
-    /// Resolve argv to the command it names, or the group it names, without
-    /// running anything. The leading non-flag tokens are the path; the longest
-    /// prefix of the path whose dotted join is a registered command wins, and
-    /// everything after it is `rest` (`scope add extra --host x` → `scope.add`
-    /// with `rest = ["extra", "--host", "x"]`). A single token that is the first
-    /// segment of some command is its [`Located::Group`]. Anything else is a
-    /// usage error with a `did you mean:` line when a name is close (plan C37)
-    /// and the help pointer for where the operator was.
-    // The error type is the plan C35 contract (`report_for` downcasts it); it
-    // is built once per failed invocation, so its size is not on a hot path.
-    #[allow(clippy::result_large_err)]
+    /// [`locate`] over this `Cli`'s registry.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the plan pins the ErrorReport return (C35)"
+    )]
     pub fn locate<'a>(&'a self, argv: &'a [String]) -> Result<Located<'a>, ErrorReport> {
-        let Some(first) = argv.first() else {
-            return Err(ErrorReport::usage("expected a command")
-                .with_why(vec![USAGE_FORM.to_string()])
-                .with_command(TOP_HELP));
-        };
-        let path_len = argv.iter().take_while(|a| !is_flag(a)).count();
-        if path_len == 0 {
-            return Err(ErrorReport::usage(format!(
-                "expected a command before flags, got `{first}`"
-            ))
-            .with_why(vec![USAGE_FORM.to_string()])
-            .with_command(TOP_HELP));
-        }
-        let path = &argv[..path_len];
-        for prefix_len in (1..=path_len).rev() {
-            let name = path[..prefix_len].join(".");
-            if let Some(cmd) = self.registry.command(&name) {
-                return Ok(Located::Command {
-                    cmd,
-                    rest: &argv[prefix_len..],
-                });
-            }
-        }
-        let group = path[0].as_str();
-        let verbs = self.group_commands(group);
-        if verbs.is_empty() {
-            let groups: Vec<&str> = self.groups();
-            let mut why = Vec::new();
-            why.extend(did_you_mean(&suggest(group, groups)));
-            return Err(ErrorReport::usage(format!("unknown command `{group}`"))
-                .with_why(why)
-                .with_command(TOP_HELP));
-        }
-        if path_len == 1 {
-            return Ok(Located::Group {
-                name: group.to_string(),
-                commands: verbs,
-            });
-        }
-        // Inside a known group: suggest its verbs, written as spaced full names.
-        let group_prefix = format!("{group}.");
-        let verb_names: Vec<&str> = verbs
-            .iter()
-            .filter_map(|c| c.name().strip_prefix(group_prefix.as_str()))
-            .collect();
-        let full_names: Vec<String> = suggest(&path[1], verb_names)
-            .into_iter()
-            .map(|verb| format!("{group} {}", spaced(verb)))
-            .collect();
-        let full_names: Vec<&str> = full_names.iter().map(String::as_str).collect();
-        let mut why = Vec::new();
-        why.extend(did_you_mean(&full_names));
-        Err(
-            ErrorReport::usage(format!("unknown command `{}`", path.join(" ")))
-                .with_why(why)
-                .with_command(group_help(group)),
-        )
-    }
-
-    /// The commands whose name starts with `<group>.`, in registration order.
-    fn group_commands(&self, group: &str) -> Vec<&Arc<dyn Command>> {
-        let prefix = format!("{group}.");
-        self.registry
-            .commands()
-            .filter(|c| c.name().starts_with(prefix.as_str()))
-            .collect()
-    }
-
-    /// The distinct first segments of every registered command, in
-    /// registration order.
-    fn groups(&self) -> Vec<&str> {
-        let mut groups: Vec<&str> = Vec::new();
-        for cmd in self.registry.commands() {
-            let group = cmd.name().split('.').next().unwrap_or_default();
-            if !groups.contains(&group) {
-                groups.push(group);
-            }
-        }
-        groups
+        locate(&self.registry, argv)
     }
 }
 
+/// Resolve argv to the command it names, or the group it names, without
+/// running anything. The leading non-flag tokens are the path; the longest
+/// prefix of the path whose dotted join is a registered command wins, and
+/// everything after it is `rest` (`scope add extra --host x` → `scope.add`
+/// with `rest = ["extra", "--host", "x"]`). A single token that is the first
+/// segment of some command is its [`Located::Group`]. Anything else is a
+/// usage error with a `did you mean:` line when a name is close (plan C37)
+/// and the help pointer for where the operator was.
+///
+/// Free of `Cli` on purpose: the help path resolves its topic here over the
+/// schema-only registry, and constructs no confirmer and probes no terminal
+/// to do it (fix Q1).
+#[expect(
+    clippy::result_large_err,
+    reason = "the plan pins the ErrorReport return (C35)"
+)]
+pub fn locate<'a>(registry: &'a Registry, argv: &'a [String]) -> Result<Located<'a>, ErrorReport> {
+    let Some(first) = argv.first() else {
+        return Err(ErrorReport::usage("expected a command")
+            .with_why(vec![USAGE_FORM.to_string()])
+            .with_command(TOP_HELP));
+    };
+    let path_len = argv.iter().take_while(|a| !is_flag(a)).count();
+    if path_len == 0 {
+        return Err(
+            ErrorReport::usage(format!("expected a command before flags, got `{first}`"))
+                .with_why(vec![USAGE_FORM.to_string()])
+                .with_command(TOP_HELP),
+        );
+    }
+    let path = &argv[..path_len];
+    for prefix_len in (1..=path_len).rev() {
+        let name = path[..prefix_len].join(".");
+        if let Some(cmd) = registry.command(&name) {
+            return Ok(Located::Command {
+                cmd,
+                rest: &argv[prefix_len..],
+            });
+        }
+    }
+    let group = path[0].as_str();
+    let verbs = group_commands(registry, group);
+    if verbs.is_empty() {
+        let groups: Vec<&str> = groups(registry);
+        let why: Vec<String> = did_you_mean(&suggest(group, groups)).into_iter().collect();
+        return Err(ErrorReport::usage(format!("unknown command `{group}`"))
+            .with_why(why)
+            .with_command(TOP_HELP));
+    }
+    if path_len == 1 {
+        return Ok(Located::Group {
+            name: group.to_string(),
+            commands: verbs,
+        });
+    }
+    // Inside a known group: suggest its verbs, written as spaced full names.
+    let group_prefix = format!("{group}.");
+    let verb_names: Vec<&str> = verbs
+        .iter()
+        .filter_map(|c| c.name().strip_prefix(group_prefix.as_str()))
+        .collect();
+    let full_names: Vec<String> = suggest(&path[1], verb_names)
+        .into_iter()
+        .map(|verb| format!("{group} {}", spaced(verb)))
+        .collect();
+    let full_names: Vec<&str> = full_names.iter().map(String::as_str).collect();
+    let why: Vec<String> = did_you_mean(&full_names).into_iter().collect();
+    Err(
+        ErrorReport::usage(format!("unknown command `{}`", path.join(" ")))
+            .with_why(why)
+            .with_command(group_help(group)),
+    )
+}
+
+/// The commands whose name starts with `<group>.`, in registration order.
+fn group_commands<'a>(registry: &'a Registry, group: &str) -> Vec<&'a Arc<dyn Command>> {
+    let prefix = format!("{group}.");
+    registry
+        .commands()
+        .filter(|c| c.name().starts_with(prefix.as_str()))
+        .collect()
+}
+
+/// The distinct groups ([`group_of`]) of every registered command, in
+/// registration order.
+fn groups(registry: &Registry) -> Vec<&str> {
+    let mut groups: Vec<&str> = Vec::new();
+    for cmd in registry.commands() {
+        let group = group_of(cmd.name());
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// A token that is a flag to the dispatcher: `--` and at least one more
+/// character (`--host`, `--yes`). Not the help parser's predicate: for
+/// `aitm::help::request` a single dash (`-h`, `-x`) is help-flag-shaped too,
+/// while here it is an argument the command's flag parser rejects by name.
 fn is_flag(tok: &str) -> bool {
     tok.len() > 2 && tok.starts_with("--")
 }
@@ -421,8 +446,11 @@ fn is_flag(tok: &str) -> bool {
 /// most once, every required param present. Every error names the spaced
 /// command, ends its causes with the command's `Usage:` line and points at
 /// the verb's help (plan C35, C37).
-// Same contract as `Cli::locate`: one `ErrorReport` per failed invocation.
-#[allow(clippy::result_large_err)]
+// Same contract as `locate`: one `ErrorReport` per failed invocation.
+#[expect(
+    clippy::result_large_err,
+    reason = "the plan pins the ErrorReport return (C35)"
+)]
 fn parse_flags(tokens: &[String], cmd: &dyn Command) -> Result<Params, ErrorReport> {
     let schema = cmd.schema();
     let name = spaced(cmd.name());
@@ -452,8 +480,7 @@ fn parse_flags(tokens: &[String], cmd: &dyn Command) -> Result<Params, ErrorRepo
                 .map(|s| format!("--{s}"))
                 .collect();
             let close: Vec<&str> = close.iter().map(String::as_str).collect();
-            let mut why = Vec::new();
-            why.extend(did_you_mean(&close));
+            let why: Vec<String> = did_you_mean(&close).into_iter().collect();
             return Err(usage_error(
                 format!("unknown flag --{flag_name} for `{name}`"),
                 why,
@@ -883,6 +910,53 @@ mod tests {
             }
             other => panic!("expected the scope group, got {other:?}"),
         }
+    }
+
+    // ---- fix Q1/Q3 (panel pass 1) ----
+
+    /// The free `locate` is the dispatcher's resolver without a `Cli`: the
+    /// help path calls it over the registry alone, so no confirmer and no
+    /// terminal probe is built to answer `aitm scope` (Q1). `Cli::locate`
+    /// gives the same answers for the same argv.
+    #[test]
+    fn free_locate_resolves_over_the_registry_alone() {
+        let cli = cli();
+        let registry = Arc::clone(&cli.registry);
+        let bare = argv(&["scope"]);
+        match locate(&registry, &bare) {
+            Ok(Located::Group { name, commands }) => {
+                assert_eq!(name, "scope");
+                let names: Vec<&str> = commands.iter().map(|c| c.name()).collect();
+                assert_eq!(names, vec!["scope.add", "scope.list"]);
+            }
+            other => panic!("expected the scope group, got {other:?}"),
+        }
+        let with_rest = argv(&["scope", "add", "extra", "--host", "x"]);
+        match locate(&registry, &with_rest) {
+            Ok(Located::Command { cmd, rest }) => {
+                assert_eq!(cmd.name(), "scope.add");
+                assert_eq!(rest, &with_rest[2..]);
+            }
+            other => panic!("expected scope.add, got {other:?}"),
+        }
+        let typo = argv(&["scpe"]);
+        let free = locate(&registry, &typo).expect_err("an unknown group is an error");
+        let via_cli = cli.locate(&typo).expect_err("the same through Cli::locate");
+        assert_eq!(free, via_cli);
+        assert_eq!(free.what, "unknown command `scpe`");
+        assert_eq!(free.why, vec!["did you mean: scope".to_string()]);
+        assert_eq!(free.command, fix("aitm --help"));
+    }
+
+    /// `group_of` is the one definition of "the group of a dotted name" (Q3):
+    /// the first segment, the whole name when there is no dot.
+    #[test]
+    fn group_of_is_the_first_dotted_segment() {
+        assert_eq!(group_of("scope.add"), "scope");
+        assert_eq!(group_of("tls.passthrough.add"), "tls");
+        assert_eq!(group_of("scope"), "scope");
+        assert_eq!(group_of(""), "");
+        assert_eq!(group_of(".add"), "");
     }
 
     /// The longest registered prefix of the path wins; everything after it

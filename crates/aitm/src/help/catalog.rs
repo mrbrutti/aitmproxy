@@ -132,7 +132,9 @@ pub fn group_info(name: &str) -> Option<&'static GroupInfo> {
 }
 
 /// The examples, keyed by dotted command name (`scope.add`) and by group name
-/// (`scope`), sorted by key (plan C45).
+/// (`scope`), sorted by key (plan C45). One entry per block, kept that way by
+/// hand: rustfmt is told to leave the table alone (fix Q7).
+#[rustfmt::skip]
 pub const EXAMPLES: &[(&str, &[&str])] = &[
     ("agent.activity", &[
         "aitm agent activity --limit 50",
@@ -586,6 +588,7 @@ pub const NO_PURPOSE: &str = "(no description)";
 mod tests {
     use std::collections::BTreeMap;
 
+    use aitm_cli::dispatch::{group_of, locate, Located};
     use aitm_core::{Config, TypeDesc};
     use aitm_plugin_rhai::RhaiConfig;
     use aitm_proto_l4::config::L4Config;
@@ -614,8 +617,9 @@ mod tests {
     const WIDE: usize = 128;
 
     /// The schema-only registry with the bundled catalogue and `l4.enabled`:
-    /// the widest command set help can show (113 commands, 19 groups). The CA
-    /// directory is pointed under the temp dir and never created (rule 12).
+    /// the widest command set help can show (19 groups; the command count is
+    /// pinned once, in `tests/describe_registry.rs`). The CA directory is
+    /// pointed under the temp dir and never created (rule 12).
     fn catalogue_registry_with_l4() -> Described {
         let mut core = Config::default();
         core.ca.dir = std::env::temp_dir().join(format!(
@@ -735,11 +739,6 @@ mod tests {
             group_names, MOCKUP_GROUPS,
             "the registry under test has the 19 groups"
         );
-        assert_eq!(
-            registry.commands().count(),
-            113,
-            "the catalogue + l4.enabled registry (plan Task 10)"
-        );
 
         let without_purpose: Vec<&str> = group_names
             .iter()
@@ -782,14 +781,198 @@ mod tests {
         );
     }
 
+    /// An example line as the shell hands it to `aitm`: split on whitespace
+    /// outside single quotes, the quotes removed, so a quoted glob or JSON
+    /// value is one argument (fix Sp3).
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut quoted = false;
+        for c in line.chars() {
+            match c {
+                '\'' => {
+                    quoted = !quoted;
+                    in_word = true;
+                }
+                c if c.is_whitespace() && !quoted => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                c => {
+                    word.push(c);
+                    in_word = true;
+                }
+            }
+        }
+        assert!(!quoted, "unbalanced single quote: {line:?}");
+        if in_word {
+            words.push(word);
+        }
+        words
+    }
+
+    #[test]
+    fn shell_words_keeps_single_quoted_values_whole() {
+        assert_eq!(
+            shell_words("aitm scope add --host '*.example.test'"),
+            ["aitm", "scope", "add", "--host", "*.example.test"]
+        );
+        assert_eq!(
+            shell_words("aitm check xss --args '{\"url\":\"https://a.test/ x\",\"param\":\"q\"}'"),
+            [
+                "aitm",
+                "check",
+                "xss",
+                "--args",
+                "{\"url\":\"https://a.test/ x\",\"param\":\"q\"}"
+            ]
+        );
+        assert_eq!(shell_words("aitm   flow list "), ["aitm", "flow", "list"]);
+        assert_eq!(shell_words("aitm x --flag=''"), ["aitm", "x", "--flag="]);
+    }
+
+    /// Why `line` is not a runnable example for `key`, or `None` when it is
+    /// (fix Sp3): split quote-aware, it must resolve through
+    /// `aitm_cli::dispatch::locate` to the command its key names (a group
+    /// key: one of the group's verbs); every `--name` after the command must
+    /// be a parameter of that command's schema (or the reserved `--yes`),
+    /// given once, with a value unless it is a bare boolean; every required
+    /// parameter must be given; nothing else may follow the command.
+    fn example_problem(registry: &aitm_core::Registry, key: &str, line: &str) -> Option<String> {
+        let argv = shell_words(line);
+        if argv.first().map(String::as_str) != Some("aitm") {
+            return Some("does not start with `aitm`".to_string());
+        }
+        let located = match locate(registry, &argv[1..]) {
+            Ok(located) => located,
+            Err(report) => return Some(format!("does not resolve: {report}")),
+        };
+        let Located::Command { cmd, rest } = located else {
+            return Some("names a group, not a verb".to_string());
+        };
+        if registry.command(key).is_some() {
+            if cmd.name() != key {
+                return Some(format!("runs `{}`, not `{key}`", cmd.name()));
+            }
+        } else if group_of(cmd.name()) != key {
+            return Some(format!("runs `{}`, outside the group", cmd.name()));
+        }
+        let schema = cmd.schema();
+        let mut given: Vec<&str> = Vec::new();
+        let mut tokens = rest.iter().peekable();
+        while let Some(token) = tokens.next() {
+            let Some(flag) = token.strip_prefix("--") else {
+                return Some(format!("stray argument {token:?}"));
+            };
+            let (name, inline) = match flag.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (flag, None),
+            };
+            if name == "yes" {
+                continue;
+            }
+            let Some(def) = schema.params.iter().find(|def| def.name == name) else {
+                return Some(format!("--{name} is not a flag of `{}`", cmd.name()));
+            };
+            if given.contains(&name) {
+                return Some(format!("--{name} given twice"));
+            }
+            given.push(name);
+            if inline.is_none() {
+                match tokens.peek() {
+                    Some(next) if !next.starts_with("--") => {
+                        tokens.next();
+                    }
+                    _ if matches!(def.ty, TypeDesc::Bool) => {}
+                    _ => return Some(format!("--{name} has no value")),
+                }
+            }
+        }
+        schema
+            .params
+            .iter()
+            .filter(|def| def.required && !given.contains(&def.name.as_str()))
+            .map(|def| format!("required --{} missing", def.name))
+            .next()
+    }
+
+    /// The checker bites on each defect class it exists for, with the words
+    /// the catalogue test will print.
+    #[test]
+    fn example_problem_names_each_defect() {
+        let described = catalogue_registry_with_l4();
+        let reg = &described.registry;
+        let problem = |key: &str, line: &str| example_problem(reg, key, line);
+        assert_eq!(problem("scope.add", "aitm scope add --host a.test"), None);
+        assert_eq!(problem("scope", "aitm scope add --host 'a.test'"), None);
+        assert_eq!(problem("ca.install", "aitm ca install --yes"), None);
+        assert_eq!(
+            problem("browser.confine", "aitm browser confine --on"),
+            None,
+            "a bare boolean flag needs no value"
+        );
+        assert_eq!(
+            problem("scope.add", "aitm scope add --hsot a.test"),
+            Some("--hsot is not a flag of `scope.add`".to_string())
+        );
+        assert_eq!(
+            problem("scope.add", "aitm scope add"),
+            Some("required --host missing".to_string())
+        );
+        assert_eq!(
+            problem("scope.add", "aitm scope add --host"),
+            Some("--host has no value".to_string())
+        );
+        assert_eq!(
+            problem("scope.add", "aitm scope add --host a --host b"),
+            Some("--host given twice".to_string())
+        );
+        assert_eq!(
+            problem("scope.add", "aitm scope add --host a extra"),
+            Some("stray argument \"extra\"".to_string())
+        );
+        assert_eq!(
+            problem("scope.add", "aitm scope list"),
+            Some("runs `scope.list`, not `scope.add`".to_string())
+        );
+        assert_eq!(
+            problem("scope", "aitm flow list"),
+            Some("runs `flow.list`, outside the group".to_string())
+        );
+        assert_eq!(
+            problem("scope", "aitm scope"),
+            Some("names a group, not a verb".to_string())
+        );
+        assert_eq!(
+            problem("scope.add", "aitm scpe add --host a"),
+            Some("does not resolve: unknown command `scpe`\n  did you mean: scope".to_string())
+        );
+        assert_eq!(
+            problem("scope.add", "scope add --host a"),
+            Some("does not start with `aitm`".to_string())
+        );
+    }
+
+    /// Every example is a line the dispatcher accepts ([`example_problem`]
+    /// finds nothing, fix Sp3), at most the schema-derived width (plan C45),
+    /// and names its own command, spaced.
     #[test]
     fn every_example_is_a_runnable_aitm_line() {
         let described = catalogue_registry_with_l4();
+        let registry = &described.registry;
         assert!(!EXAMPLES.is_empty(), "the examples table is filled");
         for (key, lines) in EXAMPLES {
             assert!(!lines.is_empty(), "`{key}` has an empty example list");
-            let budget = width_budget(&described.registry, key);
+            let budget = width_budget(registry, key);
             for line in *lines {
+                assert_eq!(
+                    example_problem(registry, key, line),
+                    None,
+                    "`{key}`: {line:?}"
+                );
                 assert!(
                     line.starts_with("aitm "),
                     "`{key}`: an example is a runnable aitm line: {line:?}"

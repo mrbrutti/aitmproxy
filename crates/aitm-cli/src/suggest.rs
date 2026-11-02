@@ -21,34 +21,34 @@ pub const MAX_SUGGESTIONS: usize = 3;
 
 /// Optimal-string-alignment Damerau–Levenshtein distance over `char`s: an
 /// insertion, a deletion, a substitution or an adjacent transposition each
-/// cost one. Case-sensitive.
+/// cost one. Case-sensitive. Memory is three rows of `b`'s length, whatever
+/// `a`'s length (argv is attacker-shaped input; fix S1).
 pub fn distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let (m, n) = (a.len(), b.len());
-    // `d[i][j]` is the distance between `a[..i]` and `b[..j]`; column 0 and
-    // row 0 are pure deletions and pure insertions.
-    let mut d: Vec<Vec<usize>> = (0..=m)
-        .map(|i| {
-            let mut row = vec![0; n + 1];
-            row[0] = i;
-            row
-        })
-        .collect();
-    d[0] = (0..=n).collect();
-    for i in 1..=m {
+    let n = b.len();
+    // Row `i` holds the distances between `a[..i]` and every `b[..j]`; the
+    // transposition term looks two rows back, so three rows are kept:
+    // `two_back` (i − 2), `prev` (i − 1) and `cur` (i). Row 0 is pure
+    // insertions; column 0 pure deletions.
+    let mut two_back: Vec<usize> = vec![0; n + 1];
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut cur: Vec<usize> = vec![0; n + 1];
+    for (i, &a_i) in a.iter().enumerate() {
+        let i = i + 1;
+        cur[0] = i;
         for j in 1..=n {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut best = (d[i - 1][j] + 1)
-                .min(d[i][j - 1] + 1)
-                .min(d[i - 1][j - 1] + cost);
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                best = best.min(d[i - 2][j - 2] + 1);
+            let cost = usize::from(a_i != b[j - 1]);
+            let mut best = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            if i > 1 && j > 1 && a_i == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(two_back[j - 2] + 1);
             }
-            d[i][j] = best;
+            cur[j] = best;
         }
+        std::mem::swap(&mut two_back, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
     }
-    d[m][n]
+    prev[n]
 }
 
 /// The candidates worth offering for `input`, by the two rules in the module
@@ -67,10 +67,14 @@ pub fn suggest<'a>(input: &str, candidates: impl IntoIterator<Item = &'a str>) -
             .collect()
     };
 
-    // Rule 2: else the closest tier only.
+    // Rule 2: else the closest tier only. The length difference is a lower
+    // bound on the distance, so a candidate it already rules out is never
+    // scored (a 100 000-character token costs nineteen subtractions, S1).
     if found.is_empty() {
+        let input_len = input.chars().count();
         let scored: Vec<(usize, &'a str)> = candidates
             .iter()
+            .filter(|candidate| input_len.abs_diff(candidate.chars().count()) <= MAX_DISTANCE)
             .map(|&candidate| (distance(input, candidate), candidate))
             .filter(|&(edits, _)| edits <= MAX_DISTANCE)
             .collect();
@@ -193,5 +197,32 @@ mod tests {
         // and a substitution), so nothing is offered.
         assert_eq!(distance("pe", "scope"), 3);
         assert_eq!(suggest("pe", ["scope", "flow"]), Vec::<&str>::new());
+    }
+
+    // ---- fix S1 (panel pass 1): a hostile-length input ----
+
+    /// A 100 000-character token (argv is attacker-shaped input) is no
+    /// group's prefix and more than [`MAX_DISTANCE`] edits from every group,
+    /// so nothing is offered — and the answer comes without building a
+    /// 100 000-row edit table per candidate: the length difference alone
+    /// rules each out, and the table that is built is three rows deep.
+    #[test]
+    fn suggest_rejects_a_100k_char_input_without_a_full_edit_table() {
+        let input: String = std::iter::repeat_n('s', 100_000).collect();
+        assert_eq!(input.chars().count(), 100_000);
+        let started = std::time::Instant::now();
+        let found = suggest(&input, GROUPS);
+        let elapsed = started.elapsed();
+        assert_eq!(found, Vec::<&str>::new());
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "suggest took {elapsed:?} for a 100 000-char input"
+        );
+        // The length pre-filter is a lower bound on the distance, so every
+        // pinned result above is unchanged; a candidate exactly MAX_DISTANCE
+        // longer or shorter is still scored (no prefix here, so rule 2 runs).
+        assert_eq!(distance("scope", "xxscope"), 2);
+        assert_eq!(suggest("scope", ["xxscope", "xxxscope"]), vec!["xxscope"]);
+        assert_eq!(suggest("xxscope", ["scope", "cope"]), vec!["scope"]);
     }
 }
