@@ -580,11 +580,19 @@ function endpoint(addr: string, port: number | null | undefined): string {
   return port != null ? `${addr}:${port}` : addr;
 }
 
+/** What `formatPacketTime` shows for a timestamp no clock can render (non-finite or outside the Date range). */
+export const INVALID_PACKET_TIME = '--:--:--.---';
+/** The largest |epoch ms| `Date` represents (ECMA-262 time value range). */
+const MAX_DATE_MS = 8.64e15;
+
 /**
  * A packet `timestamp` (epoch ms) as a wall clock, `HH:MM:SS.mmm`, 24-hour. `timeZone` is an IANA
- * zone name; omitted, the local zone (what the packet list shows the operator).
+ * zone name; omitted, the local zone (what the packet list shows the operator). A core can put any
+ * JSON number in a packet; one that is not a representable instant renders `INVALID_PACKET_TIME`
+ * rather than throwing out of the packet list render.
  */
 export function formatPacketTime(ms: number, timeZone?: string): string {
+  if (!Number.isFinite(ms) || Math.abs(ms) > MAX_DATE_MS) return INVALID_PACKET_TIME;
   const parts = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZone }).formatToParts(
     new Date(ms),
   );

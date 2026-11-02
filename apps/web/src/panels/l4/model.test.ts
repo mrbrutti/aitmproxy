@@ -377,17 +377,19 @@ describe('formatPacketTime (spec §2 timestamp)', () => {
     expect(formatPacketTime(Date.UTC(2025, 9, 31, 23, 59, 59, 999), 'UTC')).toBe('23:59:59.999');
   });
 
-  // DEFECT (tester pass 2, reported to the Coder): the fix-3 `Intl.DateTimeFormat` path throws
-  // `RangeError: Invalid time value` for a non-finite or out-of-range epoch (`new Date(9e15)` is an
-  // Invalid Date), where the pre-fix getters returned a harmless `NaN:NaN:NaN.NaN`. `PacketList.tsx`
-  // guards `timestamp != null` only, and `9000000000000000` or `1e400` are valid JSON numbers a core
-  // can put in a packet, so one bad timestamp throws out of the packet list render. Pinned with
-  // `it.fails` so the gate stays green while the defect is open: once `formatPacketTime` stops
-  // throwing, this test goes red — drop the `.fails` then.
-  it.fails('DEFECT: a non-finite or out-of-range timestamp must not throw out of the packet list render', () => {
-    for (const bad of [9_000_000_000_000_000, Number.POSITIVE_INFINITY, Number.NaN]) {
+  // Tester pass 2 found the fix-3 `Intl.DateTimeFormat` path threw `RangeError: Invalid time value`
+  // for a non-finite or out-of-range epoch (`new Date(9e15)` is an Invalid Date), where the pre-fix
+  // getters returned a harmless `NaN:NaN:NaN.NaN`. `PacketList.tsx` guards `timestamp != null` only,
+  // and `9000000000000000` or `1e400` are valid JSON numbers a core can put in a packet, so one bad
+  // timestamp would throw out of the packet list render. Fix 4: a placeholder, never a throw.
+  it('a non-finite or out-of-range timestamp renders the placeholder instead of throwing out of the packet list render (fix 4)', () => {
+    for (const bad of [9_000_000_000_000_000, -9_000_000_000_000_000, 8.64e15 + 1, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN]) {
       expect(() => formatPacketTime(bad, 'UTC'), String(bad)).not.toThrow();
+      expect(formatPacketTime(bad, 'UTC'), String(bad)).toBe('--:--:--.---');
     }
+    // The edge of the representable range is still a real clock.
+    expect(formatPacketTime(8.64e15, 'UTC')).toBe('00:00:00.000');
+    expect(formatPacketTime(-8.64e15, 'UTC')).toBe('00:00:00.000');
   });
 
   it('defaults to the local zone', () => {
