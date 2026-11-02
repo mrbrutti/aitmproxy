@@ -148,7 +148,7 @@ def main() -> int:
                "the l4_packet lane is in lanes.run", started.get("lanes"))
 
         final = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
-        note("scan.status (terminal)", {k: final.get(k) for k in ("state", "phase", "stopped_reason", "l4", "issues")})
+        note("scan.status (terminal)", {k: final.get(k) for k in ("state", "phase", "stopped_reason", "error", "lanes", "points", "checks", "l4", "issues")})
 
         section("assert: the job finished done, clean, and inside its budget")
         expect(final.get("state") == "done", "the job finished `done`", final.get("state"))
