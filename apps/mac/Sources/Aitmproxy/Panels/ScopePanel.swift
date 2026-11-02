@@ -14,8 +14,6 @@ struct ScopePanel: View {
     @State private var draft = ""
     @State private var selected: String?
     @State private var hovered: String?
-    /// Hosts sent with `scope.add` that the bus has not listed yet (kept in tertiary).
-    @State private var pending: [String] = []
     @State private var width: CGFloat = 0
     @FocusState private var fieldFocused: Bool
     @FocusState private var tableFocused: Bool
@@ -38,13 +36,15 @@ struct ScopePanel: View {
         return max(Self.hostMin, width - fixed)
     }
 
+    /// The core's list, then the adds in flight (S-081): sending, queued for the core's
+    /// return, or failed with the core's reason — each says so on its row.
     private var entries: [ScopeEntry] {
         let listed = ScopeEntry.entries(hosts: session.scopeHosts)
-        return listed + pending.filter { !session.scopeHosts.contains($0) }.map { ScopeEntry(host: $0) }
+        return listed + session.scopeAdds.hosts.filter { !session.scopeHosts.contains($0) }.map { ScopeEntry(host: $0) }
     }
 
     private var trimmed: String { draft.trimmingCharacters(in: .whitespaces) }
-    private var validation: String? { trimmed.isEmpty ? nil : ScopeEntry.validate(trimmed, existing: session.scopeHosts + pending) }
+    private var validation: String? { trimmed.isEmpty ? nil : ScopeEntry.validate(trimmed, existing: session.scopeHosts + session.scopeAdds.hosts) }
     private var canAdd: Bool { !trimmed.isEmpty && validation == nil }
 
     var body: some View {
@@ -82,7 +82,6 @@ struct ScopePanel: View {
                 fieldFocused = true
             }
         }
-        .onChange(of: session.scopeHosts) { pending.removeAll { session.scopeHosts.contains($0) } }
     }
 
     // MARK: Add
@@ -119,7 +118,6 @@ struct ScopePanel: View {
     private func add() {
         guard canAdd else { return }
         let host = trimmed
-        pending.append(host)
         session.addScope(host)
         draft = ""
         fieldFocused = true
@@ -170,19 +168,39 @@ struct ScopePanel: View {
     }
 
     private func row(_ entry: ScopeEntry) -> some View {
-        let isPending = !session.scopeHosts.contains(entry.host)
+        let addState = session.scopeAdds.state(of: entry.host)
+        let isPending = addState != nil
         let isSelected = selected == entry.host
         let ink = isPending ? Tok.Ink.tertiary.color : Tok.Ink.primary.color
+        // An add in flight carries its state where the limit columns would be (S-081).
+        let stateLine = addState.map(ScopeAddQueue.label(for:))
+        let failed: Bool = if case .failed = addState { true } else { false }
         return Button {
             selected = entry.host
             tableFocused = true
         } label: {
             HStack(spacing: Space.md) {
                 cell(entry.host, width: hostWidth).foregroundStyle(ink).truncationMode(.middle)
-                cell(entry.limit?.limitText ?? Format.dash, width: Self.limitWidth)
-                    .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
-                cell(entry.limit?.backoffText ?? Format.dash, width: Self.backoffWidth)
-                    .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
+                if let stateLine {
+                    // State and Retry share the Limit + Back-off columns' width exactly, so a
+                    // failed row keeps Host and ✕ where every other row has them (a Retry added
+                    // beside a full-width cell overflowed the row and clipped the host's leading edge).
+                    HStack(spacing: Space.sm) {
+                        Text(stateLine).lineLimit(1).truncationMode(.tail).help(stateLine)
+                            .foregroundStyle(failed ? Tok.Intercept.deep.color : Tok.Ink.tertiary.color)
+                            .accessibilityIdentifier("scope-add-state")
+                        if failed {
+                            FlatButton("Retry") { session.retryScopeAdd(entry.host) }
+                                .accessibilityLabel("Retry adding \(entry.host) to Scope")
+                        }
+                    }
+                    .frame(width: Self.limitWidth + Self.backoffWidth + Space.md, alignment: .leading)
+                } else {
+                    cell(entry.limit?.limitText ?? Format.dash, width: Self.limitWidth)
+                        .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
+                    cell(entry.limit?.backoffText ?? Format.dash, width: Self.backoffWidth)
+                        .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
+                }
                 cell(String(entry.flowCount(in: session.rows)), width: Self.flowsWidth, alignment: .trailing)
                     .foregroundStyle(ink).monospacedDigit()
                 Spacer(minLength: 0)
@@ -220,7 +238,7 @@ struct ScopePanel: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(entry.host)
-        .accessibilityValue(isPending ? "pending" : entry.limit?.readout ?? "no limit")
+        .accessibilityValue(stateLine ?? entry.limit?.readout ?? "no limit")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
@@ -231,8 +249,8 @@ struct ScopePanel: View {
     // MARK: Remove
 
     private func remove(_ host: String) {
-        if pending.contains(host), !session.scopeHosts.contains(host) {
-            pending.removeAll { $0 == host }
+        if session.scopeAdds.state(of: host) != nil, !session.scopeHosts.contains(host) {
+            session.dropScopeAdd(host)
         } else {
             session.removeScope(host) { ScopeRemoveConfirmation.ask(host: host, pausedCount: $0) }
         }

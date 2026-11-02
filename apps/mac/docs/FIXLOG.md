@@ -2,6 +2,43 @@
 
 Bugs found after the fact, with the rule each one taught. Newest first.
 
+## 2026-11-01 — A Scope add that never reached the core stayed on the page as "pending"
+
+Symptom: on the installed 0.5.10 Matt "added to scope" and the app "still claims
+nothing is in scope". The bus truth agreed with the app: `scope.list` was empty,
+`proxy.status.decrypt.scope_hosts` was 0, and the operator audit had no `scope.add`
+from the app at all — the add had never reached the core.
+Cause: the Scope page appended the typed host to a view-local `pending` list before
+the bus call and only removed it when `scope.list` named it. When the call failed
+(the embedded core was restarting — five restarts that afternoon; `OfflineActions`
+and a dropped bus both throw `disconnected`) the host stayed listed as a tertiary
+"pending" row for ever, the only error signal a transient status-bar line. The page
+showed the host; every other surface said nothing was in scope. (A second path to
+the same symptom is the core's: `aitm scope add --host` is a one-shot in-process
+dispatch that never reaches the running core — the CLI UX session owns that.)
+Fix: `ScopeAddQueue` (Kit) holds the adds in flight on the Session: `sending…`,
+`queued — added when the core is back` (bus absence; replayed when the bus
+reconnects, `BusService` calls `replayQueuedScopeAdds` after its connect-time
+`scope.list`), or `not added — <reason>` with Retry and ✕ (the core refused). The
+Scope page renders that state on the row instead of a silent pending entry.
+Rule: a surface must never show an operator's intent as if it were the system's
+state; an in-flight or failed action carries its state on the row it created, and a
+failure the bus could not deliver is queued and replayed, not forgotten.
+
+Found by the live proof of that fix (dev bundle, add typed during Proxy ▸ Restart
+Core): the row read `queued`, the title showed the new core connected, and the add
+still never landed; a row ✕ after the restart failed with "remove from scope: the
+bus connection closed" under that connected title. Second cause, in `BusService`:
+`start()` (which every embedded `.ready` calls) cancels the previous run task and
+begins another, but the superseded task still ran its unconditional teardown —
+`session.bus = .failed`, `self.client = nil` — after the new run had installed its
+client. Polling kept working (it holds its own reference), so the window looked
+connected, while every verb went through `live()`, found no client and failed with
+"the bus connection closed" until the next reconnect. On the installed app that is
+"I pressed Apply and Restart Core / the core restarted, and now nothing I do lands".
+Fix: a run checks cancellation right after its connect, sets the failed state only
+when it is still the current run, and clears `client` only if it is still its own.
+
 ## 2026-10-31 — The Flows page stopped redrawing after intercept was armed
 
 Symptom: on the installed v0.5.6, Flows page, a parked row kept reading `Paused`

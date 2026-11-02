@@ -100,6 +100,9 @@ final class BusService: FlowActions {
             }
             do {
                 let info = try await client.connect()
+                // A run that `stop()` superseded during its connect must not go on to
+                // poll (or tear down) beside the run that replaced it.
+                try Task.checkCancellation()
                 serverInfo = info
                 session.bus = .connected(address)
                 session.applyResolvedRole(info.role)
@@ -111,14 +114,25 @@ final class BusService: FlowActions {
                     return try await client.call(name, args)
                 }
                 await refreshScope()
+                // Adds typed while the core was away land now (S-081).
+                session.replayQueuedScopeAdds()
                 backoff = .seconds(1)
                 try await pollLoop(client)
             } catch {
-                session.bus = .failed(Self.describe(error))
-                session.applyResolvedRole(nil)
+                // Only the current run owns the session's bus state: a cancelled one is
+                // ending because `start()` already began another.
+                if !Task.isCancelled {
+                    session.bus = .failed(Self.describe(error))
+                    session.applyResolvedRole(nil)
+                }
             }
             await client.disconnect()
-            self.client = nil
+            // Clear only this run's client. After `Proxy ▸ Restart Core`, the superseded
+            // run reached this line after the new run had installed its client, and the
+            // unconditional `nil` left every verb failing with "the bus connection closed"
+            // under a connected title until the next reconnect, while polling (which holds
+            // its own reference) carried on — the Scope add that never landed (S-081).
+            if self.client === client { self.client = nil }
             if Task.isCancelled { break }
             try? await Task.sleep(for: backoff)
             backoff = min(backoff * 2, .seconds(30))
