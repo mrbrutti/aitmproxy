@@ -59,7 +59,7 @@ echo "-- config.yaml: listen / scope / mcp keys (values of tokens are NOT shown)
 if [ -f "$data/config.yaml" ]; then
   grep -nE '^(listen|scope|mcp|system_proxy|macos_capture|ca):' "$data/config.yaml"
   awk '/^scope:/{f=1;next} /^[^ ]/{f=0} f' "$data/config.yaml" | head -20
-  grep -nE 'operator_token|token:' "$data/config.yaml" | sed -E 's/(token:?\s*).*/\1<redacted, present>/'
+  grep -nE 'operator_token|token:' "$data/config.yaml" | sed -E 's/(token:?[[:space:]]*).*/\1<redacted, present>/'
 else
   echo "(no config.yaml)"
 fi
@@ -72,7 +72,7 @@ echo "-- audit.jsonl tail (last 5 control entries)"
 [ -f "$data/audit.jsonl" ] && tail -n 5 "$data/audit.jsonl" | cut -c1-300 | sed -E 's/("(operator_)?token[^"]*": *")[^"]*"/\1<redacted>"/g; s/(token=)[^&" ]+/\1<redacted>/g' || echo "(absent)"
 
 section "app defaults (com.mrbrutti.aitmproxy) - connection and capture keys, tokens redacted"
-defaults read com.mrbrutti.aitmproxy 2>/dev/null | grep -E '^\s*"?(capture\.[a-zA-Z.]+|proxy\.[a-zA-Z.]+|bus\.(activeKind|expectedRole|fromConfig|host|port)|setup\.[a-zA-Z.]+|firstRun[a-zA-Z.]*|settings\.tab)"? *=' || echo "(no relevant keys)"
+defaults read com.mrbrutti.aitmproxy 2>/dev/null | grep -E '^[[:space:]]*"?(capture\.[a-zA-Z.]+|proxy\.[a-zA-Z.]+|bus\.(activeKind|expectedRole|fromConfig|host|port)|setup\.[a-zA-Z.]+|firstRun[a-zA-Z.]*|settings\.tab)"? *=' || echo "(no relevant keys)"
 
 section "embedded core per-launch dirs (aitm-embedded-core)"
 tmp="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"
