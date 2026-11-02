@@ -44,8 +44,9 @@ pub use client::{PipelineClient, RecordPolicy, RequestSender, SendOptions, Versi
 pub use command::{Command, ParamDef, ParamSchema, Sensitivity, TypeDesc};
 pub use config::{
     AuditLogSetting, BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig,
-    FirefoxConfig, LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig,
-    ScopeConfig, ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig, NOTHING_DECRYPTED_ADVICE,
+    FirefoxConfig, LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig,
+    OperatorBusConfig, PocConfig, ScopeConfig, ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig,
+    NOTHING_DECRYPTED_ADVICE,
 };
 pub use ctx::{
     BrowserDriver, CallerTrust, ClickTarget, CommandHost, FindingDraft, FindingRecorder, FlowCtx,
