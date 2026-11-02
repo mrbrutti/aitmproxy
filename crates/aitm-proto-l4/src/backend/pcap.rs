@@ -77,29 +77,29 @@ impl CaptureInjectBackend for PcapBackend {
         filter: Option<&str>,
         read_timeout: Duration,
     ) -> Result<Box<dyn CaptureSource>, L4Error> {
-        let timeout_ms = i32::try_from(read_timeout.as_millis()).unwrap_or(i32::MAX);
-        // The handle is opened in immediate mode and then switched to
-        // non-blocking reads, and `read_timeout` is enforced by
-        // [`PcapCaptureSource::next_frame`] itself. libpcap's own read timeout is
-        // not a bound: on Linux 6.8 with libpcap 1.10.4 a blocking `pcap_next_ex`
-        // on an interface where no frame passes the filter never returns, in
-        // plain and in immediate mode alike (the T5 rig probe `quiet-stages`,
-        // 2026-11-02), so `await_reply`'s deadline and the capture thread's stop
-        // flag were never consulted again once an interface went quiet: every
-        // silent fuzz case hung until the engine's 60 s check timeout and
-        // `l4.capture.stop` hung on the join. A non-blocking read returns
+        // The handle is switched to non-blocking reads and `read_timeout` is
+        // enforced by [`PcapCaptureSource::next_frame`] itself. libpcap's own read
+        // timeout is not a bound: on Linux 6.8 with libpcap 1.10.4 a blocking
+        // `pcap_next_ex` on an interface where no frame passes the filter never
+        // returns, in plain and in immediate mode alike (the T5 rig probe
+        // `quiet-stages`, 2026-11-02), so `await_reply`'s deadline and the capture
+        // thread's stop flag were never consulted again once an interface went
+        // quiet: every silent fuzz case hung until the engine's 60 s check timeout
+        // and `l4.capture.stop` hung on the join. A non-blocking read returns
         // `TimeoutExpired` at once when nothing is queued; `next_frame` naps
-        // between reads and gives up at the deadline. Immediate mode stays so a
-        // BSD/macOS BPF device hands a frame over as it arrives instead of
-        // holding it until its store buffer fills. Pinned by
+        // between reads and gives up at the deadline. Pinned by
         // `linux_quiet_interface_read_returns_within_the_timeout`.
+        //
+        // Not immediate mode: on Linux that would trade the packed `TPACKET_V3`
+        // ring for `TPACKET_V2`, whose ring holds one frame per `snaplen`-sized
+        // slot (about thirty 64 KiB slots in libpcap's 2 MiB default), and a busy
+        // loopback overran it during one nap (rig run 15: the operator's capture
+        // recorded 103 of the 106 datagrams tcpdump saw). The kernel hands a V3
+        // block over when it fills or when `HANDOVER` elapses, so a frame waits
+        // at most that long; the deadline is still ours.
+        let timeout_ms = i32::try_from(read_timeout.min(HANDOVER).as_millis()).unwrap_or(i32::MAX);
         let cap = ::pcap::Capture::from_device(iface)
-            .and_then(|c| {
-                c.promisc(true)
-                    .immediate_mode(true)
-                    .timeout(timeout_ms)
-                    .open()
-            })
+            .and_then(|c| c.promisc(true).timeout(timeout_ms).open())
             .map_err(|e| unavailable("open", &e))?;
         let mut cap = cap
             .setnonblock()
@@ -430,6 +430,12 @@ fn inject_ip_packet(iface: &str, frame: &[u8]) -> Result<(), L4Error> {
 /// fifty times a second instead of a thousand.
 const IDLE_NAP_MIN: Duration = Duration::from_millis(1);
 const IDLE_NAP_MAX: Duration = Duration::from_millis(20);
+
+/// The longest the kernel may hold a captured frame in a not-yet-full ring block
+/// before handing the block to the reader (libpcap's "read timeout", the only
+/// thing it still governs here): the ceiling on the reply latency a `send_recv`
+/// pays for the packed ring.
+const HANDOVER: Duration = Duration::from_millis(10);
 
 /// The nap after one more empty read: double, capped at [`IDLE_NAP_MAX`].
 fn grow_idle_nap(nap: Duration) -> Duration {
