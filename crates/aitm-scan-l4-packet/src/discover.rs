@@ -706,10 +706,10 @@ pub fn probe_privilege(
 /// Plan every declared L4 target of a profile, and mint the points the engine
 /// schedules checks over.
 ///
-/// `requested` is the operator's field list, passed in by the lane rather than
-/// read here, so this function stays pure of the `L4Options.fields` integration
-/// shim (`crate::plan::requested_fields`, call C1). An empty list is the
-/// target's default field table.
+/// `requested` is the operator's field list (`L4Options.fields`, read by
+/// `crate::plan::requested_fields`), passed in by the lane rather than read
+/// here, so this function stays pure of the profile type. An empty list is
+/// the target's default field table.
 ///
 /// # Errors
 ///

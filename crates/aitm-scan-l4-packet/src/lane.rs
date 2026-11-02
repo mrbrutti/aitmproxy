@@ -131,9 +131,9 @@ impl PacketLane {
     }
 
     /// The field list a job fuzzes when its profile requests none. The
-    /// profile's own `fields` always wins once [`requested_fields`] is flipped
-    /// at integration (call C1); an empty list here is the target's default
-    /// field table.
+    /// profile's own `L4Options.fields` always wins ([`requested_fields`] reads
+    /// it since task 4a of the live-proof plan); an empty list here is the
+    /// target's default field table.
     #[must_use]
     pub fn with_default_fields(mut self, fields: Vec<String>) -> Self {
         self.default_fields = fields;
