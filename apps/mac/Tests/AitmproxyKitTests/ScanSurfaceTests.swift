@@ -2370,4 +2370,125 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.listErrorText(core: "the bus did not reply in time", ageMs: nil)
                 == "Unable to list jobs: the bus did not reply in time. Retrying every 2 s.")
     }
+
+    /// `scan.status.json` with the given state and elapsed, then the given edits
+    /// (a key path and a value, applied in order).
+    static func status(state: ScanJobState, elapsedMs: Int, edits: [([String], JSONValue)]) throws -> ScanJobStatus {
+        var json = try load("scan.status.json")
+        json = ScanPack.edited(json, path: ["state"], to: .string(state.rawValue))
+        json = ScanPack.edited(json, path: ["elapsed_ms"], to: .number(Double(elapsedMs)))
+        for (path, value) in edits { json = ScanPack.edited(json, path: path, to: value) }
+        return try ScanJobStatus(json: json)
+    }
+
+    /// AC9 and the parity pin P1–P14 (D4): `ScanEndText` spells the spec's table
+    /// byte for byte, with grouped numbers and `ScanFormat.plural`'s singulars.
+    @Test func endTextIsTheSpecsSentences() throws {
+        // P4–P8 and AC9: the stopped-reason sentences; nil where the state sentence or the error says it.
+        #expect(ScanEndText.stoppedReason(.errors, state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early: too many errors from the target.")
+        #expect(ScanEndText.stoppedReason(.budget, state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early: the probe budget of 2,000 was spent. Raise it in the profile to go further.")
+        #expect(ScanEndText.stoppedReason(.cancelled, state: .cancelled, probesBudget: 2000, error: nil) == nil)
+        #expect(ScanEndText.stoppedReason(.failed, state: .failed, probesBudget: 2000, error: "boom") == nil)
+        #expect(ScanEndText.stoppedReason(.other("paused"), state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early for a reason this app does not know.")
+        // The rest of D4's table.
+        #expect(ScanEndText.stoppedReason(.time, state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early: the time budget ran out.")
+        #expect(ScanEndText.stoppedReason(.cancelled, state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early: the job was cancelled.", "a cancelled reason on a non-cancelled state is said")
+        #expect(ScanEndText.stoppedReason(.sessionLost, state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early: the session was lost and the profile says stop when that happens.")
+        #expect(ScanEndText.stoppedReason(.policy, state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early: the agent policy changed to paused or read-only.")
+        #expect(ScanEndText.stoppedReason(.guardRefused, state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early: the L4 guard refused a target mid-run.")
+        #expect(ScanEndText.stoppedReason(.failed, state: .failed, probesBudget: 2000, error: nil)
+                == "Stopped early: an error ended the job.", "no error text to show, so the reason is said")
+        #expect(ScanEndText.stoppedReason(.budget, state: .done, probesBudget: 500, error: nil)
+                == "Stopped early: the probe budget of 500 was spent. Raise it in the profile to go further.")
+
+        // P9 and the crawl raw line: the token as it came, for the data face only.
+        #expect(ScanEndText.rawReasonLine(.errors) == "stopped_reason: errors")
+        #expect(ScanEndText.rawReasonLine(.other("paused")) == "stopped_reason: paused")
+        #expect(ScanEndText.rawCrawlErrorLine(.connectRefused) == "crawl.last_error: connect_refused")
+        #expect(ScanEndText.rawCrawlErrorLine(.unknown("x")) == "crawl.last_error: x")
+
+        // P10–P12: crawl trouble, singulars via `plural`, nil without errors.
+        func crawl(pages: Int, errors: Int) throws -> ScanCrawlCounters {
+            try ScanCrawlCounters(json: [
+                "pages": .number(Double(pages)), "queued": 0, "depth": 0, "forms_submitted": 0,
+                "errors": .number(Double(errors)),
+            ])
+        }
+        #expect(ScanEndText.crawlTrouble(try crawl(pages: 1, errors: 1)) == "The crawl fetched 1 page and hit 1 error")
+        #expect(ScanEndText.crawlTrouble(try crawl(pages: 46, errors: 2)) == "The crawl fetched 46 pages and hit 2 errors")
+        #expect(ScanEndText.crawlTrouble(try crawl(pages: 37, errors: 0)) == nil)
+        #expect(ScanEndText.crawlTrouble(try crawl(pages: 0, errors: 1)) == "The crawl fetched 0 pages and hit 1 error")
+
+        // P13, P14 and the rest of the `last_error` words.
+        #expect(ScanEndText.crawlErrorWords(.connectRefused) == "the target refused the connection")
+        #expect(ScanEndText.crawlErrorWords(.unknown("x")) == "the connection failed")
+        #expect(ScanEndText.crawlErrorWords(.tls) == "TLS handshake failed")
+        #expect(ScanEndText.crawlErrorWords(.timeout) == "the target did not answer in time")
+        #expect(ScanEndText.crawlErrorWords(.h2NotNegotiated) == "the target does not speak HTTP/2")
+        #expect(ScanEndText.crawlErrorWords(.transport) == "the connection failed")
+        #expect(ScanEndText.crawlErrorWords(.other) == "the connection failed")
+
+        // P1–P3: the end sentence from the merged facts; the list row carries other
+        // counters, so the terminal status must be the truth the sentence reads.
+        let done = ScanJobFacts.make(
+            summary: try Self.summary(state: .done, elapsedMs: 69_000),
+            status: try Self.status(state: .done, elapsedMs: 69_000, edits: [
+                (["points", "found"], 1020), (["checks", "scheduled"], 6468), (["checks", "done"], 6468),
+                (["checks", "running"], []), (["phase"], "done"),
+            ]))
+        #expect(ScanEndText.sentence(done) == "Done in 1:09 · 1,020 points · 6,468 checks.")
+
+        let cancelled = ScanJobFacts.make(
+            summary: try Self.summary(state: .cancelled, elapsedMs: 115_000),
+            status: try Self.status(state: .cancelled, elapsedMs: 115_000, edits: [
+                (["checks", "scheduled"], 6468), (["checks", "done"], 3236), (["stopped_reason"], "cancelled"),
+            ]))
+        #expect(ScanEndText.sentence(cancelled)
+                == "Cancelled after 1:55; 3,236 of 6,468 checks had run. What it found stays.")
+
+        let failed = ScanJobFacts.make(
+            summary: try Self.summary(state: .failed, elapsedMs: 12_000),
+            status: try Self.status(state: .failed, elapsedMs: 12_000, edits: [
+                (["stopped_reason"], "failed"), (["error"], "boom"),
+            ]))
+        #expect(ScanEndText.sentence(failed) == "Failed after 0:12.", "the error text is its own line, not the sentence")
+
+        // Singulars in the sentence.
+        let one = ScanJobFacts.make(
+            summary: try Self.summary(state: .done, elapsedMs: 1_000),
+            status: try Self.status(state: .done, elapsedMs: 1_000, edits: [
+                (["points", "found"], 1), (["checks", "scheduled"], 1), (["checks", "done"], 1),
+            ]))
+        #expect(ScanEndText.sentence(one) == "Done in 0:01 · 1 point · 1 check.")
+
+        // Nil while the job is live, and until the terminal status has landed (D2: the
+        // checks are detail-only fields, nil until `scan.status` arrives).
+        let running = ScanJobFacts.make(
+            summary: try Self.summary(state: .running, elapsedMs: 42_000),
+            status: try Self.status(state: .running, elapsedMs: 42_000, edits: []))
+        #expect(ScanEndText.sentence(running) == nil)
+        let cancelling = ScanJobFacts.make(
+            summary: try Self.summary(state: .cancelling, elapsedMs: 42_000),
+            status: try Self.status(state: .cancelling, elapsedMs: 42_000, edits: []))
+        #expect(ScanEndText.sentence(cancelling) == nil)
+        let queued = ScanJobFacts.make(summary: try Self.summary(state: .queued, elapsedMs: 0), status: nil)
+        #expect(ScanEndText.sentence(queued) == nil)
+        let unread = ScanJobFacts.make(summary: try Self.summary(state: .done, elapsedMs: 69_000), status: nil)
+        #expect(ScanEndText.sentence(unread) == nil, "a done row whose status has not landed has no checks to say")
+
+        // The grouped numbers every sentence uses: a comma every three digits, whatever the locale.
+        #expect(ScanFormat.grouped(0) == "0")
+        #expect(ScanFormat.grouped(999) == "999")
+        #expect(ScanFormat.grouped(1000) == "1,000")
+        #expect(ScanFormat.grouped(6468) == "6,468")
+        #expect(ScanFormat.grouped(1_234_567) == "1,234,567")
+    }
 }

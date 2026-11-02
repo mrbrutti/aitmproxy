@@ -509,6 +509,89 @@ public struct ScanJobsLink: Equatable, Sendable {
     }
 }
 
+// MARK: - End-state sentences (Jobs view spec D4)
+
+/// The words for a job that has stopped: one sentence for the state, one for
+/// the stopped reason, one for a crawl that hit errors, and the raw tokens for
+/// the data-face lines. Identical on the web and TUI surfaces (the parity pin);
+/// numbers are grouped (`6,468`), singulars go through `ScanFormat.plural`.
+public enum ScanEndText {
+    /// The one sentence for a terminal job; nil while the job is live, and
+    /// until its `scan.status` has landed (the checks it quotes are detail-only
+    /// fields, nil until then, spec D2).
+    public static func sentence(_ facts: ScanJobFacts) -> String? {
+        let summary = facts.summary
+        guard summary.state.isTerminal, let status = facts.status else { return nil }
+        let elapsed = ScanFormat.elapsed(ms: summary.elapsedMs)
+        switch summary.state {
+        case .done:
+            return "Done in \(elapsed) · \(count(summary.points.found, "point")) · "
+                + "\(count(status.checks.scheduled, "check"))."
+        case .cancelled:
+            return "Cancelled after \(elapsed); \(ScanFormat.grouped(status.checks.done)) of "
+                + "\(count(status.checks.scheduled, "check")) had run. What it found stays."
+        case .failed:
+            return "Failed after \(elapsed)."
+        default:
+            return nil
+        }
+    }
+
+    /// The stopped-reason sentence; nil for a reason the state sentence already
+    /// says (`cancelled` on a cancelled job) or the error text already shows
+    /// (`failed` with an error).
+    public static func stoppedReason(_ reason: ScanStoppedReason, state: ScanJobState, probesBudget: Int, error: String?)
+        -> String?
+    {
+        switch reason {
+        case .budget:
+            "Stopped early: the probe budget of \(ScanFormat.grouped(probesBudget)) was spent. "
+                + "Raise it in the profile to go further."
+        case .time: "Stopped early: the time budget ran out."
+        case .cancelled: state == .cancelled ? nil : "Stopped early: the job was cancelled."
+        case .sessionLost: "Stopped early: the session was lost and the profile says stop when that happens."
+        case .errors: "Stopped early: too many errors from the target."
+        case .policy: "Stopped early: the agent policy changed to paused or read-only."
+        case .guardRefused: "Stopped early: the L4 guard refused a target mid-run."
+        case .failed: error?.isEmpty == false ? nil : "Stopped early: an error ended the job."
+        case .other: "Stopped early for a reason this app does not know."
+        }
+    }
+
+    /// `The crawl fetched 1 page and hit 1 error`; nil when the crawl hit none.
+    public static func crawlTrouble(_ crawl: ScanCrawlCounters) -> String? {
+        guard crawl.errors > 0 else { return nil }
+        return "The crawl fetched \(count(crawl.pages, "page")) and hit \(count(crawl.errors, "error"))"
+    }
+
+    /// The words for a `crawl.last_error` token; `transport`, `other` and an
+    /// unknown token all read as a failed connection.
+    public static func crawlErrorWords(_ kind: ScanCrawlErrorKind) -> String {
+        switch kind {
+        case .connectRefused: "the target refused the connection"
+        case .tls: "TLS handshake failed"
+        case .timeout: "the target did not answer in time"
+        case .h2NotNegotiated: "the target does not speak HTTP/2"
+        case .transport, .other, .unknown: "the connection failed"
+        }
+    }
+
+    /// `stopped_reason: errors`: the raw token, for the data-face line only.
+    public static func rawReasonLine(_ reason: ScanStoppedReason) -> String {
+        "stopped_reason: \(reason.rawValue)"
+    }
+
+    /// `crawl.last_error: connect_refused`: the raw token, for the data-face line only.
+    public static func rawCrawlErrorLine(_ kind: ScanCrawlErrorKind) -> String {
+        "crawl.last_error: \(kind.rawValue)"
+    }
+
+    /// `1 check` / `6,468 checks`: `ScanFormat.plural`'s singular rule over a grouped number.
+    private static func count(_ n: Int, _ noun: String) -> String {
+        "\(ScanFormat.grouped(n)) \(noun)\(n == 1 ? "" : "s")"
+    }
+}
+
 // MARK: - The model (D8)
 
 /// Everything the Scan page shows and the app drives: the tab, the lists and
@@ -1030,6 +1113,21 @@ public enum ScanFormat {
     public static func number(_ value: Double) -> String {
         value.formatted(
             .number.precision(.fractionLength(0...3)).grouping(.never).locale(Locale(identifier: "en_US_POSIX")))
+    }
+
+    /// A count with a `,` every three digits (`6,468`, `1,234,567`) whatever the
+    /// locale: the Jobs view's numbers (Jobs view spec D4, D11). Spelled by hand
+    /// because `en_US_POSIX` formats without grouping.
+    public static func grouped(_ n: Int) -> String {
+        let digits = String(n.magnitude)
+        var groups: [Substring] = []
+        var end = digits.endIndex
+        while end > digits.startIndex {
+            let start = digits.index(end, offsetBy: -3, limitedBy: digits.startIndex) ?? digits.startIndex
+            groups.insert(digits[start..<end], at: 0)
+            end = start
+        }
+        return (n < 0 ? "-" : "") + groups.joined(separator: ",")
     }
 
     /// `yes` / `no`, for the session and L4 evidence flags.
