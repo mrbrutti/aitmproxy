@@ -143,8 +143,10 @@ def main() -> None:
                 # engine hook in T1b's follow-up PR 2, lane call in T2's follow-up), so this
                 # is a hard check: a zero counter beside real POSTs is a defect.
                 forms = int(crawl.get("forms_submitted") or 0)
-                check(forms >= 1,
-                      f"crawl.forms_submitted = {forms} (target saw form POSTs to {sorted(form_posts)})")
+                n_form_posts = sum(1 for e in reqs if e.get("method") == "POST")
+                check(1 <= forms <= max(n_form_posts, 1),
+                      f"crawl.forms_submitted = {forms} is at least one and no more than the "
+                      f"{n_form_posts} POST(s) the target logged (paths {sorted(form_posts)})")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

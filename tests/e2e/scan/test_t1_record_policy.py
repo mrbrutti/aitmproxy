@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aitm_e2e import check, fail, free_port, ok, section, skip  # noqa: E402
+from aitm_e2e import check, fail, free_port, ok, section  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
