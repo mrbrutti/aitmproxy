@@ -6,9 +6,9 @@
 // the finding is that canary coming back among the *response headers*, which
 // only a front end that decoded the break can produce.
 //
-// Nothing is poisoned and no session is fixed: the canary carries random
-// letters and is read, never acted on. The three encodings are the shipped
-// script's, unchanged. OWASP A03 Injection. CWE-113.
+// Nothing is poisoned and no session is fixed: the canary is read, never
+// acted on. The three encodings are the shipped script's, unchanged.
+// OWASP A03 Injection. CWE-113.
 const NAME = "check-crlf-injection";
 const API  = "1";
 
@@ -35,7 +35,12 @@ const META = #{
 fn load(reg) {
     reg.add_check(META, |point| {
         let base = if type_of(point.example) == "string" { point.example } else { "x" };
-        let canary = rand_text_alpha(6);
+        // The job's own marker, not random letters: it is collision-resistant
+        // and the same for every probe of this job, so the canary in a reply
+        // can be tied back to the run that put it there — and the PoC below,
+        // replayed later, looks for a value that is written down rather than
+        // one that was thrown away when the check returned.
+        let canary = probe.marker();
         // Percent-encoded CRLF, the same with no space after the colon, and the
         // overlong unicode form some front ends fold down to CR LF.
         let payloads = [
