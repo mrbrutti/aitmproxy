@@ -27,9 +27,11 @@ struct RouteBanner: View {
                 Spacer(minLength: Space.sm)
                 if let action = routes.bannerAction {
                     SmallButton(action.title) { RouteActions.run(action, session: session, openSettings: openSettings) }
-                        // Trusting is a bus call the operator makes: the button stands down while the bus is not the
-                        // operator's (`Session.trustCA()` refuses it then), as the Status page's row does.
-                        .disabled(action == .trustCA && !session.caTrustControlLive)
+                        // Trusting the CA and setting the system proxy are bus calls the operator makes: the button
+                        // stands down while the bus is not the operator's or a change is in flight (`Session.trustCA()`
+                        // / `Session.setSystemProxy()` refuse it then), as the Status page's row does.
+                        .disabled(RouteActions.standsDown(action, caTrustControlLive: session.caTrustControlLive,
+                                                          systemProxyControlLive: session.systemProxyControlLive))
                         .accessibilityIdentifier("route-banner-action")
                 }
             }
@@ -60,10 +62,25 @@ enum RouteActions {
         // The trust action is the view's to run (PR D: `perform` returns false for it on purpose); same
         // confirm-gated path as the Status page's row. The model drops the button once trusted or installing.
         if action == .trustCA { Task { await session.trustCA() }; return }
+        // The system-proxy pair likewise (spec 2026-10-31-system-proxy-automation-design §D13: operator-only,
+        // the one call path in Session+SystemProxy.swift); the model drops Set once open, Restore once off.
+        if action == .setSystemProxy { Task { await session.setSystemProxy() }; return }
+        if action == .unsetSystemProxy { Task { await session.restoreSystemProxy() }; return }
         if session.perform(connection: action) { return }
         if action == .openCaptureSettings {
             session.settingsTab = .capture
             openSettings()
+        }
+    }
+
+    /// Whether a route button must stand down now: the CA action without `Session.caTrustControlLive`, the
+    /// system-proxy pair without `Session.systemProxyControlLive` (the bus is not the operator's, or a change is
+    /// in flight). Every other action is a view-side effect and is always live.
+    static func standsDown(_ action: ConnectionAction, caTrustControlLive: Bool, systemProxyControlLive: Bool) -> Bool {
+        switch action {
+        case .trustCA: !caTrustControlLive
+        case .setSystemProxy, .unsetSystemProxy: !systemProxyControlLive
+        default: false
         }
     }
 }
@@ -83,11 +100,13 @@ struct RouteLabelStyle: LabelStyle {
 
 /// One closed route or fact in the Flows empty state (spec D4): its glyph, the line verbatim, every action
 /// as a `SmallButton`, and the detail beneath in a smaller tertiary line. A pure function of its inputs:
-/// `controlLive` is `Session.caTrustControlLive` (the Trust button stands down without it) and `run` is the
-/// caller's `RouteActions.run`.
+/// `caTrustControlLive` is `Session.caTrustControlLive` (the Trust button stands down without it),
+/// `systemProxyControlLive` is `Session.systemProxyControlLive` (the Set as / Restore System Proxy buttons
+/// stand down without it) and `run` is the caller's `RouteActions.run`.
 struct RouteAdviceRow: View {
     var route: TrafficRoute
-    var controlLive: Bool
+    var caTrustControlLive: Bool
+    var systemProxyControlLive: Bool
     var run: (ConnectionAction) -> Void
 
     static func glyph(_ kind: TrafficRoute.Kind) -> String {
@@ -115,7 +134,8 @@ struct RouteAdviceRow: View {
                 .labelStyle(RouteLabelStyle(iconWidth: Tok.Size.icon))
                 ForEach(route.actions, id: \.self) { action in
                     SmallButton(action.title) { run(action) }
-                        .disabled(action == .trustCA && !controlLive)
+                        .disabled(RouteActions.standsDown(action, caTrustControlLive: caTrustControlLive,
+                                                          systemProxyControlLive: systemProxyControlLive))
                 }
             }
             Text(route.detail)
