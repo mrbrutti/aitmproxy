@@ -928,8 +928,11 @@ Applies to any finding from the Tester or the panel.
   dispositions, the gate, and the real runs the body cites.
 - **The PR body cites only completed real runs and says what was not run:** the sandbox runs of each task, the workspace gate with its `gate-exit=0` log, the Tester's mutant results and the security
   reviewer's differential (counts, seeds). It says that no live end-to-end through a running `aitm` was run (none exists for the PoC path), that the socket-bound suites ran only in the Terminal, and it flags
-  the three Open questions' defaults for Matt: closing the wide next-line leak (17 named core rows, 10 scanner rows and four expectations change; `author:\nJohn` masks `John` in a PoC), accepting label churn in
-  chains of secret keys, and leaving non-secret children readable (`auth:\n  user: bob`).
+  **four** defaults for Matt (spec Open questions 1 to 4): (1) closing the wide next-line leak (17 named core rows, 10 scanner rows and four expectations change; `author:\nJohn` masks `John` in a PoC), (2) accepting label churn in
+  chains of secret keys, (3) leaving non-secret children readable (`auth:\n  user: bob`), and (4) reading "the fix may not weaken what `scrub_text` masks" ownership-aware: family G1 shows tokens the old output
+  hid by a quote misparse (a non-secret key's value, a bare token, or a continuation of a secret key's value that the value rule never read: a second word, a later array element, a block scalar's body). A two-line
+  nested-only change would restore the old output on G1; it is a production change, was not run on the scanner and builder suites, the differential or the timings, and keeps a misparse (spec Amendment 1 item 1 (a)
+  and Open question 4 carry the measured numbers; quote them, do not paraphrase them).
 - Keep the notes-folder `diff-tools/` copy until the PR merges; copy it to a durable place only if Matt wants the tooling kept.
 
 ## Fix tasks (post-panel)
@@ -954,22 +957,26 @@ Tasks 1 to 9 stay as written; where they disagree with this, this governs.
 - **Counts** (measured from git with the Task 4 name recipe, and from the Tester's runs; the plan's "Counts" table is right for
   the original cut `61a35571` before the merge):
 
-  | | base `ecbf58ac` | S7 `85b81815` | head `a2181852` | after Fix 1 |
-  |---|---|---|---|---|
-  | `redact::tests` (names in `redact.rs`) | 54 | 64 | 69 | 68 |
-  | `cargo test -p aitm-core --lib redact` | 67 | 77 | 82 | 81 |
-  | `cargo test -p aitm-plugin-scanner --lib` (names in `reproduce.rs`) | 197 (45) | 201 (49) | 203 (51) | 203 (51) |
-  | `cargo test -p aitm-poc --test builder` | 23 | 24 | 26 | 26 |
+  | | base `ecbf58ac` | S7 `85b81815` | head `a2181852` | SF `a89ccbeb` (after Fix 1) | S8b `a6c3749c` (Task 9b head) |
+  |---|---|---|---|---|---|
+  | `redact::tests` (names in `redact.rs`) | 54 | 64 | 69 | 68 | 69 |
+  | `cargo test -p aitm-core --lib redact` | 67 | 77 | 82 | 81 | 82 |
+  | `cargo test -p aitm-plugin-scanner --lib` (names in `reproduce.rs`) | 197 (45) | 201 (49) | 203 (51) | 203 (51) | 203 (51) |
+  | `cargo test -p aitm-poc --test builder` | 23 | 24 | 26 | 26 | 26 |
 
-  The filter row adds the 11 lib tests of `redact_strict` (durable-audit, merged by `f3c4a9c0`) and 2 `tunnel` tests; at
-  `61a35571` it was 56 and 66. The nine tests the Tester added are the difference between S7 and head (core 5, scanner 2,
-  builder 2: names 64 to 69, 49 to 51, 24 to 26).
+  The first version of this table headed its last column "after Fix 1", which is the SF column; the S8b column (added
+  after the Task 9b panel) is the head the panel read: `scrub_text_wide_stays_linear_on_a_chain_of_wide_only_quote_openers`,
+  the Tester's one commit after SF, moves core 68 to 69 and the filter 81 to 82, and nothing else. Fix 2 (SF2 below) is
+  comments only, so it should change no count; the orchestrator confirms that at SF2. The filter row adds the 11 lib tests of `redact_strict` (durable-audit, merged by `f3c4a9c0`)
+  and 2 `tunnel` tests; at `61a35571` it was 56 and 66. The nine tests the Tester added are the difference between S7
+  and head (core 5, scanner 2, builder 2: names 64 to 69, 49 to 51, 24 to 26).
 - **Spec gaps 1 and 2 of this plan** ("63 and 65"; AC19's "three expectations" naming four values) are settled by spec
   Amendment 1, item 4. **AC8's repeat counts** (Task 3, item 5) give four families under 1 MiB (1,000,000, 500,000, 524,306,
   1,000,002 bytes) although the same item says "keep every family at 1 MiB or more": the floor binds, Fix 1 makes it true.
 - **Mutant red sets, measured** (the Tester's `RESULTS-all.txt`; the condensed report understates four): M1 20 red (a slice panic
   `byte range starts at 24 but ends at 17` is in `logs/M1-core.log`), M3 2 (AC10 and the Tester's prefix test), M4 14 (the nine and
-  the Tester's five), M5 6 (the five and the prefix test). After Fix 1 the deleted mebibyte test leaves M1 at 19 and M4 at 13.
+  the Tester's five), M5 6 (the five and the prefix test). After Fix 1 the deleted mebibyte test leaves M1 at 19 and M4 at 13;
+  at S8b the Tester's wide-chain test makes M1 20 again (the Tester's run on `a6c3749c`) and M4 is 13.
 - **Task 9's "no prior review report"** and the dispatch of Task 8 and 9 were for the first pass; Tasks 8b and 9b below are the
   re-run with the prior report in hand.
 
@@ -1509,9 +1516,14 @@ writer commits by explicit path; the rules of "Where each command runs" and "Cod
 | SHA | Commit | State | Must be an ancestor of HEAD before |
 |---|---|---|---|
 | `a2181852` | head under review (S7, the merge, three Tester commits) | green except the load-flaky workspace failures | Fix 1 |
-| `SD` | the orchestrator's docs commit of the amended spec and plan (no crate changes) | n/a | Fix 1 starts (the Coder reads it) |
-| `SF` | Fix 1 | green; production section identical to `a2181852` | Task 8b |
-| `S8b` | the Tester's last commit, or `SF` if it adds none | green | Task 9b (the panel's head) |
+| `SD` = `f22caabc` | the orchestrator's docs commit of the amended spec and plan (no crate changes) | n/a | Fix 1 starts (the Coder reads it) |
+| `SF` = `a89ccbeb` | Fix 1 | green (workspace gate `gate-exit=0`, 4201 passed); production section identical to `a2181852` | Task 8b |
+| `S8b` = `a6c3749c` | the Tester's last commit (one test after `SF`) | green (workspace gate `gate-exit=0`, 4202 passed); production section identical to `a2181852` | Task 9b (the panel's head) |
+| `SF2` | **the commit of the comment-only batch (Fix 2: the round-2 comment fixes in `redact.rs`; filled by the orchestrator)** | must stay green; production section identical to `a2181852` (the identity check of Fix 1, re-run on it) | the final workspace gate and Stage 7 |
+
+Fix 2's text is the "redact.rs comments" section of the round-2 findings (`F4-panel-round2-findings.md` in the notes folder:
+S-5, Q9b-1 to Q9b-4); it is not a task of this plan. The round-2 text edits to the spec and this plan are docs only and
+touch no crate.
 
 ### Architect's calls in this section (for Matt to correct)
 
@@ -1524,12 +1536,19 @@ writer commits by explicit path; the rules of "Where each command runs" and "Cod
 - **P5.** M9, the AC8 mutant, is new (the Tester's M8 survives by design; no listed mutant makes a nested family quadratic). It is in Task 8b only because the AC8 test changed
   meaningfully (sizes, both scrubs, one test).
 - **P6.** No AC25 (spec Amendment 1 item 6).
+- **P7.** (Round 2.) The nested-only restoration of the old G1 output (spec Amendment 1 item 1 (a)) is not a task of this plan: it is the
+  alternative of Open question 4, and the default is no code change. If Matt chooses it, it becomes a new fix task (production, `redact.rs`
+  only), with its own acceptance criterion and pin, a Tester pass that adds the scanner and builder suites and the I4 timings to the 69
+  `redact::tests` already measured, and the protocol-3 differential on the new head; the Architect writes that task then, not before.
 
 ### Notes for the orchestrator (not tasks)
 
 - The PR body flags **four** defaults for Matt: the three Open questions and Open question 4 (the ownership-aware reading), and says that the fix round changed no production line, with the
   identity check's output. It cites the real runs only and says that no live end-to-end through a running `aitm` was run.
 - Review log rows owed: P-3 with the raw red sets (M1 20, M3 2, M4 14, M5 6); Q-7's production change and Q-8(b) as accepted; the open evidence item (the workspace gate) until Task 8b step 6.
+- Review log rows owed for round 2 (Task 9b; the log is yours, I did not touch it): S-5 = Q9b-1, Q9b-4 and the test-doc half of Q9b-3 (Fix 2, `SF2`); S-6 (spec Amendment 1 item 1 (a) and (b), Residual risks 3 and 10,
+  Open question 4, Architect's call 13: text only, the choice between the default and the nested-only alternative stays Matt's); the spec half of Q9b-3 (Amendment 1 item 8); P9b-1 (four defaults: the
+  Integration notes above are fixed, **Shipped follow-up 5 still says "three" and is yours to edit**); P9b-2 = Q9b-2 (the S8b column and the SHA table above).
 - The spec's Status line should read "amended after the Stage 6 panel (Amendment 1, 2026-11-01)" once the amendment is approved (the Status line is yours; I did not touch it).
 - If `origin/main` is merged again before Task 9b, give the Tester and the panel the new merge-base and re-check the three files; a move of any of them re-opens the differential.
 

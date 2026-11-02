@@ -26,6 +26,18 @@ unchanged and no AC is added (item 6). Outputs below marked (scratch) are mine, 
 (`#[cfg(test)]` and what follows removed), both built into one scratch binary outside the worktree. They are the real
 outputs of both; they justify the decisions and are not the Stage 6 evidence, which is the reviewer's.
 
+**Round 2 (after the Task 9b panel on head `a6c3749c`, base `ecbf58ac`; spec PASS, quality PASS, security PASS, every
+finding Minor).** Text only: no behaviour of any function and no production line moves. Edited in place: item 1 (a) and (b)
+(S-6: item 1 called the alternative "the only code change" and said AC7 forbids it, and called the tokens G1 shows
+"governed by no key" as if all were bare words; both overstated), item 4 (an S8b column; "three scanner expectations"
+read four: P9b-1, P9b-2), item 8 (one more superseded statement: Q9b-3), item 9, Residual risks 3 (G1) and 10, Open
+questions 1 and 4, the Summary (one clause) and Architect's calls 4 and 13. The outputs and counts quoted in item 1 (a)
+and (b) marked (round 2) are mine, from `/tmp/claude-501/f4-arch-9b-s6/`: the head's, the base's and the alternative's
+`redact.rs` as three modules of one scratch library outside the worktree, built from `git show`, and the security
+reviewer's G1 search tool pointed at them (seed 11, 3,000,000 inputs, run by me; seeds 12 and 13 are his alone). Like
+every scratch number here they justify a decision and are not the Stage 6 evidence. The Status line stays the
+orchestrator's. No AC number or name changes and no AC is added.
+
 **1. S-1 (Important): "nothing the old output masked is exposed on well-formed input" is false as written (family
 G1).** A quoted value whose last token is a key that holds a needle and a separator, closed by its quote
 (`"x-pwd:"`), under a secret parent that swallows the child's key. The old scan, with the child's key swallowed,
@@ -52,14 +64,65 @@ layouts, nine parents; 5,248,800 inputs): raw I1 656,100 (`scrub_text`) and 874,
 token governed by a non-secret key under that reading; I1' 0; no token governed by a secret key exposed by either
 function; the child's own canary never exposed.
 
-**Decision: no code change; the invariant is restated.** (a) The only code change that restores the old output on
-these inputs is to read, inside text the scan has already read as a quoted value, the closing quote that follows a
-key and a separator as the opener of a pair. That is the misparse, and by shape it is the same quote as the closing
-quote of `token="sid:" tail="x"` (a quote after a key and a separator, then a blank), which guard R2 and AC7 require
-the scan not to read as an opener (mutant M2 shows what it costs: `token="[redacted]"[redacted]"`). The old output
-masked `hello` only because the child's key sat in plain text. (b) The tokens it newly shows are governed by
-non-secret keys or by no key, and a bare credential with no recognisable key is the documented residual of the scrub
-(the `scrub_text` doc: it cannot be detected). (c) For the nested value itself the new output is the safer one.
+**Decision: no code change; the invariant is restated.** (a) **An alternative exists and is small; I did not take it.**
+(Round 2 rewrote this: the first text called it "the only code change" and said guard R2 and AC7 forbid it. AC7 and
+the tests do not forbid the form below.)
+
+- **What it is.** It restores the old output on these inputs by reading, for a quoted pair that began inside text
+  already masked for another pair (a nested pair), the closing quote after a key and a separator as the opener of a
+  pair, as the old scan did. In `mask_secret_pairs` that is two lines: `nested` is `key_start < copied`, taken before
+  `copied` moves, and `masked_to` is `value_end + usize::from(closer.is_some() && !nested)`, so a nested quoted value no
+  longer counts its own closing quote as masked text. At the top level the quote still closes the value.
+- **What I measured (round 2, scratch: the head's `redact.rs` plus that change; the security reviewer built it first, I
+  rebuilt it from the head and got his outputs).** G1 row 1 gives `token:\n  [redacted] "[redacted]"[redacted]"` for both
+  readings: the nested value masked and the next line swallowed, as the old output swallowed it (rows 2 to 4 the same;
+  row 5 the old output for `scrub_text`, and `3Z` masked for the wide scrub). The AC7 rows are unchanged:
+  `token="sid:" tail="x"` stays `token="[redacted]" tail="x"`, and `token="sid:" x`, `token="sid:"\nx` and
+  `token="sid:"x` give what the head gives. All 69 `redact::tests` pass, in a debug and in a release build (the head: 69,
+  the base: 54), so no test of that module forbids it and none notices it. On the reviewer's G1-targeted search
+  (3,000,000 inputs, seed 11; I re-ran it and got his counts; the generator puts the tail shapes in on purpose, so the
+  counts say what the family can hide, not how often real text does), the canaries that the old output masked and that
+  are visible, head against the change, `scrub_text` then wide: a continuation a secret key owns (item (b)) 34,476 and
+  10, 71,008 and 78; a token no key owns 7,633 and 3, 12,377 and 9; a token a non-secret key governs 109,129 and 20,
+  117,911 and 82; the first token a secret key governs 0 and 0 in both.
+- **What it was not run on.** The scanner suite (203), the aitm-poc builder suite (26), the differential of Design 9
+  (I1', I5', I2, I3, G2 and G3), the I4 timings.
+- **What it costs.** It is a production change in the scan loop: a new fix task with its own acceptance criterion and pin,
+  and Fix-task protocol 3's differential on the new head; it is not an amendment. R1 as written (`masked_to` is
+  `value_end + 1` when the value was closed by its quote, for every pair) would change for nested pairs. And it keeps a
+  deliberate misparse. One quote shape (a quote after a key and a separator, then a blank) closes a value at the top
+  level and opens a pair under a swallowing parent, so the nested analog of AC7,
+  `token:\n  apikey: "sid:" tail="x"`, gives `token:\n  [redacted] "[redacted]"[redacted]"` and masks a non-secret
+  sibling's value. R2's reason (that quote closes a value; it is not an opener) is applied at the top level and not
+  one level down. It is mutant M2 limited to nested pairs, which the 69 `redact::tests` do not kill. It buys back the
+  old accident, not the secrecy of what the accident hid (item (b)).
+
+The choice between the two is Matt's (Open question 4).
+
+(b) The tokens the head newly shows are governed by non-secret keys or by no key, and "no key" is not only bare words.
+It includes continuations of a value that a secret key governs but the value rule never read (Residual risks 2 and
+10): the second word of a value, the elements of an array after the first, the body of a YAML block scalar. The old
+output hid them by accident, through the same misparse, and the same text without the G1 trigger shows them in both
+trees. Real outputs (round 2, scratch; `scrub_text` and `scrub_text_wide` agree on all three):
+
+- Second word. Input `token:\n  apikey: "x-pwd:"\n  password: hunter2 SECONDWORD\n  note: "hello"`.
+  `ecbf58ac`: `token:\n  [redacted] "x-pwd:"[redacted]"`.
+  Head: `token:\n  [redacted] "[redacted]"\n  password: [redacted] SECONDWORD\n  note: "hello"`.
+  With `apikey: "x"` in place of the trigger, both trees keep `SECONDWORD`.
+- Block scalar. Input `token:\n  apikey: "x-pwd:"\n  secret: |\n    LINE1\n    LINE2\n  note: "hello"`.
+  `ecbf58ac`: `token:\n  [redacted] "x-pwd:"[redacted]"`.
+  Head: `token:\n  [redacted] "[redacted]"\n  secret: [redacted]\n    LINE1\n    LINE2\n  note: "hello"`.
+  With `apikey: "x"` in place of the trigger, both trees keep `LINE1` and `LINE2`; bare `secret: |\n LINE1\n LINE2` is
+  `secret: [redacted]\n LINE1\n LINE2` in both.
+- Array. Input `token:\n  apikey: "x-pwd:"\n  api_keys: [first1, second2]\n  note: "hello"`.
+  `ecbf58ac`: `token:\n  [redacted] "x-pwd:"[redacted]"`.
+  Head: `token:\n  [redacted] "[redacted]"\n  api_keys: [redacted], second2]\n  note: "hello"`.
+  With `apikey: "x"` in place of the trigger, both trees give `api_keys: [redacted], second2]` too.
+
+A bare credential with no recognisable key is the documented residual of the scrub (the `scrub_text` doc: it cannot be
+detected). The restated invariant holds on G1 (0 first tokens a secret key governs exposed, in every run) and says
+nothing about these continuations; it did not on the base either. (c) For the nested value itself the new output is
+the safer one (the alternative masks it too).
 
 **Restated invariant** (replaces "nothing the old output masked is exposed on well-formed input" wherever it
 appears): *no value governed by a secret key becomes visible on well-formed input.* A token is governed by the key
@@ -98,18 +161,25 @@ their basis (Q-8(b), accepted).
 **4. P-2 (Minor): counts and a repeat count were stale.** Measured from git and the Tester's runs; the plan's Fix
 tasks section carries the same table.
 
-| | base `ecbf58ac` | S7 `85b81815` | head `a2181852` | after the plan's Fix 1 |
-|---|---|---|---|---|
-| `redact::tests` | 54 | 64 | 69 | 68 |
-| `cargo test -p aitm-core --lib redact` | 67 | 77 | 82 | 81 |
-| `cargo test -p aitm-plugin-scanner --lib` | 197 | 201 | 203 | 203 |
-| `cargo test -p aitm-poc --test builder` | 23 | 24 | 26 | 26 |
+| | base `ecbf58ac` | S7 `85b81815` | head `a2181852` | SF `a89ccbeb` (after the plan's Fix 1) | S8b `a6c3749c` (the Task 9b head) |
+|---|---|---|---|---|---|
+| `redact::tests` | 54 | 64 | 69 | 68 | 69 |
+| `cargo test -p aitm-core --lib redact` | 67 | 77 | 82 | 81 | 82 |
+| `cargo test -p aitm-plugin-scanner --lib` | 197 | 201 | 203 | 203 | 203 |
+| `cargo test -p aitm-poc --test builder` | 23 | 24 | 26 | 26 | 26 |
+
+The first version of this table labelled its last column "after the plan's Fix 1", which is SF; the S8b column (round 2)
+is the head the Task 9b panel read. The one test between SF and S8b is the Tester's
+`scrub_text_wide_stays_linear_on_a_chain_of_wide_only_quote_openers` (core 68 to 69, filter 81 to 82; scanner and builder
+do not move). Mutant M1 (no R2 and no R2'; core tests red in the Tester's runs): 20 at `a2181852`, 19 at SF (the deleted
+mebibyte test), 20 at S8b (the new test is red under it); M4 is 13 at S8b.
 
 The filter row counts the 11 lib tests of `redact_strict` (the durable-audit sibling, merged by `f3c4a9c0`) and 2
 `tunnel` tests; at the original cut `61a35571` the base filter was 56 and S7's 66, which is what the plan said. The
 spec's 63 and 65 (AC12, the AC list header) are the Architect's scratch file, which merges AC6 and AC6b; read 64 and
-66 for the original cut and the table above for the head. The "three scanner expectations" of Open question 1 and
-Architect's call 4 are the four values AC19 edits (JSON `note` and `list`, form `note`, untyped body): read four.
+66 for the original cut and the table above for the head. Open question 1 and Architect's call 4 said "3 scanner
+expectations"; round 2 edited them in place to 4, the four values AC19 edits (JSON `note` and `list`, form `note`,
+untyped body). AC19's own wording, "three expectations edited", is an AC and stays; read four.
 **AC8's repeat counts give four families under 1 MiB** (1,000,000, 500,000, 524,306 and 1,000,002 bytes); the 1 MiB
 floor of AC8 and "Left to the builder" binds, the counts do not (Architect's call 17).
 
@@ -136,18 +206,23 @@ test (`scrub_text_wide_stays_linear_when_both_scans_have_work`, Q-6) and nothing
 
 **8. Statements this amendment supersedes** (the ones marked "edited" are rewritten in place, the others are not and
 are read as stated here): Goals bullets 3 and 4 (edited); Design 2, "Why the nested value is masked": "the old output
-is never un-masked" is about the parent's token, and "the invariant I1" is I1'; Design 4, the C bullet (edited);
+is never un-masked" is about the parent's token, and "the invariant I1" is I1'; Design 3, "Why `scrub_text_wide` needs
+the third reading" (listed in round 2, Q9b-3): its "lose 'masks everything `scrub_text` masks' (I5: 23 of 400,000 for
+each, against 0)" is the raw reading of I5, to be read ownership-aware like Design 9's I5 (I did not re-measure those
+23 ownership-aware); Design 4, the C bullet (edited);
 Design 5 hazard 2 (edited); Design 6 heading, lead, closing sentence (edited), and the paragraph "Unchanged (pinned by
 AC4, AC5, AC7)", which is true of `scrub_text` and not of the wide reading for `token:\n  author: bob` and
 `auth:\n  authority: example.com` (row 30); Design 7 items 1 and 3 (edited); Design 9 I1 and I5 (edited), the
 "malformed-quote trigger" (now includes interleaved quotes) and the positive controls (b) to (d), which fire on I1'
-as before; Residual risks 3, 4 (edited), 10 (new); Anti-goals bullet 1 ("anything the old output masked" reads "any
-value that a secret key governs"); the Summary (one sentence added; its "0 old-masked canaries exposed" is a
+as before; Residual risks 3 (G1 edited again in round 2), 4 (edited), 10 (new, extended in round 2); Anti-goals bullet 1 ("anything the old output masked" reads "any
+value that a secret key governs"); the Summary (one sentence added, one clause in round 2; its "0 old-masked canaries exposed" is a
 measurement on the Architect's alphabets and stands as measured) and Architect's call 2 (same reading); AC12's 63 and 65 and AC8's
-repeat counts (item 4); AC19's and Open question 1's "three" (item 4); AC23's "every group within Residual risks 3"
+repeat counts (item 4); AC19's "three expectations" (item 4: an AC, it stays and reads four) and the "3" of Open
+question 1 and Architect's call 4 (edited to 4 in round 2); AC23's "every group within Residual risks 3"
 now includes G1 and G2.
 
-**9. Open for Matt:** Open question 4 (read the constraint ownership-aware). Its default stands unless he reverses it.
+**9. Open for Matt:** Open question 4 (read the constraint ownership-aware). Its default stands unless he reverses it;
+since round 2 it states the alternative of item 1 (a) with what it measured, what was not run on it, and what it costs.
 
 ## Intent
 
@@ -650,13 +725,25 @@ aligned, full and nested, and at least 500,000 on each of soup and dc. Seeds (st
      opener of a pair and masked the text after it, often the next line (`note: "hello`); the new scan reads the
      nested pair, closes the quote correctly, and the text after it is read by its own keys. The token that becomes
      visible is governed by a non-secret key (`note`) or by no key; the old output hid it only through the misparse,
-     and a bare token with no recognisable key is the documented residual of the scrub. The nested value itself,
-     `x-pwd:`, which the old output left in the clear, is now masked. Real outputs: Amendment 1, S-1. Not fixed, and
-     not fixable without the misparse (Amendment 1). Measured by the Stage 6 reviewer: raw I1 799 (`scrub_text`) and
+     and a bare token with no recognisable key is the documented residual of the scrub. **"No key" includes real
+     continuations** (round 2, S-6): the second word of a secret key's value (`password: hunter2 SECONDWORD`), the
+     elements of an array after the first, the body of a block scalar (`secret: |` then indented lines), all of which the
+     value rule never read (items 2 and 10), so G1 can show the tail's own value-rule residuals; the same text without
+     the G1 trigger shows them in both trees. Real outputs: Amendment 1 item 1 (b). The nested value itself, `x-pwd:`,
+     which the old output left in the clear, is now masked. Real outputs of the family: Amendment 1, S-1. Not fixed. A
+     nested-only restoration of the old output exists, two lines and a production change (Amendment 1 item 1 (a), Open
+     question 4): not taken, it keeps the misparse for nested pairs and restores the old swallow, not the secrecy of those
+     continuations. Measured by the Stage 6 reviewer: raw I1 799 (`scrub_text`) and
      1,049 (wide) of 3,000,000 well-formed inputs, 7,157 and 12,438 of 400,000 targeted ones; ownership-aware 0 of
      3.4M. Measured by the Architect on 5,248,800 inputs of a G1 generator of my own (scratch): raw I1 656,100 and
      874,800, every one a token governed by a non-secret key; ownership-aware 0; no token governed by a secret key
-     exposed.
+     exposed. Measured by the Task 9b security reviewer (a G1-targeted search whose tails hold single tokens,
+     two-word values, flow and JSON arrays, block scalars and nested pairs; 3,000,000 inputs per seed, seeds 11, 12 and
+     13, seed 11 re-run by me): the first token a secret key governs 0 exposed in `scrub_text` and in the wide scrub on
+     every seed; canaries a secret key owns but the value rule never read (item (b) of Amendment 1) 34,476, 34,697 and
+     34,424 (`scrub_text`), 71,008, 71,282 and 70,891 (wide); canaries no key owns 7,633, 7,530 and 7,557 (`scrub_text`);
+     canaries a non-secret key governs 109,129, 108,457 and 107,907 (`scrub_text`). The generator puts these shapes
+     into the tail, so these are counts of what the family can hide, not rates on real text.
    - **G2, interleaved quotes of two kinds** (`Token:Jwt:'token="'id"`, `Side=\n'rsession="'QZ"`): each kind has an
      even count, so a harness trigger for an unmatched or unescaped quote misses it; the two scans pair the quotes
      differently. Measured by the reviewer on `full` (2.4M): raw I1 31 for `scrub_text` and 101 for the wide scrub
@@ -689,11 +776,17 @@ aligned, full and nested, and at least 500,000 on each of soup and dc. Seeds (st
    next header's name), unchanged.
 9. **Same-line prose over-redacts a little more.** `token: auth: expired` now masks `expired`. It cannot be
    excluded without a line-break condition that would reopen the same-line leak.
-10. **A secret key whose value is an array or an object leaves the elements visible** (Amendment 1; found by the
-    Stage 6 security reviewer, unrated; identical in the old and the new output). `{"api_keys": ["abc123", "def456"]}`
-    becomes `{"api_keys": [redacted]"abc123", "def456"]}`: the value the scan reads for the key is `[`, because an
-    unquoted value ends at a quote. It is the shared value rule, kin to items 1 and 2. Not fixed here; named as a
-    next-spec item (bracketed values).
+10. **A secret key whose value is an array, an object or a block scalar leaves the elements or the body visible**
+    (Amendment 1; the array found by the Stage 6 security reviewer, unrated; identical in the old and the new output).
+    `{"api_keys": ["abc123", "def456"]}` becomes `{"api_keys": [redacted]"abc123", "def456"]}`: the value the scan reads
+    for the key is `[`, because an unquoted value ends at a quote. A flow array `api_keys: [first1, second2]` becomes
+    `api_keys: [redacted], second2]`. The same holds for a YAML block scalar (named in round 2, S-6):
+    `secret: |\n    LINE1\n    LINE2` becomes `secret: [redacted]\n    LINE1\n    LINE2` on `ecbf58ac` and on the head,
+    text and wide, and so do `password: >` and `api_key: |-`: the value read is the indicator, the body is not read.
+    (`private_key` is in neither vocabulary, so `private_key: |` is left whole by every tree whatever G1 does; that is a
+    vocabulary matter outside this spec.) It is the shared value rule, kin to items 1 and 2. Not fixed here; named as a next-spec item
+    (bracketed and block values). It matters to family G1 (item 3): the old output hid these bodies, and these elements,
+    by swallowing them in the misparse, and the new output shows them (Amendment 1 item 1 (b)).
 
 ### 11. Rebase hazards (what I checked)
 
@@ -897,7 +990,7 @@ Only Matt can answer these; each has a default that stands unless he reverses it
 1. **Close the next-line leak under wide-only keys (drop the wide line-break boundary)?** Default yes: it is the
    brief's "related shape", it puts a credential into a shareable artifact, and with R1 crossing a line break is
    safe (measured I1 0 on the nested alphabet). The cost: 17 pinned core rows, 5 assertions of one hostile test and
-   10 scanner rows plus 3 scanner expectations change (AC11, AC15, AC19, all named), a nested pair under a
+   10 scanner rows plus 4 scanner expectations change (AC11, AC15, AC19, all named), a nested pair under a
    wide-only parent reads `[redacted] [redacted]` in a PoC text, and `author:\nJohn` loses `John` in a PoC. The
    alternative keeps the boundary: one assertion changes, 11,487 of 300,000 nested inputs keep a wide-only
    next-line leak.
@@ -911,12 +1004,25 @@ Only Matt can answer these; each has a default that stands unless he reverses it
    Default no: the vocabulary decides, a whole-subtree rule needs an indentation model (approaches B and E,
    measured worse) and over-redacts prose.
 4. **Read Matt's constraint ("the fix may not weaken what `scrub_text` masks today") ownership-aware?** (Added by
-   Amendment 1, S-1.) Read literally it fails on well-formed input in one family (G1): a token that no secret key
-   governs, after a quoted value that ends in a key and a separator, was masked by a misparse of a closing quote and
-   now stays visible, while the nested secret value the old output left in the clear is masked. Default yes, the
-   ownership-aware reading: no value governed by a secret key becomes visible. The alternative is to restore the
-   misparse, which is the behaviour guard R2 and AC7 forbid, and which would be a new fix task and a new
-   differential, not an amendment.
+   Amendment 1, S-1; restated after round 2, S-6.) Read literally it fails on well-formed input in one family (G1): a
+   token that no secret key governs, after a quoted value that ends in a key and a separator, was masked by a misparse
+   of a closing quote and now stays visible, while the nested secret value the old output left in the clear is masked.
+   "No secret key governs" covers three things: the value of a non-secret key (`note: "hello"`), a bare token, and a
+   continuation of a secret key's value that the value rule never read (the second word of `password: hunter2
+   SECONDWORD`, the later elements of an array, the body of a block scalar; Residual risks 2, 3 and 10). Default yes, the
+   ownership-aware reading: no value governed by a secret key becomes visible, and no code changes. **The alternative
+   is real and small** (Amendment 1 item 1 (a)): a two-line change in `mask_secret_pairs`, `nested = key_start <
+   copied` and `masked_to = value_end + usize::from(closer.is_some() && !nested)`, that restores the old output on G1
+   for nested pairs only. It leaves AC7 and all 69 `redact::tests` green. On the reviewer's G1-targeted search (3,000,000
+   inputs, seed 11) it cuts the canaries the old output masked and the head shows, for `scrub_text`, from 34,476 to 10
+   (continuations), from 7,633 to 3 (no key) and from 109,129 to 20 (a non-secret key's value), and for the wide scrub
+   from 71,008 to 78, 12,377 to 9 and 117,911 to 82; the first token a secret key governs is 0 before and after. It was
+   not run on the scanner and builder suites, the differential or the timings. It costs a new
+   fix task with a new acceptance criterion and pin, Fix-task protocol 3's differential on the new head, a change to R1
+   for nested pairs, and a misparse kept on purpose (the same quote shape closes a value at the top level and opens a
+   pair under a swallowing parent, so it masks a non-secret sibling's value there). It restores the old accident, not
+   the secrecy of the continuations it hid: the same text without the G1 trigger still shows them, in both trees. The
+   choice is Matt's; the default is unchanged.
 
 ## Summary
 
@@ -931,12 +1037,15 @@ real runs: 0 old-masked canaries exposed and 0 secret pairs left on 300,000 nest
 and 89,302 leaking), the 15 hazard rows and 600,000 random padded base64 credentials identical to the old output,
 no row of `RECORDED_SCRUB_TEXT` changed, linear time at 12 times the old cost at worst. Approach A (parent keeps an
 empty value) exposes what the old output masked on 14 of 15 hazard rows; indentation and whole-line rules expose
-or leak thousands per 200,000. Three calls are Matt's: closing the wide next-line leak at the price of 17 named core rows, 10 scanner rows and
-a handful of assertions, accepting label churn in chains, and leaving non-secret children readable. Amendment 1
-(post-panel) adds a fourth: reading "may not weaken what `scrub_text` masks" as "no value governed by a secret key
-becomes visible" (Open question 4), because one well-formed family (G1) exposes a token that no secret key governs
-that the old output masked by a misparse; the "0 old-masked canaries exposed" above is a measurement on the Architect's
-alphabets, which never reached that family.
+or leak thousands per 200,000. Three calls are Matt's: closing the wide next-line leak at the price of 17 named core
+rows, 10 scanner rows and a handful of assertions, accepting label churn in chains, and leaving non-secret children
+readable. Amendment 1 (post-panel) adds a fourth: reading "may not weaken what `scrub_text` masks" as "no value
+governed by a secret key becomes visible" (Open question 4), because one well-formed family (G1) exposes a token that
+no secret key governs that the old output masked by a misparse (the value of a non-secret key, a bare token, or the
+second word, a later array element or a block scalar's body of a secret key's value, which the value rule never read).
+A two-line nested-only change would restore the old output; Open question 4 states what it measured, what was not run
+on it, and what it costs. The "0 old-masked canaries exposed" above is a measurement on the Architect's alphabets,
+which never reached that family.
 
 ## Architect's calls (for Matt to approve or correct)
 
@@ -946,7 +1055,7 @@ alphabets, which never reached that family.
    (so `auth:\n  [redacted] [redacted]`, label included).
 3. A non-secret child keeps its value (`auth:\n  user: bob` unchanged); the vocabulary decides.
 4. The wide line-break boundary is dropped (Design 3), accepting the named churn (17 pinned core rows, 5
-   assertions of one hostile test, 10 scanner rows, 3 scanner expectations) and the over-redaction of
+   assertions of one hostile test, 10 scanner rows, 4 scanner expectations) and the over-redaction of
    `author:\nJohn` in a PoC; the named alternative keeps the boundary.
 5. `scrub_text_wide` keeps two scans but its first scan judges a key inside a masked value by the wide
    vocabulary; the superset property becomes measured, not by construction.
@@ -967,8 +1076,16 @@ alphabets, which never reached that family.
 Added by Amendment 1 (2026-11-01):
 
 13. **S-1: no code change; the invariant is restated ownership-aware** (no value governed by a secret key becomes
-    visible on well-formed input). The one fix, restoring the old output on family G1, is the closing-quote misparse
-    that guard R2 and AC7 exist to forbid. Flagged for Matt as Open question 4.
+    visible on well-formed input). Corrected after round 2 (S-6): my first text called the fix for family G1 "the
+    closing-quote misparse that guard R2 and AC7 exist to forbid", and that was too strong. A two-line nested-only
+    restoration of the old G1 output exists (Amendment 1 item 1 (a)); AC7 and the 69 `redact::tests` do not forbid it. I
+    did not take it, and that is my call: it is a production change in the scan loop (it would need a new fix task and
+    the protocol-3 differential, neither of which exists), it was not run on the scanner and builder suites or the
+    timings, it keeps a misparse
+    for nested pairs, and what it restores is the old swallow, not the secrecy of the continuations the swallow hid (the
+    second word of a secret value, later array elements, a block scalar's body: they are visible without the G1
+    trigger in both trees, Residual risks 2, 3 and 10). Flagged for Matt as Open question 4, with the alternative stated
+    so that he answers on a correct premise; the default (no code change) is unchanged.
 14. **G2 and G3 are accepted as Minor residuals** inside Residual risks 3 (interleaved quotes are named, the
     "malformed-quote trigger" now includes them); no test pins any of them.
 15. **Design 6 lists classes, not every changed input**; rows 29 and 30 are added, and the one class that goes toward
@@ -984,4 +1101,5 @@ Added by Amendment 1 (2026-11-01):
     stands and is not re-run: a narrowing of Fix-task protocol 3 that the orchestrator approves with this amendment.
 19. **Q-7's production change and Q-8(b) are accepted** (the orchestrator's dispositions): the `Reading` docs get a
     comment-only sentence; the three `token="sid:"x` rows stay.
-20. **Residual risks 10 (array and object values) is named, not fixed**: a next-spec item.
+20. **Residual risks 10 (array, object and, since round 2, block-scalar values) is named, not fixed**: a next-spec
+    item.
