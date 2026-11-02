@@ -507,7 +507,9 @@ async fn bounded<T>(
         // or the statement it rejected), so it is scrubbed here, once, before
         // any call site logs it or `prime_session` propagates it (AC T2-6).
         Ok(Err(err)) => Err(anyhow::anyhow!("{}", scrub_error(&err))),
-        Err(_) => anyhow::bail!("scan: the browser did not answer within {limit:?}"),
+        // "timed out" is the word `crawl_error_token` reads, so a page the
+        // browser never answered counts as `timeout`, not `other`.
+        Err(_) => anyhow::bail!("scan: the browser timed out after {limit:?}"),
     }
 }
 
