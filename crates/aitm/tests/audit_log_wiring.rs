@@ -158,7 +158,13 @@ impl Rig {
     /// A fresh `Services` over the assembled proxy. `Services` is not `Clone`,
     /// so each consumer takes its own.
     fn services(&self) -> Services {
-        tui::services(&self.assembled.proxy, &self.cfg, None, TuiLog::Off)
+        tui::services(
+            &self.assembled.proxy,
+            &self.cfg,
+            None,
+            TuiLog::Off,
+            self.assembled.job_bus.clone(),
+        )
     }
 
     /// A server built the way `main.rs` builds its primary and its `aitm web`

@@ -50,6 +50,8 @@ pub(crate) fn inconclusive(detail: impl Into<String>, probe_flows: Vec<FlowRef>)
         },
         detail: detail.into(),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 
@@ -73,6 +75,8 @@ pub(crate) fn clean(detail: impl Into<String>, evidence: Evidence) -> Verdict {
         evidence,
         detail: detail.into(),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 

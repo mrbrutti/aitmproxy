@@ -132,10 +132,12 @@ async fn scan_rig() -> ScanRig {
     cfg.browser.obscura.allow_private =
         engine_may_reach_private(&cfg.browser.ssrf, &cfg.scope.entries);
 
-    let Assembled { proxy, ca, .. } = assemble(&cfg).expect("assemble the proxy");
+    let Assembled {
+        proxy, ca, job_bus, ..
+    } = assemble(&cfg).expect("assemble the proxy");
     let store = proxy.store();
     let guard = proxy.guard();
-    let mut services = aitm::tui::services(&proxy, &cfg, None, aitm::tui::TuiLog::Off);
+    let mut services = aitm::tui::services(&proxy, &cfg, None, aitm::tui::TuiLog::Off, job_bus);
     let listen = cfg.browser.proxy_addr;
     tokio::spawn(async move {
         let _ = proxy.run_browser(listen).await;

@@ -157,13 +157,26 @@ struct BusSettings: View {
 /// upstream TLS verification. Changes persist to UserDefaults and apply when the bundled
 /// core restarts (EmbeddedCore re-reads them each spawn). An external core is governed by
 /// its own config.yaml, so the controls are read-only then.
+///
+/// Below it, the system proxy (spec 2026-10-31-system-proxy-automation-design §D13): a live
+/// "Set as system proxy" toggle whose position is the core's fact, never a preference — it
+/// calls `Session.setSystemProxy()` / `restoreSystemProxy()` and works against an external
+/// core too; and two embedded-core preferences, "Set system proxy at launch"
+/// (`SystemProxyPreferences.autoKey`) and "Bypass hosts" (`.bypassKey`), that
+/// `EmbeddedCore.spawn()` reads and Apply & Restart Core applies.
 struct ProxySettings: View {
     @Environment(Session.self) private var session
     @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
     @AppStorage("proxy.preferredPort", store: Store.defaults) private var port = 8080
     @AppStorage("proxy.verifyUpstreamTLS", store: Store.defaults) private var verifyTLS = true
+    @AppStorage(SystemProxyPreferences.autoKey, store: Store.defaults) private var systemProxyAuto = false
+    @AppStorage(SystemProxyPreferences.bypassKey, store: Store.defaults) private var systemProxyBypass = SystemProxyPreferences.defaultBypassField
 
     private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
+
+    /// The footnote under a disabled live toggle (§D13 "disabled with the reason"): the Session's one
+    /// cause ladder, worded for Settings. Nil when the toggle is live.
+    private var liveToggleReason: String? { session.systemProxyNotLiveCause?.word }
 
     /// Apply & Restart is live only for the embedded core and only once an edit
     /// diverges from what the running core was started with. With no applied
@@ -175,6 +188,8 @@ struct ProxySettings: View {
               let appliedPort = connection.appliedPort,
               let appliedVerifyTLS = connection.appliedVerifyUpstreamTLS else { return true }
         return port != appliedPort || verifyTLS != appliedVerifyTLS
+            || systemProxyAuto != (connection.appliedSystemProxyAuto ?? false)
+            || systemProxyBypass != (connection.appliedSystemProxyBypass ?? SystemProxyPreferences.defaultBypassField)
     }
 
     var body: some View {
@@ -193,6 +208,57 @@ struct ProxySettings: View {
             }
         }
         .disabled(!usesEmbedded)
+        Section("System proxy") {
+            // Position = the core's fact (§D13), never a stored preference: the toggle reads
+            // the verb's word and each flip is one bus call. Operator-only, like capture.
+            Toggle("Set as system proxy", isOn: Binding(
+                get: { session.systemProxyPointsAtUs },
+                set: { on in Task { await (on ? session.setSystemProxy() : session.restoreSystemProxy()) } }
+            ))
+            .disabled(!session.systemProxyControlLive)
+            // One full `proxy.system.status` read when the pane appears: it is the only call that fills
+            // `guidance`; the poll's compact object does not carry it. On the one toggle, not the
+            // Section — a Section's modifiers apply to each of its rows.
+            .task { await session.refreshSystemProxyStatus() }
+            // The route line, the same words the Status page and the banner show.
+            if let line = session.connectionSummary.routes.systemProxy?.line {
+                Text(line)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            if let reason = liveToggleReason {
+                Text(reason)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            // No mechanism on this platform: the core's env-var line, to copy.
+            if let facts = session.systemProxyFacts, !facts.supported, let guidance = facts.guidance {
+                Text(guidance)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            // Embedded-core config, like the section above: read by EmbeddedCore.spawn(),
+            // applied by Apply & Restart Core. The live toggle above is not gated on this.
+            Group {
+                Toggle("Set system proxy at launch", isOn: $systemProxyAuto)
+                TextField("Bypass hosts", text: $systemProxyBypass)
+                let bypassCount = SystemProxyPreferences.bypassHosts(systemProxyBypass).count
+                if bypassCount > 0 {
+                    Text("\(bypassCount) \(bypassCount == 1 ? "host" : "hosts")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text(ConnectionSummary.bypassFieldCopy)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .disabled(!usesEmbedded)
+            Text(ConnectionSummary.systemProxyLaneSentence)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
         Section {
             Button("Apply and Restart Core") { session.restartCoreTick += 1 }
                 .disabled(!canApply)

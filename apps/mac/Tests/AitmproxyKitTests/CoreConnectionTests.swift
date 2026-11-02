@@ -105,4 +105,48 @@ import Testing
         #expect(CoreConnection.Status.degraded(reason: "exit 1: boom")
             != .degraded(reason: "other"))
     }
+
+    /// PR 4 Task 27 (spec §D13 "Settings ▸ Proxy"): the two applied system-proxy fields are nil until the embedded
+    /// core reports ready (and for a non-embedded core), carry the values as given, and take part in equality so
+    /// a registry update with new applied values is a change the Settings dirty-check sees.
+    @Test func applied_system_proxy_fields_default_to_nil_and_count_in_equality() {
+        let ready = CoreConnection(id: CoreID(rawValue: "embedded"), kind: .embedded, endpoint: endpoint(port: 9001),
+                                   status: .ready, label: "Embedded core")
+        #expect(ready.appliedSystemProxyAuto == nil)
+        #expect(ready.appliedSystemProxyBypass == nil)
+        let external = CoreConnection(id: CoreID(rawValue: "external"), kind: .external, endpoint: endpoint(port: 9002),
+                                      status: .ready, label: "127.0.0.1:9002", proxyAddress: "127.0.0.1:9090")
+        #expect(external.appliedSystemProxyAuto == nil)
+        #expect(external.appliedSystemProxyBypass == nil)
+
+        var applied = ready
+        applied.appliedSystemProxyAuto = true
+        applied.appliedSystemProxyBypass = "corp.test, *.local"
+        #expect(applied.appliedSystemProxyAuto == true)
+        #expect(applied.appliedSystemProxyBypass == "corp.test, *.local")
+        #expect(applied != ready)
+        #expect(Set([ready, applied]).count == 2)
+        #expect(applied == CoreConnection(id: CoreID(rawValue: "embedded"), kind: .embedded, endpoint: endpoint(port: 9001),
+                                          status: .ready, label: "Embedded core",
+                                          appliedSystemProxyAuto: true, appliedSystemProxyBypass: "corp.test, *.local"))
+        // `false` and "" are applied values, not "never ready": the dirty-check tells them from nil.
+        var defaults = ready
+        defaults.appliedSystemProxyAuto = false
+        defaults.appliedSystemProxyBypass = ""
+        #expect(defaults != ready)
+        #expect(defaults.appliedSystemProxyAuto == false)
+        #expect(defaults.appliedSystemProxyBypass == "")
+        // Each field counts on its own.
+        var autoOnly = ready
+        autoOnly.appliedSystemProxyAuto = true
+        var bypassOnly = ready
+        bypassOnly.appliedSystemProxyBypass = "corp.test"
+        #expect(autoOnly != bypassOnly)
+        #expect(autoOnly != applied)
+        // The registry stores the applied values as given.
+        var registry = ConnectionRegistry()
+        registry.insert(applied)
+        #expect(registry.connection(for: applied.id)?.appliedSystemProxyAuto == true)
+        #expect(registry.connection(for: applied.id)?.appliedSystemProxyBypass == "corp.test, *.local")
+    }
 }
