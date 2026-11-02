@@ -20,9 +20,9 @@ full issue mentions "no reset-rate mitigation"); zero issues for
 negatives, and each of the three answers "rejected" through its manual
 `check.<id>` verb, which is how the cell shows the variants were written); the
 five checks open exactly five raw h2 connections on the `tls` listener beside the
-job client's pooled one (told apart by the crawl's `GET /` on it; a raw connection
-that also carries `GET /` -- the rapid-reset heads aimed at `/` on T2's lane -- is
-recognised by its eight-request shape), whose per-connection request counters sorted are
+job client's pooled one (told apart by the `host` header the job client's request rows carry and the
+raw driver's HEADERS frames do not; `GET /` cannot tell them apart since the
+origin-scoped checks run on `<origin>/`), whose per-connection request counters sorted are
 `[0, 0, 0, 0, 8]` as hyper really counts them (a rejected header block never
 becomes a request; the eight cancelled rapid-reset heads do) and none above 8;
 and the issue set on P equals the issue set on V.
@@ -118,24 +118,21 @@ def run_on(op, target, label: str) -> tuple[list, list]:
     status = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
     ok(f"{label}: job ended state={status.get('state')!r} "
        f"issues={(status.get('issues') or {}).get('total')!r}")
-    # The connections the job client pooled are the ones that carried the crawl's
-    # `GET /`; every other h2 connection opened during the job is a raw probe.
-    # One raw connection can carry `GET /` too: the rapid-reset probe sends its
-    # eight cancelled heads to the point the origin-scoped check attached to,
-    # which on T2's lane is `/` itself. That connection is told apart by its
-    # shape -- exactly eight dispatched requests (or eight HEADERS streams where
-    # the target counts them), the driver's pre-dial cap -- which the crawl of a
-    # four-page site never reaches, so the rule holds on the interim lane and on
-    # T2's alike.
-    def raw_shaped(c) -> bool:
-        return int(c.get("requests", 0)) == 8 or (c.get("streams") is not None and int(c["streams"]) == 8)
+    # The connections the job client pooled are told from the raw probes by what
+    # their requests carry: the job client sends a real request with a `host`
+    # header on every row, while the raw driver's HEADERS frames carry no header
+    # map at all (the target logs an empty one). `GET /` cannot tell them apart:
+    # with amendment 38 the five origin-scoped checks run on `<origin>/`, so the
+    # baseline is `GET /` on the pooled connection AND the rapid-reset probe's
+    # eight cancelled heads are `GET /` on a raw one (T1b's and T2's live runs).
+    def has_host_header(e) -> bool:
+        headers = e.get("headers") or {}
+        return any(str(k).lower() == "host" for k in headers)
     all_conns = [c for c in target.logs.conns()
                  if c.get("listener") == "tls" and c.get("alpn") == "h2"
                  and int(c.get("opened_ms", 0)) >= t0]
-    carried_root = {e.get("conn_id") for e in target.logs.scanner_requests(seq0)
-                    if e.get("path") == "/" and e.get("listener") == "tls"}
-    pooled = {c.get("conn_id") for c in all_conns
-              if c.get("conn_id") in carried_root and not raw_shaped(c)}
+    pooled = {e.get("conn_id") for e in target.logs.scanner_requests(seq0)
+              if e.get("listener") == "tls" and has_host_header(e)}
     conns = [c for c in all_conns if c.get("conn_id") not in pooled]
     check(len(pooled) >= 1,
           f"{label}: the job client pooled at least one h2 connection for the crawl (observed {sorted(pooled)})")
