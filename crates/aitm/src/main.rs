@@ -1085,7 +1085,10 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         // Both sockets were pre-bound above, so the accept loops just run on them.
         // The stdio MCP arm ending `Ok` is the stdin-EOF exit: it gets one
         // reporter line after the `select!` (spec Open question 3, AC-W1-32),
-        // ahead of the §D9 (a) restore so it is the session's last reporter line.
+        // ahead of the §D9 (a) restore; it stays the session's last line
+        // because `reporter.quiesce()` below drops the browser teardown noise —
+        // only a failed restore's warning (by design, spec D4) or the
+        // audit-flush integrity warning (S7) may follow it.
         let stdio_transport = matches!(cfg.mcp.transport, McpTransport::Stdio);
         let mut stdio_eof = None;
         let served = tokio::select! {
@@ -1147,6 +1150,14 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
                 estimated_left = report.estimated_left,
                 "the audit log did not finish flushing before exit"
             );
+            // S7: the reporter is quiesced, so that tracing WARN is log-only;
+            // lost audit records are an integrity signal the operator must
+            // see, so the reporter says it too (a plain `warning:` line after
+            // `finish()`, C10).
+            reporter.warn(&format!(
+                "the audit log did not finish flushing before exit ({} records estimated left)",
+                report.estimated_left
+            ));
         }
     }
     result

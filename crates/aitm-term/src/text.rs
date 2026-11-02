@@ -148,7 +148,10 @@ pub fn wrap(s: &str, width: usize, indent: &str) -> Vec<String> {
 /// every `char::is_control()` character in `s` (C0 including ESC and BEL,
 /// DEL, and C1 including U+009B, the one-byte CSI) and every bidirectional
 /// control that can reorder or hide what follows it (U+061C, U+200E, U+200F,
-/// U+202A–U+202E, U+2066–U+2069; fix task S6) becomes U+FFFD, except that
+/// U+202A–U+202E, U+2066–U+2069; fix task S6) and every invisible format
+/// character that can hide inside a name (U+00AD, U+180E, U+200B,
+/// U+2060–U+2064, U+FEFF, U+FFF9–U+FFFB and the tag block U+E0000–U+E007F;
+/// S9 — the joiners U+200C and U+200D stay) becomes U+FFFD, except that
 /// `\n`, `\r`, `\t` and the line separators U+2028 and U+2029 each become one
 /// space, so a message is always one line. Content strings from other crates
 /// (WARN/ERROR text and fields, `anyhow` chains, Rhai `log.warn` text,
@@ -172,6 +175,16 @@ fn replacement(c: char) -> Option<char> {
         | '\u{200F}'
         | '\u{202A}'..='\u{202E}'
         | '\u{2066}'..='\u{2069}' => Some('\u{FFFD}'),
+        // S9: invisible format characters that hide inside a name on screen.
+        // The joiners U+200C and U+200D are deliberately not here: emoji
+        // sequences and Indic/Persian text need them.
+        '\u{00AD}'
+        | '\u{180E}'
+        | '\u{200B}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0000}'..='\u{E007F}' => Some('\u{FFFD}'),
         _ => None,
     }
 }
@@ -456,5 +469,58 @@ mod tests {
         let kept = "\u{061B}\u{200D}\u{2027}\u{202F}\u{2065}\u{206A}";
         assert!(matches!(sanitize(kept), Cow::Borrowed(_)));
         assert_eq!(sanitize(kept), kept);
+    }
+
+    // ---- fix task (panel pass 3): S9 invisible format characters ----
+
+    /// S9: zero-width and tag characters are neither `is_control()` nor bidi
+    /// controls, yet they are invisible on screen, so `evil.example` followed
+    /// by tag letters reads as `evil.example` while being another string.
+    /// The tag block U+E0000–U+E007F, U+200B, U+2060, U+FEFF, U+00AD, U+180E,
+    /// U+2061–U+2064 and U+FFF9–U+FFFB become U+FFFD too. The joiners U+200C
+    /// and U+200D stay: emoji sequences and Indic/Persian text need them.
+    #[test]
+    fn sanitize_neutralises_invisible_format_characters() {
+        assert_eq!(
+            sanitize("evil.example\u{E0061}\u{E0062}"),
+            "evil.example\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(
+            sanitize("a\u{200B}b\u{FEFF}c\u{00AD}d"),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d"
+        );
+        // Both ends of every range and each single member, one replacement
+        // each.
+        const INVISIBLE: [char; 16] = [
+            '\u{E0000}',
+            '\u{E0001}',
+            '\u{E0041}',
+            '\u{E007F}',
+            '\u{200B}',
+            '\u{2060}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{180E}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{FFF9}',
+            '\u{FFFA}',
+            '\u{FFFB}',
+        ];
+        let invisible: String = INVISIBLE.iter().collect();
+        assert_eq!(sanitize(&invisible), "\u{FFFD}".repeat(16));
+        let tags: String = (0xE0000u32..=0xE007F).filter_map(char::from_u32).collect();
+        assert_eq!(tags.chars().count(), 128);
+        assert_eq!(sanitize(&tags), "\u{FFFD}".repeat(128));
+        // The joiners stay and such text is still borrowed, as are the
+        // neighbours of the new ranges.
+        let kept = "a\u{200D}b\u{200C}c";
+        assert!(matches!(sanitize(kept), Cow::Borrowed(_)));
+        assert_eq!(sanitize(kept), kept);
+        let neighbours = "\u{00AC}\u{00AE}\u{180D}\u{180F}\u{200A}\u{205F}\u{2065}\u{FEFE}\u{FF01}\u{FFF8}\u{FFFC}\u{E0080}";
+        assert!(matches!(sanitize(neighbours), Cow::Borrowed(_)));
+        assert_eq!(sanitize(neighbours), neighbours);
     }
 }

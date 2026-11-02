@@ -940,7 +940,8 @@ impl Reporter {
 
     /// [`Reporter::send`] with the instant a non-droppable message stops
     /// waiting for room in a full queue (S5), so a call that sends twice
-    /// (`card`, `error`) is bounded as a whole.
+    /// (`card`, `error`) is bounded as a whole. The wait runs under the
+    /// state lock, so every caller is bounded by the same deadline.
     fn send_by(&self, msg: Msg, deadline: Instant) {
         let mut state = self.lock();
         if matches!(&*state, State::Idle(_)) {
@@ -948,7 +949,7 @@ impl Reporter {
         }
         let unsent = match &mut *state {
             State::Running { tx, .. } => match msg {
-                // Attacker-triggerable volume never blocks a caller and
+                // Attacker-triggerable volume never blocks on the queue and
                 // never queues without bound (S3): a full queue drops the
                 // warning and counts it for the renderer to report.
                 Msg::Warn(_) | Msg::Event(_) => match tx.try_send(msg) {
@@ -1003,8 +1004,13 @@ impl Reporter {
     /// `finish` and `finish_and_clear`: the last message, then close the
     /// channel and join the thread, then switch to synchronous plain lines.
     /// The last message waits for room and for its acknowledgement
-    /// `ACK_TIMEOUT` at most in all (S5).
+    /// `ACK_TIMEOUT` at most in all (S5), counted from the call so that the
+    /// wait for the state lock is part of it (S8).
     fn shutdown(&self, last: fn(SyncSender<()>) -> Msg) {
+        // S8: the bound starts before the lock wait, as in `send`, `card` and
+        // `error`, so every public call shares one `ACK_TIMEOUT` even while
+        // another caller holds the state lock inside `send_until`.
+        let deadline = Instant::now() + ACK_TIMEOUT;
         let mut state = self.lock();
         let previous = std::mem::replace(&mut *state, State::Finished(None));
         *state = match previous {
@@ -1014,7 +1020,6 @@ impl Reporter {
                 State::Finished(Some(renderer.into_plain()))
             }
             State::Running { tx, thread } => {
-                let deadline = Instant::now() + ACK_TIMEOUT;
                 let (ack, acked) = mpsc::sync_channel(1);
                 let sent = matches!(send_until(&tx, last(ack), deadline), Enqueued::Sent);
                 drop(tx);
