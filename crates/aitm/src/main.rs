@@ -7,8 +7,8 @@
 //! list`, `aitm scope add --host ex.test`) it hands the verb to
 //! `aitm::oneshot::run` — a local verb runs in-process, a live one on the
 //! running core (R14 spec D6/D8) — writes the rendered bytes to stdout, and
-//! exits. Invoked bare it starts
-//! the proxy accept loop and the MCP server (stdio or loopback-TCP per config),
+//! exits. Invoked bare it starts the proxy accept loop and the MCP server
+//! (stdio or loopback-TCP per config),
 //! with the configured browser engine attached when it launches, and closes
 //! the browser on every orderly exit path including SIGINT/SIGTERM (spec §D6).
 //! Invoked as `aitm tui` it does the same but with the terminal operator UI in
@@ -204,6 +204,30 @@ where
         Recovery::Nothing
     };
     Ok((bound, recovery))
+}
+
+/// Run one fallible `step` after the system-proxy auto-set: when it fails in
+/// a serving mode, give the OS its proxy back (`on_orderly_exit`, the §D9 (a)
+/// restore the early return would otherwise skip) and hand the error on
+/// unchanged, so its panel is still exact. Security S8 (R14): the operator
+/// bus binds after the auto-set so a fixed-port conflict is the M2 panel.
+async fn or_restore_system_proxy<T, F>(
+    mode: &Mode,
+    sysproxy: &SystemProxy,
+    step: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match step.await {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            if manages_system_proxy(mode) {
+                log_recovery("exit", &sysproxy.on_orderly_exit());
+            }
+            Err(err)
+        }
+    }
 }
 
 /// A recovery that failed is worth a `warn!` here; every other outcome the
@@ -836,9 +860,9 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     // returned above. Blocking shell-outs, but nothing is served yet.
     //
     // The bound addresses are read inside this block too: after the startup set,
-    // the only fallible step before the `select!` is `operator_bus::start`, whose
-    // error arm restores the system proxy itself (security S8), so the §D9 (a)
-    // restore is reached on every path.
+    // the only fallible step before the `select!` is `operator_bus::start`, run
+    // through `or_restore_system_proxy` (security S8), so the system proxy is
+    // given back on every exit path: the §D9 (a) block below, or that wrapper.
     let config_display = effective_path.display().to_string();
     let phase = reporter.phase("binding ports");
     let bound = bind_then_recover_system_proxy(&mode, &sysproxy, system_proxy.auto, async {
@@ -931,7 +955,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         .map(|shared| shared.guard.clone());
     // Bound addresses from the pre-bind step: nothing fallible may run between
     // the system-proxy auto-set and the `select!` (its restore-on-exit depends on
-    // it) except `operator_bus::start` below, which restores on its error arm.
+    // it) except `operator_bus::start` below, wrapped in `or_restore_system_proxy`.
     if let Some(guard) = &l4_live_guard {
         guard.add_self_ports(
             [proxy_addr.port(), browser_addr.port()]
@@ -991,29 +1015,24 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     // The operator bus (R14 spec D2): before the ready card and the TUI handover
     // (a fixed-port conflict is the M2 panel through `report_for`), bound outside
     // both branches so its drop, which removes the core pointer (D4), is `run()`'s end.
-    let mut operator_bus = match operator_bus::start(
-        &cfg,
-        &effective_path,
-        &services,
-        &agent_state,
-        &audit_ring,
-        push_tx.clone(),
-        l4_live_guard.clone().map(self_port_hook),
-        mint_failure,
+    // The one fallible step after the system-proxy auto-set (security S8): on
+    // failure the wrapper gives the OS its proxy back before the M2 panel, as
+    // the §D9 (a) restore below would have.
+    let mut operator_bus = or_restore_system_proxy(
+        &mode,
+        &sysproxy,
+        operator_bus::start(
+            &cfg,
+            &effective_path,
+            &services,
+            &agent_state,
+            &audit_ring,
+            push_tx.clone(),
+            l4_live_guard.clone().map(self_port_hook),
+            mint_failure,
+        ),
     )
-    .await
-    {
-        Ok(bus) => bus,
-        Err(err) => {
-            // The one fallible step after the system-proxy auto-set (security
-            // S8): give the OS its proxy back before the M2 panel, as the §D9 (a)
-            // restore below would have.
-            if manages_system_proxy(&mode) {
-                log_recovery("exit", &sysproxy.on_orderly_exit());
-            }
-            return Err(err);
-        }
-    };
+    .await?;
 
     // The scripting tier now reaches exactly the proxy's store, client and
     // guard, and a failed hook's `Event::Error` reaches the chain rather than
@@ -1539,9 +1558,10 @@ mod tests {
 
     use super::{
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
-        configured_agent_port, manages_system_proxy, parse_invocation, parse_mode, scan_services,
-        split_bus_endpoint_file_arg, split_config_arg, split_script_args, usage_reporter,
-        Invocation, Mode, StartupError, TermOpts, OPERATOR_TOKEN_USAGE,
+        configured_agent_port, manages_system_proxy, or_restore_system_proxy, parse_invocation,
+        parse_mode, scan_services, split_bus_endpoint_file_arg, split_config_arg,
+        split_script_args, usage_reporter, Invocation, Mode, StartupError, TermOpts,
+        OPERATOR_TOKEN_USAGE,
     };
     use aitm_sysproxy::Recovery;
     use aitm_term::caps::{ColorChoice, Verbosity};
@@ -2176,6 +2196,76 @@ mod tests {
         assert!(
             dir.join(STATE_FILE_NAME).is_file(),
             "the state file is on disk for the exit path to restore from"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security S8 (R14): a step that fails after `auto` set the system proxy
+    /// — the operator bus's fixed port already taken — gives the OS its proxy
+    /// back before the error becomes the panel; a one-shot mode never touches
+    /// the OS; a step that succeeds restores nothing.
+    #[tokio::test]
+    async fn a_failed_step_after_the_auto_set_restores_the_system_proxy() {
+        let (exec, sp, dir) = scripted_sysproxy("start-failed");
+        let (_, recovery) =
+            bind_then_recover_system_proxy(&Mode::Server, &sp, true, async { Ok(()) })
+                .await
+                .unwrap();
+        assert!(matches!(recovery, Recovery::Set(_)), "{recovery:?}");
+        let set_lines = mutating_lines(&exec);
+        assert_eq!(set_lines.len(), 3, "the auto-set ran: {set_lines:?}");
+
+        let ok = or_restore_system_proxy(&Mode::Server, &sp, async { Ok::<_, anyhow::Error>(7) })
+            .await
+            .unwrap();
+        assert_eq!(ok, 7);
+        assert_eq!(mutating_lines(&exec), set_lines, "success restores nothing");
+
+        // The scripted engine answers every read "off", so at exit nothing of
+        // ours is left to rewrite: the restore shows as the reads it makes to
+        // judge that, and as the consumed state file (nothing for the watchdog).
+        let runs_before = exec.runs().len();
+        assert!(
+            dir.join(STATE_FILE_NAME).is_file(),
+            "the auto-set left its file"
+        );
+        let err = or_restore_system_proxy(&Mode::Server, &sp, async {
+            Err::<(), _>(anyhow::anyhow!(
+                "cannot start: the operator bus port is already in use"
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("cannot start: the operator bus"),
+            "{err}"
+        );
+        assert!(
+            exec.runs().len() > runs_before,
+            "the exit restore read the live state"
+        );
+        assert!(
+            !dir.join(STATE_FILE_NAME).exists(),
+            "the exit restore consumed the state file"
+        );
+        assert_eq!(
+            mutating_lines(&exec),
+            set_lines,
+            "nothing of ours was left to rewrite"
+        );
+
+        let before = exec.runs().len();
+        let err = or_restore_system_proxy(&Mode::Cli(args(&["flow", "list"])), &sp, async {
+            Err::<(), _>(anyhow::anyhow!("nope"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "nope");
+        assert_eq!(
+            exec.runs().len(),
+            before,
+            "a one-shot mode never touches the OS"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
