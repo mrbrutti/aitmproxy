@@ -64,6 +64,9 @@ CASES = 100
 LIVENESS_EVERY = 25
 # 100 cases + 1 baseline + 4 scheduled liveness probes (cases 25, 50, 75, 100).
 EXPECTED_FRAMES = CASES + 1 + CASES // LIVENESS_EVERY
+# How many cases a healthy target on a loaded rig may fail to answer inside the 500 ms
+# window before this cell calls it a regression (each costs one liveness probe frame).
+MAX_SILENT_READS = 5
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.checks")
 JOB_TIMEOUT = 600.0
 
@@ -170,15 +173,18 @@ def main() -> int:
         injected = [p for p in packets if p.get("injected") is True]
         note("capture", f"{len(packets)} packets total, {len(to_port)} to port {port}, "
                         f"{len(injected)} flagged injected")
-        # Exactly 105 on a quiet rig; one liveness probe pair more for every case whose
-        # 500 ms reply window a loaded rig read as silent (the strict correlation of
-        # amendment 66 no longer lets a stray loopback frame end the window early;
-        # rig run 10 saw 106). The lane's counters above are exact regardless.
+        # Exactly 105 on a quiet rig. A case whose 500 ms reply window a loaded rig read
+        # as silent costs one more frame: the first liveness probe of its pair passes on a
+        # healthy target, so no retry (the strict correlation of amendment 66 no longer
+        # lets a stray loopback frame end the window early; rig runs 10-12 saw 106, i.e.
+        # one such case). This is the INDEPENDENT bound on what the lane sent (the
+        # status.l4 counters above are the lane reporting on itself), so the allowance is
+        # a small regression bound, not the protocol's worst case (tester finding F2).
         extra_probes = len(to_port) - EXPECTED_FRAMES
-        expect(0 <= extra_probes <= 2 * CASES,
+        expect(0 <= extra_probes <= MAX_SILENT_READS,
                f"the capture holds {EXPECTED_FRAMES} frames to port {port} "
                f"({CASES} cases + 1 baseline + {CASES // LIVENESS_EVERY} scheduled liveness probes), "
-               f"plus at most one probe pair per silent-read case",
+               f"plus at most {MAX_SILENT_READS} liveness probes for cases a loaded rig read as silent",
                len(to_port))
         note("extra liveness probes beyond the budgeted 105", extra_probes)
         stray_dst = sorted({str(p.get("dst")) for p in to_port if p.get("dst") != "127.0.0.1"})
