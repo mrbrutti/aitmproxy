@@ -117,6 +117,31 @@ as the N4 startup refusal, which the CLI journey already proved (`N4-CLI`).
 | N4 port held | CLI | PASS (above) | — | — |
 | N5 wrong token | all | SKIP | — | — |
 
+## Runner dry run at 02:25Z (`dry-run/`) — the state had changed under the run
+
+`tests/e2e/acceptance/lib/run.sh 0.5.10-dry` with no yes-list and no window, read-only. Between
+the 02:06Z readings above and this run the app was **relaunched by someone else** (core pid
+78375 → 79160, `proxy.status.version` **0.5.11**), three hosts were added to Scope
+(`example.com:443`, `www.apple.com:443`, `httpbin.org:443`) and traffic went through the
+extension. This is why D2 reads the state first and why nothing here is "arranged".
+
+| Cell | Result | What it showed |
+|---|---|---|
+| cli-livecore | FAIL | CLI-4 FAIL (one-shot `listening: false` beside a core on 8080); CLI-5 FAIL (host echoed, running core's `scope.list` unchanged); N4-CLI PASS; CLI-7 PASS |
+| mac | FAIL | MAC-1 PASS (bundle 0.5.11, core 0.5.11 pid 79160); MAC-7 PASS (All Apps already on, attached, `flows_handed_off.tcp 5`); **MAC-9a PASS**: 9 extension rows all carry `source_app` (`com.apple.Safari`, `com.apple.curl`, `capture_interface macos-ne`, `tunnel decrypted`) — so with a host in Scope and All Apps on, the Apps sidebar does get its app; **MAC-9b FAIL**: 5 proxied rows (Firefox → 8080) carry no `source_app`, and one is `CONNECT httpbin.org:443 … failed / client_rejected_certificate` (a client with its own trust store); MAC-2/3/4/5/6/13 SKIP (window / yes); MAC-8/10/11/12 BLOCKED |
+| n5 | PASS | `aitm-tui --bus <app bus> --token-file <wrong>` shows the exact sentence `bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)` and stops retrying |
+| tui, web, cli-nocore | SKIP | `port 8080 held by aitm pid 79160` (the app's core) |
+| restore diff | identical | no `yes` step ran |
+| secret grep | none | — |
+| verdict | **FAIL** (exit 1) | CLI-4, CLI-5, MAC-9b |
+
+So Matt's "Apps sidebar shows NOTHING" has two halves on his Mac: (1) extension-captured
+flows ARE attributed once a host is in Scope and All Apps is on (MAC-9a PASS on the 0.5.11 core,
+`com.apple.Safari` rows); (2) every flow that reaches the core through the system proxy or a
+browser's own proxy setting is unattributed (MAC-9b FAIL, missing feature). On the morning of
+2026-11-01 his Scope was empty, so half (1) produced nothing either — the Status words for that
+state are the MAC-3 words, still to be read on the window.
+
 ## Restore proof
 
 No `yes` step has run; nothing was changed. `state-after.txt` will be taken after the window and
@@ -129,13 +154,13 @@ and left no state file (the one-shot's in-process core minted nothing: `ca/` unc
 | Journey | PASS | FAIL | SKIP | BLOCKED |
 |---|---|---|---|---|
 | CLI | 2 | 3 | 3 | 0 |
-| MAC | 1 | 1 | 13 | 1 |
+| MAC (dry run, 0.5.11 core) | 3 | 1 | 10 | 4 |
 | TUI | 0 | 0 | 8 | 0 |
 | WEB | 0 | 0 | 8 | 0 |
-| Negatives | 1 | 0 | 4 | 0 |
+| Negatives | 2 | 0 | 3 | 0 |
 
-**Verdict so far: 0.5.10 fails the acceptance on the CLI journey (CLI-1/2/4/5) and on Apps
-attribution (MAC-9b).** Owners: PR #271 (CLI-1, CLI-2, log noise in CLI-7/N4), the
+**Verdict so far: `fail` — 0.5.10 fails the acceptance on the CLI journey (CLI-1/2/4/5) and on
+proxied-flow Apps attribution (MAC-9b); the rest is `incomplete` (window and yes-list pending).** Owners: PR #271 (CLI-1, CLI-2, log noise in CLI-7/N4), the
 `claude/cli-oneshot-live-core` PR (CLI-4, CLI-5), the proxied-flow attribution feature (MAC-9b).
 The release-blocking question for 0.5.11 is whether those three are in it.
 

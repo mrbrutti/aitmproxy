@@ -97,7 +97,7 @@ if want livecore; then
     fi
     # CLI-5 scope add: the host must reach the RUNNING core's scope.list (bus-side check through the embedded core's bus).
     run CLI-5 10 "$AITM" scope add --host acceptance-cli5.invalid; rc=$?
-    truth=$(python3 "$here/bus_truth.py" --embedded 2>/dev/null | sed -n '/== scope.list/,/== proxy.status/p' | tr -d '\n ' | head -c 200)
+    truth=$(python3 "$here/bus_truth.py" --embedded 2>/dev/null | sed -n '/== scope.list/,/== proxy.status/p' | sed '1d;$d' | tr -d '\n ' | head -c 200)
     if [ "$rc" = 0 ] && echo "$truth" | grep -q 'acceptance-cli5.invalid'; then
       res CLI-5 PASS "the running core lists it" "scope.list contains acceptance-cli5.invalid"
     else

@@ -36,8 +36,9 @@ fail=0; incomplete=0; results="$OUT/results.tsv"; : >"$results"
 run_cell() { # name cmd...
   local name="$1"; shift
   echo; echo "---- $name"
-  "$@" > >(tee "$OUT/$name.out") 2>&1; local rc=${PIPESTATUS[0]}
-  rc=$?; case "$rc" in
+  "$@" >"$OUT/$name.out" 2>&1; local rc=$?
+  cat "$OUT/$name.out"
+  case "$rc" in
     0) printf '%s\tPASS\n' "$name" >>"$results";;
     77) printf '%s\tSKIP\t%s\n' "$name" "$(grep -m1 '\[SKIP\]' "$OUT/$name.out" | head -c 200)" >>"$results"; incomplete=1;;
     *) printf '%s\tFAIL\texit %s\n' "$name" "$rc" >>"$results"; fail=1;;
@@ -52,6 +53,7 @@ cells="$here/.."
 # CLI-4/5/7 need the app's core up; CLI-1/2/3/6/8 need the ports free. Two halves, two preconditions.
 case ",$journeys," in *,cli,*) run_cell cli-livecore bash "$here/cli_journey.sh" livecore "$OUT/cli";; esac
 case ",$journeys," in *,mac,*) run_cell mac python3 "$cells/test_mac_journey.py";; esac
+case ",$journeys," in *,mac,*|*,negatives,*) run_cell n5 python3 "$cells/test_n5_wrong_token.py";; esac
 case ",$journeys," in *,tui,*) run_cell tui python3 "$cells/test_tui_journey.py";; esac
 case ",$journeys," in *,web,*) run_cell web python3 "$cells/test_web_journey.py";; esac
 case ",$journeys," in *,cli,*) run_cell cli-nocore bash "$here/cli_journey.sh" nocore "$OUT/cli";; esac
@@ -59,8 +61,8 @@ case ",$journeys," in *,cli,*) run_cell cli-nocore bash "$here/cli_journey.sh" n
 bash "$here/preflight.sh" "$OUT/state-after.txt" >/dev/null
 python3 "$here/bus_truth.py" --embedded >"$OUT/bus-truth-after.txt" 2>&1 || true
 echo; echo "---- restore diff (state-before vs state-after; timestamps and pids differ by design)"
-diff <(grep -vE '^[0-9]{4}-|^== when|pid|Nov|total' "$OUT/state-before.txt") \
-     <(grep -vE '^[0-9]{4}-|^== when|pid|Nov|total' "$OUT/state-after.txt") >"$OUT/state-diff.txt" \
+diff <(grep -vE '^[0-9]{4}-|^== when|pid|Nov|total|^written to' "$OUT/state-before.txt") \
+     <(grep -vE '^[0-9]{4}-|^== when|pid|Nov|total|^written to' "$OUT/state-after.txt") >"$OUT/state-diff.txt" \
   && echo "identical" || { echo "DIFFERS:"; cat "$OUT/state-diff.txt"; }
 
 echo; echo "---- secret leak check (operator token value, agent token value, web #t= values, AITM_WEB_TOKEN)"

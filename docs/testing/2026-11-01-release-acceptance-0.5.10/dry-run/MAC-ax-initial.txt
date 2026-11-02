@@ -1,0 +1,2 @@
+
+[stderr] 619:620: syntax error: Can’t set line to r & "	" & t & "	" & v & "	" & d. Access not allowed. (-10003)
