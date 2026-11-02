@@ -414,7 +414,10 @@ turning terminal and the final status landing.
 **Cancel gating.** `ScanPanelState.cancel(job:)` sends nothing when
 `facts(for: job)?.summary.state` is `.cancelling` or terminal (idempotent
 twice over: the engine's cancel already is). `cancelTarget` returns nil for a
-cancelling job. The header's Cancel Scan button is disabled and titled
+cancelling job. **Amendment (2026-11-02, tester finding):** the "only running
+job" fallback applies only when *no* job is selected; with a selected job
+that is cancelling or terminal, ⌥⌘. and Scan ▸ Cancel Scan do nothing rather
+than cancel a different job the operator is not looking at. The header's Cancel Scan button is disabled and titled
 `Cancelling…` while the merged state is `.cancelling`; the row's hover Cancel
 and the context-menu item are hidden for cancelling and terminal rows. The
 `scan.cancel` reply (`cancelling`) is still applied through `applyStatus` so
