@@ -1,5 +1,5 @@
-//! Tolerant colourisers for the two languages an operator edits — Rhai
-//! (plugins and PoC `script` steps) and PoC YAML — driven by the shared
+//! Tolerant colourisers for the two languages an operator edits, Rhai
+//! (plugins and PoC `script` steps) and PoC YAML, driven by the shared
 //! grammar under `docs/design/languages/` (UI-ext spec §1, plan Task 7). Each
 //! tokenizer turns source into `(SyntaxToken, text)` runs that [`style_for`]
 //! maps to the foundation `syntax.*` styles, so the Scripts editor and the
@@ -18,12 +18,12 @@ use ratatui::text::{Line, Span};
 
 use crate::theme::Theme;
 
-/// A coloured run's semantic class — the shared grammar's `map_token` targets
+/// A coloured run's semantic class: the shared grammar's `map_token` targets
 /// (`docs/design/languages/rhai.grammar.json`). `Keyword` and `Comment` are
 /// the spec's additive tokens; until `tokens.json` grows `syntax.keyword` /
 /// `syntax.comment`, the TUI resolves `Keyword` to the foundation's
 /// `syntax.boolean` (whose own token description reads "true/false/null,
-/// keywords") and `Comment` to the dim `text.tertiary` tier — a seam that
+/// keywords") and `Comment` to the dim `text.tertiary` tier, a seam that
 /// [`style_for`] changes in one place when those tokens land (spec §1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxToken {

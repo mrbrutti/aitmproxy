@@ -1,4 +1,4 @@
-//! `o` — open externally (§2.9 "placeholder + `o` opens externally"). The
+//! `o`: open externally (§2.9 "placeholder + `o` opens externally"). The
 //! terminal cannot show an image or page a 5 MB body, so the TUI hands the
 //! file to the desktop: `open` on macOS, `xdg-open` elsewhere, spawned and
 //! not waited for. A body that only exists in memory is first written to a

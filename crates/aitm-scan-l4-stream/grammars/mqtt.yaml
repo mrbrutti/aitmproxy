@@ -1,0 +1,123 @@
+# MQTT 3.1.1 as one message: the fixed header every packet starts with, and
+# the variable header and payload the packet type selects.
+#
+# Two protocol facts cannot be written in this format, which has no field that
+# depends on the value of another, so they live in `grammars/mqtt.rs` and are
+# named here instead of being left for a reader to discover:
+#
+#   * the `variable` choice is a choice *by packet type*. `Mqtt::parse` keeps
+#     only the alternative that the type nibble of `fixed.type_flags` selects
+#     and parses with that; for a type this file does not describe it tries
+#     the alternatives in the order written. Were the choice resolved by
+#     "the first alternative that parses", a SUBSCRIBE would read as a
+#     PUBLISH, because a packet id is a credible topic length.
+#   * `publish` is the QoS-0 shape, which is the only one the lane generates.
+#     A captured QoS-1 or QoS-2 PUBLISH parses with its two packet-id bytes at
+#     the head of `payload`.
+#
+# A CONNECT that announces a protocol name other than `MQTT` (3.1's `MQIsdp`)
+# still parses: `proto_name.text` is measured by its own length field, not
+# matched against a literal, so the protocol name is a mutable field like any
+# other.
+grammar: mqtt
+transport: tcp
+default_ports: [1883]
+# 3.1.1 §4.8 tells a broker to close the connection on a malformed packet
+# rather than to answer, so a close is not evidence of a fault.
+close_on_malformed_is_expected: true
+reply: >
+  The broker answers a CONNECT with a CONNACK (0x20, two bytes: the
+  session-present flag and a return code, 0 accepted and 1 to 5 refused), a
+  SUBSCRIBE with a SUBACK (0x90) carrying one granted-QoS byte per topic
+  where 0x80 means refused, a QoS-1 PUBLISH with a PUBACK (0x40) and a
+  PINGREQ with a PINGRESP (0xd0 0x00). A QoS-0 PUBLISH is not answered at
+  all. On a malformed packet the broker closes the connection without a
+  reply, which is the protocol working.
+message:
+  - name: fixed
+    type: group
+    fields:
+      # The high nibble is the packet type, the low nibble its flags:
+      # 0x10 CONNECT, 0x30 PUBLISH (QoS 0, no retain), 0x82 SUBSCRIBE,
+      # 0xa2 UNSUBSCRIBE, 0xc0 PINGREQ, 0xe0 DISCONNECT.
+      - name: type_flags
+        type: u8
+        value: "0xc0"
+        one_of: ["0x10", "0x30", "0x82", "0xa2", "0xc0", "0xe0"]
+      # Every byte after the fixed header, 7 bits at a time with the high bit
+      # as the continuation flag.
+      - { name: remaining_length, type: varint, len: { of: rest } }
+  - name: variable
+    type: choice
+    fields:
+      - name: connect
+        type: group
+        fields:
+          - name: proto_name
+            type: group
+            fields:
+              - { name: len, type: u16 be, len: { of: [text] } }
+              - { name: text, type: bytes, value: "MQTT" }
+          # 4 is MQTT 3.1.1.
+          - { name: level, type: u8, value: 4 }
+          # Bit 7 username, bit 6 password, bit 5 will-retain, bits 4-3 will
+          # QoS, bit 2 will flag, bit 1 clean session.
+          - { name: connect_flags, type: u8, value: 2 }
+          - { name: keepalive, type: u16 be, value: 60 }
+          - name: client_id
+            type: group
+            fields:
+              - { name: len, type: u16 be, len: { of: [text] } }
+              - { name: text, type: bytes }
+          # The credentials the connect flags announce. The lane never sends
+          # them: `Mqtt::strip_credentials` clears both flag bits and drops
+          # this group from a captured CONNECT before it enters the corpus.
+          - name: credentials
+            type: choice
+            fields:
+              - name: user_pass
+                type: group
+                fields:
+                  - name: username
+                    type: group
+                    fields:
+                      - { name: len, type: u16 be, len: { of: [text] } }
+                      - { name: text, type: bytes }
+                  - name: password
+                    type: group
+                    secret: true
+                    fields:
+                      - { name: len, type: u16 be, len: { of: [text] } }
+                      - { name: text, type: bytes }
+              - name: user_only
+                type: group
+                fields:
+                  - name: username
+                    type: group
+                    fields:
+                      - { name: len, type: u16 be, len: { of: [text] } }
+                      - { name: text, type: bytes }
+              - { name: none, type: bytes, size: 0 }
+      - name: publish
+        type: group
+        fields:
+          - name: topic
+            type: group
+            fields:
+              - { name: len, type: u16 be, len: { of: [text] } }
+              - { name: text, type: bytes, value: "a/b" }
+          - { name: payload, type: bytes }
+      - name: subscribe
+        type: group
+        fields:
+          - { name: packet_id, type: u16 be, value: 1 }
+          - name: topics
+            type: repeat
+            until: end
+            fields:
+              - { name: len, type: u16 be, len: { of: [text] } }
+              - { name: text, type: bytes, value: "a/#" }
+              - { name: qos, type: u8, value: 0, range: [0, 2] }
+      # PINGREQ and DISCONNECT have no variable header and no payload.
+      - { name: pingreq, type: bytes, size: 0 }
+      - { name: disconnect, type: bytes, size: 0 }

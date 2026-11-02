@@ -1,7 +1,7 @@
 //! Task 18 (plan 2026-10-31-system-proxy-automation, §D12 / §D14): the
 //! listening pill carries the system-proxy word after the address and before
 //! the intercept/capture state; the help overlay and the palette name key `s`
-//! and `:sysproxy`. Every app here is `App::new` populated by hand — there is
+//! and `:sysproxy`. Every app here is `App::new` populated by hand: there is
 //! no fixture.
 
 mod common;
@@ -141,9 +141,10 @@ fn help_overlay_names_key_s_and_keeps_its_footer() {
         line.contains("│ s         set / restore the system proxy"),
         "key column: {line:?}"
     );
-    // The new line must not push the closing hint off the box.
+    // The new line must not push the closing hint off the box (the help
+    // closes on `any other key` since the overlay learned to scroll, G85).
     assert!(
-        text.contains("Any key closes this help."),
+        text.contains("any other key closes this help."),
         "footer clipped:\n{text}"
     );
 }

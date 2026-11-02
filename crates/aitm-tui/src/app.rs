@@ -4,13 +4,20 @@
 //! `lib.rs` owns those, which is what lets every screen be tested from
 //! `BusEvent`s written inline in the core's wire shapes.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use aitm_scan_model::{
+    is_builtin_name, ChecksResult, Issue, IssueStatus, IssuesResult, JobEvent, JobId,
+    JobNotification, JobStatus, ListResult, Phase, ProfileDeleteResult, ProfileListResult,
+    ProfileSaveResult, ScanProfile, SessionMode, SessionProfile, SitemapResult, StartResult,
+    JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
+};
+use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
 
 use crate::action::ToolSchema as _;
@@ -22,7 +29,19 @@ use crate::model::{
     Finding, FlowDetail, FlowKind, FlowRow, Message, Severity, SystemProxyWord,
 };
 use crate::open::{self, OpenTarget};
+use crate::scan::{
+    due, fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
+    parse_result, row_gate, scan_host, scroll, state_text, status_token, step, tag_keyed,
+    tag_parts, typed_origin, usable_selector, walk, ConfirmReply, Dir, EditorField, FieldKind,
+    IssueFilterKey, IssuePane, JobPane, Launch, LaunchVerb, MapPane, MapSource, PendingLaunch,
+    ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab, WireConfirm,
+    CLAMPED_FIELD_MAX, CLAMPED_MAX, ERROR_DETAIL_MAX, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
+    MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
+    OTHER_SAVED, SAVED_NAME_MAX, SAVED_PATH_MAX, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
+};
+use crate::text::{cut_to, truncate};
 use crate::theme::Theme;
+use crate::ui::overlays;
 use crate::viewers::json;
 
 /// Terminal widths below which the shell changes shape (§2.10(c)).
@@ -82,9 +101,10 @@ pub enum Mode {
     Scan,
     Help,
     QuickLook,
-    /// The L4 inject confirm-over-the-wire overlay (ui-ext §3.4, L4OPS-AC10):
-    /// shows the server's wire summary; `y` re-issues with `_confirm`.
-    L4Confirm,
+    /// The confirm-over-the-wire overlay (spec D3, D7), shared by the `l4.*`
+    /// guarded verbs and the `scan.*` launches: shows the server's prompt; `y`
+    /// re-issues with `_confirm`.
+    WireConfirm,
     /// The L4 panel (`:l4`, `L`): capture / intercept availability from the
     /// status verbs, the running captures and the capture commands (L4 parity
     /// spec §1, AC15). Renders live state only.
@@ -94,9 +114,9 @@ pub enum Mode {
 /// What the one-line prompt is collecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
-    /// `:` — the command palette.
+    /// `:`, the command palette.
     Palette,
-    /// `/` — the filter expression.
+    /// `/`, the filter expression.
     Filter,
     Comment,
     Mark,
@@ -118,6 +138,18 @@ pub enum PromptKind {
     BrowserUrl,
     /// Browser view `e`: a JavaScript expression for `browser.eval`.
     BrowserEval,
+    /// Profiles `o`: an origin to add to the draft, typed (scanner v2 spec
+    /// D4, D8).
+    ScanOrigin,
+    /// Profiles `e` on a number or text field: the new value, prefilled
+    /// with the current one (spec D4).
+    ScanField,
+    /// Profiles `w` on a builtin or an unnamed draft: the name to save it
+    /// under (spec D4).
+    ScanProfileName,
+    /// Profiles `t`: an L4 target as `ip:port[/tcp|udp][ grammar]` (spec
+    /// D4).
+    ScanL4Target,
 }
 
 /// The last `browser.screenshot`: its header facts and the bytes `o` hands
@@ -163,75 +195,39 @@ pub struct BrowserState {
     pub error: Option<String>,
 }
 
-/// One discovered injection point, mirroring an entry of `scan.discover`'s
-/// `injection_points` array (`{flow, location, name, example}`). The `example`
-/// is whatever the scanner handed us (redacted at the source for cookies and
-/// secret-named parameters); the UI renders it verbatim and never re-derives a
-/// raw value.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct InjectionPointRow {
-    /// The flow this point was discovered in.
-    pub flow: String,
-    /// Where it lives (`query`, `body_param`, `header`, `cookie`,
-    /// `path_segment`, `redirect`).
-    pub location: String,
-    /// The parameter / header / segment name.
-    pub name: String,
-    /// The observed (already-redacted) example value.
-    pub example: String,
-}
+/// The rows the Scan view spends on chrome rather than list body, so a
+/// PgUp/PgDn page is `height - SCAN_CHROME_ROWS`: the three bars, the two box
+/// edges, the strip-and-banner row, a heading row, a rule, a detail line and
+/// one spare footer row (spec D11, plan task 4).
+const SCAN_CHROME_ROWS: u16 = 10;
 
-impl InjectionPointRow {
-    /// Read one `injection_points` entry; missing fields read as empty.
-    fn from_json(v: &Value) -> Self {
-        let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        Self {
-            flow: s("flow"),
-            location: s("location"),
-            name: s("name"),
-            example: s("example"),
-        }
-    }
-}
+// `SAVED_NAME_MAX`, `SAVED_PATH_MAX`, `CLAMPED_MAX` and `CLAMPED_FIELD_MAX`
+// live with the other profile bounds in `scan::profiles` (fix round G,
+// G41, G70).
 
-/// Which of the Scan view's two lists holds the cursor. Tab toggles it; ↑↓ walk
-/// the focused list and ⏎ opens its selected row's flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ScanFocus {
-    /// The reached-endpoints list (⏎ opens the endpoint's linked flow, AC3).
-    Endpoints,
-    /// The injection-points list (⏎ opens the point's flow). The default, so
-    /// the point list stays the first thing the operator walks.
-    #[default]
-    Points,
-}
+/// The local refusal while a launch waits for its reply (spec D7).
+const LAUNCH_IN_FLIGHT: &str = "a launch is already in flight";
 
-/// The Scan view's state (scanner-integration Stage 1): what `scan.discover`
-/// has reported so far. Plain data; `App::on_bus` fills it and `ui::scan` draws
-/// it. The model mirrors the scanner's `endpoints` + `injection_points` JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ScanState {
-    /// A `scan.discover` crawl is in flight; disables re-launch until it
-    /// settles (the Browser `busy` precedent).
-    pub running: bool,
-    /// The scope-bound target URL the last launch sent.
-    pub target: Option<String>,
-    /// The reached endpoints from the last result (each a flow in the store).
-    pub endpoints: Vec<String>,
-    /// AC3 endpoint→flow links from the last result: the scrubbed endpoint URL
-    /// (as it appears in `endpoints`) → the flow id it was reached as. Not every
-    /// endpoint has an entry; ⏎ on an unlinked endpoint opens nothing.
-    pub endpoint_flows: HashMap<String, String>,
-    /// The discovered injection points from the last result.
-    pub points: Vec<InjectionPointRow>,
-    /// The injection-point list cursor.
-    pub cursor: usize,
-    /// The endpoints-list cursor.
-    pub endpoint_cursor: usize,
-    /// Which list the cursor is on; Tab toggles it.
-    pub focus: ScanFocus,
-    /// The last `scan.discover` failure, shown until the next launch.
-    pub error: Option<String>,
+/// The widest a `poc_ref` grows in the "not in the Findings list" toast.
+const POC_TOAST_MAX: usize = 80;
+
+/// What the Profiles keys say when no editor is open (plan task 10).
+const NO_EDITOR: &str = "open a profile first (Enter on a row, or N for a new one)";
+
+/// Profiles `e` with an editor held but another pane focused (D11 as
+/// amended; fix round H, H48): the key edits the Fields cursor only from
+/// the Fields pane.
+const E_NEEDS_FIELDS: &str = "e edits a field: Tab to the Fields pane";
+
+/// The most cells a toast keeps (fix round H, H47): every `CallFailed`
+/// message reaches [`App::toast`] whole, so the text is bounded once, when
+/// it is stored, never per frame.
+pub const TOAST_MAX: usize = 400;
+
+/// The toast the Scan views raise when `⏎` names a flow the store no
+/// longer holds (D11): the one "not in the flow list" wording.
+fn not_in_flow_list(id: &str) -> String {
+    format!("flow {id} is not in the flow list (cleared, or not captured here)")
 }
 
 /// Whether the browser view counts a call as in flight: exactly the calls
@@ -255,20 +251,6 @@ fn browser_busy_label(name: &str) -> Option<&'static str> {
     })
 }
 
-/// The seed URL `scan.discover` is given for an in-scope host.
-fn scan_target_url(host: &str) -> String {
-    format!("http://{host}/")
-}
-
-/// Reduce a scan target (`host`, `host:port`, `http://host/path?q`) to the bare
-/// host the scope guard checks.
-fn scan_host(raw: &str) -> String {
-    let s = raw.trim();
-    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
-    let s = s.split(['/', '?', '#']).next().unwrap_or(s);
-    s.rsplit_once(':').map_or(s, |(h, _)| h).to_string()
-}
-
 /// A tool call held back for the operator's `y/N`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfirmCall {
@@ -277,6 +259,10 @@ pub struct ConfirmCall {
     pub args: Value,
     /// Where to go after the answer.
     pub return_to: Mode,
+    /// The tag a `scan.*` call leaves under on `y` (spec D4; fix round G,
+    /// G38): set by the caller that knows the key, `None` for a plain
+    /// `Call`.
+    pub tag: Option<String>,
 }
 
 /// Inspector placement; the TUI has horizontal and vertical only (§2.6).
@@ -566,8 +552,8 @@ impl InspectorState {
 /// line, body. `to_edits` turns it back into `flow.mutate` edits.
 ///
 /// The body is sent back only when its lines changed, and then with the line
-/// ending and trailing newline the original had, so an untouched body — and
-/// any body that is not UTF-8, which the editor only describes — reaches the
+/// ending and trailing newline the original had, so an untouched body, and
+/// any body that is not UTF-8, which the editor only describes, reaches the
 /// upstream byte for byte as it was captured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditBuffer {
@@ -587,7 +573,7 @@ pub struct EditBuffer {
 
 /// The body line shown for a body the editor cannot represent as text.
 fn binary_placeholder(len: usize) -> String {
-    format!("<{len} binary bytes — edit in hex is a follow-up>")
+    format!("<{len} binary bytes: edit in hex is a follow-up>")
 }
 
 impl EditBuffer {
@@ -640,8 +626,8 @@ impl EditBuffer {
     }
 
     /// The `flow.mutate` `edits` object: method, path, every header (the core
-    /// replaces by name) and — only when its lines changed and the body is
-    /// text — the body, rebuilt with the original line ending and trailing
+    /// replaces by name) and, only when its lines changed and the body is
+    /// text, the body rebuilt with the original line ending and trailing
     /// newline. An untouched or binary body is left to the core as captured.
     pub fn to_edits(&self) -> Value {
         let mut edits = Map::new();
@@ -939,7 +925,7 @@ pub struct App {
     pub filter: Option<Expr>,
     pub filter_text: String,
     pub prompt: String,
-    /// The mode the open prompt was opened from — where Esc or Enter
+    /// The mode the open prompt was opened from, where Esc or Enter
     /// returns. Set by `open_prompt` only when a prompt is not already open,
     /// so a chained prompt (PoC name → param) keeps the first one's origin.
     pub prompt_from: Mode,
@@ -1021,9 +1007,25 @@ pub struct App {
     /// The L4 operator surface's state (ui-ext Part 3): flows, scope, agent
     /// gates, craft editor, inject confirm. Inert until the bus offers `l4.*`.
     pub l4: crate::l4::L4State,
-    /// The Scan view's state (scanner-integration Stage 1). Inert until the bus
-    /// offers `scan.discover`.
+    /// The Scan view's state (spec D1, D3): the four tabs, the launch
+    /// bookkeeping and the legacy `scan.discover` one-shot. Inert until the
+    /// bus offers `scan.start` or `scan.discover` (D2).
     pub scan: ScanState,
+    /// The pending confirm-over-the-wire handshake (spec D3, D7), shared by the
+    /// `l4.*` guarded verbs and the `scan.*` launches; `Some` while the overlay
+    /// is open.
+    pub wire_confirm: Option<WireConfirm>,
+    /// The mode to return to when the wire-confirm overlay closes: `l4_inject`
+    /// and `l4_intercept_verb` set `Mode::Inspector`, the scanner launch (Task
+    /// 12) sets `Mode::Scan`.
+    pub wire_confirm_from: Mode,
+    /// A non-job push line arrived since the last `Tick` (spec D5): the flow
+    /// list is stale and the next tick issues one `Refresh` for all of them.
+    pub flows_dirty: bool,
+    /// The help overlay's first visible line (fix round G, G85): reset when
+    /// the overlay opens, moved by the arrow, page and Home/End keys while
+    /// it is shown, clamped by the view to the lines that do not fit.
+    pub help_scroll: u16,
 }
 
 impl App {
@@ -1089,6 +1091,10 @@ impl App {
             poc_build_pending: VecDeque::new(),
             l4: crate::l4::L4State::default(),
             scan: ScanState::default(),
+            wire_confirm: None,
+            wire_confirm_from: Mode::Flows,
+            flows_dirty: false,
+            help_scroll: 0,
         }
     }
 
@@ -1124,7 +1130,7 @@ impl App {
     }
 
     /// AC8: an expectation was set (`--expect-role`) and the connection did not
-    /// resolve to it — a different role, or no role echoed at all. False when
+    /// resolve to it: a different role, or no role echoed at all. False when
     /// no expectation was set or while the bus is not connected.
     pub fn role_mismatch(&self) -> bool {
         match (&self.expect_role, &self.bus) {
@@ -1382,7 +1388,7 @@ impl App {
 
     /// Bytes captured across the list, once at least one row knows a size
     /// (sizes come with `flow.detail`, F5); `None` until then, which the
-    /// status bar draws as a dash — a real `0 B` is `Some(0)` (§2.8).
+    /// status bar draws as a dash: a real `0 B` is `Some(0)` (§2.8).
     pub fn total_bytes(&self) -> Option<u64> {
         let mut known = false;
         let mut total = 0u64;
@@ -1395,10 +1401,18 @@ impl App {
         known.then_some(total)
     }
 
+    /// Show `text` in the status bar for 16 ticks. The text is bounded here,
+    /// once (fix round H, H47; D6 hostile-core bounds): control characters
+    /// stripped, cut to [`TOAST_MAX`] cells (so at most `4 * TOAST_MAX`
+    /// chars), and the buffer shrunk, so a raw core message a megabyte long
+    /// neither sits in the ring nor overflows the bar's width sums.
     pub fn toast(&mut self, level: Level, text: impl Into<String>) {
+        let mut text = text.into();
+        cut_to(&mut text, TOAST_MAX);
+        text.shrink_to_fit();
         self.toasts.push_back(Toast {
             level,
-            text: text.into(),
+            text,
             expires_at_tick: self.ticks + 16,
         });
         while self.toasts.len() > 3 {
@@ -1492,18 +1506,31 @@ impl App {
     /// Apply a user action; returns the bus work it implies.
     pub fn update(&mut self, action: Action) -> Vec<BusRequest> {
         let mut out = Vec::new();
+        // A Scan banner notice answers one key (D11 `already <state>`): the
+        // next key clears it; the timer and a resize are not keys.
+        if !matches!(action, Action::Tick | Action::Resize(..)) {
+            self.scan.notice = None;
+        }
         match action {
             Action::Quit => self.should_quit = true,
             Action::Tick => {
                 self.ticks += 1;
                 let t = self.ticks;
                 self.toasts.retain(|x| x.expires_at_tick > t);
+                // Every push line since the last tick collapses into one
+                // flow sweep (spec D5): a subscribed bus can deliver many
+                // lines per second and the list only needs one refresh.
+                if self.flows_dirty {
+                    self.flows_dirty = false;
+                    out.push(BusRequest::Refresh);
+                }
+                self.scan_tick(t, &mut out);
             }
             Action::Resize(w, h) => {
                 self.width = w;
                 self.height = h;
             }
-            Action::Help => self.mode = Mode::Help,
+            Action::Help => self.open_help(),
             Action::Back => self.back(),
             Action::Input(c) if self.mode == Mode::Prompt(PromptKind::Confirm) => {
                 out.extend(self.answer_confirm(matches!(c, 'y' | 'Y')));
@@ -1535,7 +1562,15 @@ impl App {
             | Action::Home
             | Action::End => self.navigate(&action, &mut out),
             Action::Left | Action::Right => {
-                let d: i32 = if action == Action::Left { -1 } else { 1 };
+                let dir = if action == Action::Left {
+                    Dir::Prev
+                } else {
+                    Dir::Next
+                };
+                let d: i32 = match dir {
+                    Dir::Prev => -1,
+                    Dir::Next => 1,
+                };
                 match self.mode {
                     Mode::Edit => {
                         if let Some(e) = &mut self.edit {
@@ -1552,7 +1587,12 @@ impl App {
                             usize::try_from((self.compose.field as i64 + i64::from(d)).clamp(0, 3))
                                 .unwrap_or(0)
                     }
-                    _ => self.chip = step(&Chip::ALL, self.chip, d),
+                    // Scan (plan task 10): in the Checks pane ← collapses
+                    // and → (`l`) expands the node under the cursor;
+                    // elsewhere in the view the keys do nothing (the chips
+                    // are the flow list's).
+                    Mode::Scan => self.scan_tree_fold(dir == Dir::Prev),
+                    _ => self.chip = step(&Chip::ALL, self.chip, dir),
                 }
             }
             Action::Enter => match self.mode {
@@ -1564,50 +1604,56 @@ impl App {
                     }
                 }
                 Mode::Findings => {
-                    if let Some(f) = self.findings.get(self.finding_cursor) {
-                        if let Some(id) = f.finding_capture.clone() {
-                            if self.row(&id).is_some() {
-                                self.selected = Some(id);
-                                self.mode = Mode::Inspector;
-                                self.ensure_detail(&mut out);
-                            } else {
-                                self.toast(Level::Warn, "finding capture is not in the flow store");
-                            }
-                        }
+                    let capture = self
+                        .findings
+                        .get(self.finding_cursor)
+                        .and_then(|f| f.finding_capture.clone());
+                    if let Some(id) = capture {
+                        self.open_flow(id, "finding capture is not in the flow store", &mut out);
                     }
                 }
-                // Scan: ⏎ opens the focused list's selected flow in the
-                // inspector — the injection point's flow, or the endpoint's
-                // linked flow (AC3). Parity with the web view's endpoint→flow
-                // links. An endpoint with no linked flow opens nothing; a flow
-                // no longer in the store is refused, not selected.
-                Mode::Scan => {
-                    let id = match self.scan.focus {
-                        ScanFocus::Points => self
-                            .scan
-                            .points
-                            .get(self.scan.cursor)
-                            .map(|p| p.flow.clone()),
-                        ScanFocus::Endpoints => self
-                            .scan
-                            .endpoints
-                            .get(self.scan.endpoint_cursor)
-                            .and_then(|e| self.scan.endpoint_flows.get(e).cloned()),
-                    };
-                    if let Some(id) = id {
-                        if self.row(&id).is_some() {
-                            self.selected = Some(id);
-                            self.mode = Mode::Inspector;
-                            self.inspector.reset_view();
-                            self.ensure_detail(&mut out);
-                        } else {
-                            self.toast(
-                                Level::Warn,
-                                format!(
-                                    "flow {id} is not in the flow list (cleared, or not captured here)"
-                                ),
-                            );
+                // Scan: ⏎ acts per tab (D11). On Profiles it opens the
+                // row's editor, edits the field, adds the origin or acts on
+                // the tree node, by pane (plan task 10).
+                Mode::Scan if self.scan.tab == ScanTab::Profiles => {
+                    self.profiles_enter(&mut out);
+                }
+                // On Jobs it opens the Issues
+                // tab filtered to the cursor's job and asks for its issues
+                // once (D6, "entering Issues, any filter change"); the
+                // legacy Jobs row has no job, so nothing happens there (D12).
+                Mode::Scan if self.scan.tab == ScanTab::Jobs => {
+                    if let Some(job) = self.scan.jobs.cursor_job().cloned() {
+                        self.scan.issues.filters.job = Some(job);
+                        self.scan.tab = ScanTab::Issues;
+                        self.request_issues(&mut out);
+                    }
+                }
+                // On Issues with the Detail pane focused it opens the probe
+                // (or baseline) flow under the flow cursor (D11); on the
+                // List pane it opens the row: the Detail pane takes the
+                // focus (D11 "⏎ open or act"; fix round E, E18).
+                Mode::Scan if self.scan.tab == ScanTab::Issues => {
+                    if self.scan.issues.pane == IssuePane::Detail {
+                        if let Some((id, _)) = self.scan.issues.flow_under_cursor() {
+                            let id = id.to_string();
+                            self.open_flow(id.clone(), &not_in_flow_list(&id), &mut out);
                         }
+                    } else {
+                        self.scan.issues.pane = IssuePane::Detail;
+                    }
+                }
+                // On Site map it opens the focused list's selected flow in
+                // the inspector, read from the same lists the cursor keys
+                // walk (A2), which on a legacy bus is exactly today's
+                // behaviour (D12): the injection point's flow in the Points
+                // pane, the endpoint's linked flow (AC3) in the Nodes pane.
+                // An endpoint with no linked flow opens nothing; a flow no
+                // longer in the store is refused, not selected. The other
+                // tabs act in their own tasks.
+                Mode::Scan => {
+                    if let Some(id) = self.scan.sitemap_selected_flow(self.scan_offer()) {
+                        self.open_flow(id.clone(), &not_in_flow_list(&id), &mut out);
                     }
                 }
                 Mode::Prompt(_) | Mode::Compose => out.extend(self.submit()),
@@ -1619,10 +1665,10 @@ impl App {
                 _ => {}
             },
             Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
-            Action::SidebarNext => self.sidebar_step(1, &mut out),
-            Action::SidebarPrev => self.sidebar_step(-1, &mut out),
-            Action::ChipNext => self.chip = step(&Chip::ALL, self.chip, 1),
-            Action::ChipPrev => self.chip = step(&Chip::ALL, self.chip, -1),
+            Action::SidebarNext => self.sidebar_step(Dir::Next, &mut out),
+            Action::SidebarPrev => self.sidebar_step(Dir::Prev, &mut out),
+            Action::ChipNext => self.chip = step(&Chip::ALL, self.chip, Dir::Next),
+            Action::ChipPrev => self.chip = step(&Chip::ALL, self.chip, Dir::Prev),
             Action::ChipIndex(i) => {
                 if let Some(c) = Chip::ALL.get(i) {
                     self.chip = *c;
@@ -1689,7 +1735,7 @@ impl App {
                     self.toast(
                         Level::Warn,
                         format!(
-                            "Resume all: {sent} resumed, {skipped} skipped — out of scope (add their hosts to scope to act)"
+                            "Resume all: {sent} resumed, {skipped} skipped (out of scope: add their hosts to scope to act)"
                         ),
                     );
                 }
@@ -1900,29 +1946,64 @@ impl App {
             Action::OpenScan => {
                 self.mode = Mode::Scan;
                 self.sidebar = SidebarItem::Scan;
+                // The first open lands on the tab this bus can serve (D2):
+                // Profiles when it has the v2 scanner, Jobs otherwise. Later
+                // opens restore the tab the operator left on.
+                if self.scan.opened_at_tick.is_none() {
+                    if self.scan_offer() == ScanOffer::V2 {
+                        self.scan.tab = ScanTab::Profiles;
+                    } else {
+                        self.scan.tab = ScanTab::Jobs;
+                        // A legacy result is read through its injection
+                        // points first (today's default focus); the
+                        // endpoints are the Nodes pane, one Tab away.
+                        self.scan.sitemap.pane = crate::scan::MapPane::Points;
+                    }
+                    self.scan.opened_at_tick = Some(self.ticks);
+                }
                 // Viewing the panel never crawls: a `scan.discover` is up to
                 // hundreds of real browser navigations against the target. Seed
                 // the scope-bound target the header shows, so `r` (ScanLaunch)
                 // and `:scan <host>` are the only paths that reach the wire.
-                if self.scan.target.is_none() {
+                if self.scan.legacy.target.is_none() {
                     if let Some(host) = self.scan_target_host() {
-                        self.scan.target = Some(scan_target_url(&host));
+                        // The seed follows the D8 origin rule (D12): the
+                        // scheme the captured flows show, never a hard-coded
+                        // `http://`. A host the rule refuses seeds nothing;
+                        // the launch keys name the reason when pressed.
+                        self.scan.legacy.target = typed_origin(&host, &self.flows).ok();
                     }
                 }
+                // D6, first row: opening the view lists the jobs. Quiet when
+                // the bus has no `scan.list` (a legacy bus): the Jobs tab's
+                // degraded text says so, a toast on every open would not.
+                self.request_scan_list(&mut out);
+                // Coming back to the view is entering its tab (D6): the
+                // lists may have moved while the operator was away.
+                let tab = self.scan.tab;
+                self.enter_tab_reads(tab, &mut out);
             }
-            Action::ScanLaunch => {
-                if self.scan.running {
-                    self.toast(Level::Info, "a scan is already running");
-                } else {
-                    self.scan_launch(None, &mut out);
-                }
-            }
-            Action::ScanFocusToggle => {
-                self.scan.focus = match self.scan.focus {
-                    ScanFocus::Points => ScanFocus::Endpoints,
-                    ScanFocus::Endpoints => ScanFocus::Points,
-                };
-            }
+            Action::ScanLaunch => self.scan_launch(None, &mut out),
+            Action::ScanTab(tab) => self.scan_tab(tab, &mut out),
+            Action::ScanPaneNext => self.scan.step_pane(true),
+            Action::ScanPanePrev => self.scan.step_pane(false),
+            Action::ScanCancel => self.scan_cancel(&mut out),
+            Action::ScanStart => self.scan_launch_v2(LaunchVerb::Start, &mut out),
+            Action::ScanMap => self.scan_launch_v2(LaunchVerb::Map, &mut out),
+            Action::ScanFilter(key) => self.scan_filter(key, &mut out),
+            Action::ScanFilterReset => self.scan_filter_reset(&mut out),
+            Action::ScanIssueStatus(status) => self.scan_issue_status(status, &mut out),
+            Action::ScanOpenPoc => self.scan_open_poc(),
+            Action::ScanNextPage => self.scan_next_page(&mut out),
+            Action::ScanEdit => self.scan_edit(&mut out),
+            Action::ScanToggle => self.scan_toggle(),
+            Action::ScanSave => self.scan_save(&mut out),
+            Action::ScanDelete => self.scan_delete(),
+            Action::ScanNewProfile => self.scan_new_profile(),
+            Action::ScanOriginPrompt => self.scan_origin_prompt(),
+            Action::ScanOriginAdd => self.scan_origin_add(&mut out),
+            Action::ScanOriginRemove => self.scan_origin_remove(),
+            Action::ScanL4TargetPrompt => self.scan_l4_target_prompt(),
             Action::AgentSet(p) => {
                 // `auto` and `ask` are the core's to set: the TUI shows them
                 // but never sends them (plan 2026-10-31 decision 7).
@@ -2033,7 +2114,7 @@ impl App {
             }
             Action::L4Build => out.extend(self.l4_build()),
             Action::L4Inject => out.extend(self.l4_inject()),
-            Action::L4Confirm(yes) => out.extend(self.l4_answer_confirm(yes)),
+            Action::WireConfirm(yes) => out.extend(self.answer_wire_confirm(yes)),
             Action::L4MutateParked => out.extend(self.l4_mutate_parked()),
             Action::L4RevertParked => out.extend(self.l4_revert_parked()),
             Action::L4ToggleGate(gate) => out.extend(self.l4_toggle_gate(gate)),
@@ -2094,7 +2175,7 @@ impl App {
             };
             self.toast(
                 Level::Warn,
-                format!("Out of L4 scope — add an inject entry for {iface} to inject"),
+                format!("Out of L4 scope: add an inject entry for {iface} to inject"),
             );
             return Vec::new();
         }
@@ -2120,27 +2201,58 @@ impl App {
         }]
     }
 
-    /// Answer the inject confirm overlay (L4OPS-AC10): `yes` re-issues the
-    /// identical call plus the reserved `_confirm` token; `no` cancels.
-    fn l4_answer_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
-        // The scope add was typed from the palette, not the inspector: go
-        // back to the scope panel, where the entry will appear.
-        self.mode = match self.l4.confirm.as_ref().map(|c| c.call.as_str()) {
-            Some("l4.scope.add") => Mode::Scope,
-            _ => Mode::Inspector,
-        };
-        let Some(c) = self.l4.confirm.take() else {
+    /// Answer the wire-confirm overlay (spec D3, D7): `yes` re-issues the
+    /// identical call plus the reserved `_confirm` token; `no` cancels with a
+    /// `<call> cancelled` toast. Returns to the mode the launch came from. The
+    /// `l4.*` verbs re-issue with `BusRequest::Call`; a `scan.*` launch goes
+    /// back out tagged under its verb (the pending launch stays until the
+    /// result), and a cancel clears the pending launch so the key is live.
+    fn answer_wire_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
+        self.mode = self.wire_confirm_from;
+        let Some(c) = self.wire_confirm.take() else {
             return Vec::new();
         };
+        let is_scan = c.is_scan();
         if yes {
+            if is_scan {
+                let mut out = Vec::new();
+                // A re-issue the reducer refuses (the verb left the bus)
+                // settles the launch: nothing will answer it (fix round G,
+                // G67).
+                if !self.scan_call(c.call.clone(), &c.call, c.confirmed_args(), &mut out) {
+                    self.scan.launch.pending = None;
+                }
+                return out;
+            }
             vec![BusRequest::Call {
                 name: c.call.clone(),
                 args: c.confirmed_args(),
             }]
         } else {
+            if is_scan {
+                self.scan.launch.pending = None;
+            }
             self.toast(Level::Info, format!("{} cancelled", c.call));
             Vec::new()
         }
+    }
+
+    /// Open the wire-confirm overlay on `confirm`, returning to `from` when
+    /// it closes: the one spelling the `l4.*` guarded verbs and the `scan.*`
+    /// launches share (fix round G, G67). A confirm already on screen is
+    /// replaced, not answered: its call is toasted as dropped and, for a
+    /// `scan.*` launch, the pending launch it held is cleared (the token
+    /// is gone with the prompt, so nothing can re-issue it).
+    fn open_wire_confirm(&mut self, confirm: WireConfirm, from: Mode) {
+        if let Some(old) = self.wire_confirm.take() {
+            if old.is_scan() {
+                self.scan.launch.pending = None;
+            }
+            self.toast(Level::Warn, format!("{} confirmation dropped", old.call));
+        }
+        self.wire_confirm = Some(confirm);
+        self.wire_confirm_from = from;
+        self.mode = Mode::WireConfirm;
     }
 
     /// `:scope add l4 <cidr> <ports> <iface> <direction> <capability>` (L4
@@ -2182,7 +2294,7 @@ impl App {
         if !self.has_tool("l4.agent.set") {
             self.toast(
                 Level::Warn,
-                "L4 agent gates are read-only here — set `l4.allow_agent_*` in config and restart (l4.agent.set is not on this bus)",
+                "L4 agent gates are read-only here: set `l4.allow_agent_*` in config and restart (l4.agent.set is not on this bus)",
             );
             return Vec::new();
         }
@@ -2243,7 +2355,7 @@ impl App {
         if !self.has_tool(tool) {
             self.toast(
                 Level::Warn,
-                format!("{tool} is not on this bus — in-path intercept is documented-limited here"),
+                format!("{tool} is not on this bus: in-path intercept is documented-limited here"),
             );
             return None;
         }
@@ -2252,14 +2364,14 @@ impl App {
             return None;
         };
         if !self.l4.in_scope(flow) {
-            self.toast(Level::Warn, "Out of L4 scope — intercept actions disabled");
+            self.toast(Level::Warn, "Out of L4 scope: intercept actions disabled");
             return None;
         }
         Some(parked_id)
     }
 
     /// Craft pane `m` (L4 parity spec §4, AC12): apply the editor's spec to the
-    /// selected intercept flow's parked packet — `l4.intercept.mutate {id, spec}`
+    /// selected intercept flow's parked packet, `l4.intercept.mutate {id, spec}`
     /// with the parked id from `l4.intercept.list` and the same spec the pane's
     /// Build sends to `l4.craft`. Same refusals as Forward / Drop; a spec the
     /// editor cannot parse stays in the pane as its error and sends nothing. The
@@ -2290,7 +2402,7 @@ impl App {
     }
 
     /// Craft pane `u` (AC12): discard the staged edit of the selected intercept
-    /// flow's parked packet — `l4.intercept.revert {id}`. Same refusals.
+    /// flow's parked packet, `l4.intercept.revert {id}`. Same refusals.
     fn l4_revert_parked(&mut self) -> Vec<BusRequest> {
         let Some(flow) = self.selected_l4().cloned() else {
             return Vec::new();
@@ -2368,16 +2480,16 @@ impl App {
         let msg = if host.is_empty() {
             // Only a WebSocket row can lack a host: its summary carries the
             // handshake id alone, and that flow is not in the list.
-            "Out of scope — unknown host (the WebSocket handshake is not listed)".to_string()
+            "Out of scope: unknown host (the WebSocket handshake is not listed)".to_string()
         } else {
-            format!("Out of scope — add `{host}` to scope to act")
+            format!("Out of scope: add `{host}` to scope to act")
         };
         self.toast(Level::Warn, msg);
         false
     }
 
     /// `o`: hand the thing under the cursor to the desktop (§2.9). In the
-    /// Findings panel that is the screenshot — a local file on a loopback
+    /// Findings panel that is the screenshot: a local file on a loopback
     /// bus, else fetched through `poc.artifact` (F13); elsewhere an image or
     /// large body, written to a private temp file first. Anything the
     /// terminal can show inline is not opened, and the toast says so.
@@ -2398,7 +2510,7 @@ impl App {
                         }
                     }
                 }
-                None => self.toast(Level::Info, "no screenshot yet — s captures one"),
+                None => self.toast(Level::Info, "no screenshot yet: s captures one"),
             }
             return;
         }
@@ -2413,8 +2525,8 @@ impl App {
             // The path is the bus's word. On a loopback bus it may name a
             // file here: resolve it before the desktop sees it (SEC-2) and
             // open it only when it is a regular file whose header is an
-            // image we know. Otherwise — a remote bus, or a path that does
-            // not exist here — the bytes come through `poc.artifact` (F13).
+            // image we know. Otherwise, on a remote bus or for a path that does
+            // not exist here, the bytes come through `poc.artifact` (F13).
             let local = if self.is_loopback_bus() {
                 std::fs::canonicalize(&p).ok()
             } else {
@@ -2510,7 +2622,7 @@ impl App {
         };
         match open::body_to_temp_file(&id, ext, &msg.body) {
             Ok(path) => {
-                self.toast(Level::Info, format!("wrote {} — opening", path.display()));
+                self.toast(Level::Info, format!("wrote {}, opening", path.display()));
                 self.pending_open = Some(OpenTarget {
                     path,
                     label: format!("{id} {which} body"),
@@ -2523,7 +2635,7 @@ impl App {
     /// One system-proxy change at a time, however it is reached (`s`,
     /// `:sysproxy on|off`, the raw `:proxy.system.set|unset`, the palette's
     /// tool list): refused with a Warn toast while ours is in flight or the
-    /// core's `setting` flag (another client's call) is up — the core would
+    /// core's `setting` flag (another client's call) is up: the core would
     /// refuse the second call anyway, and that refusal would wrongly settle
     /// the first one's pill. Otherwise raises the flag and returns `true`.
     fn sysproxy_begin_change(&mut self) -> bool {
@@ -2577,6 +2689,7 @@ impl App {
                 description,
                 args,
                 return_to,
+                tag: None,
             });
             self.open_prompt(PromptKind::Confirm);
             return Vec::new();
@@ -2648,9 +2761,9 @@ impl App {
     }
 
     /// The bus went away (or came back): no call sent before now will be
-    /// answered, so nothing stays "in flight" — the browser view's counters,
-    /// the CA pill's `· CA trusting…` (D17.6) and the sys-proxy pill's
-    /// `· sys-proxy setting…` (D14) alike.
+    /// answered, so nothing stays "in flight": the browser view's counters,
+    /// the CA pill's `· CA trusting…` (D17.6), the sys-proxy pill's
+    /// `· sys-proxy setting…` (D14) and the pending guarded L4 call alike.
     fn forget_inflight(&mut self) {
         self.browser.inflight = 0;
         self.browser.busy = None;
@@ -2658,6 +2771,11 @@ impl App {
         // A `proxy.system.set|unset` reply that will never come must not
         // keep the guard refusing `s` / `:sysproxy on|off` (F-tui 6).
         self.sysproxy_setting = false;
+        // Nor may a guarded L4 call whose `needs_confirmation` reply is lost
+        // with the connection keep `l4_in_flight` refusing the same control,
+        // or bind a later call of that name to stale arguments (fix round J,
+        // J1).
+        self.l4.pending = None;
     }
 
     /// Ask `ca.status` when the bus offers it (D17.5: the pill word is the
@@ -2677,6 +2795,12 @@ impl App {
     /// user-typed target (`:scan <host>`); `None` picks the selected flow's host
     /// when it is in scope, else the first concrete in-scope host.
     fn scan_launch(&mut self, explicit: Option<String>, out: &mut Vec<BusRequest>) {
+        // One crawl at a time (fix round G, G62: the one guard for `r`,
+        // `:scan <host>`, `s`/`m` on a legacy bus and the map fallback).
+        if self.scan.legacy.running {
+            self.toast(Level::Info, "a scan is already running");
+            return;
+        }
         if !self.has_tool("scan.discover") {
             self.toast(
                 Level::Warn,
@@ -2684,31 +2808,50 @@ impl App {
             );
             return;
         }
-        let host = match explicit {
-            Some(raw) => scan_host(&raw),
+        let raw = match explicit {
+            Some(raw) => raw,
             None => match self.scan_target_host() {
                 Some(h) => h,
                 None => {
                     self.toast(
                         Level::Warn,
-                        "Scan needs an in-scope host — add one to scope (S) first",
+                        "Scan needs an in-scope host: add one to scope (S) first",
                     );
                     return;
                 }
             },
         };
-        if host.is_empty() || !scope_covers(&self.scope, &host) {
-            self.toast(
-                Level::Warn,
-                format!("Out of scope — add `{host}` to scope to scan it"),
-            );
+        if self.scope_host(&raw).is_none() {
             return;
         }
-        let target = scan_target_url(&host);
-        self.scan.running = true;
-        self.scan.error = None;
-        self.scan.target = Some(target.clone());
+        // D8: a typed origin keeps its scheme and port (authority only), a
+        // bare host gets the scheme its captured flows show; a host the
+        // rule refuses is toasted and nothing reaches the wire.
+        let target = match typed_origin(&raw, &self.flows) {
+            Ok(target) => target,
+            Err(reason) => {
+                self.toast(Level::Warn, reason.to_string());
+                return;
+            }
+        };
+        self.scan.legacy.running = true;
+        self.scan.legacy.error = None;
+        self.scan.legacy.target = Some(target.clone());
         out.extend(self.call_tool("scan.discover", json!({ "target": target })));
+    }
+
+    /// What this bus can serve the Scan view (spec D2): the v2 scanner when
+    /// it offers `scan.start`, the legacy one-shot when it offers only
+    /// `scan.discover`, nothing otherwise. Each v2 control is gated by its
+    /// own verb on top of this.
+    pub fn scan_offer(&self) -> ScanOffer {
+        if self.has_tool("scan.start") {
+            ScanOffer::V2
+        } else if self.has_tool("scan.discover") {
+            ScanOffer::Legacy
+        } else {
+            ScanOffer::None
+        }
     }
 
     /// The host a scan targets when none is typed: the selected flow's host when
@@ -2723,7 +2866,20 @@ impl App {
         self.scope
             .iter()
             .find(|e| !e.starts_with("*.") && !e.is_empty())
-            .map(|e| scan_host(e))
+            .map(|e| crate::scan::scan_host(e))
+    }
+
+    /// The D8 scope guard on a launch or origin path (fix round G, G61):
+    /// `raw`'s host when the scope covers it; otherwise the one refusal
+    /// toast ([`out_of_scope`]) and `None`, and the caller sends nothing.
+    fn scope_host(&mut self, raw: &str) -> Option<String> {
+        match out_of_scope(&self.scope, raw) {
+            Some(text) => {
+                self.toast(Level::Warn, text);
+                None
+            }
+            None => Some(scan_host(raw)),
+        }
     }
 
     /// The operator answered the confirm prompt.
@@ -2735,6 +2891,13 @@ impl App {
         };
         self.mode = c.return_to;
         if yes {
+            // A `scan.*` verb leaves through the tagged path (spec D4):
+            // `scan.profile.delete` under `scan.profile.delete:<name>`.
+            if let Some(tag) = c.tag {
+                let mut out = Vec::new();
+                self.scan_call(tag, &c.name, c.args, &mut out);
+                return out;
+            }
             if CA_TRUST_TOOLS.contains(&c.name.as_str()) {
                 self.ca_installing = true;
             }
@@ -2758,8 +2921,8 @@ impl App {
                 let _ = self.answer_confirm(false);
                 return;
             }
-            Mode::L4Confirm => {
-                let _ = self.l4_answer_confirm(false);
+            Mode::WireConfirm => {
+                let _ = self.answer_wire_confirm(false);
                 return;
             }
             Mode::Prompt(kind) => {
@@ -2770,6 +2933,14 @@ impl App {
                 }
                 self.close_prompt();
                 return;
+            }
+            // Scan: Esc/`q` closes a focused detail, editor or points pane
+            // back to its list pane, and only then leaves the view (D11).
+            Mode::Scan => {
+                if self.scan.close_pane(self.scan_offer()) {
+                    return;
+                }
+                Mode::Flows
             }
             Mode::Flows => {
                 if self.filter.is_some() {
@@ -3021,6 +3192,33 @@ impl App {
                     self.browser_call("browser.eval", json!({ key: text }), &mut out);
                 }
             }
+            // A blank line is a "no" (nothing changes, the prompt closes,
+            // like every other prompt); a refused value keeps the prompt
+            // open with the line cleared (the filter prompt's convention),
+            // so the operator tries again or leaves with Esc: the one rule
+            // the four Scan prompts share (fix round G, G34).
+            Mode::Prompt(
+                PromptKind::ScanOrigin
+                | PromptKind::ScanField
+                | PromptKind::ScanL4Target
+                | PromptKind::ScanProfileName,
+            ) if text.is_empty() => self.close_prompt(),
+            Mode::Prompt(PromptKind::ScanOrigin) => {
+                let result = self.submit_scan_origin(&text, &mut out);
+                self.submit_retrying(result);
+            }
+            Mode::Prompt(PromptKind::ScanField) => {
+                let result = self.submit_scan_field(&text);
+                self.submit_retrying(result);
+            }
+            Mode::Prompt(PromptKind::ScanL4Target) => {
+                let result = self.submit_scan_l4_target(&text);
+                self.submit_retrying(result);
+            }
+            Mode::Prompt(PromptKind::ScanProfileName) => {
+                let result = self.submit_scan_profile_name(&text, &mut out);
+                self.submit_retrying(result);
+            }
             Mode::Compose => {
                 if self.compose.field < 3 {
                     self.compose.field += 1;
@@ -3032,7 +3230,7 @@ impl App {
                         if !scope_covers(&self.scope, &authority) {
                             self.toast(
                                 Level::Warn,
-                                format!("Out of scope — add `{authority}` to scope to send"),
+                                format!("Out of scope: add `{authority}` to scope to send"),
                             );
                             return out;
                         }
@@ -3048,8 +3246,22 @@ impl App {
         out
     }
 
+    /// Open the help overlay at its top (fix round G, G85).
+    fn open_help(&mut self) {
+        self.help_scroll = 0;
+        self.mode = Mode::Help;
+    }
+
     fn navigate(&mut self, action: &Action, out: &mut Vec<BusRequest>) {
         match self.mode {
+            Mode::Help => {
+                // The overlay scrolls over the lines its box cannot show
+                // (fix round G, G85); the view clamps the same way.
+                let scope_add_l4 = crate::l4::supports_operator_scope_add(&self.tools);
+                let max = overlays::help_scroll_max(self.width, self.height, scope_add_l4);
+                let page = overlays::help_page(self.width, self.height, scope_add_l4);
+                scroll(&mut self.help_scroll, action, max + 1, page);
+            }
             Mode::Prompt(PromptKind::Palette) => {
                 let n = self.palette_items().len();
                 if n > 0 {
@@ -3102,28 +3314,79 @@ impl App {
                 }
             }
             Mode::Scan => {
-                // ↑↓/paging walk whichever list Tab has focused.
-                let (n, cursor) = match self.scan.focus {
-                    ScanFocus::Points => (self.scan.points.len(), &mut self.scan.cursor),
-                    ScanFocus::Endpoints => {
-                        (self.scan.endpoints.len(), &mut self.scan.endpoint_cursor)
+                // ↑↓/paging walk the focused pane of the active tab (D11).
+                // A page is the list body: the terminal minus the view's
+                // chrome rows.
+                let page = usize::from(self.height.saturating_sub(SCAN_CHROME_ROWS)).max(1);
+                let offer = self.scan_offer();
+                let jobs_detail =
+                    self.scan.tab == ScanTab::Jobs && self.scan.jobs.pane == JobPane::Detail;
+                let issues_detail =
+                    self.scan.tab == ScanTab::Issues && self.scan.issues.pane == IssuePane::Detail;
+                if jobs_detail {
+                    // The Jobs Detail pane scrolls its lines instead of
+                    // moving a cursor (D11); the last line is the floor.
+                    let n = self.scan.jobs.detail_len();
+                    scroll(&mut self.scan.jobs.detail_scroll, action, n, page);
+                } else if issues_detail {
+                    // The Issues Detail pane: Up/Down walk the flow list
+                    // (D11, "a walkable list") and ask the view to keep the
+                    // flow under the cursor on screen; the paging keys
+                    // scroll the lines (plan task 8) and take that back, so
+                    // the scroll is what is drawn (fix round F, F7).
+                    let issues = &mut self.scan.issues;
+                    match action {
+                        Action::Up | Action::Down => {
+                            let flows = issues.flow_count();
+                            issues.detail_view.walk_flow(action, flows, page);
+                        }
+                        _ => {
+                            let n = issues.detail_len();
+                            issues.detail_view.scroll(action, n, page);
+                        }
                     }
-                };
-                if n > 0 {
-                    // A page is the list body: the terminal minus the panel
-                    // chrome (three bars, two box edges, the target and hint
-                    // lines, the list heading).
-                    let page = usize::from(self.height.saturating_sub(8)).max(1);
-                    let c = *cursor;
-                    *cursor = match action {
-                        Action::Up => c.saturating_sub(1),
-                        Action::Down => (c + 1).min(n - 1),
-                        Action::PageUp => c.saturating_sub(page),
-                        Action::PageDown => (c + page).min(n - 1),
-                        Action::Home => 0,
-                        Action::End => n - 1,
-                        _ => c,
-                    };
+                } else if self.scan.tab == ScanTab::Profiles
+                    && self.scan.profiles.pane == ProfilePane::Checks
+                {
+                    // The Checks pane walks the flattened tree's rows
+                    // (lanes, classes and checks), not the catalogue's
+                    // entries (plan task 10).
+                    let rows = self.scan.profiles.visible_len();
+                    if let Some(editor) = self.scan.profiles.editor.as_mut() {
+                        if rows > 0 {
+                            editor.tree_cursor = walk(action, editor.tree_cursor, rows, page);
+                        }
+                    }
+                } else if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
+                    if n > 0 {
+                        let c = *cursor;
+                        *cursor = walk(action, c, n, page);
+                        let moved = *cursor != c;
+                        // A new job under the Jobs cursor shows its detail
+                        // from the top.
+                        if moved && self.scan.tab == ScanTab::Jobs {
+                            self.scan.jobs.detail_scroll = 0;
+                        }
+                        // The row under the Profiles cursor is what `s`
+                        // launches without an editor: re-gate it (G73).
+                        if moved && self.scan.tab == ScanTab::Profiles {
+                            self.recompute_launch_gate();
+                        }
+                        // The Issues cursor landing on a row reads it (D6)
+                        // and shows its detail from the top.
+                        if moved && self.scan.tab == ScanTab::Issues {
+                            self.scan.issues.detail_view.reset();
+                            self.issue_cursor_landed(out);
+                        }
+                        // A new node under the Site map's Nodes cursor
+                        // shows its points from the first (G24).
+                        if moved
+                            && self.scan.tab == ScanTab::SiteMap
+                            && self.scan.sitemap.pane == MapPane::Nodes
+                        {
+                            self.scan.sitemap.point_offset = 0;
+                        }
+                    }
                 }
             }
             Mode::Compose => {
@@ -3241,16 +3504,16 @@ impl App {
 
     /// `]`/`[`: the Scope item filters the list (§2.7 "The flow list's
     /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
-    fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
-        let mut next = step(&SidebarItem::ALL, self.sidebar, d);
-        // Rows drawn only when the bus offers their verb (Scan: `scan.discover`;
-        // L4: `l4.capture.status`) are skipped: never land on a row the
-        // operator cannot see. Bounded to one lap.
+    fn sidebar_step(&mut self, dir: Dir, out: &mut Vec<BusRequest>) {
+        let mut next = step(&SidebarItem::ALL, self.sidebar, dir);
+        // Rows drawn only when the bus offers their verb (Scan: a scanner,
+        // spec D2; L4: `l4.capture.status`) are skipped: never land on a row
+        // the operator cannot see. Bounded to one lap.
         for _ in 0..SidebarItem::ALL.len() {
             if !self.sidebar_hidden(next) {
                 break;
             }
-            next = step(&SidebarItem::ALL, next, d);
+            next = step(&SidebarItem::ALL, next, dir);
         }
         self.sidebar = next;
         match self.sidebar {
@@ -3275,7 +3538,7 @@ impl App {
     /// Scan and L4 only when their verb is offered).
     fn sidebar_hidden(&self, it: SidebarItem) -> bool {
         match it {
-            SidebarItem::Scan => !self.has_tool("scan.discover"),
+            SidebarItem::Scan => self.scan_offer() == ScanOffer::None,
             SidebarItem::L4 => !self.has_tool("l4.capture.status"),
             _ => false,
         }
@@ -3325,7 +3588,7 @@ impl App {
     }
 
     /// The core's `flow.get` summary of a WebSocket flow carries no
-    /// authority, scheme or path — only the id of its 101 handshake flow
+    /// authority, scheme or path, only the id of its 101 handshake flow
     /// (`capture.rs` `summarize`). When that flow is listed, the row takes
     /// its URL from it: `https` → `wss`, `http` → `ws`. Until then (or when
     /// the handshake was evicted) the authority stays empty and the row is
@@ -3377,8 +3640,8 @@ impl App {
     }
 
     /// Get the YAML of findings that have none yet (§2.7 "PoC panel … the
-    /// YAML"): through `poc.get` (F13) when the bus has it — one request per
-    /// path, none while one is in flight — else from `poc_path` on this
+    /// YAML"): through `poc.get` (F13) when the bus has it (one request per
+    /// path, none while one is in flight), else from `poc_path` on this
     /// machine, which only means something on a loopback bus. What an
     /// earlier pass got (or failed to get) for the same `poc_path` is carried
     /// over from `previous`, so a `poc.list` poll does not ask again.
@@ -3501,7 +3764,7 @@ impl App {
             Some(d) => (d, ""),
             None => (
                 std::env::temp_dir().join("aitm-pocs"),
-                " — no PoC dir configured, so it went under the temp dir; poc.run confined to \
+                ": no PoC dir configured, so it went under the temp dir; poc.run confined to \
                  poc.dir will refuse it (pass --poc-dir)",
             ),
         };
@@ -3633,7 +3896,7 @@ impl App {
         match cmd {
             "" => {}
             "q" | "quit" => self.should_quit = true,
-            "help" | "?" => self.mode = Mode::Help,
+            "help" | "?" => self.open_help(),
             "import" => {
                 if rest.is_empty() {
                     self.toast(
@@ -3764,10 +4027,11 @@ impl App {
             "scan" => {
                 out.extend(self.update(Action::OpenScan));
                 if !rest.is_empty() {
-                    if self.scan.running {
-                        self.toast(Level::Info, "a scan is already running");
-                    } else {
-                        self.scan_launch(Some(rest.to_string()), &mut out);
+                    match self.scan_offer() {
+                        ScanOffer::None => self.toast(Level::Warn, NO_SCANNER),
+                        // D8: `:scan <origin>` under v2 is `scan.start {target}`.
+                        ScanOffer::V2 => self.scan_start_typed(rest, &mut out),
+                        ScanOffer::Legacy => self.scan_launch(Some(rest.to_string()), &mut out),
                     }
                 }
             }
@@ -3881,6 +4145,11 @@ impl App {
     /// Fold a bus event in; may ask for more work (details for new rows).
     pub fn on_bus(&mut self, event: BusEvent) -> Vec<BusRequest> {
         let mut out = Vec::new();
+        // The origin picker reads the scope and the captured flows (D8):
+        // an open editor's rows follow them. A `Flows` sweep counts only
+        // when it added or removed a row (fix round G, G37): the picker
+        // reads authorities, which a status change never moves.
+        let mut origins_moved = matches!(event, BusEvent::Scope(_));
         match event {
             BusEvent::Connected {
                 server,
@@ -3893,6 +4162,8 @@ impl App {
                     role,
                 };
                 self.tools = tools;
+                // The UI-3 gate reads the tool list (D7).
+                self.recompute_launch_gate();
                 if self.role_mismatch() {
                     let resolved = self.resolved_role().unwrap_or("unknown");
                     let expected = self.expect_role.as_deref().unwrap_or("");
@@ -3904,7 +4175,7 @@ impl App {
                     );
                 }
                 // A (re)connect is a new session: nothing sent before it
-                // will be answered — including a `proxy.system.set|unset`
+                // will be answered, including a `proxy.system.set|unset`
                 // whose reply would have settled the pill.
                 self.forget_inflight();
                 out.push(BusRequest::Refresh);
@@ -3930,6 +4201,25 @@ impl App {
             BusEvent::Disconnected(why) => {
                 self.bus = BusStatus::Disconnected(why.clone());
                 self.forget_inflight();
+                // Nothing tagged before the drop will be answered (D4), and
+                // a launch in flight is lost with the connection, as is the
+                // one `scan.issue` read (D6).
+                self.scan.inflight.clear();
+                self.scan.issues.pending_read = None;
+                self.scan.launch.pending = None;
+                // A confirm token is bound to the connection that issued it
+                // (D7): a pending confirm is dropped, not answered, whatever
+                // mode is on screen; only the overlay itself closes back to
+                // the mode the launch came from.
+                if let Some(c) = self.wire_confirm.take() {
+                    self.toast(
+                        Level::Warn,
+                        format!("{} confirmation dropped: bus disconnected", c.call),
+                    );
+                }
+                if self.mode == Mode::WireConfirm {
+                    self.mode = self.wire_confirm_from;
+                }
                 self.toast(Level::Error, format!("bus: {why}"));
             }
             BusEvent::Flows(summaries) => {
@@ -3969,6 +4259,7 @@ impl App {
                 if self.flows.len() != before {
                     self.rebuild_index();
                 }
+                origins_moved = before > had || self.flows.len() != before;
                 self.resolve_websocket_urls();
                 self.prune_details(&seen);
                 self.detail_failed.retain(|id| seen.contains(id));
@@ -3995,7 +4286,7 @@ impl App {
             BusEvent::DetailFailed(id) => {
                 self.toast(
                     Level::Warn,
-                    format!("flow.detail {id}: malformed reply — not asking again"),
+                    format!("flow.detail {id}: malformed reply, not asking again"),
                 );
                 self.detail_failed.insert(id);
             }
@@ -4035,6 +4326,8 @@ impl App {
                     .iter()
                     .filter_map(crate::l4::L4ScopeEntry::from_json)
                     .collect();
+                // The UI-3 gate reads the L4 scope (D7).
+                self.recompute_launch_gate();
             }
             BusEvent::L4Agent(v) => self.l4.gates = crate::l4::L4Gates::from_json(&v),
             // Spec §1: availability is whatever the core said last; a change
@@ -4069,7 +4362,7 @@ impl App {
                         );
                     }
                     // C12: the core answers with the PoC's YAML text, not a
-                    // path — the TUI writes the file and lists it.
+                    // path: the TUI writes the file and lists it.
                     "poc.build" => {
                         let slug = self
                             .poc_build_pending
@@ -4200,7 +4493,7 @@ impl App {
                             .or_else(|| value.as_bool())
                             .unwrap_or(self.intercept_armed);
                         let msg = if self.intercept_armed {
-                            "Intercept armed — every request pauses"
+                            "Intercept armed: every request pauses"
                         } else {
                             "Intercept disarmed"
                         };
@@ -4268,7 +4561,7 @@ impl App {
                         );
                     }
                     // F6: the row's swatch and comment come from its detail,
-                    // which is now stale — drop it and ask again.
+                    // which is now stale: drop it and ask again.
                     "flow.mark" | "flow.comment" => {
                         let msg = match (name.as_str(), &value) {
                             ("flow.mark", Value::Array(marks)) if marks.is_empty() => {
@@ -4333,7 +4626,7 @@ impl App {
                     }
                     // The L4 guarded verbs (L4OPS-AC10; L4 parity spec §3):
                     // a `needs_confirmation` reply opens the confirm overlay
-                    // **for the pending call of the same name only** — the
+                    // **for the pending call of the same name only**: the
                     // overlay is the operator's trust point, so what it shows
                     // is what `y` sends. A handshake with nothing pending for
                     // its name (the generic tool form never sets `pending`)
@@ -4353,15 +4646,15 @@ impl App {
                         };
                         let bound = pending.is_some();
                         let (call, args) = pending.unwrap_or((name.clone(), Value::Null));
-                        match crate::l4::L4Confirm::classify(&call, &args, &value) {
-                            crate::l4::ConfirmReply::Malformed => {
+                        match WireConfirm::classify(&call, &args, &value) {
+                            ConfirmReply::Malformed => {
                                 self.toast(
                                     Level::Warn,
                                     format!("{name}: malformed confirmation reply (no token)"),
                                 );
                                 return out;
                             }
-                            crate::l4::ConfirmReply::Handshake(_) if !bound => {
+                            ConfirmReply::Handshake(_) if !bound => {
                                 self.toast(
                                     Level::Warn,
                                     format!(
@@ -4370,12 +4663,19 @@ impl App {
                                 );
                                 return out;
                             }
-                            crate::l4::ConfirmReply::Handshake(confirm) => {
-                                self.l4.confirm = Some(confirm);
-                                self.mode = Mode::L4Confirm;
+                            ConfirmReply::Handshake(confirm) => {
+                                // The scope add was typed from the palette, not
+                                // the inspector: the overlay returns to the scope
+                                // panel, where the entry will appear.
+                                let from = if name == "l4.scope.add" {
+                                    Mode::Scope
+                                } else {
+                                    Mode::Inspector
+                                };
+                                self.open_wire_confirm(confirm, from);
                                 return out;
                             }
-                            crate::l4::ConfirmReply::Plain => {}
+                            ConfirmReply::Plain => {}
                         }
                         match name.as_str() {
                             // The confirmed scope add's reply is the new id;
@@ -4412,12 +4712,12 @@ impl App {
                         self.l4.gates = crate::l4::L4Gates::from_json(&value);
                         self.toast(Level::Info, "L4 agent gate updated");
                     }
-                    // Scanner Stage 1: the crawl result — reached endpoints and
+                    // Scanner Stage 1: the crawl result, reached endpoints and
                     // the injection points enumerated from captured requests.
                     "scan.discover" => {
-                        self.scan.running = false;
-                        self.scan.error = None;
-                        self.scan.endpoints = value
+                        self.scan.legacy.running = false;
+                        self.scan.legacy.error = None;
+                        self.scan.legacy.endpoints = value
                             .get("endpoints")
                             .and_then(Value::as_array)
                             .map(|a| {
@@ -4428,7 +4728,7 @@ impl App {
                             .unwrap_or_default();
                         // AC3: endpoint URL → flow id. Keep only string→string
                         // pairs; a missing or garbage map leaves it empty.
-                        self.scan.endpoint_flows = value
+                        self.scan.legacy.endpoint_flows = value
                             .get("endpoint_flows")
                             .and_then(Value::as_object)
                             .map(|m| {
@@ -4439,25 +4739,39 @@ impl App {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        self.scan.points = value
+                        self.scan.legacy.points = value
                             .get("injection_points")
                             .and_then(Value::as_array)
-                            .map(|a| a.iter().map(InjectionPointRow::from_json).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .map(crate::scan::legacy::InjectionPointRow::from_json)
+                                    .collect()
+                            })
                             .unwrap_or_default();
-                        self.scan.cursor = self
+                        self.scan.legacy.cursor = self
                             .scan
+                            .legacy
                             .cursor
-                            .min(self.scan.points.len().saturating_sub(1));
-                        self.scan.endpoint_cursor = self
+                            .min(self.scan.legacy.points.len().saturating_sub(1));
+                        self.scan.legacy.endpoint_cursor = self
                             .scan
+                            .legacy
                             .endpoint_cursor
-                            .min(self.scan.endpoints.len().saturating_sub(1));
+                            .min(self.scan.legacy.endpoints.len().saturating_sub(1));
+                        // On a legacy bus the Site map draws the result as
+                        // nodes and points (D12), built once here; on a v2
+                        // bus that also offers `scan.discover` (the `m`
+                        // fallback) the result stays in `legacy.*` and the
+                        // folded v2 lists are kept (fix round H, H20; G19).
+                        if MapSource::from(self.scan_offer()) == MapSource::Legacy {
+                            self.scan.sitemap.show_legacy(&self.scan.legacy);
+                        }
                         self.toast(
                             Level::Info,
                             format!(
                                 "scan.discover → {} endpoints · {} injection points",
-                                self.scan.endpoints.len(),
-                                self.scan.points.len()
+                                self.scan.legacy.endpoints.len(),
+                                self.scan.legacy.points.len()
                             ),
                         );
                     }
@@ -4476,7 +4790,7 @@ impl App {
                 }
                 out.push(BusRequest::Refresh);
             }
-            BusEvent::CallFailed { name, message } => {
+            BusEvent::CallFailed { name, mut message } => {
                 // A failed tracked `browser.*` call is the view's answer: the
                 // panel must show it (§2.10(c)), not only the status line.
                 if is_tracked_browser_call(&name) {
@@ -4512,7 +4826,7 @@ impl App {
                         }
                     }
                     // A guard refusal (out-of-scope / rate / denylist / oversize /
-                    // count) is surfaced verbatim; drop the pending confirm —
+                    // count) is surfaced verbatim; drop the pending confirm,
                     // only the one this failure names, so a foreign verb's
                     // failure leaves another control's pending call in place
                     // (symmetric with the `CallOk` take above).
@@ -4526,10 +4840,12 @@ impl App {
                         }
                     }
                     // A refused or failed crawl clears the running flag and keeps
-                    // the reason in the Scan view until the next launch.
+                    // the reason in the Scan view until the next launch, bounded
+                    // once here (fix round H, H35; D6 hostile-core bounds).
                     "scan.discover" => {
-                        self.scan.running = false;
-                        self.scan.error = Some(message.clone());
+                        self.scan.legacy.running = false;
+                        cut_to(&mut message, ERROR_DETAIL_MAX);
+                        self.scan.legacy.error = Some(message.clone());
                     }
                     // D14: a refusal (agent-token bus) or a failed write
                     // settles the in-flight pill; the text below is verbatim.
@@ -4541,10 +4857,1417 @@ impl App {
                 self.toast(Level::Error, message);
             }
             BusEvent::Toast(level, text) => self.toast(level, text),
-            // An F4 push: whatever it says, the list is stale; poll now.
-            BusEvent::Notification(_) => out.push(BusRequest::Refresh),
+            BusEvent::Notification(v) => self.on_notification(&v, &mut out),
+            // Every tagged call is a `scan.*` call (spec D4); the tag is
+            // settled whatever the verb, the fold is per verb.
+            BusEvent::CallTaggedOk { tag, name, value } => {
+                self.on_scan_ok(&tag, &name, value, &mut out)
+            }
+            // The tag carries the verb (`tag_parts`), so the failure needs
+            // no `name`.
+            BusEvent::CallTaggedFailed { tag, message, .. } => {
+                self.on_scan_failed(&tag, message, &mut out)
+            }
+        }
+        if origins_moved && self.scan.profiles.editor.is_some() {
+            self.refresh_origin_choices();
         }
         out
+    }
+
+    // ------------------------------------------------------ scan (v2) bus
+
+    /// Route a push line (spec D5). A `notifications/aitm/job` line for a
+    /// scan job is a trigger for the D6 reads and never touches the flow
+    /// list; a job line of another kind, or one that does not parse, is
+    /// ignored; any other method marks the flow list dirty for the next tick.
+    fn on_notification(&mut self, v: &Value, out: &mut Vec<BusRequest>) {
+        if v.get("method").and_then(Value::as_str) != Some(JOB_NOTIFICATION_METHOD) {
+            self.flows_dirty = true;
+            return;
+        }
+        let Some(params) = v.get("params") else {
+            return;
+        };
+        if params.get("kind").and_then(Value::as_str) != Some(JOB_KIND_SCAN) {
+            return;
+        }
+        let Ok(line) = JobNotification::deserialize(params) else {
+            return;
+        };
+        self.on_job_line(&line, out);
+    }
+
+    /// The D6 reads a job line triggers: `scan.status {job}` for every event;
+    /// the terminal and `issue` events also refresh the issue list when the
+    /// operator has looked at Issues (the sidebar count reads `summaries`,
+    /// which `scan.status` refreshes, so it never needs `scan.issues`).
+    ///
+    /// A job the TUI does not know (not in `order`, not started here) is
+    /// polled only while the Scan view is shown: there a `scan.list` every
+    /// ten seconds prunes what the core forgot, elsewhere nothing would, so
+    /// a core pushing fresh ids could grow the state one row per line (D6
+    /// hostile-core bounds). Outside the view the line is left to the list
+    /// the next open requests. A known job is polled from every mode.
+    fn on_job_line(&mut self, line: &JobNotification, out: &mut Vec<BusRequest>) {
+        let job = line.job.as_str();
+        // D6 hostile-core bound: a malformed id never becomes a tag key, an
+        // argument or an `inflight` entry.
+        if !is_job_id(job) {
+            return;
+        }
+        let known = self.scan.jobs.order.iter().any(|id| id == job)
+            || self.scan.jobs.started_here.contains(job);
+        if !known && self.mode != Mode::Scan {
+            return;
+        }
+        self.request_scan_status(job, out);
+        let terminal = matches!(
+            line.event,
+            JobEvent::Finished | JobEvent::Cancelled | JobEvent::Failed
+        );
+        // A terminal line replaces what the job's issues said (D6): the
+        // next landing on one of them reads it again.
+        if terminal {
+            self.scan.issues.forget_job(job);
+        }
+        let settles = terminal || line.event == JobEvent::Issue;
+        if settles && self.issues_wanted() {
+            self.request_issues(out);
+        }
+        // A terminal line for a job the Site map query covers re-reads the
+        // map while the tab is on screen (D6); entering the tab reads it
+        // anyway, so a hidden tab waits for that.
+        if terminal
+            && self.mode == Mode::Scan
+            && self.scan.tab == ScanTab::SiteMap
+            && self.scan.sitemap.query.matches(job)
+        {
+            self.request_sitemap(None, out);
+        }
+    }
+
+    /// `scan.sitemap {query, cursor?}` under its single-slot tag (spec D6):
+    /// the one spelling the tab's entry, `n`, `J`, the settling push line
+    /// and the timer share. With a cursor the reply appends (D10), without
+    /// one it replaces. Stamps `fetched_at_tick` when the call leaves.
+    /// Quiet when the bus lacks the verb: the Site map banner already says
+    /// so (D2), and the tag dedupe keeps one request in flight.
+    fn request_sitemap(&mut self, cursor: Option<&str>, out: &mut Vec<BusRequest>) {
+        let args = self.scan.sitemap.query.args(cursor);
+        if self.scan_poll("scan.sitemap".to_string(), "scan.sitemap", args, out) {
+            self.scan.sitemap.fetched_at_tick = Some(self.ticks);
+            self.scan.sitemap.appending = cursor.is_some();
+        }
+    }
+
+    /// Site map `n` (spec D11): the next page under the last reply's
+    /// `next_cursor`; inert without one or off the tab.
+    fn scan_next_page(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::SiteMap {
+            return;
+        }
+        let Some(cursor) = self.scan.sitemap.next_cursor.clone() else {
+            return;
+        };
+        self.request_sitemap(Some(&cursor), out);
+    }
+
+    /// Whether a job the Site map query covers is crawling (D6): the
+    /// filtered job when `J` names one, any job otherwise, by its last
+    /// known summary.
+    fn sitemap_crawling(&self) -> bool {
+        self.scan.jobs.summaries.values().any(|s| {
+            self.scan.sitemap.query.matches(&s.job)
+                && !s.state.is_terminal()
+                && s.phase == Phase::Crawling
+        })
+    }
+
+    /// `scan.issues {filters, limit}` under its single-slot tag (spec D6):
+    /// the one spelling the Jobs `Enter`, the settling push line, the Issues
+    /// tab's entry, filters and timer share. Stamps `fetched_at_tick` when
+    /// the call leaves. Quiet when the bus lacks the verb: the Issues banner
+    /// already says so (D2), and the tag dedupe keeps one request in flight.
+    fn request_issues(&mut self, out: &mut Vec<BusRequest>) {
+        let args = self.scan.issues.filters.args();
+        if self.scan_poll("scan.issues".to_string(), "scan.issues", args, out) {
+            self.scan.issues.fetched_at_tick = Some(self.ticks);
+        }
+    }
+
+    /// `1`..`4`: show a tab (spec D11), with the reads entering it makes
+    /// ([`App::enter_tab_reads`]). Pressing `1` on the Profiles tab itself
+    /// retries a read that failed or was lost (its reads run only while
+    /// the lists are empty).
+    fn scan_tab(&mut self, tab: ScanTab, out: &mut Vec<BusRequest>) {
+        let entering = self.scan.tab != tab;
+        self.scan.tab = tab;
+        if entering || tab == ScanTab::Profiles {
+            self.enter_tab_reads(tab, out);
+        }
+    }
+
+    /// The reads entering `tab` makes (spec D6; fix round G, G28: the one
+    /// list the open and `1`..`4` share): Issues re-reads its list with
+    /// the current filters, the Site map its first page, Profiles its list
+    /// and the check catalogue while they are empty; Jobs needs none, the
+    /// open lists the jobs.
+    fn enter_tab_reads(&mut self, tab: ScanTab, out: &mut Vec<BusRequest>) {
+        match tab {
+            ScanTab::Issues => self.request_issues(out),
+            ScanTab::SiteMap => self.request_sitemap(None, out),
+            ScanTab::Profiles => self.enter_profiles(out),
+            ScanTab::Jobs => {}
+        }
+    }
+
+    /// Issues `S` `C` `L` `T` `J` (spec D11): cycle one filter and refetch,
+    /// `J` taking the Jobs cursor's job. On the Site map `J` toggles the
+    /// map's job query the same way and re-reads the map; the other filter
+    /// keys have no Site map meaning, and no other tab has filters.
+    fn scan_filter(&mut self, key: IssueFilterKey, out: &mut Vec<BusRequest>) {
+        let cursor_job = self.scan.jobs.cursor_job().cloned();
+        match self.scan.tab {
+            ScanTab::Issues => {
+                self.scan.issues.filters.cycle(key, cursor_job.as_deref());
+                self.request_issues(out);
+            }
+            ScanTab::SiteMap => {
+                // Only `J` has a Site map meaning, and it refetches only
+                // when the query changed (fix round G, G31).
+                let changed = matches!(key, IssueFilterKey::Job)
+                    && self.scan.sitemap.query.toggle_job(cursor_job);
+                if changed {
+                    self.request_sitemap(None, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Issues `R` (spec D11): clear every filter and refetch.
+    fn scan_filter_reset(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Issues {
+            return;
+        }
+        self.scan.issues.filters = Default::default();
+        self.request_issues(out);
+    }
+
+    /// Issues `c` / `f` / `u` (spec D11): set the cursor's issue to `status`
+    /// over the wire, `scan.issue.update {id, status}` under
+    /// `scan.issue.update:<id>`, so one update per issue is in flight (the
+    /// tag dedupe); the reply replaces the issue and its row through
+    /// [`App::on_scan_ok`]. Inert off the Issues tab or on an empty list.
+    fn scan_issue_status(&mut self, status: IssueStatus, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Issues {
+            return;
+        }
+        let Some(id) = self.scan.issues.cursor_issue().map(|i| i.id.clone()) else {
+            return;
+        };
+        self.scan_call(
+            tag_keyed("scan.issue.update", &id),
+            "scan.issue.update",
+            json!({ "id": id, "status": status_token(status) }),
+            out,
+        );
+    }
+
+    /// Issues `P` (spec D11): switch to Findings with the cursor on the
+    /// first finding whose PoC file is the cursor issue's `poc_ref` or
+    /// whose title equals the issue's name; without one, toast `PoC <ref>
+    /// is not in the Findings list`, and without a `poc_ref`, `this issue
+    /// has no PoC`. The row's summary carries both fields, so the key works
+    /// before the `scan.issue` read lands.
+    ///
+    /// The ref matches the finding's `poc_path` by its file stem or its
+    /// file name (`poc-3b1c` and `poc-3b1c.yaml` both name
+    /// `/pocs/poc-3b1c.yaml`), never by substring, and a ref that is blank
+    /// after trimming counts as no PoC, so `""`, `/` or `.yaml` from a
+    /// hostile core cannot land on an unrelated finding (fix round F, F3).
+    /// The match is computed before anything is changed (F10), and the
+    /// toast cuts the ref to 80 cells (F4).
+    fn scan_open_poc(&mut self) {
+        if self.scan.tab != ScanTab::Issues {
+            return;
+        }
+        let Some(row) = self.scan.issues.cursor_issue() else {
+            return;
+        };
+        let poc_ref = row.poc_ref.as_deref().map(str::trim).unwrap_or_default();
+        if poc_ref.is_empty() {
+            self.toast(Level::Info, "this issue has no PoC");
+            return;
+        }
+        let wanted = OsStr::new(poc_ref);
+        let found = self.findings.iter().position(|f| {
+            let path = Path::new(&f.poc_path);
+            path.file_stem() == Some(wanted)
+                || path.file_name() == Some(wanted)
+                || f.title == row.name
+        });
+        match found {
+            Some(k) => {
+                self.finding_cursor = k;
+                self.mode = Mode::Findings;
+                self.sidebar = SidebarItem::Findings;
+            }
+            None => {
+                let text = format!(
+                    "PoC {} is not in the Findings list",
+                    truncate(poc_ref, POC_TOAST_MAX)
+                );
+                self.toast(Level::Warn, text);
+            }
+        }
+    }
+
+    /// `⏎` on a flow another view names (a Findings capture, a Site map
+    /// node or point, an Issues probe or baseline flow): open it in the
+    /// inspector from the top when the store holds it, else refuse with
+    /// `missing_toast` (the Scan views' [`not_in_flow_list`], the Findings
+    /// view's own text; D11, fix round F, F14).
+    fn open_flow(&mut self, id: String, missing_toast: &str, out: &mut Vec<BusRequest>) {
+        if self.row(&id).is_some() {
+            self.selected = Some(id);
+            self.mode = Mode::Inspector;
+            self.inspector.reset_view();
+            self.ensure_detail(out);
+        } else {
+            self.toast(Level::Warn, missing_toast);
+        }
+    }
+
+    /// The Issues cursor came to rest on a row (a key, or a list arriving
+    /// under it while the tab is shown): read the issue (spec D6),
+    /// `scan.issue {id}` under `scan.issue:<id>`, when `read` has no entry
+    /// for the id and no read is pending; at most one read is in flight
+    /// (fix round D, D1). The reply, not the send, fills `read`; an entry
+    /// leaves on a terminal line for its job or a fold that drops the id.
+    /// The row's id is already in the wire form (the fold dropped the rest).
+    fn issue_cursor_landed(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.issues.pane != IssuePane::List || self.scan.issues.pending_read.is_some() {
+            return;
+        }
+        let Some(id) = self.scan.issues.cursor_issue().map(|i| i.id.clone()) else {
+            return;
+        };
+        if self.scan.issues.read.contains(&id) {
+            // A landing on a read row keeps it from the next eviction
+            // (fix round G, G3).
+            self.scan.issues.read.touch(&id);
+            return;
+        }
+        if self.scan_poll(
+            tag_keyed("scan.issue", &id),
+            "scan.issue",
+            json!({ "id": id }),
+            out,
+        ) {
+            self.scan.issues.pending_read = Some(id);
+        }
+    }
+
+    /// Whether the D6 issues timer has a live job to follow: the filtered
+    /// job when the `J` filter is set, any live job otherwise.
+    fn issues_live(&self) -> bool {
+        match &self.scan.issues.filters.job {
+            Some(job) => self
+                .scan
+                .jobs
+                .state_of(job)
+                .is_some_and(|s| !s.is_terminal()),
+            None => !self.scan.jobs.live().is_empty(),
+        }
+    }
+
+    // ------------------------------------------------------ scan: Profiles
+
+    /// Entering Profiles (D6): `scan.profile.list {}` while the list is
+    /// empty and `scan.checks {}` while the catalogue is, each quiet when
+    /// the bus lacks the verb (the tab's degraded text says so) and
+    /// deduped by its tag while in flight.
+    fn enter_profiles(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.profiles.list.is_empty() {
+            self.request_profile_list(out);
+        }
+        if self.scan.profiles.checks.is_empty() {
+            self.scan_poll("scan.checks".to_string(), "scan.checks", json!({}), out);
+        }
+    }
+
+    /// `scan.profile.list {}` under its single-slot tag: the entry read and
+    /// the refresh after a save or a delete (D6).
+    fn request_profile_list(&mut self, out: &mut Vec<BusRequest>) {
+        self.scan_poll(
+            "scan.profile.list".to_string(),
+            "scan.profile.list",
+            json!({}),
+            out,
+        );
+    }
+
+    /// Profiles ⏎ by pane (D11): on the List it reads the row's profile
+    /// (`scan.profile.get {name}` under `scan.profile.get:<name>`); on
+    /// Fields it edits the field; on Origins it adds the highlighted row;
+    /// on Checks it expands a collapsed node, else cycles the node's state.
+    fn profiles_enter(&mut self, out: &mut Vec<BusRequest>) {
+        match self.scan.profiles.pane {
+            ProfilePane::List => {
+                let Some(name) = self.scan.profiles.cursor_entry().map(|p| p.name.clone()) else {
+                    return;
+                };
+                self.scan_call(
+                    tag_keyed("scan.profile.get", &name),
+                    "scan.profile.get",
+                    json!({ "name": name }),
+                    out,
+                );
+            }
+            ProfilePane::Fields => self.scan_edit(out),
+            ProfilePane::Origins => self.scan_origin_add(out),
+            ProfilePane::Checks => {
+                if self.scan.profiles.enter_node() {
+                    self.recompute_launch_gate();
+                }
+            }
+        }
+    }
+
+    /// A `scan.profile.get` reply, or `N`: show `editor` with the Fields
+    /// pane focused, its picker rows from the scope and the flows (D8), and
+    /// read the session preview an observed profile with an origin needs
+    /// (D6).
+    fn open_editor(&mut self, editor: ProfileEditor, out: &mut Vec<BusRequest>) {
+        self.scan.profiles.editor = Some(editor);
+        self.scan.profiles.pane = ProfilePane::Fields;
+        self.scan.profiles.rebuild_tree();
+        self.refresh_origin_choices();
+        self.request_session_preview(out);
+        self.recompute_launch_gate();
+    }
+
+    /// Rebuild the open editor's picker rows from the scope and the flows
+    /// (D8); nothing without an editor.
+    fn refresh_origin_choices(&mut self) {
+        if let Some(editor) = self.scan.profiles.editor.as_mut() {
+            editor.refresh_origins(&self.scope, &self.flows);
+        }
+    }
+
+    /// `scan.session.preview {target: first origin}` under
+    /// `scan.session.preview:<origin>` when the draft's session is observed
+    /// and it has an origin (D6). A held preview never suppresses the read
+    /// (D11 as amended; fix round G, G50): re-opening a profile re-reads
+    /// the session, and only the in-flight dedupe holds a duplicate. Quiet
+    /// when the bus lacks the verb: the session line is a display.
+    fn request_session_preview(&mut self, out: &mut Vec<BusRequest>) {
+        let Some(editor) = self.scan.profiles.editor.as_ref() else {
+            return;
+        };
+        if editor.draft.session.mode != SessionMode::Observed {
+            return;
+        }
+        let Some(origin) = editor.draft.target.origins.first().cloned() else {
+            return;
+        };
+        self.scan_poll(
+            tag_keyed("scan.session.preview", &origin),
+            "scan.session.preview",
+            json!({ "target": origin }),
+            out,
+        );
+    }
+
+    /// The UI-3 launch gate (spec D7): recomputed on every draft change, on
+    /// `Connected` (the tool list), on `L4Scope` (the entries), on a
+    /// Profiles cursor move, a list fold and an editor close. Without an
+    /// editor the Profiles cursor row's lanes are gated instead
+    /// ([`row_gate`]; D7 as amended, fix round G, G73).
+    fn recompute_launch_gate(&mut self) {
+        let has_layer = self.has_tool("l4.scope.list");
+        self.scan.launch.blocked = match self.scan.profiles.editor.as_ref() {
+            Some(e) => l4_gate(&e.draft, has_layer, &self.l4.scope),
+            None => self
+                .scan
+                .profiles
+                .cursor_entry()
+                .and_then(|p| row_gate(&p.summary.lanes, has_layer)),
+        };
+    }
+
+    /// Profiles and Jobs `s` / `m` (spec D7, D11): `verb` is `scan.start` or
+    /// `scan.map`. On a legacy bus both run the one-shot `r` runs (D2). Under
+    /// v2 the key is inert while the UI-3 gate holds a reason (the footer
+    /// shows it) or a launch is in flight (toast); every draft origin's host
+    /// is re-checked against the scope first (an origin can arrive from
+    /// `scan.profile.get` or outlive a scope shrink: the D8 toast, nothing
+    /// sent); `scan.map` falls back to `scan.discover` on the draft's first
+    /// origin when the bus lacks it (D2). The args come from the editor's
+    /// typed draft, else the Profiles list cursor's name.
+    fn scan_launch_v2(&mut self, verb: LaunchVerb, out: &mut Vec<BusRequest>) {
+        match self.scan_offer() {
+            ScanOffer::None => {
+                self.toast(Level::Warn, NO_SCANNER);
+                return;
+            }
+            ScanOffer::Legacy => {
+                self.scan_launch(None, out);
+                return;
+            }
+            ScanOffer::V2 => {}
+        }
+        if !matches!(self.scan.tab, ScanTab::Profiles | ScanTab::Jobs) {
+            return;
+        }
+        // The UI-3 gate holds `s` only: a map runs no L4 lane (D7 as
+        // amended; fix round G, G71).
+        if verb == LaunchVerb::Start && self.scan.launch.blocked.is_some() {
+            return;
+        }
+        if self.scan.launch.pending.is_some() {
+            self.toast(Level::Info, LAUNCH_IN_FLIGHT);
+            return;
+        }
+        // Every draft origin's host against the scope (the D8 rule, one
+        // helper for every path; fix round G, G61): the first uncovered
+        // one is toasted and nothing leaves.
+        let editor = self.scan.profiles.editor.as_ref();
+        let refused = editor.and_then(|e| {
+            e.draft
+                .target
+                .origins
+                .iter()
+                .find_map(|o| out_of_scope(&self.scope, o))
+        });
+        if let Some(text) = refused {
+            self.toast(Level::Warn, text);
+            return;
+        }
+        if verb == LaunchVerb::Map && !self.has_tool("scan.map") && self.has_tool("scan.discover") {
+            let first = editor.and_then(|e| e.draft.target.origins.first().cloned());
+            match first {
+                Some(origin) => self.scan_launch(Some(origin), out),
+                None => self.toast(Level::Info, "map needs an origin: add one (o) first"),
+            }
+            return;
+        }
+        let list_name = self
+            .scan
+            .profiles
+            .list
+            .get(self.scan.profiles.cursor)
+            .map(|p| p.name.clone());
+        let editor = self.scan.profiles.editor.as_ref();
+        // The request and the toast's profile name follow one precedence
+        // (fix round G, G63).
+        let Some(launch) = launch_args(editor, list_name.as_deref(), None) else {
+            self.toast(
+                Level::Info,
+                "nothing to launch: open a profile (⏎) or :scan <origin>",
+            );
+            return;
+        };
+        self.send_launch(verb, launch, out);
+    }
+
+    /// `:scan <origin>` under v2 (spec D8): the D8 origin rule and the scope
+    /// check, then `scan.start {target}`; refused locally only while a
+    /// launch is in flight.
+    fn scan_start_typed(&mut self, raw: &str, out: &mut Vec<BusRequest>) {
+        if self.scan.launch.pending.is_some() {
+            self.toast(Level::Info, LAUNCH_IN_FLIGHT);
+            return;
+        }
+        if self.scope_host(raw).is_none() {
+            return;
+        }
+        let target = match typed_origin(raw, &self.flows) {
+            Ok(target) => target,
+            Err(reason) => {
+                self.toast(Level::Warn, reason.to_string());
+                return;
+            }
+        };
+        let Some(launch) = launch_args(None, None, Some(&target)) else {
+            return;
+        };
+        self.send_launch(LaunchVerb::Start, launch, out);
+    }
+
+    /// The one way a launch leaves (spec D7): tagged under its verb and
+    /// recorded in `launch.pending` until the result, the prompt's cancel or
+    /// the failure; the overlay, should the server ask, returns to Scan.
+    fn send_launch(&mut self, verb: LaunchVerb, launch: Launch, out: &mut Vec<BusRequest>) {
+        if self.scan_call(verb.to_string(), verb.as_str(), launch.args.clone(), out) {
+            self.scan.launch.pending = Some(PendingLaunch { call: verb, launch });
+        }
+    }
+
+    /// Fold a `StartResult` (spec D7, D10): the job lands in the Jobs state
+    /// (`JobsState::land_started`: marked started here, fix round B, B3;
+    /// its status in `full`, the id at the front, the List pane on it), the
+    /// view switches to Jobs, the start line is toasted and a non-empty
+    /// `clamped` list is a second Warn toast. D6 hostile-core bounds: an id
+    /// outside the wire form, or a status naming another job, folds nothing
+    /// and records the error.
+    fn fold_start_result(&mut self, tag: &str, result: StartResult, fallback: Option<String>) {
+        if !is_job_id(&result.job) {
+            self.scan.set_error(ScanError::uncoded(
+                tag,
+                "reply named a job id outside the wire form",
+            ));
+            return;
+        }
+        if result.status.job != result.job {
+            self.scan.set_error(ScanError::uncoded(tag, OTHER_JOB));
+            return;
+        }
+        let id = result.job.clone();
+        self.scan.jobs.land_started(result.status);
+        self.scan.tab = ScanTab::Jobs;
+        let profile = self
+            .scan
+            .jobs
+            .full
+            .get(&id)
+            .map(|s| s.profile_name.clone())
+            .filter(|n| !n.is_empty())
+            .or_else(|| fallback.map(|n| truncate(&n, SAVED_NAME_MAX)))
+            .unwrap_or_else(|| "profile".to_string());
+        // The distinct run lanes (four at most, declaration order) and the
+        // whole toast bounded (fix round G, G72).
+        let lanes = result
+            .lanes
+            .run
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|l| lane_token(*l))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.toast(
+            Level::Info,
+            truncate(
+                &format!("{id} started: {profile} ({lanes})"),
+                SAVED_PATH_MAX,
+            ),
+        );
+        if !result.clamped.is_empty() {
+            let parts: Vec<String> = result
+                .clamped
+                .iter()
+                .take(CLAMPED_MAX)
+                .map(|c| {
+                    format!(
+                        "{} {} -> {}",
+                        truncate(&c.field, CLAMPED_FIELD_MAX),
+                        c.requested,
+                        c.applied
+                    )
+                })
+                .collect();
+            self.toast(Level::Warn, format!("clamped: {}", parts.join("; ")));
+        }
+    }
+
+    /// Profiles `N` (D11): a fresh editor over the defaults.
+    fn scan_new_profile(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        let mut out = Vec::new();
+        self.open_editor(
+            ProfileEditor::new(ScanProfile::default(), None, false),
+            &mut out,
+        );
+        debug_assert!(out.is_empty(), "a default profile has no origin to preview");
+    }
+
+    /// Profiles `e` (D11): edit the field under the Fields cursor by its
+    /// kind; inert off the tab, without an editor (a toast says what to
+    /// open) or with another pane focused (a toast names the Fields pane;
+    /// fix round H, H48).
+    fn scan_edit(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        // One blocker, the no-editor one first (fix round H, H48, H52).
+        let blocker = if self.scan.profiles.editor.is_none() {
+            Some(NO_EDITOR)
+        } else if self.scan.profiles.pane != ProfilePane::Fields {
+            Some(E_NEEDS_FIELDS)
+        } else {
+            None
+        };
+        if let Some(why) = blocker {
+            self.toast(Level::Info, why);
+            return;
+        }
+        // Checked above; the let-else only satisfies the borrow.
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return;
+        };
+        let field = editor.field();
+        match field.kind() {
+            FieldKind::Cycle | FieldKind::Toggle => {
+                if editor.cycle(field) {
+                    self.recompute_launch_gate();
+                    // A session switched to observed may now need its
+                    // preview.
+                    self.request_session_preview(out);
+                }
+            }
+            FieldKind::Text | FieldKind::Number => {
+                let text = editor.field_text();
+                self.open_prompt(PromptKind::ScanField);
+                self.prompt = text;
+            }
+            FieldKind::Origins => self.scan.profiles.pane = ProfilePane::Origins,
+            FieldKind::Checks => self.scan.profiles.pane = ProfilePane::Checks,
+            FieldKind::L4Targets => self.open_prompt(PromptKind::ScanL4Target),
+        }
+    }
+
+    /// Profiles Space (D11): flip a lane or bool field on the Fields pane,
+    /// or cycle the tri-state of the tree node under the Checks cursor.
+    fn scan_toggle(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        match self.scan.profiles.pane {
+            ProfilePane::Fields => {
+                let Some(editor) = self.scan.profiles.editor.as_mut() else {
+                    self.toast(Level::Info, NO_EDITOR);
+                    return;
+                };
+                let field = editor.field();
+                if field.kind() == FieldKind::Toggle && editor.cycle(field) {
+                    self.recompute_launch_gate();
+                }
+            }
+            ProfilePane::Checks => {
+                let Some(selector) = self.scan.profiles.cursor_node().map(|n| n.selector.clone())
+                else {
+                    return;
+                };
+                self.scan.profiles.toggle_node(&selector);
+                self.recompute_launch_gate();
+            }
+            ProfilePane::List | ProfilePane::Origins => {}
+        }
+    }
+
+    /// Profiles ← / → (`h` / `l`) in the Checks pane: collapse or expand
+    /// the lane or class node under the cursor (a check node has nothing
+    /// under it). Nothing elsewhere in the view.
+    fn scan_tree_fold(&mut self, collapse: bool) {
+        if self.scan.tab != ScanTab::Profiles || self.scan.profiles.pane != ProfilePane::Checks {
+            return;
+        }
+        self.scan.profiles.fold_node(collapse);
+    }
+
+    /// Profiles `o` (D11): the typed-origin prompt; needs an editor.
+    fn scan_origin_prompt(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        if self.scan.profiles.editor.is_none() {
+            self.toast(Level::Info, NO_EDITOR);
+            return;
+        }
+        self.open_prompt(PromptKind::ScanOrigin);
+    }
+
+    /// The `o` prompt's line (D8): the typed origin keeps its scheme, a bare
+    /// host gets the rule's; a host, port or scheme the rule refuses is the
+    /// `Err` the prompt retries on; a host the scope does not cover is
+    /// refused with the one D8 toast and the prompt closes (scope is fixed
+    /// elsewhere, so there is nothing to retype), as is a missing editor;
+    /// otherwise the origin joins the draft and the picker, and an observed
+    /// session reads its preview.
+    fn submit_scan_origin(&mut self, text: &str, out: &mut Vec<BusRequest>) -> Result<(), String> {
+        let origin = typed_origin(text, &self.flows).map_err(|e| e.to_string())?;
+        if self.scope_host(&origin).is_none() {
+            // Close-on-refusal: the toast already names the host to add.
+            return Ok(());
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            self.toast(Level::Info, NO_EDITOR);
+            return Ok(());
+        };
+        editor.note_typed_origin(&origin);
+        if editor.add_origin(&origin) {
+            self.recompute_launch_gate();
+            self.request_session_preview(out);
+        }
+        Ok(())
+    }
+
+    /// Settle a Scan prompt's submit (fix round G, G34): `Ok` closes the
+    /// prompt, `Err` toasts the reason and keeps the prompt open with the
+    /// line cleared, so the operator retypes or leaves with Esc.
+    fn submit_retrying(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.close_prompt(),
+            Err(e) => {
+                self.toast(Level::Error, e);
+                self.prompt.clear();
+            }
+        }
+    }
+
+    /// Profiles `a` in the Origins pane (D11): the highlighted picker row
+    /// joins the draft.
+    fn scan_origin_add(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Profiles || self.scan.profiles.pane != ProfilePane::Origins {
+            return;
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return;
+        };
+        let Some(origin) = editor.highlighted_origin().map(str::to_string) else {
+            return;
+        };
+        if editor.add_origin(&origin) {
+            self.recompute_launch_gate();
+            self.request_session_preview(out);
+        }
+    }
+
+    /// Profiles `d` in the Origins pane (D11): the highlighted row's origin
+    /// leaves the draft.
+    fn scan_origin_remove(&mut self) {
+        if self.scan.tab != ScanTab::Profiles || self.scan.profiles.pane != ProfilePane::Origins {
+            return;
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return;
+        };
+        let Some(origin) = editor.highlighted_origin().map(str::to_string) else {
+            return;
+        };
+        if editor.remove_origin(&origin) {
+            self.recompute_launch_gate();
+        }
+    }
+
+    /// Profiles `t` (D11): the L4 target prompt; needs an editor.
+    fn scan_l4_target_prompt(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        if self.scan.profiles.editor.is_none() {
+            self.toast(Level::Info, NO_EDITOR);
+            return;
+        }
+        self.open_prompt(PromptKind::ScanL4Target);
+    }
+
+    /// The `t` prompt's line: parsed by [`parse_l4_target`], added once.
+    fn submit_scan_l4_target(&mut self, text: &str) -> Result<(), String> {
+        let target = parse_l4_target(text).map_err(|e| e.to_string())?;
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return Err(NO_EDITOR.to_string());
+        };
+        if editor.add_l4_target(target) {
+            self.recompute_launch_gate();
+        }
+        Ok(())
+    }
+
+    /// The `ScanField` prompt's line: written into the field under the
+    /// Fields cursor (the one `e` opened the prompt on).
+    fn submit_scan_field(&mut self, text: &str) -> Result<(), String> {
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return Err(NO_EDITOR.to_string());
+        };
+        let field = editor.field();
+        editor.set_text(field, text).map_err(|e| e.to_string())?;
+        self.recompute_launch_gate();
+        Ok(())
+    }
+
+    /// Profiles `w` (D11): `scan.profile.save {profile}` with the draft
+    /// serialised with serde (D3: the whole typed copy); a builtin, a
+    /// builtin's name or an unnamed draft asks `ScanProfileName` first.
+    fn scan_save(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        let Some((builtin, name)) = self
+            .scan
+            .profiles
+            .editor
+            .as_ref()
+            .map(|e| (e.builtin, e.draft.name.trim().to_string()))
+        else {
+            self.toast(Level::Info, NO_EDITOR);
+            return;
+        };
+        if !self.scan_verb_or_toast("scan.profile.save") {
+            return;
+        }
+        if builtin || name.is_empty() || self.scan.profiles.is_builtin(&name) {
+            self.open_prompt(PromptKind::ScanProfileName);
+            return;
+        }
+        self.send_profile_save(out);
+    }
+
+    /// The `ScanProfileName` prompt's line: the trimmed name, when it is
+    /// not a builtin's and follows the engine's rule (`set_text`, which
+    /// refuses with `PROFILE_NAME_RULE`; fix round G, G42, G49), replaces
+    /// `draft.name`, then the draft is saved.
+    fn submit_scan_profile_name(
+        &mut self,
+        text: &str,
+        out: &mut Vec<BusRequest>,
+    ) -> Result<(), String> {
+        let name = text.trim();
+        if is_builtin_name(name) {
+            return Err(format!("{name} is a builtin profile; pick another name"));
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return Err(NO_EDITOR.to_string());
+        };
+        editor
+            .set_text(EditorField::Name, name)
+            .map_err(|e| e.to_string())?;
+        self.send_profile_save(out);
+        Ok(())
+    }
+
+    /// `scan.profile.save {profile: <draft>}` under its single-slot tag.
+    fn send_profile_save(&mut self, out: &mut Vec<BusRequest>) {
+        let Some(editor) = self.scan.profiles.editor.as_ref() else {
+            return;
+        };
+        let profile = match serde_json::to_value(&editor.draft) {
+            Ok(v) => v,
+            Err(e) => {
+                self.toast(
+                    Level::Error,
+                    format!("profile could not be serialised: {e}"),
+                );
+                return;
+            }
+        };
+        self.scan_call(
+            "scan.profile.save".to_string(),
+            "scan.profile.save",
+            json!({ "profile": profile }),
+            out,
+        );
+    }
+
+    /// Profiles `D` (D11): the non-builtin under the cursor (the List
+    /// row, or the open editor's profile off the List pane) goes through
+    /// the one-line `y/N` prompt, "delete profile <name>? y/N"; `y` sends
+    /// `scan.profile.delete {name}` under `scan.profile.delete:<name>`
+    /// ([`App::answer_confirm`]). A builtin is refused without a prompt.
+    fn scan_delete(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        let Some((name, builtin)) = self.scan.profiles.delete_target() else {
+            return;
+        };
+        if builtin {
+            self.toast(
+                Level::Info,
+                format!(
+                    "{} is a builtin profile and cannot be deleted",
+                    truncate(&name, SAVED_NAME_MAX)
+                ),
+            );
+            return;
+        }
+        if !self.scan_verb_or_toast("scan.profile.delete") {
+            return;
+        }
+        // Keyed by the name it deletes (spec D4), so the `y` leaves through
+        // the tagged path (fix round G, G38).
+        self.confirm = Some(ConfirmCall {
+            name: "scan.profile.delete".to_string(),
+            description: format!("delete profile {}? y/N", truncate(&name, SAVED_NAME_MAX)),
+            args: json!({ "name": name }),
+            return_to: Mode::Scan,
+            tag: Some(tag_keyed("scan.profile.delete", &name)),
+        });
+        self.open_prompt(PromptKind::Confirm);
+    }
+
+    /// Jobs `x` (spec D11): `scan.cancel {job}` for the cursor's job under
+    /// the tag `scan.cancel:<job>`, idempotent through the tag dedupe and
+    /// with no extra prompt (the engine's cancel is itself idempotent). A
+    /// terminal job makes the key inert: the banner reads `already <state>`
+    /// as a notice (nothing failed, so no `ScanError` is recorded), cleared
+    /// by the next key. Only the Jobs tab has a job under its cursor;
+    /// elsewhere, and on the legacy row (D12), the key does nothing.
+    fn scan_cancel(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Jobs {
+            return;
+        }
+        let Some(job) = self.scan.jobs.cursor_job().cloned() else {
+            return;
+        };
+        match self.scan.jobs.state_of(&job) {
+            Some(state) if state.is_terminal() => {
+                self.scan.notice = Some(format!("already {}", state_text(state)));
+            }
+            _ => {
+                let tag = tag_keyed("scan.cancel", &job);
+                self.scan_call(tag, "scan.cancel", json!({ "job": job }), out);
+            }
+        }
+    }
+
+    /// Whether the Issues list is on screen or was ever fetched (spec D6,
+    /// "when the Issues tab was ever opened"): `request_issues` stamps
+    /// `fetched_at_tick` the first time the tab is entered.
+    fn issues_wanted(&self) -> bool {
+        (self.mode == Mode::Scan && self.scan.tab == ScanTab::Issues)
+            || self.scan.issues.fetched_at_tick.is_some()
+    }
+
+    /// The D6 timers, run from every `Tick`: every [`STATUS_POLL_TICKS`] one
+    /// `scan.status` per live job (the cursor's job first, then `order` from
+    /// the rotating `poll_offset`, at most [`MAX_STATUS_FOLLOWUPS`] leaving
+    /// per firing; the rest are reached by the next firings, which start
+    /// where this one stopped), every [`LIST_POLL_TICKS`] a `scan.list`
+    /// while the Scan view is shown, and a `scan.issues` while the Issues
+    /// tab is shown and the filtered job (any job, without the filter) is
+    /// live, once [`ISSUES_POLL_TICKS`] have passed since the last
+    /// `scan.issues` left (`fetched_at_tick`, re-stamped by every request),
+    /// so entering the tab just before a modulo boundary does not fetch
+    /// twice (fix round D, D7), and a `scan.sitemap` by the same rule with
+    /// [`SITEMAP_POLL_TICKS`] while the Site map is shown and a job it
+    /// covers is crawling.
+    fn scan_tick(&mut self, t: u64, out: &mut Vec<BusRequest>) {
+        if t.is_multiple_of(STATUS_POLL_TICKS) {
+            let live = self.scan.jobs.live();
+            let attempted = self.request_scan_statuses(&live, out);
+            self.scan.jobs.advance_poll(&live[..attempted]);
+        }
+        if t.is_multiple_of(LIST_POLL_TICKS) && self.mode == Mode::Scan {
+            // A new timer window: the healed jobs may be polled again (G83).
+            self.scan.jobs.healed.clear();
+            self.request_scan_list(out);
+        }
+        let issues_due = due(self.scan.issues.fetched_at_tick, t, ISSUES_POLL_TICKS);
+        if issues_due
+            && self.mode == Mode::Scan
+            && self.scan.tab == ScanTab::Issues
+            && self.issues_live()
+        {
+            self.request_issues(out);
+        }
+        // The Site map: forty ticks after the last read, while the tab is
+        // shown and a covered job is crawling (D6).
+        let sitemap_due = due(self.scan.sitemap.fetched_at_tick, t, SITEMAP_POLL_TICKS);
+        if sitemap_due
+            && self.mode == Mode::Scan
+            && self.scan.tab == ScanTab::SiteMap
+            && self.sitemap_crawling()
+        {
+            self.request_sitemap(None, out);
+        }
+    }
+
+    /// `scan.list {}` under its single-slot tag, stamping `listed_at_tick`.
+    fn request_scan_list(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan_poll("scan.list".to_string(), "scan.list", json!({}), out) {
+            self.scan.jobs.listed_at_tick = self.ticks;
+        }
+    }
+
+    /// `scan.status {job}` under its keyed tag: the one spelling of the
+    /// request the push line, the status timer and the `scan.list` fold
+    /// share. Returns whether the call left.
+    fn request_scan_status(&mut self, job: &str, out: &mut Vec<BusRequest>) -> bool {
+        self.scan_poll(
+            tag_keyed("scan.status", job),
+            "scan.status",
+            json!({ "job": job }),
+            out,
+        )
+    }
+
+    /// `scan.status` for each of `jobs` in turn until [`MAX_STATUS_FOLLOWUPS`]
+    /// have left (spec D6, hostile-core bounds): a job already in flight
+    /// costs nothing and the rest wait for the next firing. Returns how many
+    /// of `jobs` were attempted (the prefix the cap let through), which the
+    /// status timer moves its walk past.
+    fn request_scan_statuses(&mut self, jobs: &[JobId], out: &mut Vec<BusRequest>) -> usize {
+        let mut sent = 0;
+        let mut attempted = 0;
+        for job in jobs {
+            if sent >= MAX_STATUS_FOLLOWUPS {
+                break;
+            }
+            attempted += 1;
+            if self.request_scan_status(job, out) {
+                sent += 1;
+            }
+        }
+        attempted
+    }
+
+    /// A timer- or push-driven `scan.*` read: silent when the bus lacks the
+    /// verb (the tab's degraded text already says so, and a toast four times
+    /// a second would not help), otherwise [`App::scan_call`].
+    fn scan_poll(
+        &mut self,
+        tag: String,
+        name: &str,
+        args: Value,
+        out: &mut Vec<BusRequest>,
+    ) -> bool {
+        self.has_tool(name) && self.scan_call(tag, name, args, out)
+    }
+
+    /// Whether the bus offers `name` (spec D2; fix round G, G40): when it
+    /// does not, the missing verb is recorded as `<name> is not on this
+    /// bus` in the owning tab's error line and toasted, once, here.
+    fn scan_verb_or_toast(&mut self, name: &str) -> bool {
+        if self.has_tool(name) {
+            return true;
+        }
+        let err = ScanError::missing_verb(name);
+        self.toast(Level::Warn, err.wording());
+        self.scan.set_error(err);
+        false
+    }
+
+    /// The one way a `scan.*` call leaves the reducer (spec D4). A verb the
+    /// bus lacks is [`App::scan_verb_or_toast`]'s refusal; a tag already in
+    /// flight is not re-issued. Returns whether the call was pushed.
+    fn scan_call(
+        &mut self,
+        tag: String,
+        name: &str,
+        args: Value,
+        out: &mut Vec<BusRequest>,
+    ) -> bool {
+        if !self.scan_verb_or_toast(name) {
+            return false;
+        }
+        if self.scan.inflight.contains(&tag) {
+            return false;
+        }
+        self.scan.inflight.insert(tag.clone());
+        out.push(BusRequest::CallTagged {
+            tag,
+            name: name.to_string(),
+            args,
+        });
+        true
+    }
+
+    /// A tagged `scan.*` call answered: settle the tag and fold the reply by
+    /// verb (spec D10) through [`App::scan_reply`]. A reply that does not
+    /// match the contract leaves the state and records a
+    /// `ScanError { code: None }`. No `Refresh` is ever pushed from here
+    /// (D4). Later tasks add their verbs to this match.
+    fn on_scan_ok(&mut self, tag: &str, name: &str, value: Value, out: &mut Vec<BusRequest>) {
+        self.scan.inflight.remove(tag);
+        match name {
+            "scan.start" | "scan.map" => {
+                // A `needs_confirmation` reply opens the shared overlay with
+                // the pending launch kept for the re-issue (D7); any other
+                // reply settles the launch, folded as a `StartResult` when
+                // it matches the contract. A reply with no pending launch
+                // (a cancel or a drop already settled it) is recorded, not
+                // folded (D7 as amended; fix round G, G67).
+                let Some(pending) = self.scan.launch.pending.as_ref() else {
+                    self.scan
+                        .set_error(ScanError::uncoded(tag, "reply with no pending launch"));
+                    return;
+                };
+                if let Some(confirm) =
+                    WireConfirm::from_reply(pending.call.as_str(), &pending.launch.args, &value)
+                {
+                    self.open_wire_confirm(confirm, Mode::Scan);
+                    return;
+                }
+                let fallback = self
+                    .scan
+                    .launch
+                    .pending
+                    .take()
+                    .and_then(|p| p.launch.profile_name);
+                if let Some(result) = self.scan_reply::<StartResult>(tag, &value) {
+                    self.fold_start_result(tag, result, fallback);
+                }
+            }
+            "scan.status" | "scan.cancel" => {
+                // D6 hostile-core bound: the reply is folded only under the
+                // job the tag asked about, so a core cannot mint a new live
+                // job (and a new poll) per reply.
+                if let Some(status) = self.scan_reply_keyed::<JobStatus>(
+                    tag,
+                    &value,
+                    |s: &JobStatus| s.job.as_str(),
+                    OTHER_JOB,
+                ) {
+                    self.scan.fold_job_status(status);
+                }
+            }
+            "scan.list" => {
+                if let Some(list) = self.scan_reply::<ListResult>(tag, &value) {
+                    let followups = self.scan.fold_job_list(list);
+                    self.request_scan_statuses(&followups, out);
+                    // The list a `not_found` self-heal asked for clears the
+                    // error it left (D13 as amended; fix round G, G74).
+                    if let Some(healed) = self.scan.heal_pending.take() {
+                        self.scan.clear_error(&healed);
+                    }
+                }
+            }
+            "scan.issues" => {
+                if let Some(result) = self.scan_reply::<IssuesResult>(tag, &value) {
+                    self.scan.issues.fold_result(result);
+                    // The page arriving puts the cursor on a row: read it
+                    // while the tab is on screen (D6, cursor landing).
+                    if self.mode == Mode::Scan && self.scan.tab == ScanTab::Issues {
+                        self.issue_cursor_landed(out);
+                    }
+                }
+            }
+            "scan.sitemap" => {
+                // The page replaces the map, or appends after `n` (D10);
+                // a reply that misses the contract leaves the map (the
+                // next send sets the append flag again).
+                if let Some(result) = self.scan_reply::<SitemapResult>(tag, &value) {
+                    // An over-long `next_cursor` is dropped by the fold
+                    // and recorded here (fix round G, G16).
+                    if let Some(err) = self.scan.sitemap.fold_result(result) {
+                        self.scan.set_error(err);
+                    }
+                }
+            }
+            "scan.profile.list" => {
+                if let Some(list) = self.scan_reply::<ProfileListResult>(tag, &value) {
+                    self.scan.profiles.fold_list(list);
+                    // The cursor row may have changed (G73).
+                    self.recompute_launch_gate();
+                }
+            }
+            "scan.checks" => {
+                if let Some(result) = self.scan_reply::<ChecksResult>(tag, &value) {
+                    self.scan.profiles.fold_checks(result);
+                }
+            }
+            "scan.profile.get" => {
+                // The same hostile-core bound as `scan.status`: the profile
+                // is folded only under the name the tag asked for, so a
+                // reply cannot swap another profile into the editor.
+                // The draft is echoed back on `w` and `s`, so a profile
+                // over the draft bounds is refused whole (fix round G,
+                // G45): the editor stays closed and no preview leaves.
+                if let Some(profile) = self.scan_reply_keyed::<ScanProfile>(
+                    tag,
+                    &value,
+                    |p: &ScanProfile| p.name.as_str(),
+                    OTHER_PROFILE,
+                ) {
+                    match fold_profile(tag, profile) {
+                        Ok(profile) => {
+                            let name = profile.name.clone();
+                            let builtin = self.scan.profiles.is_builtin(&name);
+                            self.open_editor(ProfileEditor::new(profile, Some(name), builtin), out);
+                        }
+                        Err(err) => self.scan.set_error(err),
+                    }
+                }
+            }
+            "scan.profile.save" => {
+                // `saved` is adopted as `loaded_from` only when it is a
+                // usable selector naming the draft (fix round G, G46); any
+                // other reply is recorded, not adopted.
+                if let Some(saved) = self.scan_reply::<ProfileSaveResult>(tag, &value) {
+                    let names_draft = self
+                        .scan
+                        .profiles
+                        .editor
+                        .as_ref()
+                        .is_some_and(|e| e.draft.name == saved.saved);
+                    if usable_selector(&saved.saved) && names_draft {
+                        let name = truncate(&saved.saved, SAVED_NAME_MAX);
+                        let path = truncate(&saved.path, SAVED_PATH_MAX);
+                        self.toast(Level::Info, format!("saved {name} at {path}"));
+                        if let Some(editor) = self.scan.profiles.editor.as_mut() {
+                            editor.saved_as(saved.saved);
+                        }
+                    } else {
+                        self.scan.set_error(ScanError::uncoded(tag, OTHER_SAVED));
+                    }
+                    self.request_profile_list(out);
+                }
+            }
+            "scan.profile.delete" => {
+                // The result names no profile; the tag's key does.
+                let name = tag_parts(tag).1.unwrap_or_default().to_string();
+                if let Some(result) = self.scan_reply::<ProfileDeleteResult>(tag, &value) {
+                    let shown = truncate(&name, SAVED_NAME_MAX);
+                    if result.deleted {
+                        self.toast(Level::Info, format!("deleted {shown}"));
+                    } else {
+                        self.toast(Level::Warn, format!("{shown} was not a saved profile"));
+                    }
+                    // The editor over the deleted profile is stale: it
+                    // closes, and the launch key is re-gated on the row.
+                    if self.scan.profiles.on_deleted(&name) {
+                        self.recompute_launch_gate();
+                    }
+                    self.request_profile_list(out);
+                }
+            }
+            "scan.session.preview" => {
+                // Folded only under the origin the tag asked for (names
+                // only are in the type, D7).
+                if let Some(preview) = self.scan_reply_keyed::<SessionProfile>(
+                    tag,
+                    &value,
+                    |p: &SessionProfile| p.origin.as_str(),
+                    OTHER_ORIGIN,
+                ) {
+                    let origin = tag_parts(tag).1.unwrap_or_default().to_string();
+                    self.scan.profiles.fold_preview(&origin, preview);
+                }
+            }
+            "scan.issue" | "scan.issue.update" => {
+                // The read's reply, ok or not, settles the one read in
+                // flight (D6); an update is its own keyed call.
+                if name == "scan.issue" {
+                    self.scan.issues.pending_read = None;
+                }
+                // The same hostile-core bound as `scan.status`: the issue
+                // is folded only under the id the tag asked for. Both
+                // verbs replace `read[id]` and the matching list row (D10;
+                // an id the page no longer lists is not inserted, fix
+                // round E, E11).
+                if let Some(issue) = self.scan_reply_keyed::<Issue>(
+                    tag,
+                    &value,
+                    |i: &Issue| i.id.as_str(),
+                    OTHER_ISSUE,
+                ) {
+                    let answered = issue.id.clone();
+                    self.scan.issues.fold_issue(issue);
+                    // A landing the pending read held back is retried once
+                    // (fix round E, E10): while the Issues tab is shown,
+                    // a cursor row other than the one answered is read
+                    // now if it is still unread (`issue_cursor_landed`
+                    // keeps the List-pane and `read` checks). Only a
+                    // successful reply retries, so there is no loop.
+                    let moved_on = self
+                        .scan
+                        .issues
+                        .cursor_issue()
+                        .is_some_and(|row| row.id != answered);
+                    if name == "scan.issue"
+                        && moved_on
+                        && self.mode == Mode::Scan
+                        && self.scan.tab == ScanTab::Issues
+                    {
+                        self.issue_cursor_landed(out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse a `scan.*` reply into its D10 type: the one parse /
+    /// clear-or-set scaffold every verb arm shares. A match clears the error
+    /// this tag left behind (D13) and is returned for the fold; a mismatch
+    /// records the contract error under the tag and yields `None`, so the
+    /// prior state stays on screen. The banner notice is not touched here:
+    /// only the next key clears it (spec D3; fix round F, F15), so a
+    /// background status poll cannot erase `already done` before the
+    /// operator reads it.
+    fn scan_reply<T: serde::de::DeserializeOwned>(
+        &mut self,
+        tag: &str,
+        value: &Value,
+    ) -> Option<T> {
+        match parse_result::<T>(tag, value) {
+            Ok(parsed) => {
+                self.scan.clear_error(tag);
+                Some(parsed)
+            }
+            Err(e) => {
+                self.scan.set_error(e);
+                None
+            }
+        }
+    }
+
+    /// [`App::scan_reply`] for a keyed verb (`<verb>:<key>`): the parsed
+    /// reply is returned only when `key` reads the tag's key off it (spec
+    /// D6, hostile-core bounds); otherwise the uncoded error `other`
+    /// (`OTHER_JOB`, `OTHER_ISSUE`) is recorded under the tag and nothing is
+    /// folded. `scan.status`, `scan.cancel`, `scan.issue` and
+    /// `scan.issue.update` share it (fix round D, D9). The tag is the
+    /// verb's source ([`tag_parts`]), so no verb name travels beside it.
+    fn scan_reply_keyed<T: serde::de::DeserializeOwned>(
+        &mut self,
+        tag: &str,
+        value: &Value,
+        key: fn(&T) -> &str,
+        other: &'static str,
+    ) -> Option<T> {
+        let parsed = self.scan_reply::<T>(tag, value)?;
+        if Some(key(&parsed)) == tag_parts(tag).1 {
+            Some(parsed)
+        } else {
+            self.scan.set_error(ScanError::uncoded(tag, other));
+            None
+        }
+    }
+
+    /// A tagged `scan.*` call failed (spec D9, D13): the error is recorded
+    /// where its tab shows it and toasted. Two whys: a `not_found` on a
+    /// keyed `scan.status` / `scan.cancel` (`ScanError::not_found_job`,
+    /// spec call 8) drops the job from `started_here` too, else the
+    /// `scan.list` the self-heal asks for would put it back at the front;
+    /// a refused launch clears `pending` so the key is live again, and the
+    /// Profiles footer reads the wording off the tab's error
+    /// (`ScanState::refused_launch`), the UI-3 `blocked` text taking
+    /// precedence over it (D13), so nothing more is kept for it here.
+    fn on_scan_failed(&mut self, tag: &str, message: String, out: &mut Vec<BusRequest>) {
+        self.scan.inflight.remove(tag);
+        let err = ScanError::from_message(tag, &message);
+        if err.verb == "scan.issue" {
+            self.scan.issues.pending_read = None;
+        }
+        // The pending launch is answered: the key is live again (D7, D13).
+        if self
+            .scan
+            .launch
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.call.as_str() == tag)
+        {
+            self.scan.launch.pending = None;
+        }
+        if let Some(job) = err.not_found_job() {
+            let job = job.to_string();
+            self.scan.jobs.forget(&job);
+            // The requested list's success clears this error (D13 as
+            // amended, G74) and asks no status for the job until the
+            // timer's list (G83).
+            self.scan.jobs.healed.insert(job);
+            self.scan.heal_pending = Some(tag.to_string());
+            self.request_scan_list(out);
+        }
+        self.toast(Level::Error, err.wording());
+        self.scan.set_error(err);
     }
 
     /// A `browser.*` call answered: fill the view. A navigate re-reads the
@@ -4612,7 +6335,7 @@ impl App {
 }
 
 /// Whether `path` is a regular file whose first bytes are an image header
-/// [`crate::viewers::image::dimensions`] recognises — what Findings `o` is
+/// [`crate::viewers::image::dimensions`] recognises: what Findings `o` is
 /// willing to hand to the desktop. Judged on the opened handle, like
 /// [`read_poc_yaml`]; a file that cannot be opened is not an image either.
 fn is_image_file(path: &Path) -> bool {
@@ -4680,7 +6403,7 @@ fn title_case(word: &str) -> String {
 }
 
 /// C12: whether a `poc.build` reply is the PoC's YAML text rather than a
-/// path — it spans lines, or it neither contains a `/` nor ends in
+/// path: it spans lines, or it neither contains a `/` nor ends in
 /// `.yaml`/`.yml`.
 fn looks_like_yaml(s: &str) -> bool {
     s.contains('\n') || !(s.contains('/') || s.ends_with(".yaml") || s.ends_with(".yml"))
@@ -4696,7 +6419,7 @@ fn poc_slug(name: Option<&str>, seq: usize) -> String {
 }
 
 /// The scalar value of the first `key:` line in a YAML text (any indent),
-/// quotes stripped — enough to title a PoC the TUI just wrote.
+/// quotes stripped: enough to title a PoC the TUI just wrote.
 fn yaml_field(yaml: &str, key: &str) -> Option<String> {
     yaml.lines().find_map(|l| {
         let (k, v) = l.trim_start().split_once(':')?;
@@ -4756,7 +6479,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "scan",
-        "Scan view: scope-bound scan.discover (r crawls; :scan <host> crawls a host)",
+        "Scan view: profiles, jobs, site map, issues (s starts scan.start; :scan <origin> starts against an origin)",
     ),
     (
         "l4",
@@ -4814,11 +6537,6 @@ fn craft_dst(spec: &Value) -> Option<String> {
 pub fn fuzzy(needle: &str, hay: &str) -> bool {
     let mut it = hay.chars();
     needle.chars().all(|n| it.any(|h| h == n))
-}
-
-fn step<T: Copy + PartialEq>(all: &[T], cur: T, d: i32) -> T {
-    let i = all.iter().position(|x| *x == cur).unwrap_or(0) as i32;
-    all[(i + d).rem_euclid(all.len() as i32) as usize]
 }
 
 fn compose_field(f: &mut ComposeForm) -> &mut String {
@@ -5055,7 +6773,7 @@ mod tests {
         assert!(reqs.is_empty());
         assert_eq!(
             app.current_toast().map(|t| t.text.as_str()),
-            Some("Out of scope — add `telemetry.vendor.example` to scope to act")
+            Some("Out of scope: add `telemetry.vendor.example` to scope to act")
         );
         app.selected = Some("f1".into());
         assert_eq!(
@@ -5139,7 +6857,7 @@ mod tests {
         let bytes = [0x00u8, 0xff, 0x89, b'P', b'N', b'G', 0xfe];
         let mut e = EditBuffer::from_request("f9", &message_with_body(&bytes));
         assert!(!e.body_is_text);
-        assert_eq!(e.lines[3], "<7 binary bytes — edit in hex is a follow-up>");
+        assert_eq!(e.lines[3], "<7 binary bytes: edit in hex is a follow-up>");
         // Edit a header: that is sent; the body key is absent.
         e.lines[1] = "host: other.test".into();
         let edits = e.to_edits();
@@ -5954,7 +7672,7 @@ mod tests {
             .current_toast()
             .unwrap()
             .text
-            .ends_with("aitm-tui-img.png — opening"));
+            .ends_with("aitm-tui-img.png, opening"));
         assert!(app.take_open_target().is_none(), "taken once");
         let _ = std::fs::remove_file(&t.path);
         // The request pane of the same flow has no body to open.
@@ -6211,13 +7929,13 @@ mod tests {
         assert_eq!(
             app.current_toast().map(|t| t.text.as_str()),
             Some(
-                "Resume all: 1 resumed, 1 skipped — out of scope (add their hosts to scope to act)"
+                "Resume all: 1 resumed, 1 skipped (out of scope: add their hosts to scope to act)"
             )
         );
     }
 
-    /// An app on `f41` — a completed GET whose response is a small JSON
-    /// document, 18 lines as a tree — with the Response pane's JSON tab
+    /// An app on `f41` (a completed GET whose response is a small JSON
+    /// document, 18 lines as a tree) with the Response pane's JSON tab
     /// focused. Both the summary and the body are written here.
     fn json_tab_app() -> App {
         let mut app = crate::connected_app(200, 50);
@@ -7170,8 +8888,8 @@ mod tests {
     }
 
     /// F-tui 1 (review log, plan 2026-10-31-system-proxy-automation): a
-    /// second `s` / `:sysproxy on|off` while a change is in flight — ours or
-    /// the core's `setting` flag — is refused with a Warn toast and no call;
+    /// second `s` / `:sysproxy on|off` while a change is in flight (ours or
+    /// the core's `setting` flag) is refused with a Warn toast and no call;
     /// `:sysproxy status` still goes through mid-flight.
     #[test]
     fn a_second_toggle_mid_flight_is_refused_with_a_warn_toast() {
@@ -7233,7 +8951,7 @@ mod tests {
 
     /// F-tui 6 (panel Important): a bus drop mid-flight loses the reply that
     /// would have settled the pill. A (re)connect is a new session, so it
-    /// drops our in-flight flag too — otherwise the guard would refuse every
+    /// drops our in-flight flag too; otherwise the guard would refuse every
     /// later `s` / `:sysproxy on|off` for the rest of the run.
     #[test]
     fn a_reconnect_drops_the_in_flight_flag_so_the_guard_lets_the_retry_through() {
