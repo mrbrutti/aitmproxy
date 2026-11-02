@@ -138,17 +138,13 @@ def main() -> None:
                 ok(f"{len(reqs)} crawler requests logged by the target")
 
                 section("crawl.forms_submitted (umbrella amendment 53: the engine's report_forms_submitted hook)")
-                # The target log above proved the lane submitted forms. The engine
-                # does not write `crawl.forms_submitted` until T1b's follow-up PR 2
-                # adds the `JobCtx` hook (amendment 53): until then a zero counter
-                # beside real POSTs is the engine gap, reported as a loud SKIP, not
-                # a failure of the crawl. Once the hook lands this is a hard check.
+                # The target log above proved the lane submitted forms; the lane reports
+                # the count through `JobCtx::report_forms_submitted` (umbrella amendment 53,
+                # engine hook in T1b's follow-up PR 2, lane call in T2's follow-up), so this
+                # is a hard check: a zero counter beside real POSTs is a defect.
                 forms = int(crawl.get("forms_submitted") or 0)
-                if forms >= 1:
-                    ok(f"crawl.forms_submitted = {forms} (target saw POSTs to {sorted(form_posts)})")
-                else:
-                    skip(f"engine lacks report_forms_submitted (amendment 53): crawl.forms_submitted is "
-                         f"{forms} while the target saw form POSTs to {sorted(form_posts)}")
+                check(forms >= 1,
+                      f"crawl.forms_submitted = {forms} (target saw form POSTs to {sorted(form_posts)})")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
