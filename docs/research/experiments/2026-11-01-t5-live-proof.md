@@ -135,7 +135,7 @@ Linux rate-limits ICMP errors per destination (`net.ipv4.icmp_ratelimit = 1000` 
 
 ### (v) Real-bus cells on the rig (Task 4b, follow-up PR off main 7f942f9f)
 
-**Result:** all three T5 cells PASS on the rig through the real engine (`run.py scan`, real `aitm` core with file caps, real `aitm-testtarget-serve`, `tcpdump` witness), rig run 11 at `ef950434`, 2026-11-02 07:09 UTC, and again at the merged head `c5c96d1e` (branch + main 0ea7bccc; run 12, 07:3x UTC, `cells-final-*.txt`: the same three PASS lines, `24 pass, 14 skip, 0 fail`, 106/106/23/11 datagrams) (`/tmp/claude/t5-proof-linux/cells-t5-lines.txt`, `cells-summary.txt`, `cells-scan.log`; rig `~/t5-proof/20261102T070921Z/`):
+**Result:** all three T5 cells PASS on the rig through the real engine (`run.py scan`, real `aitm` core with file caps, real `aitm-testtarget-serve`, `tcpdump` witness), rig run 11 at `ef950434`, 2026-11-02 07:09 UTC (`cells-t5-lines.txt`, `cells-summary.txt`), again at the merged head `c5c96d1e` (run 12, `cells-run12-{summary.txt,t5-lines.txt,scan.log}`) and at the code head `346a1156` (run 13, `cells-run13-*`); the final-head run after the stage-6 fix round is quoted in the plan's Shipped section (`/tmp/claude/t5-proof-linux/cells-t5-lines.txt`, `cells-summary.txt`, `cells-scan.log`; rig `~/t5-proof/20261102T070921Z/`):
 
 ```
   PASS  scan/test_t5_bounded_clean.py  (9.1s)
@@ -147,7 +147,7 @@ e2e summary: 24 pass, 14 skip, 0 fail
 
 Ledger (spec D3, from the runner): the T5 cells exercised `scan.start`, `scan.status` and `scan.checks` (all three), and `scan.issues` + `scan.issue` (`test_t5_crash_oracle`), all at the operator role. `tcpdump` on `lo` for the whole surface: 17 965 frames, 226 ICMP, 501 UDP, 168 RST; 106 datagrams to each of the two echo targets (bounded-clean and the P job: 100 cases + 1 baseline + 4 scheduled probes + one liveness probe for a case the loaded rig read as silent), 23 to the V-crash target (2 loop cases + baseline + probes + 3 replays), 11 to the closed UDP port (10 cases + baseline), 215 replies back to our source port.
 
-What the cells proved, with the detail from run 10 (`cells-scan.log` of 2026-11-02 06:5x UTC, the last run that printed per-assertion lines, and the lane's traced trail `cells-run10-vjob-trail.txt`):
+What the cells proved. The runner prints a cell's own lines only when it fails, so the per-assertion detail below comes from run 10 (`cells-run10-scan.log`, the run in which `test_t5_crash_oracle` still failed on `location.l4` and printed every line, and `test_t5_bounded_clean` on the frame count), from the lane's traced trail of that run (`cells-run10-vjob-trail.txt`), and, for the passing cells, from the final run's direct per-cell logs (`cells-final-test_t5_*.log`, each cell run once more on its own with stdout kept):
 
 - `test_t5_bounded_clean`: `scan.start` → job `done`, `lanes.run == ["l4_packet"]`, `points: found 1, audited 1`, `checks: scheduled 2, done 2`, `status.l4 = { cases: 100, crashes: 0, liveness_failures: 0, retired_elements: 0 }`, zero issues; the operator's own `l4.capture` (inbound) holds every frame to the pinned port with `dst 127.0.0.1`; the patched target logged no downtime.
 - `test_t5_pins_dryrun`: `scan.start` with `fields: ["ipv4.src"]` and with `["dst"]` refused synchronously with `scan: invalid_profile: field path "ipv4.src" is pinned and cannot be fuzzed` (no job created); a dry run reports `dry_run: true`, finishes `done`, sends nothing (`status.l4.cases == 0`, no frame on the capture).
@@ -163,13 +163,13 @@ Diagnostics kept from the hunt: the lane logs its stop reasons, the triage trail
 
 ### (vi) macOS
 
-Blocked on the product's privilege units. `aitm-l4-helper` phase 1 (unit p2: `bpf-permissions --dry-run`, `bpf-revert --dry-run`, `probe`, `version`) exists in its own PR; the notarized bundle that lets the app register it and trigger a real apply (units p3/p4) does not yet. Once the engine is on `main`, the three T5 cells SKIP 77 on this Mac with exactly:
+Blocked on the product's privilege units. `aitm-l4-helper` phase 1 (unit p2: `bpf-permissions --dry-run`, `bpf-revert --dry-run`, `probe`, `version`) exists in its own PR; the notarized bundle that lets the app register it and trigger a real apply (units p3/p4) does not yet. On this Mac the three T5 cells are expected to SKIP 77 with exactly:
 
 ```
 packet-capture permission not granted (aitm-l4-helper phase 1 pending)
 ```
 
-The cells gate on `l4.privilege` (both `capabilities.capture` and `capabilities.inject` must be `state == "available"` with `via == "process"`) and fall back to `l4.capture.status` on a core without the verb. **What this branch's cells print today:** a core built from this branch registers no `scan.start` (the engine is PR #232), so all three cells SKIP 77 earlier, at `require_verbs` (`missing verb scan.start, ...`), before the privilege gate is reached; the privilege literal above is what `packet_lane_gate` prints once the engine is on `main`, pinned by the tester's direct probe of all eleven gate branches (`/tmp/claude/t5-tester/pygate.log`, stage 5 report), not by a cell run on this Mac. Nothing was installed and no `/dev/bpf*` mode changed on Matt's Mac. State recorded read-only by `scripts/t5-live-proof-macos.sh record` at `19372ae4` (`/tmp/claude/t5-proof-mac/record-20261101T195150Z.txt`):
+The cells gate on `l4.privilege` (both `capabilities.capture` and `capabilities.inject` must be `state == "available"` with `via == "process"`) and fall back to `l4.capture.status` on a core without the verb. **State of this build:** the engine (PR #232) is in this tree, so on this Mac the cells reach `packet_lane_gate` and the literal above is what it prints for a core whose `l4.privilege` reports no `process` capture; that literal is pinned by the tester's direct probe of all eleven gate branches (`/tmp/claude/t5-tester/pygate.log`, stage 5 report of PR #264) and by `tests/e2e/aitm_e2e/scan.py`; a Mac run of the three cells from this tree has not been made (the Mac leg is blocked on the helper), so the exact line has not yet been observed from a cell on this Mac. Nothing was installed and no `/dev/bpf*` mode changed on Matt's Mac. State recorded read-only by `scripts/t5-live-proof-macos.sh record` at `19372ae4` (`/tmp/claude/t5-proof-mac/record-20261101T195150Z.txt`):
 
 ```
 $ ls -l /dev/bpf0 /dev/bpf1
@@ -183,7 +183,7 @@ exit 77: aitm-l4-helper not present: Mac leg pending the notarized bundle (units
 
 ## Conclusion
 
-**Linux: proven at lane level and through the real engine.** (Section (v): all three real-bus cells PASS at ef950434; the crash oracle found, reproduced three times and retired a real userland crash on the rig.) On a real kernel with real privilege the merged lane classifies real reactions exactly as designed: 20 of 20 RSTs from a closed TCP port, 20 of 20 ICMP port-unreachables from a closed UDP port, 100 of 100 clean correlated echoes, zero false crashes and zero liveness failures, with an independent `tcpdump` agreeing frame for frame. Getting there exposed two pre-existing Critical transport defects no mock could show (the capture reads its own stimulus; layer-2 injection is inert on Linux loopback) and corrected one assumption (loopback is exempt from the ICMP per-peer rate limit, so the pace is for remote targets). The real-bus cells remain to be run once PR #232's engine is on `main`.
+**Linux: proven at lane level and through the real engine.** (Section (v): all three real-bus cells PASS at ef950434; the crash oracle found, reproduced three times and retired a real userland crash on the rig.) On a real kernel with real privilege the merged lane classifies real reactions exactly as designed: 20 of 20 RSTs from a closed TCP port, 20 of 20 ICMP port-unreachables from a closed UDP port, 100 of 100 clean correlated echoes, zero false crashes and zero liveness failures, with an independent `tcpdump` agreeing frame for frame. Getting there exposed two pre-existing Critical transport defects no mock could show (the capture reads its own stimulus; layer-2 injection is inert on Linux loopback) and corrected one assumption (loopback is exempt from the ICMP per-peer rate limit, so the pace is for remote targets).
 
 **macOS:** blocked on the helper bundle; recorded as SKIP 77 with the exact reason above. The lane needs read+write on `/dev/bpf*` for the core process (`via: process`); nothing in the lane needs the system extension.
 
