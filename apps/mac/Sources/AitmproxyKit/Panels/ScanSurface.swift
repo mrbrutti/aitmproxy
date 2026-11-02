@@ -672,6 +672,275 @@ public enum ScanEndText {
     }
 }
 
+// MARK: - The derived progress model (Jobs view D8, D9)
+
+/// The pace a running audit is keeping: two bus counters (`checks.done`,
+/// `checks.scheduled`) over the job's elapsed time, nothing more (Jobs view D8
+/// amendment). The elapsed time includes the crawl, so the estimate is conservative.
+public struct ScanPace: Equatable, Sendable {
+    /// `ceil((scheduled - done) / checksPerSecond)`.
+    public var secondsToGo: Int
+    /// `done / (elapsedMs / 1000)`.
+    public var checksPerSecond: Double
+
+    public init(secondsToGo: Int, checksPerSecond: Double) {
+        self.secondsToGo = secondsToGo
+        self.checksPerSecond = checksPerSecond
+    }
+}
+
+/// What the Jobs row's ring, the card's lane and the KPI strip show for one job,
+/// derived from the merged facts by one total rule (Jobs view D8 and its
+/// amendment; parity pins P15–P22). The engine sends counters, never a
+/// percentage; every value here says so in its help.
+public struct ScanJobProgress: Equatable, Sendable {
+    public enum Ring: Equatable, Sendable {
+        /// A state this build does not know: nothing to draw.
+        case none
+        /// Progress exists but cannot be measured (queued, passive, nothing scheduled yet).
+        case indeterminate
+        /// The fraction, 0…1.
+        case determinate(Double)
+        /// A terminal job: the final fraction, dimmed; nil when the counters give none.
+        case finished(Double?)
+    }
+
+    public var ring: Ring
+    /// The determinate value, 0…1; nil otherwise (including a finished ring).
+    public var fraction: Double?
+    /// `50 %` (a non-breaking space), floored so a running job never reads `100 %`
+    /// before `done == scheduled`; nil when `fraction` is nil.
+    public var percentText: String?
+    /// The card's progress line; `""` for a terminal job (the card shows the end sentence, D9).
+    public var phaseLine: String
+    /// `Now: xss-reflected` / `Now: xss-reflected and 3 more`; nil when `checks.running`
+    /// is empty. The parity spelling the web and the TUI share.
+    public var nowLine: String?
+    /// `3,236 of 6,468 checks (derived from the engine's counters)`, the crawl's `46 of
+    /// 58 pages (derived …)`, or `Progress is not known yet`.
+    public var helpText: String
+    /// `3,232 checks to go`; while running in auditing or reporting with something
+    /// scheduled and left; nil otherwise and when terminal.
+    public var checksToGoText: String?
+    /// `now · xss-reflected and 3 more`: the lane's spelling of `nowLine`; nil with it.
+    public var nowTag: String?
+    /// `at this pace, about 1:04 to go`; only while running in auditing with a derivable pace.
+    public var estimateText: String?
+    /// `Derived from the counters: 3,236 checks done in 1:04, about 51 checks per
+    /// second, 3,232 to go.`; nil with `estimateText`.
+    public var estimateHelp: String?
+
+    static let waitingLine = "Waiting for the engine to start this job."
+    static let passiveLine = "Passive checks over captured traffic"
+    static let schedulingLine = "Scheduling checks"
+    static let reportingLine = "Writing results"
+    static let unknownHelp = "Progress is not known yet"
+    static let derivedSuffix = " (derived from the engine's counters)"
+
+    public init(_ facts: ScanJobFacts) {
+        let summary = facts.summary
+        let status = facts.status
+        let checks = status?.checks
+        let crawl = status?.crawl
+        let running = checks?.running ?? []
+
+        nowLine = Self.nowLine(running)
+        nowTag = running.first.map { "now · " + Self.nowIds(running, first: $0) }
+
+        let checksFraction: Double? = checks.flatMap { Self.fraction(of: $0.done, over: $0.scheduled) }
+        let pagesFraction: Double? = crawl.flatMap { Self.fraction(of: $0.pages, over: $0.pages + $0.queued) }
+        let checksHelp: String? = checks.flatMap { checks in
+            checksFraction == nil ? nil : Self.checksLine(checks)
+        }
+        let pagesHelp: String? = crawl.flatMap { crawl in
+            pagesFraction == nil
+                ? nil
+                : ScanFormat.grouped(crawl.pages) + " of "
+                    + ScanFormat.plural(crawl.pages + crawl.queued, "page", grouped: true)
+        }
+
+        var ring: Ring = .indeterminate
+        var line = ""
+        var help: String? = nil
+        var toGo: String? = nil
+        var pace: ScanPace? = nil
+
+        switch summary.state {
+        case .queued:
+            line = Self.waitingLine
+        case .running, .cancelling:
+            guard let checks, let crawl else {
+                line = summary.phase.word
+                break
+            }
+            switch summary.phase {
+            case .crawling:
+                if let pagesFraction { ring = .determinate(pagesFraction) }
+                line = ScanFormat.plural(crawl.pages, "page", grouped: true) + ", "
+                    + ScanFormat.grouped(crawl.queued) + " queued"
+                help = pagesHelp
+            case .passive:
+                line = Self.passiveLine
+            case .auditing:
+                if let checksFraction {
+                    ring = .determinate(checksFraction)
+                    line = Self.checksLine(checks)
+                } else {
+                    line = Self.schedulingLine
+                }
+                help = checksHelp
+                if summary.state == .running {
+                    toGo = ScanFormat.checksToGo(done: checks.done, scheduled: checks.scheduled)
+                    pace = ScanFormat.paceEstimate(
+                        done: checks.done, scheduled: checks.scheduled, elapsedMs: summary.elapsedMs)
+                }
+            case .reporting:
+                ring = .determinate(1)
+                line = Self.reportingLine
+                help = checksHelp
+                if summary.state == .running {
+                    toGo = ScanFormat.checksToGo(done: checks.done, scheduled: checks.scheduled)
+                }
+            case .queued, .done, .other:
+                line = summary.phase.word
+            }
+        case .done, .cancelled, .failed:
+            ring = .finished(checksFraction ?? pagesFraction)
+            help = checksFraction != nil ? checksHelp : pagesHelp
+        case .other:
+            ring = .none
+            line = summary.state.word
+        }
+
+        self.ring = ring
+        phaseLine = line
+        if case .determinate(let value) = ring {
+            fraction = value
+            percentText = "\(Int((value * 100).rounded(.down)))\u{00A0}%"
+        } else {
+            fraction = nil
+            percentText = nil
+        }
+        helpText = help.map { $0 + Self.derivedSuffix } ?? Self.unknownHelp
+        checksToGoText = toGo
+        if let pace, let checks {
+            estimateText = ScanFormat.estimateText(pace)
+            estimateHelp = ScanFormat.estimateHelp(
+                done: checks.done, elapsedMs: summary.elapsedMs, pace: pace, toGo: checks.scheduled - checks.done)
+        } else {
+            estimateText = nil
+            estimateHelp = nil
+        }
+    }
+
+    /// `3,236 of 6,468 checks`.
+    private static func checksLine(_ checks: ScanCheckCounters) -> String {
+        ScanFormat.grouped(checks.done) + " of " + ScanFormat.plural(checks.scheduled, "check", grouped: true)
+    }
+
+    /// `done / total` when `total > 0`; nil otherwise.
+    private static func fraction(of done: Int, over total: Int) -> Double? {
+        guard total > 0 else { return nil }
+        return Double(done) / Double(total)
+    }
+
+    private static func nowLine(_ running: [String]) -> String? {
+        guard let first = running.first else { return nil }
+        return "Now: " + nowIds(running, first: first)
+    }
+
+    /// `xss-reflected` / `xss-reflected and 3 more`.
+    private static func nowIds(_ running: [String], first: String) -> String {
+        running.count > 1 ? "\(first) and \(running.count - 1) more" : first
+    }
+}
+
+extension ScanFormat {
+    /// `checks.done` over the elapsed time (Jobs view D8 amendment); nil when no rate can
+    /// be derived: `elapsedMs <= 0`, `done <= 0` (rate 0), `scheduled <= 0` or
+    /// `done >= scheduled`. The caller limits it to a running audit.
+    public static func paceEstimate(done: Int, scheduled: Int, elapsedMs: Int) -> ScanPace? {
+        guard elapsedMs > 0, done > 0, scheduled > 0, done < scheduled else { return nil }
+        let checksPerSecond = Double(done) / (Double(elapsedMs) / 1000)
+        let secondsToGo = Int((Double(scheduled - done) / checksPerSecond).rounded(.up))
+        return ScanPace(secondsToGo: secondsToGo, checksPerSecond: checksPerSecond)
+    }
+
+    /// `3,232 checks to go` / `1 check to go`; nil when nothing is scheduled or nothing is left.
+    public static func checksToGo(done: Int, scheduled: Int) -> String? {
+        guard scheduled > 0, done < scheduled else { return nil }
+        return plural(scheduled - done, "check", grouped: true) + " to go"
+    }
+
+    /// `at this pace, about 1:04 to go`.
+    public static func estimateText(_ pace: ScanPace) -> String {
+        "at this pace, about \(elapsed(ms: pace.secondsToGo * 1000)) to go"
+    }
+
+    /// `Derived from the counters: 3,236 checks done in 1:04, about 51 checks per second,
+    /// 3,232 to go.`; the rate is rounded (`about 1 check per second`), or `fewer than 1
+    /// check per second` when it rounds to 0.
+    public static func estimateHelp(done: Int, elapsedMs: Int, pace: ScanPace, toGo: Int) -> String {
+        let rate = Int(pace.checksPerSecond.rounded())
+        let rateWords = rate == 0 ? "fewer than 1 check per second" : "about \(plural(rate, "check")) per second"
+        return "Derived from the counters: \(plural(done, "check", grouped: true)) done in \(elapsed(ms: elapsedMs)), "
+            + "\(rateWords), \(grouped(toGo)) to go."
+    }
+}
+
+/// One line of the job card's attention block (Jobs view D9): the count sentence
+/// and the engine's samples behind its disclosure, empty for a line with none.
+public struct ScanAttentionLine: Equatable, Sendable {
+    /// `7 checks could not run`.
+    public var text: String
+    /// The disclosure's rows; empty for none.
+    public var samples: [ScanCheckErrorSample]
+
+    public init(text: String, samples: [ScanCheckErrorSample]) {
+        self.text = text
+        self.samples = samples
+    }
+}
+
+extension ScanEndText {
+    /// The attention lines, in this order and only when non-zero: `<n> checks could
+    /// not run` with `errorSamples`, `<n> checks were skipped` with `skippedSamples`,
+    /// the crawl trouble line (`crawlTroubleLine`) with no samples. Empty until a
+    /// status has landed; rendered in every state.
+    public static func attention(_ facts: ScanJobFacts) -> [ScanAttentionLine] {
+        guard let status = facts.status else { return [] }
+        var lines: [ScanAttentionLine] = []
+        let checks = status.checks
+        if checks.errors > 0 {
+            lines.append(ScanAttentionLine(
+                text: ScanFormat.plural(checks.errors, "check", grouped: true) + " could not run",
+                samples: checks.errorSamples))
+        }
+        if checks.skipped > 0 {
+            let verb = checks.skipped == 1 ? "was" : "were"
+            lines.append(ScanAttentionLine(
+                text: ScanFormat.plural(checks.skipped, "check", grouped: true) + " \(verb) skipped",
+                samples: checks.skippedSamples))
+        }
+        if let trouble = crawlTroubleLine(status.crawl) {
+            lines.append(ScanAttentionLine(text: trouble, samples: []))
+        }
+        return lines
+    }
+
+    /// The **Notices** list: the launch's notices (`clamped` and `lanes.skipped` from
+    /// the `scan.start` result, `ScanSurfaceModel.launchNotices`) first, then the
+    /// status's `clamped` rows and skipped lanes the notices did not already spell out.
+    public static func notices(_ status: ScanJobStatus, launchNotices: [String]) -> [String] {
+        var lines = launchNotices
+        for line in status.clamped.map(ScanFormat.clampedText) + status.lanes.skipped.map(ScanFormat.skippedLaneText)
+        where !lines.contains(line) {
+            lines.append(line)
+        }
+        return lines
+    }
+}
+
 // MARK: - The model (D8)
 
 /// Everything the Scan page shows and the app drives: the tab, the lists and

@@ -2137,3 +2137,391 @@ extension ScanSurfaceTests {
         #expect(!ScanSurface.profileNameCollides("standard-2", with: listed))
     }
 }
+
+// MARK: - Jobs view PR 2: the derived progress model, the pace estimate, attention lines (plan Task 2.2)
+
+extension ScanSurfaceTests {
+    /// `scan.list.json`'s first row with the given state and phase: a job the list
+    /// knows but whose `scan.status` has not landed.
+    static func progressRow(state: ScanJobState, phase: ScanPhase, elapsedMs: Int = 64_000) throws -> ScanJobSummary {
+        var row = try #require(load("scan.list.json")["jobs"]?.arrayValue?.first)
+        row = ScanPack.edited(row, path: ["state"], to: .string(state.rawValue))
+        row = ScanPack.edited(row, path: ["phase"], to: .string(phase.rawValue))
+        row = ScanPack.edited(row, path: ["elapsed_ms"], to: .number(Double(elapsedMs)))
+        return try ScanJobSummary(json: row)
+    }
+
+    /// The merged facts for `scan.status.json` re-stated with the given state, phase,
+    /// elapsed and edits, under a list row that agrees on the state and phase.
+    static func progressFacts(state: ScanJobState, phase: ScanPhase, elapsedMs: Int = 64_000,
+                              edits: [([String], JSONValue)] = []) throws -> ScanJobFacts {
+        var json = try load("scan.status.json")
+        json = ScanPack.edited(json, path: ["state"], to: .string(state.rawValue))
+        json = ScanPack.edited(json, path: ["phase"], to: .string(phase.rawValue))
+        json = ScanPack.edited(json, path: ["elapsed_ms"], to: .number(Double(elapsedMs)))
+        for (path, value) in edits { json = ScanPack.edited(json, path: path, to: value) }
+        return ScanJobFacts.make(
+            summary: try progressRow(state: state, phase: phase, elapsedMs: elapsedMs),
+            status: try ScanJobStatus(json: json))
+    }
+
+    /// The `checks` edits for a job with `done` of `scheduled` checks and the given ids in flight.
+    static func checks(done: Int, scheduled: Int, running: [String] = []) -> [([String], JSONValue)] {
+        [
+            (["checks", "scheduled"], .number(Double(scheduled))), (["checks", "done"], .number(Double(done))),
+            (["checks", "running"], .array(running.map { .string($0) })),
+        ]
+    }
+
+    /// AC13, P15–P22 (Jobs view D8 and its amendment): the ring, the fraction, the
+    /// percent, the phase line and the now line are derived from the merged facts by
+    /// one total rule; `nowTag` is the lane's spelling of the parity `nowLine`.
+    @Test func jobProgressFollowsTheDerivedRule() throws {
+        let fourIds = ["xss-reflected", "sqli-error", "open-redirect", "ssrf"]
+
+        // P15: auditing, 3,236 of 6,468 checks.
+        let auditing = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 3236, scheduled: 6468, running: fourIds)))
+        let auditFraction = try #require(auditing.fraction)
+        #expect(abs(auditFraction - 0.5003) < 0.0001)
+        guard case .determinate(let ringValue) = auditing.ring else { Issue.record("ring is \(auditing.ring)"); return }
+        #expect(abs(ringValue - 0.5003) < 0.0001)
+        #expect(auditing.percentText == "50\u{00A0}%")
+        #expect(auditing.phaseLine == "3,236 of 6,468 checks")
+        #expect(auditing.helpText == "3,236 of 6,468 checks (derived from the engine's counters)")
+        // P22: four ids.
+        #expect(auditing.nowLine == "Now: xss-reflected and 3 more")
+        #expect(auditing.nowTag == "now · xss-reflected and 3 more")
+
+        // The percent floors: 6,467 of 6,468 is still 99 %, never 100 % before done == scheduled.
+        let almost = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 6467, scheduled: 6468)))
+        #expect(almost.percentText == "99\u{00A0}%")
+        let complete = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 6468, scheduled: 6468)))
+        #expect(complete.percentText == "100\u{00A0}%")
+
+        // P16: crawling, 46 pages and 12 queued.
+        let crawling = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .crawling, edits: [(["crawl", "pages"], 46), (["crawl", "queued"], 12)]))
+        let crawlFraction = try #require(crawling.fraction)
+        #expect(abs(crawlFraction - 0.7931) < 0.0001)
+        #expect(crawling.percentText == "79\u{00A0}%")
+        #expect(crawling.phaseLine == "46 pages, 12 queued")
+        #expect(crawling.helpText == "46 of 58 pages (derived from the engine's counters)")
+        let onePage = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .crawling, edits: [(["crawl", "pages"], 1), (["crawl", "queued"], 0)]))
+        #expect(onePage.phaseLine == "1 page, 0 queued")
+        #expect(onePage.fraction == 1)
+        let noPages = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .crawling, edits: [(["crawl", "pages"], 0), (["crawl", "queued"], 0)]))
+        #expect(noPages.ring == .indeterminate)
+        #expect(noPages.fraction == nil)
+        #expect(noPages.phaseLine == "0 pages, 0 queued")
+        #expect(noPages.helpText == "Progress is not known yet")
+
+        // P17: passive.
+        let passive = ScanJobProgress(try Self.progressFacts(state: .running, phase: .passive))
+        #expect(passive.ring == .indeterminate)
+        #expect(passive.fraction == nil)
+        #expect(passive.percentText == nil)
+        #expect(passive.phaseLine == "Passive checks over captured traffic")
+        #expect(passive.helpText == "Progress is not known yet")
+
+        // P18: reporting.
+        let reporting = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .reporting, edits: Self.checks(done: 6468, scheduled: 6468)))
+        #expect(reporting.ring == .determinate(1))
+        #expect(reporting.fraction == 1)
+        #expect(reporting.percentText == "100\u{00A0}%")
+        #expect(reporting.phaseLine == "Writing results")
+        #expect(reporting.helpText == "6,468 of 6,468 checks (derived from the engine's counters)")
+
+        // P19: queued, whatever the phase and the counters.
+        let queued = ScanJobProgress(try Self.progressFacts(
+            state: .queued, phase: .queued, edits: Self.checks(done: 10, scheduled: 20)))
+        #expect(queued.ring == .indeterminate)
+        #expect(queued.fraction == nil)
+        #expect(queued.percentText == nil)
+        #expect(queued.phaseLine == "Waiting for the engine to start this job.")
+        #expect(queued.helpText == "Progress is not known yet")
+        let queuedNoStatus = ScanJobProgress(ScanJobFacts(
+            summary: try Self.progressRow(state: .queued, phase: .queued), status: nil))
+        #expect(queuedNoStatus.ring == .indeterminate)
+        #expect(queuedNoStatus.phaseLine == "Waiting for the engine to start this job.")
+        #expect(queuedNoStatus.nowLine == nil)
+
+        // P20: auditing with nothing scheduled yet.
+        let scheduling = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 0, scheduled: 0)))
+        #expect(scheduling.ring == .indeterminate)
+        #expect(scheduling.fraction == nil)
+        #expect(scheduling.percentText == nil)
+        #expect(scheduling.phaseLine == "Scheduling checks")
+        #expect(scheduling.helpText == "Progress is not known yet")
+
+        // P21: cancelled keeps the final fraction in a finished ring, with no percent.
+        let cancelled = ScanJobProgress(try Self.progressFacts(
+            state: .cancelled, phase: .done, elapsedMs: 115_000, edits: Self.checks(done: 3236, scheduled: 6468)))
+        guard case .finished(let finished?) = cancelled.ring else { Issue.record("ring is \(cancelled.ring)"); return }
+        #expect(abs(finished - 0.5003) < 0.0001)
+        #expect(cancelled.fraction == nil)
+        #expect(cancelled.percentText == nil)
+        #expect(cancelled.phaseLine == "")
+        #expect(cancelled.helpText == "3,236 of 6,468 checks (derived from the engine's counters)")
+        // A finished job whose checks never scheduled falls back to the crawl; one with neither has no fraction.
+        let failedCrawl = ScanJobProgress(try Self.progressFacts(
+            state: .failed, phase: .done, elapsedMs: 12_000,
+            edits: Self.checks(done: 0, scheduled: 0) + [(["crawl", "pages"], 3), (["crawl", "queued"], 1)]))
+        guard case .finished(let crawlFinished?) = failedCrawl.ring else { Issue.record("ring is \(failedCrawl.ring)"); return }
+        #expect(abs(crawlFinished - 0.75) < 0.0001)
+        #expect(failedCrawl.helpText == "3 of 4 pages (derived from the engine's counters)")
+        let failedEmpty = ScanJobProgress(try Self.progressFacts(
+            state: .failed, phase: .done, elapsedMs: 12_000,
+            edits: Self.checks(done: 0, scheduled: 0) + [(["crawl", "pages"], 0), (["crawl", "queued"], 0)]))
+        #expect(failedEmpty.ring == .finished(nil))
+        #expect(failedEmpty.fraction == nil)
+        #expect(failedEmpty.phaseLine == "")
+        #expect(failedEmpty.helpText == "Progress is not known yet")
+        // A terminal list row whose status has not landed: finished with nothing to derive from.
+        let doneNoStatus = ScanJobProgress(ScanJobFacts(
+            summary: try Self.progressRow(state: .done, phase: .done), status: nil))
+        #expect(doneNoStatus.ring == .finished(nil))
+        #expect(doneNoStatus.phaseLine == "")
+
+        // Cancelling runs the rule for its phase; the view freezes it.
+        let cancelling = ScanJobProgress(try Self.progressFacts(
+            state: .cancelling, phase: .auditing, edits: Self.checks(done: 3236, scheduled: 6468, running: ["xss-reflected"])))
+        let cancellingFraction = try #require(cancelling.fraction)
+        #expect(abs(cancellingFraction - 0.5003) < 0.0001)
+        #expect(cancelling.percentText == "50\u{00A0}%")
+        #expect(cancelling.phaseLine == "3,236 of 6,468 checks")
+        // P22: one id.
+        #expect(cancelling.nowLine == "Now: xss-reflected")
+        #expect(cancelling.nowTag == "now · xss-reflected")
+
+        // Running without a status yet: indeterminate, the phase word.
+        let unread = ScanJobProgress(ScanJobFacts(
+            summary: try Self.progressRow(state: .running, phase: .auditing), status: nil))
+        #expect(unread.ring == .indeterminate)
+        #expect(unread.fraction == nil)
+        #expect(unread.percentText == nil)
+        #expect(unread.phaseLine == "Auditing")
+        #expect(unread.helpText == "Progress is not known yet")
+        #expect(unread.nowLine == nil)
+        #expect(unread.nowTag == nil)
+        let unreadCrawl = ScanJobProgress(ScanJobFacts(
+            summary: try Self.progressRow(state: .running, phase: .crawling), status: nil))
+        #expect(unreadCrawl.ring == .indeterminate)
+        #expect(unreadCrawl.phaseLine == "Crawling")
+
+        // P22: no id in flight.
+        let idle = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 3236, scheduled: 6468, running: [])))
+        #expect(idle.nowLine == nil)
+        #expect(idle.nowTag == nil)
+        let two = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 1, scheduled: 2, running: ["a", "b"])))
+        #expect(two.nowLine == "Now: a and 1 more")
+        #expect(two.nowTag == "now · a and 1 more")
+
+        // The total rule's edges, not spec literals: a running job in a phase the table
+        // does not name reads the phase word, indeterminate; an unknown state has no ring
+        // and reads the state as it came.
+        let oddPhase = ScanJobProgress(try Self.progressFacts(state: .running, phase: .other("warming")))
+        #expect(oddPhase.ring == .indeterminate)
+        #expect(oddPhase.phaseLine == "warming")
+        let oddState = ScanJobProgress(try Self.progressFacts(state: .other("paused"), phase: .auditing))
+        #expect(oddState.ring == ScanJobProgress.Ring.none)
+        #expect(oddState.fraction == nil)
+        #expect(oddState.percentText == nil)
+        #expect(oddState.phaseLine == "paused")
+        #expect(oddState.helpText == "Progress is not known yet")
+    }
+
+    /// AC44 (Jobs view D8 amendment): the pace is two bus counters over the elapsed
+    /// time, says so in its help, and is absent whenever a rate cannot be derived.
+    @Test func paceEstimateIsDerivedFromTheCounters() throws {
+        let pace = try #require(ScanFormat.paceEstimate(done: 3236, scheduled: 6468, elapsedMs: 64_000))
+        #expect(pace.secondsToGo == 64)
+        #expect(abs(pace.checksPerSecond - 50.5625) < 0.001)
+        #expect(ScanFormat.estimateText(pace) == "at this pace, about 1:04 to go")
+        #expect(ScanFormat.estimateHelp(done: 3236, elapsedMs: 64_000, pace: pace, toGo: 3232)
+                == "Derived from the counters: 3,236 checks done in 1:04, about 51 checks per second, 3,232 to go.")
+
+        #expect(ScanFormat.paceEstimate(done: 0, scheduled: 6468, elapsedMs: 10_000) == nil, "rate 0")
+        #expect(ScanFormat.paceEstimate(done: 3236, scheduled: 6468, elapsedMs: 0) == nil, "no elapsed time")
+        #expect(ScanFormat.paceEstimate(done: 6468, scheduled: 6468, elapsedMs: 90_000) == nil, "nothing to go")
+        #expect(ScanFormat.paceEstimate(done: 3236, scheduled: 0, elapsedMs: 64_000) == nil, "nothing scheduled")
+        #expect(ScanFormat.paceEstimate(done: 7000, scheduled: 6468, elapsedMs: 64_000) == nil, "done past scheduled")
+        #expect(ScanFormat.paceEstimate(done: 3236, scheduled: 6468, elapsedMs: -5) == nil, "a negative elapsed")
+
+        // The rate's words: `about 1 check per second` and `fewer than 1 check per second`.
+        let one = try #require(ScanFormat.paceEstimate(done: 10, scheduled: 20, elapsedMs: 10_000))
+        #expect(abs(one.checksPerSecond - 1) < 0.001)
+        #expect(one.secondsToGo == 10)
+        #expect(ScanFormat.estimateText(one) == "at this pace, about 0:10 to go")
+        #expect(ScanFormat.estimateHelp(done: 10, elapsedMs: 10_000, pace: one, toGo: 10)
+                == "Derived from the counters: 10 checks done in 0:10, about 1 check per second, 10 to go.")
+        let slow = try #require(ScanFormat.paceEstimate(done: 1, scheduled: 100, elapsedMs: 10_000))
+        #expect(abs(slow.checksPerSecond - 0.1) < 0.001)
+        #expect(slow.secondsToGo == 990, "ceil(99 / 0.1)")
+        #expect(ScanFormat.estimateText(slow) == "at this pace, about 16:30 to go")
+        #expect(ScanFormat.estimateHelp(done: 1, elapsedMs: 10_000, pace: slow, toGo: 99)
+                == "Derived from the counters: 1 check done in 0:10, fewer than 1 check per second, 99 to go.")
+        // The seconds round up: 3 to go at 2 per second is 2 s, not 1.
+        let partial = try #require(ScanFormat.paceEstimate(done: 2, scheduled: 5, elapsedMs: 1_000))
+        #expect(partial.secondsToGo == 2)
+        // An hour and more reads `h:mm:ss`.
+        let long = try #require(ScanFormat.paceEstimate(done: 1, scheduled: 3601, elapsedMs: 1_000))
+        #expect(ScanFormat.estimateText(long) == "at this pace, about 1:00:00 to go")
+
+        // `checksToGo`: grouped, singular, absent when nothing is scheduled or nothing is left.
+        #expect(ScanFormat.checksToGo(done: 3236, scheduled: 6468) == "3,232 checks to go")
+        #expect(ScanFormat.checksToGo(done: 6467, scheduled: 6468) == "1 check to go")
+        #expect(ScanFormat.checksToGo(done: 6468, scheduled: 6468) == nil)
+        #expect(ScanFormat.checksToGo(done: 0, scheduled: 0) == nil)
+        #expect(ScanFormat.checksToGo(done: 0, scheduled: 6468) == "6,468 checks to go")
+        #expect(ScanFormat.checksToGo(done: 7000, scheduled: 6468) == nil)
+
+        // On the model: auditing carries all three; the estimate reads the merged elapsed.
+        let auditing = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, elapsedMs: 64_000, edits: Self.checks(done: 3236, scheduled: 6468)))
+        #expect(auditing.estimateText == "at this pace, about 1:04 to go")
+        #expect(auditing.estimateHelp
+                == "Derived from the counters: 3,236 checks done in 1:04, about 51 checks per second, 3,232 to go.")
+        #expect(auditing.checksToGoText == "3,232 checks to go")
+
+        // Auditing with nothing scheduled, or everything done: no estimate, nothing to go.
+        let scheduling = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 0, scheduled: 0)))
+        #expect(scheduling.estimateText == nil)
+        #expect(scheduling.estimateHelp == nil)
+        #expect(scheduling.checksToGoText == nil)
+        let complete = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 6468, scheduled: 6468)))
+        #expect(complete.estimateText == nil)
+        #expect(complete.checksToGoText == nil)
+
+        // Crawling, passive, queued, cancelling and cancelled: no estimate, nothing to go.
+        let crawling = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .crawling,
+            edits: Self.checks(done: 3236, scheduled: 6468) + [(["crawl", "pages"], 46), (["crawl", "queued"], 12)]))
+        #expect(crawling.estimateText == nil)
+        #expect(crawling.estimateHelp == nil)
+        #expect(crawling.checksToGoText == nil)
+        let passive = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .passive, edits: Self.checks(done: 3236, scheduled: 6468)))
+        #expect(passive.estimateText == nil)
+        #expect(passive.checksToGoText == nil)
+        let queued = ScanJobProgress(try Self.progressFacts(
+            state: .queued, phase: .queued, edits: Self.checks(done: 3236, scheduled: 6468)))
+        #expect(queued.estimateText == nil)
+        #expect(queued.checksToGoText == nil)
+        let cancelling = ScanJobProgress(try Self.progressFacts(
+            state: .cancelling, phase: .auditing, edits: Self.checks(done: 3236, scheduled: 6468)))
+        #expect(cancelling.estimateText == nil)
+        #expect(cancelling.estimateHelp == nil)
+        #expect(cancelling.checksToGoText == nil)
+        let cancelled = ScanJobProgress(try Self.progressFacts(
+            state: .cancelled, phase: .done, elapsedMs: 115_000, edits: Self.checks(done: 3236, scheduled: 6468)))
+        #expect(cancelled.estimateText == nil)
+        #expect(cancelled.estimateHelp == nil)
+        #expect(cancelled.checksToGoText == nil)
+        let unread = ScanJobProgress(ScanJobFacts(
+            summary: try Self.progressRow(state: .running, phase: .auditing), status: nil))
+        #expect(unread.estimateText == nil)
+        #expect(unread.checksToGoText == nil)
+
+        // Reporting: never an estimate; checks to go only while done < scheduled.
+        let reportingDone = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .reporting, edits: Self.checks(done: 6468, scheduled: 6468)))
+        #expect(reportingDone.estimateText == nil)
+        #expect(reportingDone.estimateHelp == nil)
+        #expect(reportingDone.checksToGoText == nil)
+        let reportingShort = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .reporting, edits: Self.checks(done: 6467, scheduled: 6468)))
+        #expect(reportingShort.estimateText == nil)
+        #expect(reportingShort.checksToGoText == "1 check to go")
+    }
+
+    /// AC15 (Jobs view D9): the attention lines count only what is non-zero, in the
+    /// order could-not-run, skipped, crawl trouble, each with its samples; the Notices
+    /// list is the launch's notices plus the status's clamps and skipped lanes, once each.
+    @Test func attentionLinesCountOnlyNonZero() throws {
+        let sample: JSONValue = ["check": "http.sqli-error", "point": "GET /search?q", "detail": "Connection refused (os error 61)"]
+        let secondSample: JSONValue = ["check": "http.ssrf", "point": "POST /hook", "detail": "no lane"]
+        let decodedSample = try ScanCheckErrorSample(json: sample)
+        let decodedSecond = try ScanCheckErrorSample(json: secondSample)
+
+        // Nothing to say: the fixture's status has no check errors, no skips and a clean crawl.
+        let clean = try Self.progressFacts(state: .done, phase: .done, elapsedMs: 69_000)
+        #expect(ScanEndText.attention(clean) == [])
+        #expect(ScanEndText.attention(ScanJobFacts(
+            summary: try Self.progressRow(state: .done, phase: .done), status: nil)) == [], "no status, nothing to count")
+
+        // 7 could not run, one sample; any state (a running job already shows them).
+        let errors = try Self.progressFacts(state: .running, phase: .auditing, edits: [
+            (["checks", "errors"], 7), (["checks", "error_samples"], .array([sample])),
+        ])
+        #expect(ScanEndText.attention(errors) == [ScanAttentionLine(text: "7 checks could not run", samples: [decodedSample])])
+        #expect(ScanEndText.attention(errors).first?.samples.count == 1)
+        let oneError = try Self.progressFacts(state: .done, phase: .done, edits: [(["checks", "errors"], 1)])
+        #expect(ScanEndText.attention(oneError) == [ScanAttentionLine(text: "1 check could not run", samples: [])])
+
+        // 3 skipped, two samples.
+        let skipped = try Self.progressFacts(state: .done, phase: .done, edits: [
+            (["checks", "skipped"], 3), (["checks", "skipped_samples"], .array([sample, secondSample])),
+        ])
+        #expect(ScanEndText.attention(skipped)
+                == [ScanAttentionLine(text: "3 checks were skipped", samples: [decodedSample, decodedSecond])])
+        let oneSkipped = try Self.progressFacts(state: .done, phase: .done, edits: [(["checks", "skipped"], 1)])
+        #expect(ScanEndText.attention(oneSkipped).map(\.text) == ["1 check was skipped"])
+
+        // Crawl trouble: the suffix only when the engine set `last_error`; never a sample.
+        let refused = try Self.progressFacts(state: .done, phase: .done, edits: [
+            (["crawl", "pages"], 0), (["crawl", "errors"], 1), (["crawl", "last_error"], "connect_refused"),
+        ])
+        #expect(ScanEndText.attention(refused) == [ScanAttentionLine(
+            text: "The crawl fetched 0 pages and hit 1 error — the target refused the connection", samples: [])])
+        let onePage = try Self.progressFacts(state: .done, phase: .done, edits: [
+            (["crawl", "pages"], 1), (["crawl", "errors"], 1),
+        ])
+        #expect(ScanEndText.attention(onePage) == [ScanAttentionLine(text: "The crawl fetched 1 page and hit 1 error", samples: [])])
+
+        // All three, in the spec's order, grouped counts.
+        let everything = try Self.progressFacts(state: .done, phase: .done, edits: [
+            (["checks", "errors"], 1200), (["checks", "error_samples"], .array([sample])),
+            (["checks", "skipped"], 3), (["checks", "skipped_samples"], .array([secondSample])),
+            (["crawl", "pages"], 46), (["crawl", "errors"], 2),
+        ])
+        #expect(ScanEndText.attention(everything) == [
+            ScanAttentionLine(text: "1,200 checks could not run", samples: [decodedSample]),
+            ScanAttentionLine(text: "3 checks were skipped", samples: [decodedSecond]),
+            ScanAttentionLine(text: "The crawl fetched 46 pages and hit 2 errors", samples: []),
+        ])
+
+        // Notices: the launch's lines first, then the status's clamps and skipped lanes it did not already say.
+        let status = try #require(Self.progressFacts(state: .running, phase: .auditing, edits: [
+            (["clamped"], .array([
+                ["field": "budget.probes", "requested": 50000, "applied": 20000],
+                ["field": "budget.time_s", "requested": 7200, "applied": 3600],
+            ])),
+        ]).status)
+        let launchNotices = ["Clamped budget.probes 50000 → 20000", "Skipped ws: lane not available on this build"]
+        #expect(ScanEndText.notices(status, launchNotices: launchNotices) == [
+            "Clamped budget.probes 50000 → 20000", "Skipped ws: lane not available on this build",
+            "Clamped budget.time_s 7200 → 3600",
+        ])
+        #expect(ScanEndText.notices(status, launchNotices: []) == [
+            "Clamped budget.probes 50000 → 20000", "Clamped budget.time_s 7200 → 3600",
+            "Skipped ws: lane not available on this build",
+        ])
+        let quiet = try #require(Self.progressFacts(state: .running, phase: .auditing, edits: [
+            (["lanes", "skipped"], .array([])),
+        ]).status)
+        #expect(ScanEndText.notices(quiet, launchNotices: []) == [])
+        #expect(ScanEndText.notices(quiet, launchNotices: ["Clamped budget.probes 50000 → 20000"])
+                == ["Clamped budget.probes 50000 → 20000"])
+    }
+}
