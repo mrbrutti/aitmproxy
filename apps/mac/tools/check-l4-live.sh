@@ -59,7 +59,15 @@ check_no_embedded_switch() {
     done
 }
 
-checks="live_path no_embedded_switch"
+# verbs-gated: Session's verb items pass through the L4 gate (AC29, task M6), so an L4 row
+# offers no HTTP verb from the context menu, the Flow menu, the keyboard or the palette.
+check_verbs_gated() {
+    local f=Sources/Aitmproxy/Session+Verbs.swift
+    [ -f "$f" ] || { fail verbs-gated "$f"; return; }
+    grep -q 'L4RowVerbs\.gate' "$f" || fail verbs-gated "$f"
+}
+
+checks="live_path no_embedded_switch verbs_gated"
 for c in $checks; do
     "check_$c"
 done
