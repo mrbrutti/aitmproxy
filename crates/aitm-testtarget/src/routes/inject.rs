@@ -305,7 +305,9 @@ fn leading_number(s: &str) -> Option<u64> {
 /// Vulnerable: the host is "interpolated into a shell command line", so a
 /// shell metacharacter starts a second command. No process is ever spawned:
 /// `id` resolves to [`seed::CMDI_MARKER`], `sleep n` to a delay the caller
-/// awaits, anything else to a `command not found` line. Patched: the host
+/// awaits, `echo <words>` to the words themselves (escaped, nothing
+/// interpreted: this is what lets an echoed split marker reassemble), anything
+/// else to a `command not found` line. Patched: the host
 /// must match `^[A-Za-z0-9.-]{1,253}$`.
 ///
 /// Returns the response plus the seconds the caller must sleep first.
@@ -331,12 +333,26 @@ fn cmdi(mode: SeedMode, host: &str) -> (Resp, Option<u64>) {
             } else if let Some(rest) = strip_prefix_ci(cmd, "sleep") {
                 sleep = leading_number(rest.trim()).map(|n| n.min(MAX_SLEEP_SECS));
                 None
+            } else if let Some(words) = echo_words(cmd) {
+                Some(html_escape(words))
             } else {
                 Some(format!("sh: {}: command not found", html_escape(cmd)))
             }
         }
     };
     (ping_body(target, output.as_deref()), sleep)
+}
+
+/// The words an `echo` command would print: `echo AB12` -> `AB12`, `echo` -> ``.
+/// Case-insensitive like `sleep`; `echoAB12` is no echo (a word boundary is
+/// required) and answers `command not found` like any unknown command.
+fn echo_words(cmd: &str) -> Option<&str> {
+    let rest = strip_prefix_ci(cmd, "echo")?;
+    if rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+        Some(rest.trim())
+    } else {
+        None
+    }
 }
 
 /// `<pre>PING <host>: 56 data bytes</pre>`, with the injected command's output
@@ -923,6 +939,55 @@ mod tests {
         assert_eq!(strip_prefix_ci("slee\u{e9}", "sleep"), None);
         assert_eq!(strip_prefix_ci("SLEEP 3", "sleep"), Some(" 3"));
         assert_eq!(strip_prefix_ci("sl", "sleep"), None);
+    }
+
+    #[tokio::test]
+    async fn cmdi_echo_prints_the_words() {
+        // The bundled `check-command-injection.rhai` probe: a split marker that
+        // only execution reassembles. Through every separator that starts a
+        // command, V answers the words on their own line.
+        for target in [
+            "/ping?host=1;echo%20AAABBB",
+            "/ping?host=1|echo%20AAABBB",
+            "/ping?host=1%26%26echo%20AAABBB",
+        ] {
+            let (status, _, body) = get(V, target).await;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert_eq!(body, "<pre>PING 1: 56 data bytes\nAAABBB</pre>", "{target}");
+            assert!(!body.contains("echo AAA"), "{target}: {body}");
+        }
+        // Bare `echo` prints an empty line; the words are escaped, never run.
+        let (_, _, body) = get(V, "/ping?host=1;echo").await;
+        assert_eq!(body, "<pre>PING 1: 56 data bytes\n</pre>");
+        let (_, _, body) = get(V, "/ping?host=1;echo%20%3Cb%3Ex%3C/b%3E%20y").await;
+        assert_eq!(
+            body,
+            "<pre>PING 1: 56 data bytes\n&lt;b&gt;x&lt;/b&gt; y</pre>"
+        );
+        let (_, _, body) = get(V, "/ping?host=1;ECHO%20z").await;
+        assert_eq!(body, "<pre>PING 1: 56 data bytes\nz</pre>");
+        // No word boundary: not an echo.
+        let (_, _, body) = get(V, "/ping?host=1;echoAAABBB").await;
+        assert_eq!(
+            body,
+            "<pre>PING 1: 56 data bytes\nsh: echoAAABBB: command not found</pre>"
+        );
+        // The one-`&` and substitution shapes of the same probe stay negative
+        // (the words keep their trailing text, or no command is split at all).
+        let (_, _, body) = get(V, "/ping?host=1%26echo%20AAABBB").await;
+        assert_eq!(body, "<pre>PING 1&amp;echo AAABBB: 56 data bytes</pre>");
+        let (_, _, body) = get(V, "/ping?host=1$(echo%20AAA)BBB").await;
+        assert_eq!(body, "<pre>PING 1: 56 data bytes\nAAA)BBB</pre>");
+        assert_eq!(cmdi(V, "1;echo 3").1, None, "echo never sleeps");
+        assert_eq!(echo_words("echo"), Some(""));
+        assert_eq!(echo_words("echo  a  b "), Some("a  b"));
+        assert_eq!(echo_words("echoes"), None);
+        assert_eq!(echo_words("ech"), None);
+
+        // P: the `;` fails the hostname allowlist before any shell is emulated.
+        let (status, _, body) = get(P, "/ping?host=1;echo%20AAABBB").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "invalid host");
     }
 
     #[tokio::test]

@@ -525,6 +525,11 @@ SEEDS = (
     ("cmdi ;sleep 2", "GET", "/ping?host=" + Q("localhost;sleep 2"), None, None,
      lambda st, h, t, dt: st == 200 and dt >= 2.0,
      lambda st, h, t, dt: st == 400 and dt < 1.0),
+    # The bundled Rhai cmdi check's probe shape: a split marker only execution
+    # reassembles (amendment 64). The raw `echo AAA` must not appear in V's body.
+    ("cmdi ;echo marker", "GET", "/ping?host=" + Q("localhost;echo AAABBB"), None, None,
+     lambda st, h, t, dt: st == 200 and "\nAAABBB</pre>" in t and "echo AAA" not in t,
+     lambda st, h, t, dt: st == 400 and t == "invalid host"),
     ("xxe", "POST", "/xml", {"content-type": "text/xml"}, XXE_BODY,
      lambda st, h, t, dt: st == 200 and TRAVERSAL_MARKER in t,
      lambda st, h, t, dt: st == 400 and t == "DTD not allowed"),
