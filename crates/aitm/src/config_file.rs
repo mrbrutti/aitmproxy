@@ -667,6 +667,9 @@ struct McpFile {
     /// The durable audit log: `true` (the default file), `false` or `off`, or an
     /// absolute path. Absent keeps the default.
     audit_log: Option<AuditLogFile>,
+    /// The loopback operator bus (R14 §D2). Absent keeps the defaults: on, with
+    /// an ephemeral port.
+    operator_bus: Option<OperatorBusFile>,
 }
 
 impl McpFile {
@@ -681,8 +684,22 @@ impl McpFile {
         if let Some(a) = self.audit_log {
             c.audit_log = a.into_setting()?;
         }
+        if let Some(b) = self.operator_bus {
+            set(&mut c.operator_bus.enabled, b.enabled);
+            set(&mut c.operator_bus.port, b.port);
+        }
         Ok(())
     }
+}
+
+/// `operator_bus: {enabled?, port?}`. `enabled: false` is the explicit opt-out
+/// (no operator bus, no token minting); `port: 0` (the default) is ephemeral,
+/// and the port is ignored when the transport is loopback TCP.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorBusFile {
+    enabled: Option<bool>,
+    port: Option<u16>,
 }
 
 /// `audit_log: true | false | off | /absolute/path`. Untagged, so each YAML
@@ -960,7 +977,7 @@ impl FindingsFile {
 #[cfg(test)]
 mod tests {
     use super::{parse, parse_settings};
-    use aitm_core::McpTransport;
+    use aitm_core::{McpTransport, OperatorBusConfig};
     use aitm_plugin_scanner::ScannerConfig;
     use aitm_scan_model::LaneKind;
 
@@ -1310,5 +1327,33 @@ mod tests {
             }
             other => panic!("expected StreamableHttp, got {other:?}"),
         }
+    }
+
+    /// AC-R14-7: the `mcp.operator_bus` section. Absent → the defaults
+    /// (`enabled: true`, `port: 0`: an ephemeral loopback operator bus); both
+    /// keys are read; an unknown key under it is an error (`deny_unknown_fields`).
+    #[test]
+    fn operator_bus_section_parses_and_defaults() {
+        let s = parse_settings("").expect("an empty document is all defaults");
+        assert_eq!(
+            s.core.mcp.operator_bus,
+            OperatorBusConfig {
+                enabled: true,
+                port: 0
+            }
+        );
+        let s = parse_settings("mcp:\n  operator_bus:\n    enabled: false\n    port: 9091\n")
+            .expect("both keys are read");
+        assert_eq!(
+            s.core.mcp.operator_bus,
+            OperatorBusConfig {
+                enabled: false,
+                port: 9091
+            }
+        );
+        let err = parse_settings("mcp:\n  operator_bus:\n    bogus: 1\n")
+            .expect_err("an unknown key under operator_bus is refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("unknown field `bogus`"), "{text}");
     }
 }

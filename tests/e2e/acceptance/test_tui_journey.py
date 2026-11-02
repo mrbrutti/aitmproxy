@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -63,6 +64,18 @@ PAUSE_HINT = "[a Resume] [A Resume all] [d Kill · abort mode: reset (429/503 ne
 
 w = StepWriter(os.path.join(OUT, "tui-steps.tsv"), EXPECTED_STEPS)
 step = w.step
+
+
+def pgrep_lines(pattern: str) -> str:
+    """`pgrep -fl` matches for a literal command line: "" when there are none (exit 1), the
+    matches on exit 0, and a `[pgrep error …]` marker on any other exit so a tool failure is
+    never read as "nothing left"."""
+    r = subprocess.run(["pgrep", "-fl", re.escape(pattern)], capture_output=True, text=True, check=False)
+    if r.returncode == 0:
+        return r.stdout.strip()
+    if r.returncode == 1:
+        return ""
+    return f"[pgrep error {r.returncode}: {r.stderr.strip()[:80]}]"
 
 
 def audit_since(t0_ms: int) -> list[dict]:
@@ -268,7 +281,11 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         term.press("q")
         rc = term.wait_exit(10)
         after = scutil()
-        left = sh("pgrep", "-fl", f"{AITM} tui").strip()
+        # `pgrep` exits 1 with nothing on either stream when no process matches; `sh()` would
+        # render that exit as a `[stderr]` marker and fail the step with nothing left behind.
+        # The pattern is the literal command line (`re.escape`); a pgrep error is reported, not
+        # folded into "nothing left".
+        left = pgrep_lines(f"{AITM} tui")
         if rc == 0 and after == before_scutil and not left:
             step("TUI-8", "PASS", "exit 0, no child left, scutil unchanged", "audit: last entries from this pid")
         else:

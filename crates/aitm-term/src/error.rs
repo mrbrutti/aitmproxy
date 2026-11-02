@@ -7,7 +7,9 @@
 //! the two-space indent and shortens the log path to `~`; the plain form
 //! (pipes, files, `-v`, CI) is `error: <what>` followed by unwrapped indented
 //! lines and carries no escape byte. Nothing here touches a terminal or the
-//! environment; the caller passes the [`Caps`] it measured.
+//! environment; the caller passes the [`Caps`] it measured. `ErrorReport` is
+//! also an error type (`Display` + `std::error::Error`), so `aitm-cli` can
+//! return one inside `anyhow::Error` and `report_for` can take it back out.
 
 use std::path::{Path, PathBuf};
 
@@ -43,7 +45,8 @@ pub enum ErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixCommand(pub String);
 
-/// An error as the operator should read it (spec D6).
+/// An error as the operator should read it (spec D6); also the typed usage
+/// error `aitm-cli` returns (plan C35): `report_for` passes it through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorReport {
     pub kind: ErrorKind,
@@ -199,6 +202,25 @@ impl ErrorReport {
         }
     }
 }
+
+/// The headline, then each `why` sentence and the `fix` prose as two-space
+/// indented lines, with no trailing newline. `command` and `log` are
+/// rendering concerns ([`ErrorReport::render_rich`],
+/// [`ErrorReport::render_plain`]) and are not part of `Display`, so an
+/// `anyhow` chain prints the error as prose (plan C35).
+impl std::fmt::Display for ErrorReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.what)?;
+        for sentence in self.why.iter().chain(self.fix.iter()) {
+            f.write_str("\n")?;
+            f.write_str(INDENT)?;
+            f.write_str(sentence)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ErrorReport {}
 
 #[cfg(test)]
 mod tests {
@@ -420,5 +442,38 @@ mod tests {
         );
         assert!(out.starts_with("\x1b[31m✕\x1b[0m "));
         assert!(!out.contains('\r'));
+    }
+
+    // ---- wave 2, task 1: `Display` and `std::error::Error` (plan C35) ----
+
+    #[test]
+    fn display_is_the_headline_and_indented_causes() {
+        let report = ErrorReport::usage("unknown command `scpe`")
+            .with_why(vec!["did you mean: scope".into()]);
+        assert_eq!(
+            report.to_string(),
+            "unknown command `scpe`\n  did you mean: scope"
+        );
+        assert_eq!(ErrorReport::failure("x").to_string(), "x");
+
+        // Every `why` and the `fix` prose are indented lines; `command` and
+        // `log` are rendering concerns and never appear in `Display`.
+        let full = ErrorReport::failure("cannot start")
+            .with_why(vec!["held by another aitm".into(), "or the mac app".into()])
+            .with_fix("Free it.")
+            .with_command("lsof -nP -iTCP:8080 -sTCP:LISTEN")
+            .with_log(Some(PathBuf::from("/Users/matt/x.log")));
+        assert_eq!(
+            full.to_string(),
+            "cannot start\n  held by another aitm\n  or the mac app\n  Free it."
+        );
+    }
+
+    #[test]
+    fn error_report_round_trips_through_anyhow() {
+        let r = ErrorReport::usage("a").with_command("aitm scope");
+        let err = anyhow::Error::new(r.clone());
+        assert_eq!(err.downcast_ref::<ErrorReport>(), Some(&r));
+        assert_eq!(err.to_string(), "a");
     }
 }

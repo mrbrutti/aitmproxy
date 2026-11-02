@@ -184,10 +184,10 @@
       <h2 id="run">Running a PoC</h2>
       <p><code>poc.run</code> loads the file, runs the steps in order with no agent in the loop, judges <code>success</code> and writes its artifacts. <code>http</code> steps go through the proxy's guarded client, so the target must be in scope (<code>scope.entries</code> in <code>config.yaml</code>); <code>browser</code> steps also need the embedded browser. <code>--target</code> fills the variable <code>target</code>, and <code>--vars</code> takes a JSON object of any others; both beat a <code>default</code>. The path must end in <code>.yaml</code> or <code>.yml</code>, and when <code>poc.dir</code> is set, <code>poc.run</code>, <code>poc.get</code> and <code>poc.list</code> are confined to that directory.</p>
       <div class="pair">
-        <div class="pair-row"><span class="pair-who">cli</span><code><span class="pr">$ </span>aitm poc run --poc_path pocs/status-check.yaml --target https://staging.example.com --vars '{"param":"q"}'</code></div>
+        <div class="pair-row"><span class="pair-who">cli</span><code><span class="pr">$ </span>aitm poc run --poc_path pocs/reflected-xss-search-q.yaml --target https://staging.example.com --vars '{"param":"q"}'</code></div>
         <div class="pair-row"><span class="pair-who">agent</span><code>poc.run({ poc_path: <span class="s">"pocs/reflected-xss-search-q.yaml"</span>, target: <span class="s">"https://staging.example.com"</span>, vars: { param: <span class="s">"q"</span> } })</code></div>
       </div>
-      <p>The one-shot CLI has no browser attached, so it runs only PoCs without <code>browser</code> steps or <code>browser-eval</code> matchers. That is why the first line names a different file: the example above needs the browser, so run it by agent or from a UI's Findings panel (<em>Run again</em>). Either way the result has the same shape, and the CLI prints it as JSON:</p>
+      <p>The one-shot <code>aitm poc run</code> runs on the running core, so <code>browser</code> steps and <code>browser-eval</code> matchers work from a terminal too; the same file runs by agent or from a UI's Findings panel (<em>Run again</em>). Either way the result has the same shape, and the CLI prints it as JSON:</p>
       <figure class="code term">
         <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span><span class="in">aitm poc run --poc_path pocs/status-check.yaml --target https://staging.example.com</span>
@@ -209,7 +209,7 @@
 
       <h3 id="artifacts">The three artifacts</h3>
       <ul>
-        <li><strong>Finding capture</strong> (<code>finding_capture</code>): the flow of the last <code>http</code> step, as an id in the flow store. With no <code>http</code> step the newest flow captured during the run stands in, and a run that captured nothing fails. The one-shot CLI's store ends with the command, so the id matters most in a long-lived core.</li>
+        <li><strong>Finding capture</strong> (<code>finding_capture</code>): the flow of the last <code>http</code> step, as an id in the flow store. With no <code>http</code> step the newest flow captured during the run stands in, and a run that captured nothing fails. A one-shot <code>aitm poc run</code> records into the running core's store, so the id stays valid for as long as that core runs.</li>
         <li><strong>The PoC file</strong> (<code>poc_path</code>): a YAML copy, <code>&lt;id&gt;.poc.yaml</code>, in a fresh owner-only directory <code>aitm-poc-&lt;id&gt;-…</code> under <code>poc.out_dir</code>, or the system temp directory when that is unset.</li>
         <li><strong>The screenshot</strong> (<code>screenshot_path</code>): <code>screenshot.png</code> in the same directory when the PoC took one, and an empty string when it did not. <code>poc.artifact</code> reads either file back, confined to <code>poc.out_dir</code>.</li>
       </ul>
@@ -226,7 +226,7 @@
   <span class="yk">dir:</span> <span class="yv">/path/to/findings</span></code></pre>
       </figure>
       <div class="callout">
-        <p><strong>By agent:</strong> over MCP, <code>poc.run</code> is refused unless <code>poc.allow_agent_run</code> is <code>true</code>. Operator sessions and the one-shot CLI are never gated: the terminal UI and the macOS app's own core are operator sessions, and the web UI becomes one when <code>mcp.operator_token</code> is set. <code>poc.run</code> is also a write command, so the agent policy applies: it runs under <code>auto</code>, <code>all</code> and <code>ask</code> and is refused under <code>readonly</code> and <code>paused</code>. Scope, rate limits and the SSRF check apply in every case. Calls an assistant makes are recorded in the audit ring with their origin, and <code>agent.activity</code> reads it.</p>
+        <p><strong>By agent:</strong> over MCP, <code>poc.run</code> is refused unless <code>poc.allow_agent_run</code> is <code>true</code>. Operator sessions are never gated: the terminal UI, the macOS app's own core and the one-shot CLI (which connects to the running core as the operator) are operator sessions, and the web UI is one through the operator URL on its ready card. <code>poc.run</code> is also a write command, so the agent policy applies: it runs under <code>auto</code>, <code>all</code> and <code>ask</code> and is refused under <code>readonly</code> and <code>paused</code>. Scope, rate limits and the SSRF check apply in every case. Calls an assistant makes are recorded in the audit ring with their origin, and <code>agent.activity</code> reads it.</p>
       </div>
     </div>
 

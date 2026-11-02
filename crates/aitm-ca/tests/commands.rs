@@ -1124,15 +1124,15 @@ fn audit_fail_closed() {
 fn confirm_prompts() {
     let h = Harness::scripted(false);
 
+    // The prompt is the C47 line protocol: question, "  SHA-256 <fp>" detail
+    // line, notes, then the short final ask (M-W2-6).
     let p = h.confirm("ca.install", &[]).expect("install asks");
-    assert!(
-        p.starts_with("Install the aitmproxy root CA (SHA-256 "),
-        "{p}"
-    );
-    assert!(p.contains(FIXTURE_FP256), "{p}");
+    assert!(p.starts_with("Install the aitmproxy root CA into "), "{p}");
+    assert!(p.contains(&format!("\n  SHA-256 {FIXTURE_FP256}\n")), "{p}");
     assert!(p.contains(&format!("into {K_USER} (scope user)?")), "{p}");
     assert!(p.contains(OBSCURA_FLAG), "{p}");
     assert!(p.contains("obscura"), "{p}");
+    assert!(p.ends_with("\nInstall it?"), "{p}");
 
     let p = h
         .confirm("ca.install", &[("scope", str_arg("system"))])
@@ -1146,7 +1146,8 @@ fn confirm_prompts() {
     assert_eq!(
         p,
         format!(
-            "Remove the aitmproxy root CA (SHA-256 {FIXTURE_FP256}) from {K_USER} (scope user)?"
+            "Remove the aitmproxy root CA from {K_USER} (scope user)?\n  SHA-256 \
+             {FIXTURE_FP256}\nRemove it?"
         )
     );
 
@@ -2049,4 +2050,42 @@ fn cancelled_install_logs_the_stderr_tail_at_debug() {
     assert_eq!(warns.len(), 1, "{capture:?}");
     let error = warns[0].fields.get("error").expect("WARN carries error");
     assert!(!error.contains("canceled"), "{error}");
+}
+
+/// Tester (wave 2, AC-W2-8, plan C47): the install prompt is the exact
+/// four-line protocol — question, `  SHA-256 <fp>` detail, one note, the
+/// final ask — so `aitm_term::prompt::ConfirmPrompt::parse` splits it as
+/// M-W2-6 shows; the text carries no `[y/N]` (the renderer appends it) and
+/// no dotted command name. The uninstall prompt is three lines.
+#[test]
+fn confirm_prompt_is_the_exact_line_protocol() {
+    let h = Harness::scripted(false);
+    let p = h.confirm("ca.install", &[]).expect("install asks");
+    assert_eq!(
+        p,
+        format!(
+            "Install the aitmproxy root CA into {K_USER} (scope user)?\n  SHA-256 {FIXTURE_FP256}\nEvery TLS client that uses that store will then trust certificates this proxy mints. The embedded obscura browser is unaffected; it trusts the CA via --ca-cert.\nInstall it?"
+        )
+    );
+    let lines: Vec<&str> = p.lines().collect();
+    assert_eq!(lines.len(), 4);
+    assert!(lines[0].ends_with('?') && !lines[0].starts_with(' '));
+    assert!(lines[1].starts_with("  SHA-256 "));
+    assert!(!lines[2].starts_with(' ') && !lines[2].ends_with('?'));
+    assert_eq!(lines[3], "Install it?");
+    assert!(!p.contains("[y/N]"));
+    assert!(!p.contains("ca.install"), "no dotted name in prose: {p}");
+    assert!(!p.contains('\r') && !p.ends_with('\n'));
+
+    let u = h
+        .confirm("ca.uninstall", &[("scope", str_arg("system"))])
+        .expect("uninstall asks");
+    assert_eq!(
+        u,
+        format!(
+            "Remove the aitmproxy root CA from /Library/Keychains/System.keychain (scope system)?\n  SHA-256 {FIXTURE_FP256}\nRemove it?"
+        )
+    );
+    assert_eq!(u.lines().count(), 3);
+    assert!(!u.contains("[y/N]") && !u.contains("ca.uninstall"));
 }

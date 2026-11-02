@@ -44,6 +44,9 @@ etherparse = "0.21"
 # `thiserror` for `L4GuardError` — a trivial Cargo.toml merge at integration,
 # flagged in the Task 2 handover.)
 thiserror = "2"
+# `PrivilegeState` (privilege plan P1b.6) logs one `info!` line per packet-capture
+# state change (AC24). Workspace version; nothing new enters the lock.
+tracing.workspace = true
 # Wire backend (M5 Task 6): libpcap bindings for L2 capture + inject
 # (`Capture::sendpacket`), the same code path on macOS and Linux. Version pinned
 # from research note 08 (pcap 2.5.0, best-maintained of the group). libpcap ships
@@ -69,6 +72,14 @@ socket2 = { version = "0.6", features = ["all"] }
 # `L4Unavailable` on every other OS.
 [target.'cfg(target_os = "linux")'.dependencies]
 nfq = "0.2.5"
+# Core end of the privileged helper session (privilege plan P1b.12): the
+# `SO_PEERCRED` check on the accepted socket (`socket`) and the core's own uid
+# to compare it against (`user`); `signal` for the SIGINT a held Ctrl-C sends
+# the launcher child (`PrivilegeState::cancel_prompt`, spec §5.5, panel 2;
+# `nix::sys::signal::kill` is a safe fn). Safe API, so `#![forbid(unsafe_code)]`
+# holds. 0.31 is already locked in the workspace (via `mac_address`); only the
+# feature set and this edge are new.
+nix = { version = "0.31", features = ["socket", "user", "signal"] }
 
 [dev-dependencies]
 # The command tests build a core `CommandHost`, whose `ProxyClient` seam returns a

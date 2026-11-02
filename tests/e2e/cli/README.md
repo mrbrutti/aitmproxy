@@ -130,3 +130,173 @@ A missing precondition is reported as `SKIP: …` (counted, never a FAIL):
 Bus, bridge and operator tokens are generated into `0600` files, read into
 shell variables and only ever compared with `grep -c -F`; the script never
 prints one, and the failure-context dumps redact `#t=` URL fragments.
+
+## Help
+
+`tests/e2e/cli/help.sh` is the live proof for the wave-2 help product (spec
+`docs/superpowers/specs/2026-11-01-cli-terminal-reporting-design.md`,
+AC-W2-1 … AC-W2-10; plan
+`docs/superpowers/plans/2026-11-01-cli-terminal-reporting-wave2-plan.md`,
+Task 16). It runs the real binary and asserts the plan's literal
+expectations, section by section: the top page (`aitm --help` = `aitm -h` =
+`aitm help`, byte-identical; the first line, the `Groups:`/`Options:`/
+`Examples:`/`Learn more:` headings, 19 groups with the bundled catalogue and
+18 with `AITM_NO_BUNDLED_SCRIPTS=1`, zero ESC bytes when piped, nothing
+created, median wall < 100 ms, no new package in `Cargo.lock`), every group
+page (`aitm <group>` = `aitm help <group>` = `aitm <group> --help`; the
+`scope` verbs and footer), every verb page (`Usage:`, `Flags:` with types
+and `[required]`, `Examples:`; nothing booted, no log written), did-you-mean
+and the no-dotted-names rule over six usage errors, the `Usage:`-form mode
+errors and the Homebrew pins (`web operator UI`, `aitm-tui --help`), the
+`[y/N]` prompt of `aitm ca install` recorded on a pty and **declined with
+`n`** (the fingerprint on its own line; `--yes` is never passed, so no
+keychain is written), the two sibling scripts, and the rich TTY rendering
+(dim descriptions, bold headings, no cursor movement, `NO_COLOR`, and the
+SGR-stripped page equal to the piped one line for line).
+
+```bash
+tests/e2e/cli/help.sh                                  # everything
+AITM_HELP_SECTIONS=top,groups,verbs tests/e2e/cli/help.sh
+```
+
+### Prerequisites
+
+- A built `aitm` (`cargo build -p aitm`) — or set `AITM_BIN=/path/to/aitm`.
+  For the 19-group count, the bundled catalogue must be discoverable beside
+  the binary (`scripts/bundled` for a dev build, `share/aitm/scripts` for an
+  installed one); otherwise section 1 notes it and asserts 18.
+- `aitm-tui` beside the binary (`cargo build -p aitm-tui`) for the
+  `aitm-tui --help` pin; absent, that one check SKIPs.
+- `python3` on `PATH` (the binary's real path for the catalogue lookup, byte
+  counts in the `script` casts). Without it the script exits 2 at once
+  (`FATAL: python3 is required`), as `term-reporting.sh` does.
+- For sections 6 and 8, `script` able to allocate a pty (see the SKIP
+  reasons).
+
+Run it **directly in a terminal** (not through `| tee`): sections 6 (the
+prompt) and 8 (the TTY rendering) record real TTY sessions and are guarded by
+`[ -t 1 ]`; when stdout is a pipe they SKIP with that reason. Capture the
+output with `script -q <log> tests/e2e/cli/help.sh` if you need a file. Exit
+status is non-zero if any assertion fails. Every section uses a fresh,
+isolated `HOME` under a scratch dir; no section serves a bus or opens a
+port, nothing touches `~/Library/Application Support/aitmproxy`, the system
+proxy or a keychain (section 6 reads the login keychain before and after
+the declined prompt, on macOS, to show it is unchanged).
+
+### Environment
+
+| Var                   | Default / meaning |
+|-----------------------|-------------------|
+| `AITM_BIN`            | `target/debug/aitm`, else `target/release/aitm`; the binary under test |
+| `AITM_EXPECT_VERSION` | the workspace `Cargo.toml` `version`; what the top page's first line must carry |
+| `AITM_HELP_SECTIONS`  | `all`; a comma list of sections by number or name (`top groups verbs dym usage prompt siblings tty`) |
+
+The runner's own `RUST_LOG`, `NO_COLOR`, `CLICOLOR_FORCE`, `AITM_TERM`, `CI`,
+`AITM_LOG_FILE`, `AITM_CONFIG`, `XDG_CONFIG_HOME`, `AITM_NO_BUNDLED_SCRIPTS`,
+`AITM_BUNDLED_SCRIPTS` and `AITM_SCRIPTS` are unset for the run; each section
+states the variables it needs on the command line.
+
+### Documented SKIP reasons
+
+A missing precondition is reported as `SKIP: …` (counted, never a FAIL):
+
+- sections 6 and 8, the prompt and the TTY rendering: stdout is not a TTY
+  (`[ -t 1 ]`), or `script` cannot allocate a pty (the Claude sandbox);
+- the `aitm-tui --help` pin: no `aitm-tui` beside `AITM_BIN`
+  (`cargo build -p aitm-tui`);
+- the `Cargo.lock` check: `git` unavailable, or neither
+  `claude/cli-ux-terminal-reporting-64b09b` nor `origin/main` is a known ref.
+
+Section 7 runs `cli-startup.sh` and `term-reporting.sh` (sections `preboot`
+and `exitcodes`) against the same binary and needs what they need
+(`python3`, loopback sockets); it takes a few minutes.
+
+## One-shot verbs on a running core
+
+`tests/e2e/cli/oneshot-live-core.sh` is the live proof for R14 (spec
+`docs/superpowers/specs/2026-11-01-cli-oneshot-live-core-design.md`, plan
+`docs/superpowers/plans/2026-11-01-cli-oneshot-live-core-plan.md`, Task 11).
+It boots the real binary and proves, section by section with the plan's
+literal expectations: a default core's card (`Bus: stdio (MCP)`, the
+`Operator bus` row, the Scope next step), the token minted into the `0600`
+`config.yaml` on the first run and the `run/cores/<pid>.json` pointer (`0600`
+in a `0700` dir, its keys, its held `flock`, no token in it, the port bound on
+`127.0.0.1` only); `aitm scope add --host example.com` and `aitm scope list`
+acting on that core from a second shell (exact stdout bytes, empty stderr, a
+python operator client over the bus, the `aitm-cli` audit line, `scope list`
+within 2× `ca status`); a quiet second start and the pointer's removal on
+SIGTERM, Ctrl-C and stdin EOF; the refusal panels with no core (R1, R5), a
+configured port nobody listens on (R2, with and without another core), a
+stale pointer after SIGKILL (deleted, nothing dialed), two cores (R11, then
+`--bus --token-file`), a rotated token (R7, fixed by a restart), the Cli-only
+gate (R9), the explicit override and its usage errors, a silent and a closing
+listener (R10, R2'); the opt-out and fixed-port cards and the operator-bus
+port-in-use panel; the shared loopback bus (`Bus: … · operator`); `aitm web`
+and `aitm tui` reached by a one-shot; `AITM_RUN_DIR`; the W1 scripts still
+green; the six doc greps.
+
+```bash
+tests/e2e/cli/oneshot-live-core.sh                      # everything
+AITM_TERM_SECTIONS=card,oneshot tests/e2e/cli/oneshot-live-core.sh
+AITM_TERM_SECTIONS=16 tests/e2e/cli/oneshot-live-core.sh   # the docs greps only; needs no core
+```
+
+### Prerequisites
+
+- A built `aitm` (`cargo build -p aitm`) — or set `AITM_BIN=/path/to/aitm`.
+- `python3` on `PATH`: free ports, the port holders and the two deliberately
+  broken listeners, the operator bus client, the pointer and `flock` checks,
+  sha256. Without it the script exits 2 at once.
+- `127.0.0.1:8080` and `:8081` free: a "default core" is bare `aitm` with no
+  config file (the spec's definition), so it listens on the default ports.
+  A section whose default ports are taken FAILs its setup naming the port;
+  sections 5, 7, 11 and 12 pick free ports for their own configs.
+- For section 13's `aitm tui` half, a TTY and a `script` that can allocate a
+  pty; for the `lsof` checks, `lsof` on `PATH`.
+
+Run it **directly in a terminal** for the `aitm tui` half of section 13 (it
+is guarded by `[ -t 1 ]` and SKIPs through a pipe); capture with
+`script -q <log> tests/e2e/cli/oneshot-live-core.sh` if you need a file.
+Section 15 runs `cli-startup.sh` and `term-reporting.sh` (the latter under
+`script -q` when a TTY is present, so its §14 recordings run), which takes
+several minutes. Exit status is non-zero if any assertion fails. Every section
+uses an isolated `HOME` under a scratch dir; nothing touches
+`~/Library/Application Support/aitmproxy`, the system proxy or a keychain,
+and no CA is installed.
+
+### Environment
+
+| Var                  | Default / meaning |
+|----------------------|-------------------|
+| `AITM_BIN`           | `target/debug/aitm`, else `target/release/aitm`; the binary under test |
+| `AITM_TERM_SECTIONS` | `all`; a comma list of sections by number or name (`card oneshot restart refusals configport stale twocores rotated gate explicit optout shared surfaces rundir w1pins docs`); passed to `term-reporting.sh` as `all` |
+
+The runner's `RUST_LOG`, `NO_COLOR`, `CLICOLOR_FORCE`, `AITM_TERM`, `CI`,
+`AITM_LOG_FILE`, `AITM_OBSCURA_BIN`, `AITM_TUI_LOG`, `AITM_CONFIG`,
+`XDG_CONFIG_HOME`, `AITM_RUN_DIR`, `AITM_BUS` and `AITM_BUS_TOKEN` are unset
+for the run; each section states the variables it needs.
+
+### Documented SKIP reasons
+
+A missing precondition is reported as `SKIP: …` (counted, never a FAIL):
+
+- section 13, the `aitm tui` half: stdout is not a TTY (`[ -t 1 ]`), or
+  `script` cannot allocate a pty (the Claude sandbox);
+- the `lsof` checks (section 1: the operator bus port bound on `127.0.0.1`
+  only; section 12: exactly one bus listener): `lsof` not on `PATH`.
+
+The mac app's embedded core (AC-R14-14) is a step of the plan's live-proof
+recipe, not of this script.
+
+### Token hygiene
+
+The minted operator token is read from the `0600` config with `sed` into a
+shell variable and only ever used as a `grep -c -F` needle whose count must be
+0, written by the `printf` builtin into a `0600` file for `--token-file`, or
+exported as `AITM_BUS_TOKEN` from the variable for one child; it is never
+echoed, logged or placed on a command line, and the python bus client reads it
+from the file in-process. No token-bearing file is `cat`ed or shown in a
+failure dump. Cores that must stay up read stdin from a pipe the script holds
+open (a default core serves MCP on stdio and exits on EOF, which section 3
+proves on purpose). Every spawned core, port holder and feeder is tracked by
+PID and killed by the exit trap; there is no global `pkill`.

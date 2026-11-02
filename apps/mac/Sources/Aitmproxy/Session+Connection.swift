@@ -24,6 +24,7 @@ extension Session {
             scopeHostCount: scopeHosts.count,
             flowCount: rows.count,
             listenAddress: effectiveListenAddress,
+            coreCapture: captureStatus.map(CoreCaptureStatus.init),
             systemProxy: systemProxy,
             systemProxyFacts: systemProxyFacts,
             caTrust: caTrust,

@@ -154,6 +154,69 @@ import Testing
         #expect(detached.actions.first == .restartCore)
     }
 
+    /// The fold of the `capture.status` reply (PR #200's shape) into the lane's input: attached +
+    /// TCP and UDP handoffs summed, and the core's own reason carried onto the detail when the
+    /// provider is not attached.
+    @Test func coreCaptureStatusComesFromTheVerbsReply() throws {
+        let attachedJSON = """
+        {"enabled":true,"feeder":{"state":"listening"},"provider":{"state":"attached","attached_at":1761900000000,
+         "team_id":"995PCLM9KH"},"scope_tokens":["www.example.com"],"flows_handed_off":{"tcp":4,"udp":3},
+         "last_handoff_at":1761900001000,"capability":"capturing"}
+        """
+        let attached = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(attachedJSON))))
+        #expect(attached == CoreCaptureStatus(providerAttached: true, flowsHandedOff: 7))
+        #expect(make(capability: .capturing, hosts: 1, coreCapture: attached).capture.detail
+                == "attached · 1 host in scope · 7 flows handed off")
+
+        let gateOffJSON = """
+        {"enabled":false,"feeder":{"state":"off","reason":"macos_capture.enabled is false"},
+         "provider":{"state":"detached"},"flows_handed_off":{"tcp":0,"udp":0},"last_handoff_at":null,
+         "capability":"feeder_off","capability_reason":"macos_capture.enabled is false"}
+        """
+        let gateOff = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(gateOffJSON))))
+        #expect(gateOff.providerAttached == false)
+        #expect(gateOff.reason == "macos_capture.enabled is false")
+        let lane = make(capability: .capturing, hosts: 1, coreCapture: gateOff).capture
+        #expect(lane.state == .warning)
+        #expect(lane.word == "on, core not attached")
+        #expect(lane.detail == "extension on · 1 host in scope · core not attached · macos_capture.enabled is false")
+
+        // A bind failure with no capability_reason falls back to the feeder's reason; a listening
+        // feeder that is simply not yet attached has no reason and the detail stays bare.
+        let bindFailed = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(
+            #"{"enabled":true,"feeder":{"state":"bind_failed","reason":"cannot bind the capture sockets (address in use)"},"capability":"degraded"}"#))))
+        #expect(bindFailed == CoreCaptureStatus(providerAttached: false, flowsHandedOff: 0,
+                                                reason: "cannot bind the capture sockets (address in use)"))
+        let awaiting = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(
+            #"{"enabled":true,"feeder":{"state":"listening"},"capability":"awaiting_provider"}"#))))
+        #expect(awaiting == CoreCaptureStatus(providerAttached: false, flowsHandedOff: 0, reason: nil))
+        #expect(make(capability: .capturing, hosts: 1, coreCapture: awaiting).capture.detail
+                == "extension on · 1 host in scope · core not attached")
+    }
+
+    /// The mapping is total over the wire: a bind failure with no reason and a state this build does
+    /// not know carry no reason (never a bare " · " on the detail); two huge counts saturate instead of
+    /// trapping; a reason with newlines or over 512 characters follows the Kit's advice rule (one line,
+    /// cut), and a blank reason is nil.
+    @Test func coreCaptureStatusMappingIsTotalOverTheWire() throws {
+        func core(_ json: String) throws -> CoreCaptureStatus {
+            CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(json))))
+        }
+        #expect(try core(#"{"enabled":true,"feeder":{"state":"bind_failed"},"capability":"degraded"}"#).reason == nil)
+        #expect(try core(#"{"enabled":true,"feeder":{"state":"paused"},"capability":"snoozing"}"#)
+                == CoreCaptureStatus(providerAttached: false, flowsHandedOff: 0, reason: nil))
+        let huge = try core(#"{"enabled":true,"feeder":{"state":"listening"},"provider":{"state":"attached"},"flows_handed_off":{"tcp":9223372036854774784,"udp":9223372036854774784},"capability":"capturing"}"#)
+        #expect(huge.flowsHandedOff == Int.max)
+        let long = String(repeating: "x", count: 600)
+        let noisy = try core(#"{"enabled":false,"feeder":{"state":"off","reason":"line one\nline two"},"capability":"feeder_off","capability_reason":"\#(long)"}"#)
+        #expect(noisy.reason?.count == 512)
+        let multiline = try core(#"{"enabled":false,"feeder":{"state":"off","reason":"line one\nline two"},"capability":"feeder_off"}"#)
+        #expect(multiline.reason == "line one line two")
+        #expect(try core(#"{"enabled":false,"feeder":{"state":"off","reason":"   "},"capability":"feeder_off"}"#).reason == nil)
+        #expect(make(capability: .capturing, hosts: 1, coreCapture: multiline).capture.detail
+                == "extension on · 1 host in scope · core not attached · line one line two")
+    }
+
     // MARK: Overall + steps
 
     @Test func overallIsTheWorstLane() {

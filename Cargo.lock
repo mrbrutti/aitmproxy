@@ -132,6 +132,7 @@ version = "0.5.13"
 dependencies = [
  "aitm-core",
  "aitm-mcp",
+ "aitm-term",
  "anyhow",
  "futures",
  "serde_json",
@@ -406,6 +407,7 @@ dependencies = [
  "etherparse",
  "futures",
  "nfq",
+ "nix 0.31.3",
  "pcap",
  "pnet_packet",
  "rhai",
@@ -414,6 +416,7 @@ dependencies = [
  "serde_yaml",
  "socket2",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
 ]
 

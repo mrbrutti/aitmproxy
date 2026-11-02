@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # e2e: tier=manual surface=acceptance
 """Release acceptance, journey WEB (spec §D5, negatives §D7): the INSTALLED `aitm web` on the
-operator's real HOME, its ready card (WEB-1), then a REAL Google Chrome over CDP
+operator's real HOME, its ready card (WEB-1, read from stderr: wave 1 G1/D13), then a REAL Google Chrome over CDP
 (lib/web_journey.mjs) for the page words (WEB-2/3/6, N2-WEB, N5-WEB), the system-proxy flips
 only with Matt's yes (WEB-4/7) and the bypass precondition, a second browser's traffic as a hand
 step (WEB-5, --manual; judged from the page by the mjs, the web cell has no bus client), and the
@@ -60,14 +60,18 @@ AITM = os.environ.get("AITM", INSTALLED_CLI)
 CHROME = os.environ.get("CHROME", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 BROWSER_STEPS = ("WEB-2", "WEB-3", "WEB-4", "WEB-5", "WEB-6a", "WEB-6b", "WEB-6c", "WEB-6d", "WEB-7", "N2-WEB", "N5-WEB")
 EXPECTED_STEPS = ("WEB-1",) + BROWSER_STEPS + ("WEB-8", "WEB-9", "WEB-10", "N1-WEB", "N3-WEB")
+# Wave 1 (spec 2026-11-01-cli-terminal-reporting, G1/D13): the ready card is a human line, so it is
+# on STDERR; stdout stays free (JSON-RPC for the stdio transport, the answer for a one-shot). On the
+# cell's pipe it arrives in the plain form — `Label: value · command` rows, no pill line, no rules;
+# the rules and the `aitm web` pill exist only on a TTY — so the rows are matched with an optional
+# colon and any spacing.
 CARD_WANT = {
-    "title line `aitm web`": r"^\s*aitm web\s*$",
-    "Web UI line": r"Web UI\s+http://127\.0\.0\.1:8082/#t=",
-    "Proxy line": r"Proxy\s+127\.0\.0\.1:8080",
-    "Browser line (SSRF-filtered)": r"Browser\s+127\.0\.0\.1:8081\s+\(SSRF-filtered\)",
-    "Bus ready": r"Bus\s+ready",
+    "Web UI line": r"^\s*Web UI:?\s+http://127\.0\.0\.1:8082/#t=",
+    "Proxy line": r"^\s*Proxy:?\s+127\.0\.0\.1:8080",
+    "Browser line (SSRF-filtered)": r"^\s*Browser:?\s+127\.0\.0\.1:8081\s+\(SSRF-filtered\)",
+    "Bus ready": r"^\s*Bus:?\s+ready",
 }
-SCOPE_LINE = "Scope      Nothing is decrypted until a host is in Scope."
+SCOPE_LINE = re.compile(r"^\s*Scope:?\s+Nothing is decrypted until a host is in Scope\.", re.M)
 
 w = StepWriter(os.path.join(OUT, "web-steps.tsv"), EXPECTED_STEPS)
 step = w.step
@@ -95,49 +99,74 @@ def note_secret(value: str) -> None:
         f.write(value + "\n")
 
 
+def log_redacted(dst, line: str) -> bool:
+    """One line to the log through the writer's redaction; False once the log is closed."""
+    try:
+        dst.write(w.redact(line))
+        dst.flush()
+        return True
+    except ValueError:  # the log was closed at the end of the cell while a last line arrived
+        return False
+
+
 def pump_redacted(src, dst) -> None:
-    """Copy `aitm web`'s stderr to the log file line by line through the writer's redaction."""
+    """Copy a child stream (or any line iterable) to the log line by line, redacted."""
     for line in src:
-        try:
-            dst.write(w.redact(line))
-            dst.flush()
-        except ValueError:  # the log was closed at the end of the cell while a last line arrived
+        if not log_redacted(dst, line):
             return
 
 
-def read_card(proc: subprocess.Popen, deadline_s: float) -> tuple[list[str], str | None, str | None]:
-    """The ready card from stdout, read in a thread so a silent `aitm web` cannot hang the cell:
-    stops at the SECOND rule line (`────`), at EOF, or at the deadline."""
+STDOUT_LINES: list[str] = []
+
+
+def pump_stdout(src, dst) -> None:
+    """`aitm web`'s stdout carries nothing (wave 1 G1); keep what arrives for WEB-1's
+    "nothing from the Rhai loader on stdout" check and log it, redacted."""
+    for line in src:
+        STDOUT_LINES.append(line.rstrip("\n"))
+        if not log_redacted(dst, line):
+            return
+
+
+def read_card(proc: subprocess.Popen, deadline_s: float, log) -> tuple[list[str], str | None, str | None]:
+    """The ready card from STDERR (wave 1 G1/D13), read in a thread so a silent `aitm web` cannot
+    hang the cell: stops at the `Log` row when the log file opened (the plain form's last row;
+    absent it, the deadline ends the read), at EOF, or at the deadline. Every stderr line, card or
+    not, goes to the log through the writer's redaction (`installed.redact` masks `#t=` bearers by
+    pattern, so the first copy is masked before `note_secret` runs), and once the card is in,
+    `pump_redacted` keeps doing that for the rest of the run."""
     q: queue.Queue[str | None] = queue.Queue()
 
     def pump() -> None:
-        for line in proc.stdout:
+        for line in proc.stderr:
             q.put(line)
         q.put(None)
 
     threading.Thread(target=pump, daemon=True).start()
     card: list[str] = []
     op_url = agent_url = None
-    rules = 0
     end = time.time() + deadline_s
+    eof = False
     while time.time() < end:
         try:
             line = q.get(timeout=max(0.05, end - time.time()))
         except queue.Empty:
             break
         if line is None:
+            eof = True
             break
+        log_redacted(log, line)
         card.append(line.rstrip("\n"))
-        m = re.match(r"\s*Operator\s+(https?://\S+)", line)
+        m = re.match(r"\s*Operator:?\s+(https?://\S+)", line)
         if m:
             op_url = m.group(1)
-        m = re.match(r"\s*Web UI\s+(https?://\S+)", line)
+        m = re.match(r"\s*Web UI:?\s+(https?://\S+)", line)
         if m:
             agent_url = m.group(1)
-        if "────" in line:
-            rules += 1
-            if rules >= 2:
-                break
+        if re.match(r"\s*Log:?\s+\S", line):
+            break
+    if not eof:
+        threading.Thread(target=pump_redacted, args=(iter(q.get, None), log), daemon=True).start()
     return card, op_url, agent_url
 
 
@@ -169,33 +198,36 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
     log_path = os.path.join(OUT, "aitm-web.log")
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.Popen([AITM, "web"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
-        threading.Thread(target=pump_redacted, args=(proc.stderr, log), daemon=True).start()
+        # stdout carries nothing for `aitm web` (wave 1 G1); whatever arrives is kept for WEB-1
+        # and logged, redacted.
+        threading.Thread(target=pump_stdout, args=(proc.stdout, log), daemon=True).start()
         try:
             # WEB-1 — the ready card.
-            card, op_url, agent_url = read_card(proc, 20)
+            card, op_url, agent_url = read_card(proc, 20, log)
             for u in (op_url, agent_url):
                 if u and "#t=" in u:
                     note_secret(u.split("#t=", 1)[1].split("&", 1)[0])
             shown = "\n".join(card)
             with open(os.path.join(OUT, "WEB-1.txt"), "w", encoding="utf-8") as f:
                 f.write(w.redact(shown))
-            loader = sum(1 for ln in card if "loaded script" in ln or "script loaded into the host" in ln)
+            loader = sum(1 for ln in card + STDOUT_LINES if "loaded script" in ln or "script loaded into the host" in ln)
+            stdout_lines = len(STDOUT_LINES)
             have = {label: bool(re.search(rx, shown, re.M)) for label, rx in CARD_WANT.items()}
-            rules = sum(1 for ln in card if "────" in ln)
-            have["two rules"] = rules == 2
+            # Wave 1 G1: nothing on stdout, from the loader or anything else (CLI-3's twin).
+            have["stdout empty"] = stdout_lines == 0
             scope_empty = not pre_scope
             if scope_empty:
-                have["Scope line (Scope empty)"] = SCOPE_LINE in shown
+                have["Scope line (Scope empty)"] = bool(SCOPE_LINE.search(shown))
             healthz = ""
             try:
                 healthz = urllib.request.urlopen("http://127.0.0.1:8082/healthz", timeout=5).read().decode()
             except Exception as e:  # noqa: BLE001
                 healthz = f"error {e}"
-            obs = f"card lines {len(card)} ({loader} loader lines); " + ", ".join(f"{k}: {v}" for k, v in have.items()) + f"; Operator line {'present' if op_url else 'ABSENT'}; config scope empty {scope_empty}; /healthz {healthz.strip()}"
+            obs = f"card lines {len(card)} on stderr ({loader} loader lines; stdout {stdout_lines} lines); " + ", ".join(f"{k}: {v}" for k, v in have.items()) + f"; Operator line {'present' if op_url else 'ABSENT'}; config scope empty {scope_empty}; /healthz {healthz.strip()}"
             if all(have.values()) and loader == 0 and healthz.strip() == '{"ok":true}':
                 step("WEB-1", "PASS", obs)
             else:
-                step("WEB-1", "FAIL", obs, "", "log noise / card shape: PR #271" if loader or not have["two rules"] else "")
+                step("WEB-1", "FAIL", obs, "", "regression after #271 (loader noise)" if loader else "")
             if not op_url:
                 for sid in BROWSER_STEPS:
                     step(sid, "BLOCKED", "no Operator line: mcp.operator_token is not set in the operator's config (`aitm operator-token generate` is a manual step on 0.5.10)")

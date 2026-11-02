@@ -24,7 +24,7 @@ wire and the UDP echo replies it received -- never a fixture. It proves the "[D0
     out-of-scope port is refused by the guard.
 
 Blocked-aware: the first step reads `l4.capture.status`; when `available` is false it prints
-`blocked: needs D0: <the core's reason>` and exits 77 (the honest verdict on this Mac, where
+`blocked: needs approval: <the core's reason>` and exits 77 (the honest verdict on this Mac, where
 /dev/bpf* is root-only). Every later step that hits the privilege wall SKIPs the same way.
 
 Env model (like the sibling l4 cells): AITM_BUS_ADDR + AITM_BUS_OPERATOR_TOKEN (+ AITM_BUS_TOKEN
@@ -117,8 +117,9 @@ def show(label: str, value) -> None:
 
 
 def blocked(reason) -> None:
-    """The honest [D0] verdict: print it bare (for the plan's grep) and SKIP with it."""
-    line = f"blocked: needs D0: {reason}"
+    """The honest verdict while capture needs approval (`l4.capture.status.reason`): print it
+    bare (for the plan's grep) and SKIP with it."""
+    line = f"blocked: needs approval: {reason}"
     print(line, flush=True)
     skip(line)
 

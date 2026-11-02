@@ -224,16 +224,38 @@ public struct TrafficRoutes: Hashable, Sendable {
     }
 }
 
-/// What the core itself reports about the capture extension, once the read-only
-/// `capture.status` bus verb exists (proposed 2026-10-31). Optional input: when present it
-/// sharpens the capture lane's detail; the app's own tunnel status stays the fallback.
+/// What the core itself reports about the capture extension, from the read-only
+/// `capture.status` bus verb (PR #200). Optional input: when present it sharpens the capture
+/// lane's detail; the app's own tunnel status stays the fallback (spec "Facts from the other
+/// sessions folded in": the verb's reply overrides the detail line, never the lane's source).
 public struct CoreCaptureStatus: Hashable, Sendable {
     public var providerAttached: Bool
     public var flowsHandedOff: Int
+    /// The core's own reason when its capture path is not running — `capability_reason`, else the
+    /// feeder's `reason` (a closed vocabulary: "macos_capture.enabled is false", "not a macOS build",
+    /// "not started", "stopped", "cannot bind the capture sockets (<kind>)" …). Nil while attached.
+    public var reason: String?
 
-    public init(providerAttached: Bool, flowsHandedOff: Int) {
+    public init(providerAttached: Bool, flowsHandedOff: Int, reason: String? = nil) {
         self.providerAttached = providerAttached
         self.flowsHandedOff = flowsHandedOff
+        self.reason = reason
+    }
+
+    /// The fold of the verb's reply: `provider.state == attached`, TCP + UDP handoffs of the current
+    /// attachment (saturating — two wire counts must never trap the app), and the core's reason when
+    /// it has one, under the Kit's wire-text rule for advice (`DecryptStatus.displayAdvice`: blank is
+    /// nil, one line, cut at 512). One mapping, so the lane never reads the raw reply.
+    public init(_ status: CaptureStatus) {
+        let feederReason: String? = switch status.feeder {
+        case .off(let reason): reason
+        case .bindFailed(let reason): reason
+        case .listening, .unknown: nil
+        }
+        let (sum, overflow) = status.tcpHandedOff.addingReportingOverflow(status.udpHandedOff)
+        self.init(providerAttached: status.providerAttached,
+                  flowsHandedOff: overflow ? Int.max : sum,
+                  reason: (status.capabilityReason ?? feederReason).flatMap(DecryptStatus.displayAdvice))
     }
 }
 
@@ -442,9 +464,14 @@ public struct ConnectionSummary: Hashable, Sendable {
         case .on:
             var detail = "extension on · \(hosts)"
             if let coreCapture {
-                detail = coreCapture.providerAttached
-                    ? "attached · \(hosts) · \(coreCapture.flowsHandedOff) flows handed off"
-                    : "extension on · \(hosts) · core not attached"
+                if coreCapture.providerAttached {
+                    detail = "attached · \(hosts) · \(coreCapture.flowsHandedOff) flows handed off"
+                } else {
+                    // The core's reason joins the detail when it has one ("macos_capture.enabled is
+                    // false" while the app's switch still reads on), so the card says why, not just that.
+                    let why = coreCapture.reason.map { " · \($0)" } ?? ""
+                    detail = "extension on · \(hosts) · core not attached\(why)"
+                }
             }
             let attached = coreCapture?.providerAttached ?? true
             return ConnectionLane(kind: .capture, state: attached ? .ok : .warning,

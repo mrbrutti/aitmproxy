@@ -372,11 +372,13 @@ fn errors_name_the_command_or_flag() {
     let id = FlowId::new().to_string();
 
     let e = err_text(cli.dispatch(&argv(&[])));
-    assert!(e.contains("usage"), "{e}");
-    assert!(e.contains("flow list") && e.contains("demo ping"), "{e}");
+    assert!(
+        e.contains("expected a command") && e.contains("Usage: aitm <group> <verb>"),
+        "{e}"
+    );
 
     let e = err_text(cli.dispatch(&argv(&["flow", "nope"])));
-    assert!(e.contains("unknown command `flow.nope`"), "{e}");
+    assert!(e.contains("unknown command `flow nope`"), "{e}");
 
     let e = err_text(cli.dispatch(&argv(&["--id", &id])));
     assert!(e.contains("command") && e.contains("before"), "{e}");
@@ -506,7 +508,7 @@ fn confirmer_gates_invoke() {
     let (cli, cmd) = confirm_cli(Some(no.clone()));
     let e = err_text(cli.dispatch(&argv(&["demo", "confirm"])));
     assert!(e.contains("aborted"), "{e}");
-    assert!(e.contains("demo.confirm"), "names the command: {e}");
+    assert!(e.contains("demo confirm"), "names the command: {e}");
     assert_eq!(cmd.invoked.load(Ordering::SeqCst), 0, "nothing ran");
     assert_eq!(no.prompts(), vec!["Proceed?".to_string()]);
 
@@ -545,7 +547,7 @@ fn non_interactive_needs_yes() {
     let (cli, cmd) = confirm_cli(Some(Arc::new(TtyConfirmer::new(false))));
     let e = err_text(cli.dispatch(&argv(&["demo", "confirm"])));
     assert!(e.contains("--yes"), "{e}");
-    assert!(e.contains("demo.confirm"), "names the command: {e}");
+    assert!(e.contains("demo confirm"), "names the command: {e}");
     assert_eq!(cmd.invoked.load(Ordering::SeqCst), 0);
 }
 

@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use aitm_core::{
     Body, CommandHost, Config, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, Frontend, HeaderMap,
     HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState, McpConfig, McpTransport,
-    MemFlowStore, Params, ProxyClient, ScopeConfig, ScopeEntry, StdGuard, Value,
+    MemFlowStore, OperatorBusConfig, Params, ProxyClient, ScopeConfig, ScopeEntry, StdGuard, Value,
 };
 use aitm_plugins::{ControlPlugin, ScopePlugin};
 use futures::future::BoxFuture;
@@ -271,6 +271,7 @@ fn config_get_is_redacted_and_requires_config() {
                 token: "SECRET-TOKEN".into(),
                 endpoint_file: None,
             },
+            operator_bus: OperatorBusConfig::default(),
             ..McpConfig::default()
         },
         ..Config::default()

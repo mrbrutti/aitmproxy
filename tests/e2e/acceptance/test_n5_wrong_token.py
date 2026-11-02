@@ -111,7 +111,8 @@ def n4_web() -> None:
     with open(os.path.join(OUT, "N4-WEB.txt"), "w", encoding="utf-8") as fh:
         fh.write(text)
     panel, miss = n4_words(text)
-    card = re.search(r"Web UI\s+http", out) is not None
+    # The card is on stderr since wave 1 (G1/D13), `Web UI: http…` on a pipe: look in both streams.
+    card = re.search(r"Web UI:?\s+http", text) is not None
     if panel and rc not in (None, 0) and not card:
         step("N4-WEB", "PASS", f"panel, exit {rc}, no card first" + (f"; missing follow-up lines {miss}" if miss else ""), f"8080 held by {port_holder(8080)}")
     else:

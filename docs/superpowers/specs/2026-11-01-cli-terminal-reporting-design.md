@@ -12,7 +12,7 @@
 
 - G1. Three channels, never mixed: results on stdout; every human line (header, phases, card, warnings, errors, help) on stderr; diagnostics in a log file or behind `-v`/`RUST_LOG` on stderr. Tracing never writes to stdout in any mode.
 - G2. Startup is a live checklist drawn in place on a TTY, one plain line per phase when piped, and ends in a ready card that says what is listening and what to do next.
-- G3. `aitm --version` and `aitm --help` answer from a pre-boot fast path: nothing created, nothing loaded, exit 0.
+- G3. `aitm --version` and `aitm --help` answer from a pre-boot fast path: nothing created, nothing loaded, exit 0. (Amended 2026-11-01, wave-2 plan C30/C31: `aitm --help` reads the config file read-only and compiles the script catalogue so it lists exactly this install's commands; it still creates nothing, opens no log and boots no proxy. `--version` stays the pure fast path.)
 - G4. Every error is a panel: what happened, the likely cause, the exact fix command on its own line, and where the log is.
 - G5. One vocabulary with the TUI, web and mac surfaces (`· CA trusted`, the `●` pill, lane words, `NOTHING_DECRYPTED_ADVICE` verbatim) and one glyph set with an ASCII fallback.
 - G6. A written terminal design system (glyphs, colour roles, spacing, motion, width, text rules) in this document that waves 2 and 3 and every later command inherit.
@@ -24,7 +24,7 @@
 - The ratatui TUI's own screens, widgets and status bar (`crates/aitm-tui`), beyond the terminal handover in §D11.
 - The web UI (`apps/web`) and the mac app (`apps/mac`), beyond the one dev-script consumer update in §D13.
 - The bus/MCP protocol, command schemas, verbs, or any wire format. `--json` (wave 3) prints exactly what the bus returns.
-- One-shot verbs reaching a running core instead of a fresh in-memory proxy (research R14): a product question routed separately; wave 3 only makes the one-shot say honestly what it changed and where (see Open questions).
+- One-shot verbs reaching a running core (research R14): decided and specified in `2026-11-01-cli-oneshot-live-core-design.md`, which also re-pins AC-W1-6, AC-W1-30 and AC-W3-7 (see Open question 1).
 - The `aitm web` stdin-EOF exit (memory `aitmproxy-web-stdin-eof-exit`): a lifecycle decision, not a rendering one; this spec only states how the ready card behaves around it (Open questions).
 - `aitm web --no-open` doing something (R24), the confirmation prompt's wording (R25, already a good what/fix shape), and quieting benign WARNs in `aitm_core::proxy` (memory `operator-first-run-hygiene` item 1): all out of scope here.
 - Windows. Shipped targets are macOS and Linux.
@@ -45,7 +45,7 @@
 - **Dependencies.** Zero new crates in wave 1 **(Orchestrator's call, direction B1)**: `crossterm 0.29` (already in `Cargo.lock` via `aitm-tui`; `aitm-term` declares it with default features plus nothing new) and `unicode-width 0.2` (in the lock). No `indicatif`, `console`, `anstyle`, `anstream`, `clap`, `miette`, `comfy-table`, `tracing-appender`. A later wave that wants a table or pager crate says so in its own plan with the lock delta.
 - **Performance.** `aitm --version` < 100 ms wall on Matt's machine and creates no file; the reporter adds < 5 ms to startup in any mode; no busy loop (the ticker sleeps on a channel timeout and only while a phase is live past its first-draw delay); one extra OS thread while phases run, none after `finish()`.
 - **Platform.** macOS and Linux; `TERM=linux` and non-UTF-8 locales get ASCII glyphs.
-- **Security.** The workspace forbids `unsafe` (`unsafe_code = "forbid"`); crossterm hides the ioctls. The log file is opened `0600`, `O_APPEND`, `O_CREAT`, never follows a symlink into another user's file (`O_NOFOLLOW` on open), lives under the per-user aitmproxy directory. No token reaches any sink, line or file (AC-W1-22). The pre-boot paths read no config and touch no key material.
+- **Security.** The workspace forbids `unsafe` (`unsafe_code = "forbid"`); crossterm hides the ioctls. The log file is opened `0600`, `O_APPEND`, `O_CREAT`, never follows a symlink into another user's file (`O_NOFOLLOW` on open), lives under the per-user aitmproxy directory. No token reaches any sink, line or file (AC-W1-22). `--version` reads no config and touches no key material; `--help` reads the config read-only (wave-2 plan C31, 2026-11-01) and touches no key material.
 - **Shared-file discipline.** Another session (L4 privilege) is editing `crates/aitm/src/main.rs` and `crates/aitm/src/wire.rs` now. Wave 1 makes **no edit to `wire.rs`**, and its edits to `main.rs` are additive and small: one `Reporter` handle created in `main`, `phase()`/`done()` calls around the existing steps, the error branch at the top of `main` routed to one `render_error`, the `init_tracing` call replaced by `startup::init_tracing`, the `aitm web` `println!` replaced by `reporter.card(...)`, the one-shot `eprintln!` replaced by `reporter.error(...)`. All new code lives in `crates/aitm-term` and the new module `crates/aitm/src/startup.rs`. `addr_in_use_error` keeps its signature and its `Display` text (§D6).
 - **Proof is live, never fixtures** (Matt's hard rule). Every acceptance criterion is provable on the real binary through the Terminal panel: a `script`-recorded real-terminal session (cursor-up sequences and the final screen read from the captured bytes), the same binary piped to a file (zero ESC bytes), a real holder on the port for the port-in-use panel, `/usr/bin/time aitm --version` in a fresh `HOME`, the log file's existence, mode and content, and `tests/e2e/cli/cli-startup.sh` green. Unit tests drive the renderer through its `io::Write` seam with a fake `Caps`; that is allowed because it tests the renderer, not the product's evidence.
 
@@ -294,7 +294,7 @@ Learn more:
   Trust the CA:  aitm ca install
 ```
 
-After (W2), `aitm --help` is grouped with every verb (19 groups, 91 verbs; `l4` appears when `l4.enabled`), two aligned columns, dim descriptions wrapped to width, an `Examples:` block and the `Learn more:` footer; `aitm scope` prints the `scope` group's help; `aitm scope add --help` prints the flags with types and defaults and one or two examples. Mock-up of a group page (W2):
+After (W2), `aitm --help` is grouped with every verb (19 groups, 91 verbs; `l4` appears when `l4.enabled`), two aligned columns, dim descriptions wrapped to width, an `Examples:` block and the `Learn more:` footer; `aitm scope` prints the `scope` group's help; `aitm scope add --help` prints the flags with types and defaults and one or two examples. Mock-up of a group page (W2; **illustrative** — the exact page, bytes and verbs, is the wave-2 plan's M-W2-2, which the code pins; `remove` and the counts here are not):
 
 ```text
 aitm scope — which hosts are decrypted
@@ -306,7 +306,6 @@ Verbs:
   add --host <host>         Add a host, host:port or *.wildcard to Scope.
   remove --host <host>      Remove a host from Scope.
   list                      List the Scope entries.
-  example                   Print an example Scope entry.
 
 Examples:
   $ aitm scope add --host app.example.test
@@ -588,6 +587,8 @@ pub fn version_line() -> String;                            // "aitm 0.5.11"
 pub const SYNOPSIS: &str;                                   // M3's W1 text, with the version interpolated
 ```
 
+> Wave 2 (plan C32, 2026-11-01): `Help` and `SYNOPSIS` are deleted by wave-2 Task 15; every help form becomes `Mode::Help`, resolved by `crate::help` before the runtime (it reads the config read-only and compiles the catalogue, C31). The block above is the wave-1 shape; see the wave-2 amendments under D15.
+
 `main()` calls `startup::pre_boot` **before** `parse_invocation`, before the runtime, before any config read, tracing sink, script tier or CA: `Version` prints `version_line()` + `\n` on stdout and exits 0; `Help` prints `SYNOPSIS` on stdout and exits 0. `pre_boot` steps over `--config <p>`/`--config=<p>` **and** the terminal flags (`-v`, `-vv`, `--verbose`, `-q`, `--quiet`, `--color <v>`, `--color=<v>`) before matching the alias, so `aitm --config x --version`, `aitm -v --version` and `aitm --color never -h` all answer pre-boot and create nothing (tester pass 2 F3: before the fix a leading terminal flag booted the host). **Why a static synopsis and not the existing registry text (Architect's call, deviating from the orchestrator's "existing usage text"):** the registry's usage is `Cli::usage()` over `Registry::commands()`, and the registry is built by `wire::assemble`, which calls `Ca::load_or_generate` (`crates/aitm-proto-http/src/ca.rs:42`) and so mints the CA key; there is no side-effect-free registry in wave 1, and `wire.rs` is frozen. The static group list is pinned by a unit test that assembles the registry in a temp CA dir and compares first segments (AC-W1-9). W2 adds the schema-only registry and restyles the whole help.
 
 `aitm-tui --help` keeps exit 2 and `usage: aitm-tui` **(Orchestrator's call, Homebrew pin)**; `aitm web --help` keeps `web operator UI` in its text (W1 leaves `web::USAGE` untouched; W2 restyles it with that phrase kept).
@@ -666,7 +667,10 @@ No human-facing text bypasses the layer. Allowed direct writers: `crates/aitm-te
 
 - A schema-only registry: `aitm::wire::describe_commands(features: &Features) -> Vec<(String /*dotted*/, aitm_core::ParamSchema)>` that constructs no proxy and no CA (W2 may edit `wire.rs`; the L4 session will have landed). Every command's `schema()` is pure data today, so each plugin gains a `describe()` or the registry is built over inert handles — the W2 plan decides.
 - Help renderer in `aitm-term`: `pub fn help_page(caps: &Caps, page: &HelpPage) -> String` with `HelpPage { title, usage: Vec<String>, sections: Vec<HelpSection { heading, rows: Vec<(String, String)> }>, examples: Vec<String>, footer: Vec<String> }`; two columns aligned to the longest left cell capped at 28, descriptions dim and wrapped to width, plain when `!caps.color`; `aitm help` and `aitm --help` identical; `aitm <group>` → the group page; `aitm <group> <verb> --help` → flags with `<type>`, `[default]`, required marks and one or two examples from a new optional `example` field on `ParamSchema` or a static examples table in `startup.rs`.
-- Did-you-mean: own Damerau–Levenshtein over group and verb names, suggesting up to 3 within distance 2: `unknown command \`scpe\`` / `  did you mean: scope` / `  ▸ aitm --help`. No new crate.
+
+  **Wave-2 amendments (plan 2026-11-01-cli-terminal-reporting-wave2-plan.md, 2026-11-01):** the schema-only registry is `aitm::describe::registry` in a new module, not `wire::describe_commands` (`wire.rs` is frozen until PR #267; plan C28, pinned against the live registry); `HelpPage` is the ordered model `{ title, about, usage, blocks: Vec<Block> }` with `Block::{Section, Examples, Text, Lines}` (C41); `PreBoot::Help` is deleted by wave-2 Task 15 and every help form is `Mode::Help` resolved by `crate::help` before the runtime (C32); the D8 code block above shows the wave-1 shape. The W2 group-page block in M3 is illustrative: the plan's M-W2-2 is the exact page, with the core's verb sentences printed verbatim (T6).
+
+- Did-you-mean: own Damerau–Levenshtein over group and verb names, suggesting up to 3: the names the input is a prefix of, else only the closest names within distance 2 (so a near-miss yields one name, not every name two edits away; plan C37): `unknown command \`scpe\`` / `  did you mean: scope` / `  ▸ aitm --help`. No new crate.
 - Dotted names never in prose: `aitm-cli` error strings print `cmd.replace('.', " ")`; the one-shot usage form becomes `Usage: aitm <group> <verb> [--flag <value>]...`; `tui`, `operator-token` and `web` usage lines all use the `Usage:` form and `web`'s keeps the phrase `web operator UI`.
 - Exit codes: usage → 2 everywhere (already W1), failures → 1.
 
@@ -753,7 +757,7 @@ Each is observable on the real binary unless marked (unit). W1 unless tagged.
 
 Status at approval (2026-11-01): questions 1–3 are routed to Matt through the orchestrator with the defaults below in force; questions 4–6 were decided at approval with their defaults. A different answer from Matt is a spec amendment.
 
-1. **R14, one-shot verbs and a running core** — *routed to Matt; default in force.* Should `aitm scope add` (and every state-changing one-shot) reach a running core over the loopback bus when one exists, instead of a fresh in-memory proxy? Default: no change in W1–W3; W3 prints the honest `this one-shot proxy only` line (AC-W3-7). A yes becomes its own spec.
+1. **R14, one-shot verbs and a running core** — *decided 2026-11-01 (Matt, via the orchestrator): yes.* Specified in `docs/superpowers/specs/2026-11-01-cli-oneshot-live-core-design.md`: every surface serves a loopback operator bus by default and publishes a pointer file, one-shot verbs act on the running core and refuse with a panel when none is reachable. That spec re-pins AC-W1-6 (the Scope next-step line appears only when the card's own core is reachable by a one-shot), AC-W1-30 (the one-shot timing subject becomes `aitm ca status`, a local verb) and AC-W3-7 (the honest stderr line names the core for live verbs; M5's `this one-shot proxy only` clause applies to local verbs only).
 2. **R11 for other one-shot verbs** — *routed to Matt; default in force.* `aitm scope list` still boots the host (and mints a CA on a fresh `HOME`) because the registry needs the proxy. Should read-only verbs get a side-effect-free path? Default: W2's schema-only registry covers help; verbs keep booting (quietly, with the log file) until the R14 decision.
 3. **`aitm web` stdin EOF** — *routed to Matt; default in force and implemented.* With the card now on stderr and nothing on stdout, `aitm web </dev/null` still exits 0 when the stdio MCP arm ends. Default: W1 prints `stdin closed · stdio MCP transport ended` as the reporter's last line (rich: `✓` prefix) when the stdio MCP arm ends on EOF, so the silence is gone (AC-W1-32); the lifecycle decision (whether `aitm web` should exit at all) stays routed to Matt.
 4. **`AITM_TERM` naming** — *decided: keep `AITM_TERM=rich|ascii|plain`* (one variable, three words; cargo's two-variable split is not adopted).

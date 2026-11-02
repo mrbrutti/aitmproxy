@@ -31,15 +31,25 @@ use std::sync::Arc;
 
 use aitm_core::{Command, CommandHost, ParamSchema, Params, Plugin, Registry, Value};
 
-use crate::backend::L4Error;
+use crate::backend::pcap::PcapBackend;
+use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::commands::intercept::InterceptSessions;
+use crate::commands::PrivilegeReportSource;
 use crate::config::{InterceptConfig, L4Config};
 use crate::flow::{InMemoryL4FlowStore, L4FlowStore};
 use crate::guard::L4Guard;
+use crate::privilege::availability::{capture_availability, intercept_availability};
+use crate::privilege::state::{PrivilegeConfig, ProcessLifetime};
+use crate::privilege::PrivilegeState;
 
-/// The result of the cheap startup capability probe, cached into [`L4Module`] so
-/// each wire-touching command returns the specific missing-capability reason without
-/// re-probing. `Some(reason)` means that class of capability is **unavailable**.
+/// The result of the cheap startup capability probe. `Some(reason)` means that
+/// class of capability is **unavailable**.
+///
+/// Since the privilege plan (P1b.7) the production module gates its wire verbs on
+/// the live [`PrivilegeState`] instead; this type stays as the low-level probe
+/// ([`L4Privilege::probe`]) and as the **fixed** privilege the test constructors
+/// ([`L4Module::with_privilege`], [`L4Module::with_shared`]) take, whose reason
+/// strings the gate and the status verbs then carry verbatim.
 ///
 /// The two classes mirror the spec's privilege model:
 /// - `capture_inject` — raw capture/inject (`l4.capture.*`, `l4.inject`,
@@ -155,9 +165,10 @@ impl L4Availability {
 }
 
 /// Where a status verb reads one capability class's availability **at invoke time**
-/// (spec §1, L4PAR-AC38). Today [`L4Module::load`] builds one per class over a clone
-/// of the cached [`L4Privilege`]; the privilege spec (D0) swaps in a live
-/// `PrivilegeState` without touching the commands.
+/// (spec §1, L4PAR-AC38). [`L4Module::load`] builds one per class over the module's
+/// `PrivilegeSource`: the live [`PrivilegeState`] in production (privilege spec
+/// §2.1, §2.4), read afresh on every call, so the status verbs and the gated verbs
+/// can never disagree.
 pub type AvailabilitySource = Arc<dyn Fn() -> L4Availability + Send + Sync>;
 
 impl L4Privilege {
@@ -231,13 +242,13 @@ fn probe() -> L4Privilege {
     let has = |cap: u32| bits & (1u64 << cap) != 0;
     L4Privilege {
         capture_inject: (!has(CAP_NET_RAW)).then(|| {
-            "missing CAP_NET_RAW (raw capture/inject needs `setcap cap_net_raw+ep` on the \
-             binary, or root)"
+            "missing CAP_NET_RAW (raw capture and inject need the packet-capture helper or a \
+             privileged process)"
                 .to_string()
         }),
         intercept: (!has(CAP_NET_ADMIN)).then(|| {
-            "missing CAP_NET_ADMIN (in-path NFQUEUE needs `setcap cap_net_admin+ep` on the \
-             binary, or root)"
+            "missing CAP_NET_ADMIN (in-path interception needs the core itself to hold \
+             CAP_NET_ADMIN)"
                 .to_string()
         }),
     }
@@ -250,11 +261,7 @@ fn probe() -> L4Privilege {
 fn probe() -> L4Privilege {
     use std::io::ErrorKind;
 
-    let mut capture_inject = Some(
-        "no read+write access to any /dev/bpf* device (capture/inject needs it; install \
-         ChmodBPF or run with privilege)"
-            .to_string(),
-    );
+    let mut capture_inject = Some("no read+write access to any /dev/bpf* device".to_string());
     for n in 0..256u32 {
         let path = format!("/dev/bpf{n}");
         match std::fs::OpenOptions::new()
@@ -288,14 +295,83 @@ fn probe() -> L4Privilege {
     L4Privilege::unavailable_both("no supported L4 capture/inject backend on this platform")
 }
 
-/// A wire-touching `l4.*` command wrapped so that, when the startup probe found the
-/// required capability absent, every invocation returns a typed
-/// [`L4Error::Unavailable`] naming the missing capability — without touching the wire
-/// or re-probing. `name`/`schema` delegate to the inner command, so the command still
-/// appears, honestly, in `tools/list`.
+/// The capability class a gated verb needs (privilege plan P1b.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateClass {
+    /// Raw capture/inject: `l4.capture.*`, `l4.inject`, `l4.send_recv`.
+    CaptureInject,
+    /// In-path interception: `l4.intercept.*`. `configured` is whether the
+    /// `l4.intercept` block is present; privilege outranks configuration.
+    Intercept { configured: bool },
+}
+
+/// Where the gate and the status verbs read a class's availability.
+///
+/// A production module reads the live [`PrivilegeState`] on **every** call
+/// (privilege spec §2.1, AC7): a core started before approval serves capture
+/// after it, with no rebuild. The test constructors that take an
+/// [`L4Privilege`] ([`L4Module::with_privilege`], [`L4Module::with_shared`])
+/// hold that fixed result instead, carrying its reason strings verbatim, which
+/// is what the parity tests' literals pin.
+enum PrivilegeSource {
+    Live(Arc<PrivilegeState>),
+    Fixed(L4Privilege),
+}
+
+impl PrivilegeSource {
+    /// The capture/inject backend the wire verbs hold (privilege spec §2.1, plan
+    /// P1b.8): the live state's [`RoutedBackend`](crate::backend::routed::RoutedBackend),
+    /// which routes every call on the current report; or, for a fixed test
+    /// privilege, the plain in-process libpcap backend (the fixed gate already
+    /// refuses an unavailable class before any call reaches it).
+    fn backend(&self) -> Arc<dyn CaptureInjectBackend> {
+        match self {
+            Self::Live(state) => state.backend(),
+            Self::Fixed(_) => Arc::new(PcapBackend::new()),
+        }
+    }
+
+    /// The [`PrivilegeReport`](crate::privilege::report::PrivilegeReport) source
+    /// the two status verbs carry under `privilege` (privilege spec §2.4, plan
+    /// P1b.9): the live state's `report()` on every call; `None` for a fixed test
+    /// privilege, which has no report to show.
+    fn report_source(&self) -> PrivilegeReportSource {
+        match self {
+            Self::Live(state) => {
+                let state = state.clone();
+                Arc::new(move || Some(state.report()))
+            }
+            Self::Fixed(_) => Arc::new(|| None),
+        }
+    }
+
+    /// One class's availability now (spec §2.4 mapping, plan P1b.4).
+    fn availability(&self, class: GateClass) -> L4Availability {
+        match (self, class) {
+            (Self::Live(state), GateClass::CaptureInject) => capture_availability(&state.report()),
+            (Self::Live(state), GateClass::Intercept { configured }) => {
+                intercept_availability(&state.report(), configured)
+            }
+            (Self::Fixed(privilege), GateClass::CaptureInject) => privilege.capture_availability(),
+            (Self::Fixed(privilege), GateClass::Intercept { configured }) => {
+                privilege.intercept_availability(configured)
+            }
+        }
+    }
+}
+
+/// A wire-touching `l4.*` command wrapped so that every invocation first reads its
+/// class's availability from the shared [`PrivilegeSource`]: available ⇒ the inner
+/// command runs; otherwise a typed [`L4Error::Unavailable`] carrying the exact
+/// `reason` the status verb reports (privilege spec §2.4: for `needs_approval`,
+/// `packet capture is not allowed yet (<how.label>)`). Nothing touches the wire
+/// while gated. `name`, `schema`, `sensitivity` and `confirm_prompt` delegate to the
+/// inner command, so the command appears honestly in `tools/list` and keeps its
+/// `confirmable` reading before and after the privilege flips (AC27).
 struct L4Gated {
     inner: Arc<dyn Command>,
-    reason: String,
+    privilege: Arc<PrivilegeSource>,
+    class: GateClass,
 }
 
 impl Command for L4Gated {
@@ -314,31 +390,42 @@ impl Command for L4Gated {
         self.inner.sensitivity()
     }
 
-    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        Err(anyhow::Error::new(L4Error::Unavailable(
-            self.reason.clone(),
-        )))
+    fn confirm_prompt(&self, args: &Params) -> Option<String> {
+        // The operator handshake is the inner command's to offer; the gate neither
+        // hides nor invents it (spec §2.4, AC27).
+        self.inner.confirm_prompt(args)
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        match self.privilege.availability(self.class) {
+            L4Availability::Available => self.inner.invoke(args, host),
+            L4Availability::Unavailable { reason, .. } => {
+                Err(anyhow::Error::new(L4Error::Unavailable(reason)))
+            }
+        }
     }
 }
 
-/// Wrap each command in `cmds` as [`L4Gated`] when `reason` is `Some` (the capability
-/// is unavailable); otherwise leave them live. The two status verbs never reach
-/// this function: `wire_commands` / `intercept_commands` return them separately
-/// and [`L4Module::load`] registers them beside the gated list, so they always
-/// answer with the availability object (spec §1, L4PAR-AC9).
-fn gate(cmds: Vec<Arc<dyn Command>>, reason: Option<&str>) -> Vec<Arc<dyn Command>> {
-    match reason {
-        None => cmds,
-        Some(reason) => cmds
-            .into_iter()
-            .map(|inner| {
-                Arc::new(L4Gated {
-                    inner,
-                    reason: reason.to_string(),
-                }) as Arc<dyn Command>
-            })
-            .collect(),
-    }
+/// Wrap every command in `cmds` as [`L4Gated`] over `privilege` for `class`. Always
+/// wraps: availability is decided per call, never at registration, so a flip after
+/// start-up is seen (AC7). The two status verbs never reach this function:
+/// `wire_commands` / `intercept_commands` return them separately and
+/// [`L4Module::load`] registers them beside the gated list, so they always answer
+/// with the availability object (spec §1, L4PAR-AC9).
+fn gate(
+    cmds: Vec<Arc<dyn Command>>,
+    privilege: &Arc<PrivilegeSource>,
+    class: GateClass,
+) -> Vec<Arc<dyn Command>> {
+    cmds.into_iter()
+        .map(|inner| {
+            Arc::new(L4Gated {
+                inner,
+                privilege: privilege.clone(),
+                class,
+            }) as Arc<dyn Command>
+        })
+        .collect()
 }
 
 /// The L4 protocol feature as a core [`Plugin`]. Holds the shared guard + flow
@@ -351,31 +438,53 @@ pub struct L4Module {
     /// Live `l4.intercept` sessions, shared with the intercept commands so a
     /// session started by one call outlives it.
     sessions: Arc<InterceptSessions>,
-    /// The cached startup capability probe: wire verbs are gated on it, fail-closed.
-    privilege: L4Privilege,
+    /// Where the wire verbs' gate and the status verbs read privilege: the live
+    /// state in production, a fixed result in tests. Fail-closed either way.
+    privilege: Arc<PrivilegeSource>,
 }
 
 impl L4Module {
-    /// Build a module from config, running the cheap startup capability probe. The
-    /// binary (M5 Task 13) is the only caller in production; tests that want a known
-    /// privilege state use [`with_privilege`](L4Module::with_privilege).
+    /// Build a module from config over a fresh live [`PrivilegeState`] for this OS
+    /// (`l4.enabled`, the `l4.privilege` block, a serving process). The wire verbs
+    /// are gated on it per call, fail-closed, and see a later approval without a
+    /// restart (privilege spec AC7). Tests that want a known privilege state use
+    /// [`with_privilege`](L4Module::with_privilege) or
+    /// [`with_state`](L4Module::with_state).
     #[must_use]
     pub fn new(cfg: &L4Config) -> Self {
-        Self::with_privilege(cfg, L4Privilege::probe())
+        let state = PrivilegeState::new(&PrivilegeConfig {
+            enabled: cfg.enabled,
+            l4: cfg.privilege.clone(),
+            lifetime: ProcessLifetime::Serving,
+        });
+        Self::with_state(cfg, Arc::new(state))
     }
 
-    /// Build a module from config over an explicit capability probe result. The
-    /// binary passes the real probe (or a configured override); tests force a known
-    /// privilege state. Wire-touching verbs are gated on `privilege`, fail-closed.
+    /// Build a module from config over a shared live [`PrivilegeState`] (the one
+    /// the `l4.privilege` verb and the status replies read too). Every gated verb
+    /// reads `state.report()` when invoked.
+    #[must_use]
+    pub fn with_state(cfg: &L4Config, state: Arc<PrivilegeState>) -> Self {
+        Self::from_config(cfg, Arc::new(PrivilegeSource::Live(state)))
+    }
+
+    /// Build a module from config over a **fixed** capability probe result, whose
+    /// reason strings the gate and the status verbs carry verbatim. A test
+    /// constructor, for tests that force a known privilege state; the binary
+    /// builds over the live state with [`with_state`](L4Module::with_state) /
+    /// [`with_shared_state`](L4Module::with_shared_state).
     #[must_use]
     pub fn with_privilege(cfg: &L4Config, privilege: L4Privilege) -> Self {
-        Self {
-            guard: Arc::new(L4Guard::new(cfg)),
-            store: Arc::new(InMemoryL4FlowStore::new()),
-            intercept_cfg: cfg.intercept.clone(),
-            sessions: Arc::new(InterceptSessions::new()),
+        Self::from_config(cfg, Arc::new(PrivilegeSource::Fixed(privilege)))
+    }
+
+    fn from_config(cfg: &L4Config, privilege: Arc<PrivilegeSource>) -> Self {
+        Self::from_parts(
+            Arc::new(L4Guard::new(cfg)),
+            Arc::new(InMemoryL4FlowStore::new()),
+            cfg.intercept.clone(),
             privilege,
-        }
+        )
     }
 
     /// Build a module over an already-shared guard + store (for wiring that owns
@@ -388,22 +497,19 @@ impl L4Module {
         store: Arc<dyn L4FlowStore>,
         intercept_cfg: Option<InterceptConfig>,
     ) -> Self {
-        Self {
+        Self::from_parts(
             guard,
             store,
             intercept_cfg,
-            sessions: Arc::new(InterceptSessions::new()),
-            privilege: L4Privilege::available(),
-        }
+            Arc::new(PrivilegeSource::Fixed(L4Privilege::available())),
+        )
     }
 
-    /// Build a module over an **already-shared** guard + store, keeping the
-    /// fail-closed privilege gate. Unlike [`with_parts`](L4Module::with_parts)
-    /// (which assumes privilege present), this takes the real startup probe so the
-    /// wire verbs still fail closed when a capability is absent — the production
-    /// path when the binary owns the guard/store so the scripting engine's
-    /// [`L4Language`](crate::language::L4Language) and this command module act over
-    /// the **same** L4 engagement state (no divergent guard/store).
+    /// Build a module over an **already-shared** guard + store and a **fixed**
+    /// privilege result, keeping the fail-closed gate. A test constructor: the
+    /// binary, which pre-builds the L4 state for the scripting engine's
+    /// [`L4Language`](crate::language::L4Language), uses
+    /// [`with_shared_state`](L4Module::with_shared_state) over the live state.
     #[must_use]
     pub fn with_shared(
         guard: Arc<L4Guard>,
@@ -411,6 +517,47 @@ impl L4Module {
         intercept_cfg: Option<InterceptConfig>,
         privilege: L4Privilege,
     ) -> Self {
+        Self::from_parts(
+            guard,
+            store,
+            intercept_cfg,
+            Arc::new(PrivilegeSource::Fixed(privilege)),
+        )
+    }
+
+    /// Build a module over an **already-shared** guard + store and the shared live
+    /// [`PrivilegeState`]: the production path when the binary owns the guard/store
+    /// so the scripting engine's [`L4Language`](crate::language::L4Language) and
+    /// this command module act over the **same** L4 engagement state, and every
+    /// gated verb sees a privilege flip without a restart (AC7).
+    #[must_use]
+    pub fn with_shared_state(
+        guard: Arc<L4Guard>,
+        store: Arc<dyn L4FlowStore>,
+        intercept_cfg: Option<InterceptConfig>,
+        state: Arc<PrivilegeState>,
+    ) -> Self {
+        Self::from_parts(
+            guard,
+            store,
+            intercept_cfg,
+            Arc::new(PrivilegeSource::Live(state)),
+        )
+    }
+
+    fn from_parts(
+        guard: Arc<L4Guard>,
+        store: Arc<dyn L4FlowStore>,
+        intercept_cfg: Option<InterceptConfig>,
+        privilege: Arc<PrivilegeSource>,
+    ) -> Self {
+        // Over a live state, attach the guard a Linux helper session's backend is
+        // built over (plan P1b.14 hand-over): every live constructor (`new`,
+        // `with_state`, `with_shared_state`) passes here, so the binary's wiring
+        // cannot forget it. A fixed source has no state to attach to.
+        if let PrivilegeSource::Live(state) = &*privilege {
+            state.set_guard(Arc::clone(&guard));
+        }
         Self {
             guard,
             store,
@@ -470,27 +617,42 @@ impl Plugin for L4Module {
         // privilege gate (`gate`, outer) so an unprivileged core returns a typed
         // `L4Unavailable` before the flag is even consulted. The operator who opted in
         // still sees an honest, drivable surface (amended M5 Task 13).
-        // Both availability sources close over a clone of the one cached probe the
-        // gate below reads, and the status verbs query them at invoke time (spec §1,
-        // L4PAR-AC38): `l4.capture.status` / `l4.intercept.status` and the gated
-        // verbs' `L4Unavailable` reason cannot disagree, and D0 swaps in a live
-        // `PrivilegeState` here without touching the commands. Each status verb
-        // comes back separately from its gated list and registers ungated beside
-        // it, so it always answers (L4PAR-AC9).
+        // Both availability sources close over the one `PrivilegeSource` the gate
+        // below reads (the live `PrivilegeState` in production), and the status
+        // verbs query them at invoke time (spec §1, L4PAR-AC38): `l4.capture.status`
+        // / `l4.intercept.status` and the gated verbs' `L4Unavailable` reason cannot
+        // disagree, and a privilege flip after start-up is seen by both (privilege
+        // spec AC7). Each status verb comes back separately from its gated list and
+        // registers ungated beside it, so it always answers (L4PAR-AC9).
+        let intercept_class = GateClass::Intercept {
+            configured: self.intercept_cfg.is_some(),
+        };
         let capture_source: AvailabilitySource = {
             let privilege = self.privilege.clone();
-            Arc::new(move || privilege.capture_availability())
+            Arc::new(move || privilege.availability(GateClass::CaptureInject))
         };
         let intercept_source: AvailabilitySource = {
             let privilege = self.privilege.clone();
-            let configured = self.intercept_cfg.is_some();
-            Arc::new(move || privilege.intercept_availability(configured))
+            Arc::new(move || privilege.availability(intercept_class))
         };
-        let (wire, capture_status) =
-            crate::commands::wire_commands(self.guard(), self.store(), capture_source);
+        // Both status verbs also carry the live `PrivilegeReport` under their
+        // optional `privilege` key (privilege spec §2.4, L4PRIV-AC4, plan P1b.9);
+        // a fixed test privilege has no report, so the reply stays the parity four.
+        let report_source = self.privilege.report_source();
+        // The wire verbs share one backend: in production the state's routed
+        // backend, so a helper session or a later approval is seen per call
+        // (privilege spec §2.1, plan P1b.8).
+        let (wire, capture_status) = crate::commands::wire_commands(
+            self.guard(),
+            self.store(),
+            capture_source,
+            self.privilege.backend(),
+            report_source.clone(),
+        );
         for cmd in gate(
             crate::commands::agent_gate(wire, &gates),
-            self.privilege.capture_inject.as_deref(),
+            &self.privilege,
+            GateClass::CaptureInject,
         ) {
             reg.add_command(cmd);
         }
@@ -505,10 +667,12 @@ impl Plugin for L4Module {
             self.sessions.clone(),
             self.intercept_cfg.clone(),
             intercept_source,
+            report_source,
         );
         for cmd in gate(
             crate::commands::agent_gate(intercept, &gates),
-            self.privilege.intercept.as_deref(),
+            &self.privilege,
+            intercept_class,
         ) {
             reg.add_command(cmd);
         }
@@ -551,6 +715,80 @@ mod tests {
         guard: &'a StdGuard,
     ) -> CommandHost<'a> {
         CommandHost::new(store, client, guard, None)
+    }
+
+    /// A prober scripted to one fixed macOS `needs_approval` row; these tests
+    /// never run the real platform probe.
+    struct OneRowProber;
+
+    impl crate::privilege::state::Prober for OneRowProber {
+        fn gather(
+            &self,
+            _request: Option<&crate::privilege::report::RequestProgress>,
+        ) -> crate::privilege::derive::ProbeInputs {
+            use crate::privilege::derive::{MacInputs, ProbeInputs};
+            use crate::privilege::report::Platform;
+            ProbeInputs {
+                enabled: true,
+                platform: Platform::Macos,
+                mac: Some(MacInputs {
+                    bpf_rw_opens: false,
+                    receipt: None,
+                    handoff_app_embeds_helper: false,
+                }),
+                linux: None,
+                request: None,
+                now_ms: 1_762_000_000_000,
+            }
+        }
+    }
+
+    /// A live `PrivilegeState` over the scripted prober, the way the binary
+    /// holds one (shared with the `l4.privilege` verb and the scripting engine).
+    fn live_state() -> Arc<PrivilegeState> {
+        Arc::new(PrivilegeState::with_prober(
+            &PrivilegeConfig {
+                enabled: true,
+                l4: crate::config::L4PrivilegeConfig::default(),
+                lifetime: ProcessLifetime::Serving,
+            },
+            Box::new(OneRowProber),
+            Arc::new(|| 1_762_000_000_000),
+        ))
+    }
+
+    /// Plan P1b.14 hand-over: a module built over a **live** state attaches its
+    /// guard to that state, so a Linux helper session that connects can build its
+    /// `HelperBackend` over the module's guard instead of failing the attach with
+    /// "no L4 guard attached to the privilege state". Both live constructors the
+    /// binary's `assemble_with` uses (`with_state`, `with_shared_state`) do it.
+    #[test]
+    fn live_constructors_attach_the_guard_to_the_privilege_state() {
+        let cfg = L4Config {
+            enabled: true,
+            ..L4Config::default()
+        };
+
+        let state = live_state();
+        assert!(!state.has_guard(), "a fresh state has no guard attached");
+        let _module = L4Module::with_state(&cfg, Arc::clone(&state));
+        assert!(
+            state.has_guard(),
+            "with_state must attach the module's guard"
+        );
+
+        let state = live_state();
+        let guard = Arc::new(L4Guard::new(&cfg));
+        let _module = L4Module::with_shared_state(
+            Arc::clone(&guard),
+            Arc::new(InMemoryL4FlowStore::new()),
+            None,
+            Arc::clone(&state),
+        );
+        assert!(
+            state.has_guard(),
+            "with_shared_state must attach the shared guard"
+        );
     }
 
     fn registered(cfg: &L4Config) -> (Registry, Arc<L4Guard>, Arc<dyn L4FlowStore>) {

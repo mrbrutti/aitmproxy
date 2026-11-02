@@ -34,7 +34,7 @@ use aitm_core::{
     Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
 
-use super::{epoch_ms, field};
+use super::{epoch_ms, field, PrivilegeReportSource};
 use crate::backend::L4Error;
 use crate::config::{InterceptConfig, Verdict};
 use crate::craft::PacketSpec;
@@ -300,18 +300,30 @@ impl Command for InterceptStop {
 // ---- l4.intercept.status ------------------------------------------------------
 
 /// `l4.intercept.status` — whether in-path interception is available on this core
-/// (`available`, `code`, `reason`) and the live interception sessions (read-only).
-/// Never privilege-gated (spec §1): it always answers.
+/// (`available`, `code`, `reason`) and the live interception sessions (read-only),
+/// plus, when the core reads a live privilege state, the `PrivilegeReport` under
+/// `privilege` (privilege spec §2.4, L4PRIV-AC4). Never privilege-gated (spec §1):
+/// it always answers.
 pub(crate) struct InterceptStatus {
     sessions: Arc<InterceptSessions>,
     source: AvailabilitySource,
+    privilege: PrivilegeReportSource,
 }
 
 impl InterceptStatus {
-    /// A status command over the shared session registry and the in-path class's
-    /// [`AvailabilitySource`], read on every invoke (L4PAR-AC38).
-    pub(crate) fn new(sessions: Arc<InterceptSessions>, source: AvailabilitySource) -> Self {
-        Self { sessions, source }
+    /// A status command over the shared session registry, the in-path class's
+    /// [`AvailabilitySource`] and the [`PrivilegeReportSource`], both read on every
+    /// invoke (L4PAR-AC38).
+    pub(crate) fn new(
+        sessions: Arc<InterceptSessions>,
+        source: AvailabilitySource,
+        privilege: PrivilegeReportSource,
+    ) -> Self {
+        Self {
+            sessions,
+            source,
+            privilege,
+        }
     }
 }
 
@@ -327,16 +339,20 @@ impl Command for InterceptStatus {
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Report whether in-path interception is available on this core \
-                          (`available`, `code`, `reason`) and the live interception sessions \
-                          with their parked-packet counts. Always answers, never `L4 \
-                          unavailable`."
+                          (`available`, `code`, `reason`), the live interception sessions \
+                          with their parked-packet counts and, when known, the `privilege` \
+                          report. Always answers, never `L4 unavailable`."
                 .into(),
             params: vec![],
-            result: TypeDesc::Object(super::availability_fields(
-                "sessions",
-                TypeDesc::Array(Box::new(TypeDesc::Object(session_fields()))),
-                "The live interception sessions; `[]` when unavailable.",
-            )),
+            result: TypeDesc::Object({
+                let mut fields = super::availability_fields(
+                    "sessions",
+                    TypeDesc::Array(Box::new(TypeDesc::Object(session_fields()))),
+                    "The live interception sessions; `[]` when unavailable.",
+                );
+                fields.push(super::privilege_field());
+                fields
+            }),
         }
     }
 
@@ -352,11 +368,12 @@ impl Command for InterceptStatus {
             .collect();
         // Stable, caller-friendly order (the registry is a HashMap).
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(super::availability_object(
+        let reply = super::availability_object(
             &(self.source)(),
             "sessions",
             out.into_iter().map(|(_, v)| v).collect(),
-        ))
+        );
+        Ok(super::with_privilege(reply, (self.privilege)()))
     }
 }
 
@@ -751,26 +768,30 @@ impl Command for InterceptDrop {
 /// registry, which [`crate::module::L4Module::load`] registers ungated beside
 /// them so it always answers (spec §1, L4PAR-AC9). Kept additive and separate
 /// from [`super::active_commands`] so the command groups register independently.
+/// `privilege` is the [`PrivilegeReportSource`] the status verb carries under its
+/// optional `privilege` key (plan P1b.9).
 pub(crate) fn intercept_commands(
     guard: Arc<L4Guard>,
     store: Arc<dyn L4FlowStore>,
     sessions: Arc<InterceptSessions>,
     config: Option<InterceptConfig>,
     availability: AvailabilitySource,
+    privilege: PrivilegeReportSource,
 ) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
     let start = InterceptStart::new(guard.clone(), store, sessions.clone(), config);
-    commands_over(start, guard, sessions, availability)
+    commands_over(start, guard, sessions, availability, privilege)
 }
 
 /// The seven gated intercept commands over one start command + session registry,
 /// plus the status verb. The guard is threaded to `forward` so a staged mutation
 /// is re-checked before reinject; `availability` (the in-path class's source,
-/// read at invoke time) to `status`.
+/// read at invoke time) and `privilege` (the report source) to `status`.
 fn commands_over(
     start: InterceptStart,
     guard: Arc<L4Guard>,
     sessions: Arc<InterceptSessions>,
     availability: AvailabilitySource,
+    privilege: PrivilegeReportSource,
 ) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
     let gated: Vec<Arc<dyn Command>> = vec![
         Arc::new(start),
@@ -783,7 +804,7 @@ fn commands_over(
     ];
     (
         gated,
-        Arc::new(InterceptStatus::new(sessions, availability)),
+        Arc::new(InterceptStatus::new(sessions, availability, privilege)),
     )
 }
 
@@ -1263,6 +1284,105 @@ mod tests {
 
     // ---- tests ----------------------------------------------------------------
 
+    /// Privilege spec §2.4 / L4PRIV-AC4 (plan P1b.9): `l4.intercept.status` gains
+    /// the optional `privilege` key beside the parity four, whose values are
+    /// byte-identical with and without the report source. `code` comes from
+    /// `intercept_availability` over the same report, never a literal: a macOS
+    /// report maps to `unsupported_platform`; a Linux report without
+    /// `CAP_NET_ADMIN` (and without `CAP_NET_RAW`) maps to `needs_privilege`.
+    #[test]
+    fn status_carries_privilege_additively() {
+        use crate::privilege::availability::intercept_availability;
+        use crate::privilege::derive::{derive, LinuxInputs, MacInputs, ProbeInputs};
+        use crate::privilege::report::{Platform, PrivilegeReport};
+
+        const NOW: u64 = 1_762_000_000_123;
+        let macos = derive(&ProbeInputs {
+            enabled: true,
+            platform: Platform::Macos,
+            mac: Some(MacInputs {
+                bpf_rw_opens: false,
+                receipt: None,
+                handoff_app_embeds_helper: false,
+            }),
+            linux: None,
+            request: None,
+            now_ms: NOW,
+        });
+        let linux_no_admin = derive(&ProbeInputs {
+            enabled: true,
+            platform: Platform::Linux,
+            mac: None,
+            linux: Some(LinuxInputs {
+                cap_net_raw: false,
+                cap_net_admin: false,
+                session_connected: false,
+                helper: None,
+                policy_file_present: false,
+                pkexec_present: false,
+                prompt_possible: false,
+                last_session_error: None,
+            }),
+            request: None,
+            now_ms: NOW,
+        });
+
+        let parts = HostParts::new();
+        let keys = |v: &Value| -> Vec<String> {
+            let Value::Object(obj) = v else {
+                panic!("status returns an object, got {v:?}");
+            };
+            obj.keys().cloned().collect()
+        };
+
+        for (report, want_code) in [
+            (macos, "unsupported_platform"),
+            (linux_no_admin, "needs_privilege"),
+        ] {
+            let availability: AvailabilitySource = {
+                let report = report.clone();
+                Arc::new(move || intercept_availability(&report, true))
+            };
+            let with_report: PrivilegeReportSource = {
+                let report: PrivilegeReport = report.clone();
+                Arc::new(move || Some(report.clone()))
+            };
+            let sessions = Arc::new(InterceptSessions::new());
+
+            let full = InterceptStatus::new(sessions.clone(), availability.clone(), with_report)
+                .invoke(Params::default(), &parts.host())
+                .expect("status answers with a privilege report");
+            assert_eq!(
+                keys(&full),
+                ["available", "code", "privilege", "reason", "sessions"],
+                "{want_code}"
+            );
+            let Value::Object(full_obj) = &full else {
+                unreachable!()
+            };
+            assert_eq!(full_obj.get("available"), Some(&Value::Bool(false)));
+            assert_eq!(
+                full_obj.get("code"),
+                Some(&Value::Str(want_code.into())),
+                "{want_code}"
+            );
+            assert_eq!(full_obj.get("sessions"), Some(&Value::Array(vec![])));
+            assert_eq!(full_obj.get("privilege"), Some(&report.to_value()));
+
+            let parity = InterceptStatus::new(sessions, availability, Arc::new(|| None))
+                .invoke(Params::default(), &parts.host())
+                .expect("status answers without a privilege report");
+            assert_eq!(
+                keys(&parity),
+                ["available", "code", "reason", "sessions"],
+                "{want_code}"
+            );
+            let mut full_minus_privilege = full_obj.clone();
+            full_minus_privilege.remove("privilege");
+            assert_eq!(parity, Value::Object(full_minus_privilege), "{want_code}");
+        }
+    }
+
     /// `intercept_commands` mints the whole `l4.intercept.*` surface over the shared
     /// session registry.
     #[test]
@@ -1276,6 +1396,7 @@ mod tests {
             sessions,
             Some(cfg(0)),
             Arc::new(|| crate::module::L4Availability::Available),
+            Arc::new(|| None),
         );
         let names: Vec<&str> = gated.iter().map(|c| c.name()).collect();
         assert_eq!(

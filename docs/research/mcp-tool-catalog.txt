@@ -186,6 +186,10 @@ commands:
       Record a finding (after a passing poc.run): writes a human-readable YAML record and a runs.jsonl line, returns its id.
   findings remove --id <string>
       Delete a recorded finding's YAML (the runs.jsonl history is kept). Operator/CLI only.
+  l4 privilege
+      Report whether this core can capture, inject and intercept raw packets right now, what must be approved first and how (never a shell command), the privileged helper's status, and the progress of the last l4.privilege.request. Read-only; agents may call it. It answers even when L4 is off in this core's config (enabled: false, every capability unsupported).
+  l4 privilege request
+      Ask the operating system for packet-capture permission: on macOS the Aitmproxy app is asked to set it up and macOS prompts for approval; on Linux a polkit password prompt starts the packet-capture helper. Returns at once; poll l4.privilege for the request's progress. Operator and CLI only: an agent is refused before anything runs.
   l4 interfaces
       List the capture-capable network interfaces (read-only).
   l4 scope add --cidr <string> --interface <string> --direction <string> --capability <string> [--ports <string>] [--inject_rate_pps <int>] [--inject_rate_burst <int>]
@@ -209,7 +213,7 @@ commands:
   l4 send_recv --spec <value> --dst <string> --interface <string> [--port <int>] [--timeout_ms <int>] [--expect <string>]
       Scapy sr/sr1: inject a crafted stimulus and return the correlated reply (Response / Other / NoResponse) linked to the stimulus in an L4 flow. Guarded (Inject+Capture); never hangs (bounded by `timeout_ms`).
   l4 capture status
-      Report whether capture is available on this core (`available`, `code`, `reason`) and the flow ids of running captures. Always answers, never `L4 unavailable`.
+      Report whether capture is available on this core (`available`, `code`, `reason`), the flow ids of running captures and, when known, the `privilege` report. Always answers, never `L4 unavailable`.
   l4 intercept start --interface <string> [--direction <string>] [--queue_num <int>]
       Bind the in-path NFQUEUE and open a guarded interception session (Linux). Requires an `Intercept` scope entry on the interface + direction; returns the session's flow id. `L4Unavailable` when in-path is disabled or unsupported.
   l4 intercept stop --flow <string>
@@ -225,7 +229,7 @@ commands:
   l4 intercept drop --id <string>
       Drop a parked packet (verdict Drop). `false` if the id is not parked.
   l4 intercept status
-      Report whether in-path interception is available on this core (`available`, `code`, `reason`) and the live interception sessions with their parked-packet counts. Always answers, never `L4 unavailable`.
+      Report whether in-path interception is available on this core (`available`, `code`, `reason`), the live interception sessions with their parked-packet counts and, when known, the `privilege` report. Always answers, never `L4 unavailable`.
   l4 agent status
       Report the four per-capability agent gate states (inject, capture, intercept, widen) that govern the agent (MCP) L4 path. Read-only.
   l4 agent set --capability <string> --allowed <true|false>
