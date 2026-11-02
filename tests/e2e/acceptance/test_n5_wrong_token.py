@@ -35,9 +35,9 @@ AITM = os.environ.get("AITM", INSTALLED_CLI)
 REFUSAL = "bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)"
 # Wave 1's M2 panel (spec 2026-11-01-cli-terminal-reporting-design, M2 "after"): the headline has no
 # trailing period, the two why sentences follow, and the holder command is the panel's `fix:` line
-# on a pipe / `▸` on a TTY (0.5.10 said "Find the holder with:"). The TTY form wraps the why lines at
-# the terminal's width (80 in the spec's M2 drawing), so the words are matched across any whitespace
-# (`n4_words`).
+# on a pipe / `▸` on a TTY (0.5.10 said "in use." and "Find the holder with:"). The TTY form wraps
+# the why lines at the terminal's width (80 in the spec's M2 drawing), so `N4_CHECKS` matches the
+# words across any whitespace.
 N4_PANEL = "cannot start: the proxy port 127.0.0.1:8080 is already in use"
 N4_HOLDER_LINE = "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program."
 N4_FREE_LINE = "Free it, or set `listen:` to another address in"
@@ -52,16 +52,26 @@ def strip_ansi(s: str) -> str:
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", s)
 
 
-def _has_words(text: str, phrase: str) -> bool:
-    """`phrase` present with any run of whitespace between its words (the TTY form wraps)."""
-    return re.search(r"\s+".join(re.escape(w) for w in phrase.split()), text) is not None
+def _words(phrase: str) -> str:
+    """Regex for `phrase` with any run of whitespace between its words (the TTY form wraps)."""
+    return r"\s+".join(re.escape(w) for w in phrase.split())
+
+
+# The two marks that tell wave 1's panel from 0.5.10's are pinned: the headline is not followed by
+# a period, and the holder command stands on the fix line (`fix: lsof …` piped, `▸ lsof …` on a TTY).
+N4_CHECKS = (
+    ("headline without a trailing period", re.compile(_words(N4_PANEL) + r"(?!\.)")),
+    ("holder sentence", re.compile(_words(N4_HOLDER_LINE))),
+    ("free-it sentence", re.compile(_words(N4_FREE_LINE))),
+    ("fix line (`fix:` or `▸` + lsof)", re.compile(r"(?:fix:|▸)[ \t]+" + _words(N4_LSOF))),
+)
 
 
 def n4_words(text: str) -> tuple[bool, list[str]]:
-    """Wave 1's port-in-use panel: the headline decides; the why sentences and the `lsof` fix
-    line are reported when missing."""
-    miss = [x for x in (N4_PANEL, N4_HOLDER_LINE, N4_FREE_LINE, N4_LSOF) if not _has_words(text, x)]
-    return _has_words(text, N4_PANEL), miss
+    """Wave 1's port-in-use panel: the headline (no trailing period) decides; the why sentences
+    and the `fix:`/`▸ lsof` line are reported when missing."""
+    miss = [name for name, rx in N4_CHECKS if not rx.search(text)]
+    return N4_CHECKS[0][0] not in miss, miss
 
 
 def n5_tui(core) -> None:
