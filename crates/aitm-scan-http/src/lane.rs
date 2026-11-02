@@ -403,6 +403,13 @@ async fn crawl_origin(
         Engine::Client => crawlers.client,
     };
     let report = crawler.crawl(origin, seeds, job, &limits).await?;
+    // Forms the crawl found but deliberately did not submit (a live form that
+    // disagreed with the page, a tag the browser could not answer) are told to
+    // the job, so `crawl.forms_skipped` says the map is not the whole form
+    // surface (T1b's additive hook, 2026-11-01).
+    if report.forms_skipped > 0 {
+        job.report_forms_skipped(u64::from(report.forms_skipped));
+    }
     if let Some(reason) = report.stopped_reason {
         tracing::info!(
             job = job.job_id(),

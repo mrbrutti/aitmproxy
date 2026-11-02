@@ -717,18 +717,32 @@ impl<'a> Run<'a> {
         extracted: &Extracted,
         depth: u32,
     ) -> anyhow::Result<Step> {
-        if !self.limits.submit_forms || self.limits.forms_per_page == 0 {
+        let forms: Vec<FormSpec> = if self.limits.submit_forms && self.limits.forms_per_page > 0 {
+            extracted
+                .forms
+                .iter()
+                .filter(|form| {
+                    form_action(form, page, self.origin, extracted.base.as_deref()).is_some()
+                })
+                .take(self.limits.forms_per_page as usize)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        tracing::debug!(
+            target: "scan",
+            job = self.job.job_id(),
+            url = %safe_url(page.as_str()),
+            submit_forms = self.limits.submit_forms,
+            forms_per_page = self.limits.forms_per_page,
+            declared = extracted.forms.len(),
+            admitted = forms.len(),
+            "crawl: forms on this page"
+        );
+        if forms.is_empty() {
             return Ok(Step::Continue);
         }
-        let forms: Vec<FormSpec> = extracted
-            .forms
-            .iter()
-            .filter(|form| {
-                form_action(form, page, self.origin, extracted.base.as_deref()).is_some()
-            })
-            .take(self.limits.forms_per_page as usize)
-            .cloned()
-            .collect();
 
         for form in forms {
             if self.job.cancelled() {
@@ -744,7 +758,18 @@ impl<'a> Run<'a> {
             // counted: the submit would go wherever *that* form points.
             let live = match bounded(self.job, self.browser.eval(&tag_form_js(form.index))).await {
                 Ok(value) => LiveForm::from_value(&value),
-                Err(_) => continue,
+                Err(err) => {
+                    self.report.forms_skipped = self.report.forms_skipped.saturating_add(1);
+                    tracing::debug!(
+                        target: "scan",
+                        job = self.job.job_id(),
+                        url = %safe_url(page.as_str()),
+                        form = form.index,
+                        error = %err,
+                        "crawl: the browser could not tag the form; skipped"
+                    );
+                    continue;
+                }
             };
             let agrees = live.as_ref().is_some_and(|live| {
                 live.matches(&form, page, self.origin, extracted.base.as_deref())
