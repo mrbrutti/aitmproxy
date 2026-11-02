@@ -317,8 +317,8 @@ pub fn tools(names: &[&str]) -> Vec<ToolInfo> {
 #[allow(unused_imports)]
 pub use aitm_tui::CORE_TOOLS;
 
-/// The 22 commands the bus served before that merge: a bus with none of
-/// the F5/F6/F7/F12/F13/M3 tools. Tests that prove a *missing* tool degrades
+/// The 22 commands the bus served before the F5/F6/F7/F12/F13/M3 tools
+/// landed: a bus with none of them. Tests that prove a *missing* tool degrades
 /// honestly connect to this list; `CORE_TOOLS` is for "today's core".
 pub const PRE_MERGE_TOOLS: &[&str] = &[
     "flow.list",

@@ -11,7 +11,7 @@ use aitm_scan_model::{
 };
 
 use super::{
-    is_job_id, lane_token, severity_counts, severity_token, ScanError, DETAIL_VALUE_MAX,
+    is_job_id, lane_token, more, severity_counts, severity_token, ScanError, DETAIL_VALUE_MAX,
     SEVERITY_ORDER,
 };
 use crate::text::{clean, cut_to, truncate};
@@ -391,15 +391,6 @@ fn cap<T>(v: &mut Vec<T>) -> usize {
     dropped
 }
 
-/// `+n` when `dropped` entries were cut off a list, empty otherwise.
-fn more(dropped: usize) -> String {
-    if dropped > 0 {
-        format!(" +{dropped}")
-    } else {
-        String::new()
-    }
-}
-
 /// The most rows a `scan.list` reply folds to (fix round H, H36; D6
 /// hostile-core bounds): the list is cut to this many before the
 /// started-here ids are put in front, so `order` is bounded in count.
@@ -501,10 +492,8 @@ fn targets_text(targets: &[String], dropped: usize) -> String {
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
-    let more = targets.len().saturating_sub(TARGETS_JOINED) + dropped;
-    if more > 0 {
-        text.push_str(&format!(" +{more}"));
-    }
+    let beyond = targets.len().saturating_sub(TARGETS_JOINED) + dropped;
+    text.push_str(&more(beyond));
     truncate(&text, 4 * TARGETS_MAX)
 }
 

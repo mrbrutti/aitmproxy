@@ -18,10 +18,6 @@ use aitm_tui::theme::Theme;
 use common::{connect, draw, sample_app, text_of, to_text, toast, CORE_TOOLS};
 use serde_json::json;
 
-fn screen(app: &App, cols: u16, rows: u16) -> String {
-    text_of(app, cols, rows)
-}
-
 /// D7: the title and footnote are picked by the call name (`scan.*` reads the
 /// scan-launch wording, `l4.*` the guarded-L4 wording) and the server's prompt
 /// is shown verbatim between them.
@@ -36,7 +32,7 @@ fn the_overlay_titles_and_footnotes_by_call_name() {
     });
     app.mode = Mode::WireConfirm;
 
-    let text = screen(&app, 200, 50);
+    let text = text_of(&app, 200, 50);
     assert!(
         text.contains("Confirm over the wire: scan launch"),
         "scan launch title: {text}"
@@ -56,7 +52,7 @@ fn the_overlay_titles_and_footnotes_by_call_name() {
         prompt: "P".into(),
         token: "tok-1".into(),
     });
-    let text = screen(&app, 200, 50);
+    let text = text_of(&app, 200, 50);
     assert!(
         text.contains("Confirm over the wire: guarded L4 action"),
         "guarded L4 title: {text}"
@@ -125,7 +121,7 @@ fn a_disconnect_drops_the_pending_confirm() {
             .map(|t| t.text.as_str())
             .collect::<Vec<_>>()
     );
-    let text = screen(&app, 200, 50);
+    let text = text_of(&app, 200, 50);
     assert!(
         !text.contains("Confirm over the wire"),
         "the overlay is gone: {text}"
@@ -216,7 +212,7 @@ fn the_box_fits_both_widths() {
     app.mode = Mode::WireConfirm;
 
     for (cols, rows) in [(90u16, 40u16), (200, 50)] {
-        let text = screen(&app, cols, rows);
+        let text = text_of(&app, cols, rows);
         let count = text.matches("Confirm over the wire: scan launch").count();
         assert_eq!(count, 1, "the title appears once at {cols}x{rows}: {text}");
     }
@@ -237,7 +233,7 @@ fn the_prompt_wraps_by_cell_width_not_chars() {
         token: "tok-1".into(),
     });
     app.mode = Mode::WireConfirm;
-    let text = screen(&app, 60, 20);
+    let text = text_of(&app, 60, 20);
     // `to_text` writes a wide glyph as the glyph and one pad cell.
     let rows: Vec<&str> = text.lines().filter(|l| l.contains('日')).collect();
     assert_eq!(
@@ -289,7 +285,7 @@ fn a_scan_confirm_draws_over_the_scan_view() {
     assert_eq!(app.mode, Mode::WireConfirm);
     assert_eq!(app.wire_confirm_from, Mode::Scan);
 
-    let text = screen(&app, 200, 50);
+    let text = text_of(&app, 200, 50);
     assert!(
         text.contains("Confirm over the wire: scan launch"),
         "the overlay is up: {text}"
@@ -324,7 +320,7 @@ fn an_l4_confirm_from_flows_still_shows_the_flow_list() {
         app.mode = Mode::WireConfirm;
         app.wire_confirm_from = from;
 
-        let text = screen(&app, 200, 50);
+        let text = text_of(&app, 200, 50);
         assert!(
             text.contains("Confirm over the wire: guarded L4 action"),
             "{from:?}: the overlay is up: {text}"
@@ -393,7 +389,7 @@ fn a_prompt_wider_than_the_box_wraps_and_keeps_the_key_line_last() {
     let mut app = sample_app(200, 50);
     app.wire_confirm = Some(confirm);
     app.mode = Mode::WireConfirm;
-    let text = screen(&app, 200, 50);
+    let text = text_of(&app, 200, 50);
     let title = text
         .lines()
         .position(|l| l.contains("Confirm over the wire: scan launch"))
@@ -481,7 +477,7 @@ fn an_l4_inject_shows_the_wire_confirm_and_reissues_with_the_token() {
     );
     assert_eq!(app.mode, Mode::WireConfirm, "the confirm overlay opens");
     assert_eq!(app.wire_confirm_from, Mode::Inspector);
-    let text = screen(&app, 200, 50);
+    let text = text_of(&app, 200, 50);
     assert!(
         text.contains("Confirm over the wire: guarded L4 action"),
         "guarded L4 title: {text}"

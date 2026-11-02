@@ -167,7 +167,7 @@ fn row_text(text: &str, needle: &str) -> String {
 }
 
 /// The Profiles keys of spec D11 and plan task 10, in `Mode::Scan`. `Right`
-/// stays `Enter` (`tests/scan_surface.rs` pins it for the legacy point
+/// stays `Enter` (`tests/scan_v2_legacy.rs` pins it for the legacy point
 /// list); `l` is the expand key the tree gets instead.
 #[test]
 fn profiles_keys_map_to_their_actions() {

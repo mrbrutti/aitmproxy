@@ -79,6 +79,18 @@ pub const DETAIL_VALUE_MAX: usize = 400;
 /// footer wrap, the toast and every clone of the error read bounded text.
 pub const ERROR_DETAIL_MAX: usize = 240;
 
+/// ` +n` when `dropped` entries were cut off a list at fold, empty
+/// otherwise: the one suffix every Detail line that lists bounded entries
+/// ends in (the Jobs lanes, checks, clamps and targets, the Issues `job`
+/// line; fix round I, I4).
+pub(crate) fn more(dropped: usize) -> String {
+    if dropped > 0 {
+        format!(" +{dropped}")
+    } else {
+        String::new()
+    }
+}
+
 /// The tab a `scan.*` verb's error line belongs to (spec D9: "the owning
 /// tab"; plan task 13). The profile verbs, the catalogue, the session
 /// preview and the two launch verbs are the Profiles tab's (a launch is

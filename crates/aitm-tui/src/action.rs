@@ -10,8 +10,7 @@ use crate::model::{AgentPolicy, AgentState, Finding, FlowDetail, ProxyStatus};
 
 /// The reserved argument a confirm-over-the-wire re-issue carries (spec D3,
 /// D7; `server.rs` `needs_confirmation`). No tool schema declares it: the bus
-/// task's prune keeps it, the overlay's `confirmed_args` adds it, and the
-/// fixture bus looks for it.
+/// task's prune keeps it and the overlay's `confirmed_args` adds it.
 pub const CONFIRM_KEY: &str = "_confirm";
 
 /// A tool the bus offers, enough to build the palette and a form: the

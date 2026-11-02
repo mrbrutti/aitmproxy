@@ -15,9 +15,9 @@ use aitm_scan_model::{
 use serde_json::{json, Map, Value};
 
 use super::{
-    confidence_token, is_issue_id, lane_token, scroll, severity_token, status_token, step, walk,
-    wire_token, Dir, ScanError, CURSOR_MAX, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, ISSUES_PAGE_LIMIT,
-    SEVERITY_ORDER,
+    confidence_token, is_issue_id, lane_token, more, scroll, severity_token, status_token, step,
+    walk, wire_token, Dir, ScanError, CURSOR_MAX, DETAIL_LIST_MAX, DETAIL_VALUE_MAX,
+    ISSUES_PAGE_LIMIT, SEVERITY_ORDER,
 };
 use crate::action::Action;
 use crate::text::{clean, cut_to, truncate};
@@ -1047,11 +1047,7 @@ fn location_text(issue: &Issue) -> String {
 /// by [`bound_issue`]) joined by `, `, then ` +n` for the finders the fold
 /// cut past [`DETAIL_LIST_MAX`].
 fn jobs_text(issue: &Issue, dropped: usize) -> String {
-    let mut text = issue.jobs_or_job().join(", ");
-    if dropped > 0 {
-        text.push_str(&format!(" +{dropped}"));
-    }
-    text
+    format!("{}{}", issue.jobs_or_job().join(", "), more(dropped))
 }
 
 /// The `l4` detail line (fix round H, H60): `ip:port/proto`, then the

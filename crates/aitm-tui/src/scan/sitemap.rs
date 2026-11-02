@@ -243,7 +243,8 @@ impl SitemapState {
             self.points = result.points;
         }
         // The reply names the job it chose (H61); an appended page that does
-        // not keeps the first page's.
+        // not keeps the first page's, and one naming a different job
+        // overwrites the head's: the core's word (I11).
         if let Some(mut job) = result.job {
             cut(&mut job);
             self.job = Some(job);

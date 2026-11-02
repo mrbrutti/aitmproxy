@@ -659,6 +659,7 @@ fn palette_finds_sysproxy_by_name_and_description_and_enter_shows_usage() {
 fn help_overlay_orders_the_s_line_and_keeps_its_footer() {
     let mut app = listening_app();
     for (c, r) in [(100u16, 37u16), (120, 40), (160, 50)] {
+        let _ = app.update(Action::Resize(c, r));
         app.mode = Mode::Help;
         app.help_scroll = 0;
         let text = text_of(&app, c, r);
@@ -675,7 +676,6 @@ fn help_overlay_orders_the_s_line_and_keeps_its_footer() {
             blt < s && s < yo,
             "order at {c}×{r}: b/l/t={blt} s={s} y/o={yo}"
         );
-        let _ = app.update(Action::Resize(c, r));
         let _ = app.update(Action::End);
         let end = text_of(&app, c, r);
         assert!(

@@ -104,7 +104,7 @@ fn browser(key: KeyEvent) -> Option<Action> {
 /// toggle, `w` save, `D` delete, `N` new, `o` typed origin, `a`/`d` add or
 /// remove the picker row, `t` L4 target, `h`/`l`/← collapse or expand a
 /// tree node; → stays ⏎ (it opens the Site map's row and the legacy point's
-/// flow, which `tests/scan_surface.rs` pins), and ⏎ expands a collapsed
+/// flow, which `tests/scan_v2_legacy.rs` pins), and ⏎ expands a collapsed
 /// node too.
 fn scan(key: KeyEvent) -> Option<Action> {
     if let Some(a) = nav(key) {
