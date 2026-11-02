@@ -39,6 +39,16 @@ fn header_value(headers, name) {
 
 fn load(reg) {
     reg.add_check(META, |point| {
+        // `point.url` is `()` when the lane recorded no URL for this point, and
+        // an origin-scoped audit has no origin to attribute an answer to.
+        if type_of(point.url) != "string" {
+            return #{
+                outcome: "inconclusive",
+                confidence: "tentative",
+                detail: "This insertion point carries no URL, so there is no origin to audit.",
+            };
+        }
+
         // A canary nobody owns, so a reflection cannot be a real allow-list hit.
         let canary = "https://" + probe.marker() + ".aitm-canary.example";
         let reply = probe.raw(#{ method: "GET", url: point.url, headers: #{ "origin": canary } });

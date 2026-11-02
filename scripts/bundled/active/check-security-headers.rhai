@@ -36,6 +36,16 @@ const META = #{
 
 fn load(reg) {
     reg.add_check(META, |point| {
+        // `point.url` is `()` when the lane recorded no URL for this point, and
+        // an origin-scoped audit has no origin to attribute an answer to.
+        if type_of(point.url) != "string" {
+            return #{
+                outcome: "inconclusive",
+                confidence: "tentative",
+                detail: "This insertion point carries no URL, so there is no origin to audit.",
+            };
+        }
+
         let reply = probe.baseline();
         let missing = "";
         let count = 0;
