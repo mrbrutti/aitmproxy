@@ -26,6 +26,10 @@
 
 Live run on the fixed head 404cb613 (full parallel cells): 31 pass / 8 skip / 1 fail; `test_t3_h2_sender.py` and `test_t2_mutable_points.py` PASS under load (amendment 74 + 80 proof); `test_t3_catalogue_sweep.py` no longer stops on errors — it ends `stopped_reason: budget` at probes 2000 with 975/1052 checks done and `open-redirect` unreached, because the default 2000-probe budget is smaller than the fifteen-script catalogue. The cell now asks for `budget.probes: 8000` (ceiling 20 000) so the sweep runs its whole catalogue.
 
+### Task 4: `scan.start` answers with the queued record as written (amendment 71c; queue-head fix)
+
+**Files:** `crates/aitm-plugin-scanner/src/jobs.rs` (one statement moved). Main's own gate on 179bc01f failed `worker::tests::start_returns_queued_within_the_call_and_the_job_reaches_done` at `assert_eq!(started.status.state, JobState::Queued)`: `jobs::start` spawned the worker and only then read the status back for its `StartResult`, so the answer could already read `running`/`done`. Spec D5 "Start" (write `state: queued`, spawn, return): the snapshot is now taken before the spawn — a production fix, not a test relaxation, because the verbs test pins the same `state: queued` on the wire and both assert exactly the spec's promise. Sweep: no other snapshot-state assertion in the scanner's tests. Proof: the two tests ×50 default and ×50 `--test-threads=1` (log in the Review log).
+
 ## Acceptance (orchestrator, Terminal)
 - Full workspace gate exit 0 (core change).
 - Live proof under the **parallel** full run (`python3 tests/e2e/run.py scan`, the load-dependent case): `test_t3_catalogue_sweep.py` reaches 1052/1052 checks without `stopped_reason: errors`; `test_t3_h2_sender.py` and `test_t2_mutable_points.py` see P probed; counts no worse than #292's final (28 / 8 / 4 → the three core reds green).
