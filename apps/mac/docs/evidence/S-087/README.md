@@ -21,3 +21,10 @@
   (it does not list `<findings.dir>/scan/pocs/…`), so the Findings page has nothing to select and the status bar
   shows the spec's fallback "PoC <path> is not in this app's findings list". Engine/contract gap for T1b:
   `poc.list` should include the scanner's PoCs (or `scan.issue` should carry a finding the Findings page lists).
+
+## Third run (core built from main 3aa8cc67, embedded)
+`09-main-3aa8cc67-issues-6.png` — Issues tab after job `scan-e6b8d1df` on the testtarget: "Issues 6" in the tab,
+groups Medium 2 (Reflected cross-site scripting on GET /search q and GET /greet name, certain) and Low 4 (Missing
+security header sec-ch-ua firm, Reflected parameter value /search q tentative, Cookie without Secure or HttpOnly
+/lang set firm, Open redirect /redirect next certain); the harness `scan.status` for the same job reports
+`issues {low 4, medium 2}` (`../S-086/ac9-harness-main-3aa8cc67.log`).

@@ -44,3 +44,10 @@ an inject L4 scope entry `cidr 127.0.0.1/32, interface "*", direction outbound, 
   with that error). The handshake and the D9 error rendering are proven; a running L4 job needs a build with the
   lane.
 - `tools-list-names-abaf5264.txt` — that core's verbs (`l4.scope.*`, every `scan.*`, `flow.subscribe`).
+
+## Third run (core built from main 3aa8cc67, embedded)
+`10-main-3aa8cc67-profiles-thorough.png` — seven builtin profiles listed by main's engine (l4-full, l4-stream-safe,
+light-http, map-only, passive-only, standard, thorough); `standard` selected, target `http://127.0.0.1:8097` added
+with "Add in-scope host", Speed set to Thorough, footer reads "Edited builtin — Start Scan uses these values;
+Duplicate… to keep them." Checks list from `scan.checks` (cookie-flag, open-redirect, reflected-xss, reflection,
+security-header …).
