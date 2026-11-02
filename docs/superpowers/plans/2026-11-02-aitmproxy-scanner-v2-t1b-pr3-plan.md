@@ -315,6 +315,7 @@ Kept by the main session during stage 6. One row per finding.
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
 | 1 | Coder (Task 1) | Note | The plan's fan-out list (93 sites / 50 files) was a grep count; the compiler's list is 74 literals in 55 files (pattern matches and `..head` sites need nothing; eight files the plan did not list). Two `aitm-scan-ws` files take one `peer: None` each because the compile requires it | accepted; committed as d74b1245 (rebased) |
+| 2 | Coder (Task 2) | Note | The ruling lists seventeen redirect-like names; the plan's `[&str; 18]` miscounted — the seventeen ship verbatim (`REDIRECT_NAMES`), an eighteenth spelling is a one-line add if the coordinator names one. The name branch also tags `ParamNameQuery`/`ParamNameBody` points (harmless: `open-redirect`'s kinds never schedule a param-name point; `scan.points` shows the trait) | accepted; committed by path |
 | 3 | Coder (Task 3) | Note | The plan pointed at "the existing pooled-h2 reuse test (≈1802, three streams)"; at the reference SHA that test makes three dials with one error, so it cannot assert a peer per response — a dedicated pooled-path test (one dial, three sends, each names the pooled peer) was added instead | accepted; committed by path |
 
 ## Shipped
