@@ -2136,7 +2136,8 @@ pub(crate) mod test_support {
             }
         }
 
-        /// Poll `registry.status(job)` until it is terminal, or give up.
+        /// Wait for `job` to be terminal via the registry's terminal signal
+        /// (see [`wait_terminal`]); no clock, only the `TERMINAL_NET` safety net.
         pub(crate) async fn wait_terminal(&self, job: &str) -> aitm_scan_model::JobStatus {
             wait_terminal(&self.engine.registry, job).await
         }
@@ -2195,8 +2196,11 @@ pub(crate) mod test_support {
         terminal_status(registry, job)
     }
 
-    /// [`wait_terminal`] for a harness polling from **outside** a runtime: it
+    /// [`wait_terminal`] for a harness waiting from **outside** a runtime: it
     /// blocks on the same signal through a short-lived current-thread runtime.
+    /// Call it only from a thread that is not inside a tokio runtime
+    /// (`Runtime::block_on` panics when nested); the `commands.rs` harness
+    /// qualifies because its `#[test]` threads never enter its own runtime.
     pub(crate) fn wait_terminal_blocking(
         registry: &crate::jobs::JobRegistry,
         job: &str,
@@ -2731,17 +2735,24 @@ mod tests {
 
         // A waiter parked on the signal wakes when `finish` flips it, and
         // reads a terminal status when it does.
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
         let waiter = {
             let registry_status = Arc::clone(&status);
             let mut rx = rx.clone();
             tokio::spawn(async move {
+                let mut parked = Some(parked_tx);
                 while !*rx.borrow_and_update() {
+                    // Tell the test we are about to park, so `finish` below is
+                    // guaranteed to be the wake-up and not a value read first.
+                    if let Some(tx) = parked.take() {
+                        let _ = tx.send(());
+                    }
                     rx.changed().await.expect("sender alive");
                 }
                 registry_status.read().unwrap().state
             })
         };
-        tokio::task::yield_now().await;
+        parked_rx.await.expect("the waiter reports before parking");
         {
             let mut guarded = status.write().unwrap();
             guarded.state = aitm_scan_model::JobState::Done;
@@ -3217,7 +3228,7 @@ mod tests {
         // at once, so a waiter never parks on it.
         assert!(
             *registry
-                .terminal_signal(&scan - 00000002)
+                .terminal_signal("scan-00000002")
                 .expect("the reloaded job has a signal")
                 .borrow(),
             "a reloaded record starts terminal"

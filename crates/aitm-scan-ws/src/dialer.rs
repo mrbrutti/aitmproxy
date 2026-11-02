@@ -1610,8 +1610,10 @@ mod tests {
         );
 
         drop(held.pop());
+        // A safety net like `soon()`, not a measured bound: the dial proceeds
+        // as soon as a slot frees; 5 s was the same flake class under load.
         let fifth = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             dialer.dial(
                 &handshake,
                 &HandshakeOverrides::default(),

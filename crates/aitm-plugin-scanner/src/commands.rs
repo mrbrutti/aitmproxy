@@ -2790,7 +2790,9 @@ mod tests {
                 .clone()
         }
 
-        /// Poll a job to its terminal state from outside the runtime.
+        /// Wait for a job's terminal state from outside the runtime, on the
+        /// registry's terminal signal (`test_support::wait_terminal_blocking`;
+        /// this `#[test]` thread is never inside the harness runtime).
         fn wait_terminal(&self, job: &str) -> aitm_scan_model::JobStatus {
             crate::jobs::test_support::wait_terminal_blocking(&self.engine.registry, job)
         }
