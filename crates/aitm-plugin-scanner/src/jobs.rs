@@ -135,7 +135,8 @@ pub struct JobEntry {
     pub started_by: StartedBy,
     /// What discovery found, for `scan.sitemap`.
     pub discovery: Arc<RwLock<Discovery>>,
-    /// The normalized origins the job is single-flight on.
+    /// The normalized HTTP origins and the L4 `ip:port` targets the job is
+    /// single-flight on (amendment 73a).
     pub origins: Vec<String>,
     /// Whether an agent started it, so the worker knows to re-check policy.
     pub is_agent: bool,
@@ -213,7 +214,7 @@ impl JobRegistry {
 
     /// `scan.start`'s concurrency gate and admission as **one** critical
     /// section (spec D5 "Registry"/`busy`; security review, whole branch,
-    /// 2026-11-01): the `max_jobs` ceiling and the per-origin single flight
+    /// 2026-11-01): the `max_jobs` ceiling and the per-target single flight
     /// are checked, a free id is minted and the entry `build(id)` returns is
     /// inserted, all under the same lock, so two callers racing each other
     /// cannot both see a free slot and both take it.
@@ -947,8 +948,9 @@ pub fn start(
     // verb layer (Task 15) refuses with exactly the same words.
     agent_gate(engine, &caller, &profile, force_map)?;
 
-    // (7) and (8): the concurrency gate — the job ceiling and the per-origin
-    // single flight — and the admission, in one critical section of the
+    // (7) and (8): the concurrency gate — the job ceiling and the per-target
+    // single flight, over the HTTP origins *and* the L4 `ip:port` targets
+    // (amendment 73a) — and the admission, in one critical section of the
     // registry (`JobRegistry::admit`). The confinement token lives on the
     // entry and drops with it, so a job can never leave the egress posture
     // held.
@@ -968,7 +970,7 @@ pub fn start(
         state: JobState::Queued,
         phase: Phase::Queued,
         profile_name: profile.name.clone(),
-        targets,
+        targets: targets.clone(),
         started_by: started_by.clone(),
         started_at: util::now_ms(),
         probes: ProbeCounters {
@@ -987,7 +989,7 @@ pub fn start(
     let status = Arc::new(RwLock::new(status));
     let job = engine
         .registry
-        .admit(engine.cfg.max_jobs as usize, &origins, |id| {
+        .admit(engine.cfg.max_jobs as usize, &targets, |id| {
             status.write().unwrap_or_else(|e| e.into_inner()).job = id.clone();
             JobEntry {
                 status: Arc::clone(&status),
@@ -995,7 +997,7 @@ pub fn start(
                 confine,
                 started_by: started_by.clone(),
                 discovery: Arc::clone(&discovery),
-                origins: origins.clone(),
+                origins: targets.clone(),
                 is_agent: caller.is_agent(),
                 terminal: tokio::sync::watch::channel(false).0,
             }
@@ -2418,7 +2420,9 @@ mod tests {
     use std::sync::Arc;
 
     use aitm_core::{AgentPolicy, Frontend, ScopeRateGuard};
-    use aitm_scan_model::{Intensity, LaneKind, ScanErrorCode, SessionMode, SkippedLane};
+    use aitm_scan_model::{
+        Intensity, L4TargetSpec, L4Transport, LaneKind, ScanErrorCode, SessionMode, SkippedLane,
+    };
 
     /// Spec D5, call B3: the services are bound by the binary after the proxy
     /// is built. A verb that runs before that fails with a **plain** error —
@@ -2746,6 +2750,104 @@ mod tests {
         .expect_err("the same origin is single-flight");
         assert_eq!(code(&err), ScanErrorCode::Busy);
         h.cancel_all();
+    }
+
+    /// Amendment 73a: `scan.start`'s single flight covers the L4 targets as
+    /// well as the HTTP origins. Two jobs over *different* origins that name
+    /// the same `ip:port` are `busy` on that target; a different port is free.
+    ///
+    /// The l4 lane is not on this build, so it is skipped and no L4 guard is
+    /// consulted (`services.l4` is `None` in the harness). The profile still
+    /// has to *name* an l4 lane, because `profiles::validate` refuses a
+    /// `target.l4` that names none — the lane being absent is what makes this
+    /// a pure admission test, with the http `FakeLane`'s blocking check
+    /// keeping the first job active.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn busy_on_the_same_l4_target() {
+        let h = Harness::new().with_blocking_check().with_max_jobs(3);
+        h.bind();
+        let profile = |origin: &str, port: u16| {
+            let mut profile = h.profile(&[origin]);
+            profile.lanes = vec![LaneKind::Http, LaneKind::L4Packet];
+            profile.target.l4 = vec![L4TargetSpec {
+                ip: "127.0.0.1".to_string(),
+                port,
+                proto: L4Transport::Tcp,
+                grammar: None,
+            }];
+            profile
+        };
+
+        crate::jobs::start(&h.engine, profile("http://scan.test", 9), operator(), false)
+            .expect("the first job starts");
+
+        let err = crate::jobs::start(
+            &h.engine,
+            profile("http://other.test", 9),
+            operator(),
+            false,
+        )
+        .expect_err("the same l4 target is single-flight");
+        assert_eq!(code(&err), ScanErrorCode::Busy);
+        assert_eq!(
+            err.to_string(),
+            "scan: busy: a scan is already running against 127.0.0.1:9"
+        );
+
+        crate::jobs::start(
+            &h.engine,
+            profile("http://other.test", 10),
+            operator(),
+            false,
+        )
+        .expect("a different l4 port is free");
+
+        h.cancel_all();
+    }
+
+    /// Amendment 73a at the registry: [`crate::jobs::JobRegistry::admit`]'s
+    /// single flight is per *target*, so an L4 `ip:port` a live entry holds
+    /// refuses the next job exactly as an HTTP origin does, whatever the
+    /// origins around it are.
+    #[test]
+    fn admit_refuses_a_target_already_active() {
+        let registry = crate::jobs::JobRegistry::new(10);
+        let build = |targets: Vec<String>| {
+            move |id: &String| crate::jobs::JobEntry {
+                status: Arc::new(std::sync::RwLock::new(aitm_scan_model::JobStatus {
+                    job: id.clone(),
+                    state: aitm_scan_model::JobState::Running,
+                    targets: targets.clone(),
+                    ..aitm_scan_model::JobStatus::default()
+                })),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                confine: None,
+                started_by: Default::default(),
+                discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+                origins: targets.clone(),
+                is_agent: false,
+                terminal: tokio::sync::watch::channel(false).0,
+            }
+        };
+        let targets = |origin: &str, l4: &str| vec![origin.to_string(), l4.to_string()];
+
+        let first = targets("http://a.test:80", "127.0.0.1:9");
+        registry
+            .admit(4, &first, build(first.clone()))
+            .expect("the first job is admitted");
+
+        let second = targets("http://b.test:80", "127.0.0.1:9");
+        assert_eq!(
+            registry
+                .admit(4, &second, build(second.clone()))
+                .expect_err("the l4 target is already active"),
+            crate::jobs::AdmitRefused::Origin("127.0.0.1:9".to_string())
+        );
+
+        let third = targets("http://b.test:80", "127.0.0.1:10");
+        registry
+            .admit(4, &third, build(third.clone()))
+            .expect("a different l4 port, and a free origin, is admitted");
     }
 
     /// AC T5-3 (spec D8.4): a lane refuses a profile it cannot run **before**
