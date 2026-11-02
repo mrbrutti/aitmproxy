@@ -125,6 +125,14 @@ root, rustfmt the leaf file only if needed): (a) tests only, (b) production.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1 | security | Minor | S-1: two definitions of "harness run" (`harnessAuditLogFile` matched `APP_LIVE == "1"`, `SettingsDomain.select` any non-empty `APP_LIVE`); `APP_LIVE=true` isolated the defaults suite but not the audit | fixed in the round-1 fix commit (spec Amendment 1: non-empty rule for both variables) |
+| 1 | security | Minor | S-2: U+0085 / U+2028 / U+2029 pass the newline guard; libyaml folds NEL inside a double-quoted scalar (no injection, no token exposure) | fixed in the round-1 fix commit (`yamlDoubleQuoted` refuses them; NEL test) |
+| 1 | security | Minor | S-3: a relative `APP_STORE` is resolved against the cwd, not refused | accepted by the orchestrator for Matt 2026-11-02 (autonomous mode): operator-controlled input, same as `Store.url`, the core hardens the resolved path, `snap-dev.sh` passes an absolute store; flagged in the PR body |
+| 1 | quality | Minor | Q-1: `yaml()` doc comment said "both paths" with three spliced paths | fixed in the round-1 fix commit |
+| 1 | quality | Minor | Q-2: Swift pin test hand-spelled the Rust literal instead of deriving it from the asserted fragment | fixed in the round-1 fix commit |
+| 1 | quality | Minor | Q-3: `harnessAuditLogFile` doc comment claimed the same predicate as `SettingsDomain` while it differed | fixed in the round-1 fix commit (resolved with S-1) |
+| 2 | quality | Minor | Q-4: golden default-document test named after the moment it was written | fixed in the round-1 fix commit (renamed `default_config_is_exactly_this_document`) |
+| 1 | spec | Minor | P-1: AC4's `\r` half not exercised on `auditLogFile` | fixed in the round-1 fix commit |
 
 ## Shipped
 
