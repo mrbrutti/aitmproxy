@@ -380,7 +380,7 @@
 <article class="feat" data-reveal id="scriptable">
   <div class="prose">
     <h2 class="h3">All of it, scriptable</h2>
-    <p>Every capability on this page is a registered command. The web UI, the terminal UI and the macOS app call it by that name, an assistant calls it over MCP under the same scope and sensitivity rules, and the self-contained ones also run one-shot from the CLI. Rhai plugins run in a sandbox, reach the flow, HTTP, browser, store and scope through guarded host calls, and can register commands of their own. Whoever issues a command, the activity log records its origin, the command, its redacted arguments and whether it ran.</p>
+    <p>Every capability on this page is a registered command. The web UI, the terminal UI and the macOS app call it by that name, an assistant calls it over MCP under the same scope and sensitivity rules, and every one of them runs one-shot from the CLI on the running core (the self-contained ones run on this machine). Rhai plugins run in a sandbox, reach the flow, HTTP, browser, store and scope through guarded host calls, and can register commands of their own. Whoever issues a command, the activity log records its origin, the command, its redacted arguments and whether it ran.</p>
     <p><a class="arrow" href="scripting.html">Scripting reference</a><br><a class="arrow" href="poc.html">PoC format reference</a></p>
   </div>
   <div class="feat-stack">

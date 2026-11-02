@@ -1249,6 +1249,9 @@ section_docs() {
   doc_grep site/poc.html 'has no browser' 0
   doc_grep docs/scanner.md 'not the one-shot CLI' 0
   doc_grep site/poc.html 'poc_path pocs/reflected-xss-search-q.yaml' 1
+  doc_grep site/index.html 'does not steer a proxy that is already running' 0
+  doc_grep site/index.html 'the self-contained ones also run one-shot' 0
+  doc_grep site/features.html 'the self-contained ones also run one-shot' 0
   end_section
 }
 

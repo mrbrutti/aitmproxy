@@ -387,7 +387,7 @@ content-type: application/json
 
       <article class="feature" data-reveal>
         <h3 class="h3">Scriptable, all of it</h3>
-        <p>Every command above is registered once: the UIs and MCP call it by the same name, the self-contained ones also run one-shot from the CLI, and Rhai plugins can register commands of their own.</p>
+        <p>Every command above is registered once: the UIs and MCP call it by the same name, every one of them runs one-shot from the CLI on the running core (the self-contained ones run on this machine), and Rhai plugins can register commands of their own.</p>
         <div class="pair">
           <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm script validate --path guard-admin-writes.rhai</code></div>
           <div class="pair-row is-agent"><span class="pair-who">agent</span><code>script.validate({ path: <span class="s">"guard-admin-writes.rhai"</span> })</code></div>
