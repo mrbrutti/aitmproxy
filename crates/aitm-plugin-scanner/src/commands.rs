@@ -233,7 +233,7 @@ impl ScanDiscover {
     }
 
     /// Wait until `job` is over or `within` has passed, on the registry's
-    /// terminal signal ([`jobs::JobRegistry::terminal_signal`]): the wait ends
+    /// terminal wait ([`jobs::JobRegistry::wait_terminal`]): the wait ends
     /// when the worker's `finish` has run, not on the first read of a terminal
     /// `state`, so the job's handles (its egress hold) are released by the
     /// time the verb answers. No polling: the deadline is a `tokio::time::timeout`
@@ -244,40 +244,43 @@ impl ScanDiscover {
     /// `None` when the deadline passed first. `last` always holds the newest
     /// status seen, whether or not the job settled in time.
     fn wait_until(&self, job: &str, within: Duration, last: &mut JobStatus) -> Option<JobStatus> {
-        let settled = match (
-            self.engine.registry.terminal_signal(job),
-            self.engine.late.get(),
-        ) {
-            (Some(signal), Ok(services)) => {
+        let settled = match self.engine.late.get() {
+            Ok(services) => {
                 let (tx, rx) = std::sync::mpsc::channel();
+                let engine = Arc::clone(&self.engine);
+                let job = job.to_string();
                 services.rt.spawn(async move {
-                    let settled = tokio::time::timeout(within, finished(signal)).await.is_ok();
+                    let settled = tokio::time::timeout(within, engine.registry.wait_terminal(&job))
+                        .await
+                        .is_ok();
                     // The verb may have stopped listening (its connection
                     // closed); nobody else cares about the answer.
                     let _ = tx.send(settled);
                 });
-                // `Err`: the runtime dropped the task on shutdown; there is
-                // nothing left to wait for.
-                rx.recv().unwrap_or(true)
+                // The receive is bounded a second past the task's own
+                // deadline: this thread blocks here, and if the caller's
+                // runtime *is* `services.rt` on a single thread (never the
+                // shipped core, which is multi-threaded; `blocking` only
+                // yields the worker there), nothing could drive the task and
+                // an unbounded `recv` would hang the verb for ever. Bounded,
+                // a starved task degrades to "not settled": the deadline,
+                // cancel and grace run as before and the last status answers.
+                match rx.recv_timeout(within.saturating_add(Duration::from_secs(1))) {
+                    Ok(settled) => settled,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                    // The runtime dropped the task on shutdown; there is
+                    // nothing left to wait for.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+                }
             }
-            // The entry is gone, or (unreachable once `jobs::start` has
-            // succeeded) the services are not bound: nothing to wait for.
-            _ => true,
+            // Unreachable once `jobs::start` has succeeded: the services are
+            // not bound, so nothing can be running.
+            Err(_) => true,
         };
         if let Some(status) = self.engine.registry.status(job) {
             *last = status;
         }
         settled.then(|| last.clone())
-    }
-}
-
-/// Resolve once the job behind `signal` is finished, or once its registry
-/// entry is gone (the sender dropped with it).
-async fn finished(mut signal: tokio::sync::watch::Receiver<bool>) {
-    while !*signal.borrow_and_update() {
-        if signal.changed().await.is_err() {
-            return;
-        }
     }
 }
 

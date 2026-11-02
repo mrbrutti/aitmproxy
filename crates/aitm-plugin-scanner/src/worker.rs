@@ -25,7 +25,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -234,7 +234,9 @@ pub struct JobRuntime {
     session: Option<Arc<SessionMaterial>>,
     budget: Arc<JobBudget>,
     status: Arc<RwLock<JobStatus>>,
-    markers: AtomicU64,
+    /// The per-call marker counter (amendment 57), as wide as
+    /// [`crate::util::marker`]'s counter: it wraps rather than truncates.
+    markers: AtomicU32,
     /// Per-job marker seed (amendment 55): minted once when the runtime is
     /// built, mixed into every marker so two jobs' first markers differ.
     marker_seed: u32,
@@ -285,7 +287,55 @@ pub struct JobRuntime {
     check_error_samples: Mutex<Vec<CheckErrorSample>>,
 }
 
+/// The handles a [`JobRuntime`] works through: the job's metered client, the
+/// flow store, the scope guard, and the optional browser and session material.
+pub(crate) struct RuntimeServices {
+    pub(crate) client: Arc<dyn ProxyClient>,
+    pub(crate) store: Arc<dyn FlowStore>,
+    pub(crate) guard: Arc<dyn ScopeRateGuard>,
+    pub(crate) browser: Option<Arc<dyn BrowserDriver>>,
+    pub(crate) session: Option<Arc<SessionMaterial>>,
+}
+
 impl JobRuntime {
+    /// A runtime for `job` with every counter at zero, no lane running, no
+    /// session lost, and a fresh marker seed (amendment 55). The inputs are
+    /// the only things that vary between runtimes; everything else starts
+    /// from the same empty state, so a new counter is added here once.
+    pub(crate) fn new(
+        job: String,
+        profile: ScanProfile,
+        services: RuntimeServices,
+        budget: Arc<JobBudget>,
+        status: Arc<RwLock<JobStatus>>,
+    ) -> Self {
+        Self {
+            job,
+            profile,
+            client: services.client,
+            store: services.store,
+            guard: services.guard,
+            browser: services.browser,
+            session: services.session,
+            budget,
+            status,
+            markers: AtomicU32::new(0),
+            marker_seed: crate::util::marker_seed(),
+            session_lost: AtomicBool::new(false),
+            lane_charges: AtomicU64::new(0),
+            charges_by_lane: Mutex::new(BTreeMap::new()),
+            current_lane: Mutex::new(None),
+            in_crawl: AtomicBool::new(false),
+            crawl_charges: AtomicU64::new(0),
+            crawl_errors: AtomicU64::new(0),
+            last_crawl_error: Mutex::new(None),
+            forms_skipped: AtomicU64::new(0),
+            forms_submitted: AtomicU64::new(0),
+            check_errors: AtomicU64::new(0),
+            check_error_samples: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Whether a lane has reported the session gone.
     fn session_is_lost(&self) -> bool {
         self.session_lost.load(Ordering::SeqCst)
@@ -341,14 +391,6 @@ impl JobRuntime {
                 "check error samples are full ({MAX_CHECK_ERROR_SAMPLES}); further distinct errors are counted only",
             );
         }
-    }
-
-    /// The error samples kept so far (amendment 58).
-    fn check_error_samples(&self) -> Vec<CheckErrorSample> {
-        self.check_error_samples
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
 
     /// Budget units lanes charged outside an HTTP send.
@@ -487,7 +529,7 @@ impl JobCtx for JobRuntime {
     /// counter is mixed with this job's seed (amendment 55), so no two jobs
     /// share a first marker either.
     fn marker(&self) -> String {
-        let counter = self.markers.fetch_add(1, Ordering::SeqCst) as u32;
+        let counter = self.markers.fetch_add(1, Ordering::SeqCst);
         crate::util::marker(self.marker_seed, counter)
     }
 
@@ -687,31 +729,19 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         slot.canary = picked;
     }
 
-    let runtime = Arc::new(JobRuntime {
-        job: job.clone(),
-        profile: profile.clone(),
-        client: Arc::clone(&job_client),
-        store: Arc::clone(&store),
-        guard,
-        browser,
-        session: observed.as_ref().map(|s| Arc::new(s.material.clone())),
-        budget: Arc::clone(&budget),
-        status: Arc::clone(&status),
-        markers: AtomicU64::new(0),
-        marker_seed: crate::util::marker_seed(),
-        session_lost: AtomicBool::new(false),
-        lane_charges: AtomicU64::new(0),
-        charges_by_lane: Mutex::new(BTreeMap::new()),
-        current_lane: Mutex::new(None),
-        in_crawl: AtomicBool::new(false),
-        crawl_charges: AtomicU64::new(0),
-        crawl_errors: AtomicU64::new(0),
-        last_crawl_error: Mutex::new(None),
-        forms_skipped: AtomicU64::new(0),
-        forms_submitted: AtomicU64::new(0),
-        check_errors: AtomicU64::new(0),
-        check_error_samples: Mutex::new(Vec::new()),
-    });
+    let runtime = Arc::new(JobRuntime::new(
+        job.clone(),
+        profile.clone(),
+        RuntimeServices {
+            client: Arc::clone(&job_client),
+            store: Arc::clone(&store),
+            guard,
+            browser,
+            session: observed.as_ref().map(|s| Arc::new(s.material.clone())),
+        },
+        Arc::clone(&budget),
+        Arc::clone(&status),
+    ));
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
 
     set_phase(&status, JobState::Running, aitm_scan_model::Phase::Crawling);
@@ -1583,10 +1613,16 @@ fn sync_counters(
     );
     // The sample list only ever grows (to its cap) on the runtime, so a
     // longer reading is the newer one and never walks the status backwards.
-    let samples = runtime.check_error_samples();
+    // Compared under the lock and cloned only when it has grown: this runs
+    // after every item, and the list is usually the same length as last time.
+    let samples = runtime
+        .check_error_samples
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if samples.len() > guarded.checks.error_samples.len() {
-        guarded.checks.error_samples = samples;
+        guarded.checks.error_samples = samples.clone();
     }
+    drop(samples);
     raise(
         &mut guarded.probes.rate_waits,
         meter.rate_waits.load(Ordering::SeqCst),
@@ -1744,61 +1780,17 @@ mod tests {
         OnLost, Phase, RecordProbes, StoppedReason,
     };
 
-    /// A [`FakeCheck`] re-labelled `scope: origin` (amendment 38), recording
-    /// the id of every point it was run against.
-    ///
-    /// `FakeCheck`'s own metadata is `scope: point` and it lives in
-    /// `jobs::test_support`, which this task does not write; the wrapper keeps
-    /// the scripted behaviour and changes only the one field the scheduler
-    /// reads here.
-    struct OriginScoped {
-        inner: Arc<FakeCheck>,
-        meta: aitm_scan_model::CheckMeta,
-        seen: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl OriginScoped {
-        fn new(id: &str) -> Arc<Self> {
-            let inner = FakeCheck::new(id, "demo", FakeRun::clean());
-            let mut meta = aitm_scan_model::Check::meta(inner.as_ref()).clone();
-            meta.scope = aitm_scan_model::CheckScope::Origin;
-            Arc::new(Self {
-                inner,
-                meta,
-                seen: std::sync::Mutex::new(Vec::new()),
-            })
-        }
-
-        /// The point ids the check was run against, in order.
-        fn seen(&self) -> Vec<String> {
-            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
-        }
-    }
-
-    impl aitm_scan_model::Check for OriginScoped {
-        fn meta(&self) -> &aitm_scan_model::CheckMeta {
-            &self.meta
-        }
-
-        fn run<'a>(
-            &'a self,
-            point: &'a aitm_scan_model::InsertionPoint,
-            host: &'a dyn aitm_scan_model::ProbeHost,
-        ) -> futures::future::BoxFuture<'a, aitm_scan_model::Verdict> {
-            self.seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(point.id.clone());
-            self.inner.run(point, host)
-        }
-    }
-
     /// Amendment 38 (spec D4/D8): an origin-scoped HTTP check runs once per
     /// target origin even when the crawl discovered no insertion point at all,
     /// and it is run against the origin item, not against a discovered point.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_origin_scoped_check_runs_on_an_origin_without_points() {
-        let check = OriginScoped::new("fake.origin");
+        let check = FakeCheck::with_scope(
+            "fake.origin",
+            "demo",
+            aitm_scan_model::CheckScope::Origin,
+            FakeRun::clean(),
+        );
         let h = Harness::new().with_lane(
             FakeLane::http()
                 .with_points(Vec::new())
@@ -1823,7 +1815,7 @@ mod tests {
         assert_eq!(status.checks.scheduled, 1);
         assert_eq!(status.checks.done, 1);
         assert_eq!(
-            check.seen(),
+            check.points_seen(),
             vec!["origin:http://scan.test:80".to_string()],
             "the check ran once, against the origin item"
         );
@@ -1834,7 +1826,12 @@ mod tests {
     /// that counter is about discovered insertion points.
     #[tokio::test(flavor = "multi_thread")]
     async fn origin_items_do_not_count_as_audited_points() {
-        let origin = OriginScoped::new("fake.origin");
+        let origin = FakeCheck::with_scope(
+            "fake.origin",
+            "demo",
+            aitm_scan_model::CheckScope::Origin,
+            FakeRun::clean(),
+        );
         let h = Harness::new().with_lane(
             FakeLane::http()
                 .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
@@ -1861,7 +1858,7 @@ mod tests {
         assert_eq!(status.points.queued, 3);
         assert_eq!(status.checks.done, 3);
         assert_eq!(
-            origin.seen(),
+            origin.points_seen(),
             vec!["origin:http://scan.test:80".to_string()]
         );
     }
@@ -1934,7 +1931,7 @@ mod tests {
             lane = lane.with_check(FakeCheck::new(
                 &format!("fake.error{i}"),
                 "demo",
-                FakeRun::error(detail),
+                FakeRun::error(*detail),
             ));
         }
         let h = Harness::new().with_lane(lane);
@@ -1993,8 +1990,7 @@ mod tests {
     /// `MAX_EXCERPT_BYTES`; the length is what tells the two orders apart.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_check_error_detail_is_scrubbed_then_bounded() {
-        let detail: &'static str =
-            Box::leak(format!("runner missing: token=abc123 {}", "b".repeat(300)).into_boxed_str());
+        let detail = format!("runner missing: token=abc123 {}", "b".repeat(300));
         let h = Harness::new().with_lane(FakeLane::http().with_check(FakeCheck::new(
             "fake.loud",
             "demo",
@@ -2207,9 +2203,10 @@ mod tests {
         assert_eq!(status.crawl.errors, 0);
     }
 
-    /// Spec D5 / call B15: a host whose answers are all unusable trips the
-    /// per-host error ladder, and the job ends `done` with
-    /// `stopped_reason: errors`.
+    /// Spec D5 / call B15: a host whose every request fails in transport
+    /// (amendment 40: connect and transport failures climb the ladder, a
+    /// status never does) trips the per-host error ladder, and the job ends
+    /// `done` with `stopped_reason: errors`.
     ///
     /// Whole-branch quality finding: the ladder was keyed two ways — the
     /// client recorded under the raw request authority (`scan.test`) and
@@ -2704,9 +2701,7 @@ mod tests {
         job: &str,
         started_at: u64,
     ) -> (super::JobRuntime, Arc<std::sync::RwLock<JobStatus>>) {
-        use std::collections::BTreeMap;
-        use std::sync::atomic::{AtomicBool, AtomicU64};
-        use std::sync::{Mutex, RwLock};
+        use std::sync::RwLock;
         use std::time::Instant;
 
         let status = Arc::new(RwLock::new(JobStatus {
@@ -2714,35 +2709,23 @@ mod tests {
             started_at,
             ..JobStatus::default()
         }));
-        let runtime = super::JobRuntime {
-            job: job.to_string(),
-            profile: h.profile(&["http://scan.test"]),
-            client: Arc::clone(&h.client) as Arc<dyn aitm_core::ProxyClient>,
-            store: Arc::clone(&h.store) as Arc<dyn FlowStore>,
-            guard: Arc::clone(&h.guard) as Arc<dyn aitm_core::ScopeRateGuard>,
-            browser: None,
-            session: None,
-            budget: Arc::new(crate::client::JobBudget::new(
+        let runtime = super::JobRuntime::new(
+            job.to_string(),
+            h.profile(&["http://scan.test"]),
+            super::RuntimeServices {
+                client: Arc::clone(&h.client) as Arc<dyn aitm_core::ProxyClient>,
+                store: Arc::clone(&h.store) as Arc<dyn FlowStore>,
+                guard: Arc::clone(&h.guard) as Arc<dyn aitm_core::ScopeRateGuard>,
+                browser: None,
+                session: None,
+            },
+            Arc::new(crate::client::JobBudget::new(
                 100,
                 Instant::now() + Duration::from_secs(60),
                 tokio_util::sync::CancellationToken::new(),
             )),
-            status: Arc::clone(&status),
-            markers: AtomicU64::new(0),
-            marker_seed: crate::util::marker_seed(),
-            session_lost: AtomicBool::new(false),
-            lane_charges: AtomicU64::new(0),
-            charges_by_lane: Mutex::new(BTreeMap::new()),
-            current_lane: Mutex::new(None),
-            in_crawl: AtomicBool::new(false),
-            crawl_charges: AtomicU64::new(0),
-            crawl_errors: AtomicU64::new(0),
-            last_crawl_error: Mutex::new(None),
-            forms_skipped: AtomicU64::new(0),
-            forms_submitted: AtomicU64::new(0),
-            check_errors: AtomicU64::new(0),
-            check_error_samples: Mutex::new(Vec::new()),
-        };
+            Arc::clone(&status),
+        );
         (runtime, status)
     }
 
@@ -2856,18 +2839,6 @@ mod tests {
             "a sync copies, it does not add"
         );
         assert_eq!(seen.crawl.forms_skipped, 0);
-    }
-
-    /// Amendment 53 is additive on the wire: a status record written before
-    /// any lane reported submissions — no `forms_submitted` key at all —
-    /// still parses, and reads 0 (the struct-level serde default).
-    #[test]
-    fn a_record_without_forms_submitted_reads_zero() {
-        let old: aitm_scan_model::CrawlCounters =
-            serde_json::from_str(r#"{"pages":3,"queued":0,"depth":1}"#)
-                .expect("a record without forms_submitted parses");
-        assert_eq!(old.forms_submitted, 0);
-        assert_eq!(old.pages, 3);
     }
 
     /// Replicate the end-of-crawling fold the worker does: fold `crawl.errors`

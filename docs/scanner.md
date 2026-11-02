@@ -421,9 +421,10 @@ present only when `findings.dir` is set, because the reproduction's
 A fourth note (amendment 58): a check that returns `error` is counted in
 `checks.errors`, and the first eight distinct `(check, detail)` pairs of a job
 are kept on `checks.error_samples` as `{ check, point, detail }` (the detail
-scrubbed and bounded like an evidence excerpt) with one warning logged per
-distinct detail, so a lane that is inert leaves a trace instead of `done` with
-nothing to show. `crawl.forms_submitted` is written by any lane through
+scrubbed and bounded like an evidence excerpt) with one warning per distinct
+detail kept (the first eight), then one notice that the sample store is full;
+later distinct errors are counted only. So a lane that is inert leaves a trace
+instead of `done` with nothing to show. `crawl.forms_submitted` is written by any lane through
 `JobCtx::report_forms_submitted`; the interim lane counts the POST forms it
 submitted (amendment 53).
 

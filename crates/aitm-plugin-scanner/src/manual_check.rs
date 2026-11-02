@@ -21,7 +21,7 @@
 //! interim HTTP lane discover and host the point out of that store. The
 //! operator's capture list is untouched.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -200,7 +200,7 @@ impl Command for ManualCheck {
             store: Arc::clone(&scratch),
             guard: Arc::clone(&services.guard),
             budget,
-            markers: AtomicU64::new(0),
+            markers: AtomicU32::new(0),
             marker_seed: util::marker_seed(),
         });
 
@@ -252,21 +252,25 @@ impl Command for ManualCheck {
     }
 }
 
-/// `verdict` with its evidence — and every `more` sibling's — scrubbed through
-/// [`util::scrub`] and `matched` bounded, in that order (amendment 16): a cut
-/// before the scrub could leave a credential fragment the scrubber no longer
-/// recognises. Idempotent, so a Rhai verdict the bridge already scrubbed comes
-/// through unchanged.
+/// `verdict` with its `detail` and evidence — and every `more` sibling's —
+/// scrubbed through [`util::scrub`] and `matched` bounded, in that order
+/// (amendment 16): a cut before the scrub could leave a credential fragment
+/// the scrubber no longer recognises. Idempotent, so a Rhai verdict the bridge
+/// already scrubbed comes through unchanged.
 fn scrubbed(mut verdict: Verdict) -> Verdict {
-    // `detail` can echo a response snippet just like `matched` (the bridge's
-    // plain-string verdict form puts the whole string there); the job path
-    // never emits it, the manual path does, so it is scrubbed here too.
+    scrub_verdict(&mut verdict);
+    verdict.more.iter_mut().for_each(scrub_verdict);
+    verdict
+}
+
+/// Scrub one [`Verdict`]'s own free text in place: its `detail` and its
+/// [`Evidence`]. `detail` can echo a response snippet just like `matched` (the
+/// bridge's plain-string verdict form puts the whole string there); the job
+/// path never emits it, the manual path does, so it is scrubbed here too. One
+/// rule for the root and every sibling, so neither place can be missed.
+fn scrub_verdict(verdict: &mut Verdict) {
     verdict.detail = util::scrub(&verdict.detail);
     scrub_evidence(&mut verdict.evidence);
-    for sibling in &mut verdict.more {
-        scrub_evidence(&mut sibling.evidence);
-    }
-    verdict
 }
 
 /// Scrub one [`Evidence`]'s two free-text fields in place.
@@ -395,7 +399,8 @@ struct ManualJob {
     store: Arc<dyn FlowStore>,
     guard: Arc<dyn aitm_core::ScopeRateGuard>,
     budget: Arc<JobBudget>,
-    markers: AtomicU64,
+    /// The per-call marker counter, as wide as [`util::marker`]'s.
+    markers: AtomicU32,
     /// Minted per invocation (amendment 55): a manual run's markers are as
     /// unguessable up front as a job's.
     marker_seed: u32,
@@ -448,7 +453,7 @@ impl JobCtx for ManualJob {
 
     /// Fresh per call (amendment 57), seeded per invocation (amendment 55).
     fn marker(&self) -> String {
-        let counter = self.markers.fetch_add(1, Ordering::SeqCst) as u32;
+        let counter = self.markers.fetch_add(1, Ordering::SeqCst);
         util::marker(self.marker_seed, counter)
     }
 }
@@ -576,7 +581,7 @@ mod tests {
                             matched: Some("Cookie: sid=s3cr3t-cookie".to_string()),
                             ..Evidence::default()
                         },
-                        detail: "sibling".to_string(),
+                        detail: "sibling: Authorization: Bearer abc.def.ghi".to_string(),
                         poc_hint: None,
                         location: None,
                         more: Vec::new(),
@@ -906,6 +911,11 @@ mod tests {
         let sibling = obj(&more[0], "evidence");
         assert_eq!(obj(sibling, "matched"), &s("Cookie: [redacted]"));
         assert_eq!(obj(sibling, "payload"), &s("sid=[redacted]"));
+        assert_eq!(
+            obj(&more[0], "detail"),
+            &Value::Str("sibling: Authorization: [redacted]".into()),
+            "a sibling's detail is scrubbed like the root's"
+        );
     }
 
     /// Deny-by-default: a URL outside the HTTP scope is refused before anything

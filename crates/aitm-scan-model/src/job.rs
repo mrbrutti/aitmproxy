@@ -458,25 +458,26 @@ mod tests {
     /// Panel Q4 — the summary is structurally the status minus exactly the
     /// per-phase detail: every surviving key carries the same value, and no
     /// key is added.
-    /// Additive crawl counters (2026-11-01): `errors` and `forms_skipped`
-    /// default to 0 when absent on the wire, so an older frontend's record or
-    /// a lane that never reports them still parses; both serialize by name.
+    /// Additive crawl counters (2026-11-01, amendment 53): `errors`,
+    /// `forms_skipped` and `forms_submitted` default to 0 when absent on the
+    /// wire — a record written before any of them existed carries none of
+    /// the three keys — so an older frontend's record or a lane that never
+    /// reports them still parses; they serialize by name.
     #[test]
     fn crawl_counters_additive_fields_default_to_zero() {
-        let old: CrawlCounters =
-            serde_json::from_str(r#"{"pages":3,"queued":0,"depth":1,"forms_submitted":2}"#)
-                .expect("a record without the additive fields parses");
+        let old: CrawlCounters = serde_json::from_str(r#"{"pages":3,"queued":0,"depth":1}"#)
+            .expect("a record without the additive fields parses");
         assert_eq!(
             old,
             CrawlCounters {
                 pages: 3,
                 depth: 1,
-                forms_submitted: 2,
                 ..CrawlCounters::default()
             }
         );
         assert_eq!(old.errors, 0);
         assert_eq!(old.forms_skipped, 0);
+        assert_eq!(old.forms_submitted, 0);
 
         let json = serde_json::to_value(CrawlCounters {
             forms_skipped: 4,
