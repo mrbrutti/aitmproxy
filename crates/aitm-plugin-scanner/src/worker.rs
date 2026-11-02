@@ -1662,9 +1662,10 @@ mod tests {
             .expect("the job is in the registry");
         // `cancel` answers with the status as it stands: `Cancelling` while the
         // worker is still unwinding, or already `Cancelled` when the finaliser
-        // beat this read on the multi-thread runtime (CI: "left: Cancelled,
-        // right: Cancelling"; amendment 71b). Either says the cancel took; the
-        // terminal facts are asserted after the signal below.
+        // beat this read on the multi-thread runtime (CI Rust gate on #229,
+        // #287, #290, #292, 2026-11-02: "left: Cancelled, right: Cancelling";
+        // coordinator's amendment 71b, test determinism). Either says the cancel
+        // took; the terminal facts are asserted after the signal below.
         assert!(
             matches!(cancelling.state, JobState::Cancelling | JobState::Cancelled),
             "cancel answered {:?}",
@@ -2692,9 +2693,9 @@ mod tests {
         .expect("the job starts");
         // No pre-terminal read of the hold here: on the multi-thread runtime
         // the lane's panic can end the job before this line runs, so "a
-        // running job holds the posture" raced the supervisor (CI flake,
-        // amendment 71b). The cancel test above pins that property race-free
-        // behind its blocking check.
+        // running job holds the posture" raced the supervisor (CI Rust gate on
+        // #289, 2026-11-02; coordinator's amendment 71b). The cancel test above
+        // pins that property race-free behind its blocking check.
 
         // The terminal signal decides when the job is over; `TERMINAL_NET` is
         // the only net (the old 2 s bound tripped on a loaded gate machine).

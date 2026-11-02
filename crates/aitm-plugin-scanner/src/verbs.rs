@@ -1565,9 +1565,12 @@ mod tests {
 
     /// AC T1-1: `scan.start` returns the accepted job at once; the work happens
     /// in the background. Proven without a clock: the job runs a check that
-    /// cannot end until the job is cancelled, so the verb answering at all,
-    /// with the job's terminal signal still unset, shows it did not wait for
-    /// the work (the old `elapsed() < 2 s` bound tripped on a loaded CI runner;
+    /// does not end until the job is cancelled (or the engine's
+    /// `check_timeout_s`, 60 s by default, cuts it), so the verb answering with
+    /// the job's terminal signal still unset shows it did not wait for the
+    /// work; a `scan.start` that did wait would come back late with the signal
+    /// already `true` — a failure, not a hang. The old `elapsed() < 2 s` bound
+    /// tripped on a loaded CI runner (#290, 2026-11-02; coordinator's
     /// amendment 71b).
     #[tokio::test(flavor = "multi_thread")]
     async fn start_returns_a_start_result_immediately() {
