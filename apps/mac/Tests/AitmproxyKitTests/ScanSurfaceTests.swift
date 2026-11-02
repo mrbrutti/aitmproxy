@@ -2982,4 +2982,104 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.cancelHelpText.contains(banned))
         #expect("Stopped early: the time budget ran out.".contains(banned) == false, "`Stopped` is not the whole word `stop`")
     }
+
+    /// AC25 (Jobs view D13): Scan Again is client-side only. The arguments are the
+    /// status's `profile_name` plus a `target.origins` override; the gate is Start
+    /// Scan's; the help names the profile and the hosts; the confirm sheet's summary
+    /// line is derived from either argument shape; the inline error has its own slot.
+    @Test func scanAgainArgumentsAndGate() throws {
+        let doneJob = "scan-done"
+        let runningJob = "scan-1a2b3c4d"
+        let done = try Self.progressFacts(state: .done, phase: .done, edits: Self.compJob + [(["job"], .string(doneJob))])
+        let running = try Self.progressFacts(state: .running, phase: .auditing, edits: Self.compJob)
+        var model = ScanSurfaceModel()
+        model.applyStatus(try #require(done.status))
+        model.applyStatus(try #require(running.status))
+
+        // The arguments: the exact dictionary the engine resolves then merges.
+        let args = try #require(model.scanAgainArguments(for: doneJob))
+        #expect(args.tool == "scan.start")
+        let expected: [String: JSONValue] = [
+            "profile_name": "standard",
+            "overrides": ["target": ["origins": ["http://127.0.0.1:8117"]]],
+        ]
+        #expect(args.args == expected)
+        #expect(model.scanAgainArguments(for: runningJob) == nil, "a running job cannot be scanned again")
+        #expect(model.scanAgainArguments(for: "scan-unknown") == nil, "nor an unread one")
+
+        // The gate: nil in scope with the tool; else why not, in Start Scan's order.
+        let inScope = ["127.0.0.1:8117"]
+        #expect(model.scanAgainRefusal(for: doneJob, scopeHosts: inScope, tools: Self.toolsWithStart) == nil)
+        #expect(model.scanAgainRefusal(for: doneJob, scopeHosts: Self.scope, tools: Self.toolsWithStart)
+                == "Out of scope — add 127.0.0.1:8117 to scope to scan it")
+        #expect(model.scanAgainRefusal(for: doneJob, scopeHosts: [], tools: Self.toolsWithStart)
+                == "Out of scope — add 127.0.0.1:8117 to scope to scan it", "an empty scope covers nothing")
+        #expect(model.scanAgainRefusal(for: doneJob, scopeHosts: inScope, tools: Self.legacyTools)
+                == "scan.start is not on this bus")
+        #expect(model.scanAgainRefusal(for: doneJob, scopeHosts: inScope, tools: []) == "scan.start is not on this bus")
+        #expect(model.scanAgainRefusal(for: runningJob, scopeHosts: inScope, tools: Self.toolsWithStart)
+                == "Select a finished job.")
+        #expect(model.scanAgainRefusal(for: "scan-unknown", scopeHosts: inScope, tools: Self.toolsWithStart)
+                == "Select a finished job.")
+        let cancelled = try Self.progressFacts(
+            state: .cancelled, phase: .done, edits: Self.compJob + [(["job"], .string("scan-cancelled"))])
+        model.applyStatus(try #require(cancelled.status))
+        #expect(model.scanAgainRefusal(for: "scan-cancelled", scopeHosts: inScope, tools: Self.toolsWithStart) == nil,
+                "cancelled and failed are finished too")
+        // An L4 lane needs a known Inject entry, exactly as Start Scan does.
+        let l4 = try Self.progressFacts(
+            state: .done, phase: .done,
+            edits: Self.compJob + [(["job"], .string("scan-l4")), (["lanes", "requested"], ["http", "l4_stream"])])
+        model.applyStatus(try #require(l4.status))
+        #expect(model.scanAgainRefusal(for: "scan-l4", scopeHosts: inScope, tools: Self.toolsWithStart) == scanL4Hint)
+        model.l4InjectScopeKnown = false
+        #expect(model.scanAgainRefusal(for: "scan-l4", scopeHosts: inScope, tools: Self.toolsWithStart) == scanL4Hint)
+        model.l4InjectScopeKnown = true
+        #expect(model.scanAgainRefusal(for: "scan-l4", scopeHosts: inScope, tools: Self.toolsWithStart) == nil)
+        #expect(model.scanAgainRefusal(for: doneJob, scopeHosts: inScope, tools: Self.toolsWithStart) == nil,
+                "an HTTP-only job never needs the L4 entry")
+
+        // The help names what will run.
+        #expect(ScanSurfaceModel.scanAgainHelp(try #require(done.status))
+                == "Start a new job with profile standard against 127.0.0.1:8117")
+        let twoHosts = try Self.progressFacts(
+            state: .done, phase: .done, edits: [(["targets"], ["http://a.test", "https://b.test:8443/x"])])
+        #expect(ScanSurfaceModel.scanAgainHelp(try #require(twoHosts.status))
+                == "Start a new job with profile standard against a.test, b.test:8443")
+
+        // The confirm sheet's summary line, from either argument shape.
+        let request = try #require(L4ConfirmRequest(json: [
+            "structuredContent": ["status": "needs_confirmation", "prompt": "Really?", "confirm_token": "t"],
+        ]))
+        let again = ScanConfirm(tool: args.tool, arguments: args.args, request: request)
+        #expect(again.summaryLine == "Profile standard · 127.0.0.1:8117")
+        var profile = try Self.standardProfile()
+        profile.name = "my-api"
+        profile.target.origins = ["https://api.shop-staging.test", "https://auth.shop-staging.test/login"]
+        let start = ScanConfirm(tool: "scan.start", arguments: ["profile": profile.json()], request: request)
+        #expect(start.summaryLine == "Profile my-api · api.shop-staging.test, auth.shop-staging.test")
+
+        // The inline error has its own slot and its own clearing rules (D13).
+        #expect(model.scanAgainError == nil)
+        model.select(job: doneJob)
+        model.launchInFlight = true
+        model.applyScanAgainError(ScanLaunchError(busMessage: "scan: busy: no", origins: ["http://127.0.0.1:8117"]))
+        #expect(model.scanAgainError?.code == "busy")
+        #expect(model.scanAgainError?.display == "A scan on this origin is already running")
+        #expect(!model.launchInFlight)
+        #expect(model.statusLine == nil, "the Profiles footer is Start Scan's home, not Scan Again's")
+        #expect(model.launchError == nil)
+        model.select(job: doneJob)
+        #expect(model.scanAgainError != nil, "re-selecting the same job keeps it")
+        model.select(job: runningJob)
+        #expect(model.scanAgainError == nil, "selecting another job clears it")
+        model.applyScanAgainError(ScanLaunchError(busMessage: "scan: invalid_profile: no such profile", origins: []))
+        #expect(model.scanAgainError?.display == "no such profile")
+        model.clearScanAgainError()
+        #expect(model.scanAgainError == nil, "Escape clears it")
+        model.applyScanAgainError(ScanLaunchError(busMessage: "plain words", origins: []))
+        #expect(model.scanAgainError?.display == "plain words")
+        model.applyStart(try ScanStartResult(json: Self.load("scan.start.json")))
+        #expect(model.scanAgainError == nil, "a successful start clears it")
+    }
 }

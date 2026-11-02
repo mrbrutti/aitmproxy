@@ -269,6 +269,26 @@ public struct ScanConfirm: Hashable, Sendable {
         args["_confirm"] = .string(request.token)
         return args
     }
+
+    /// What the sheet says it is about to start (Jobs view D13): `Profile standard ·
+    /// 127.0.0.1:8117`, read from the arguments in either shape: Start Scan's inline
+    /// `profile` (its `name` and `target.origins`) or Scan Again's `profile_name` plus
+    /// the `overrides.target.origins` override. A name the arguments lack reads `—`;
+    /// the host clause is left off when there are no origins.
+    public var summaryLine: String {
+        let name: String?
+        let origins: [JSONValue]
+        if let profile = arguments["profile"] {
+            name = profile["name"]?.stringValue
+            origins = profile["target"]?["origins"]?.arrayValue ?? []
+        } else {
+            name = arguments["profile_name"]?.stringValue
+            origins = arguments["overrides"]?["target"]?["origins"]?.arrayValue ?? []
+        }
+        let profile = (name?.isEmpty == false ? name : nil) ?? ScanFormat.missingValue
+        let hosts = ScanFormat.hostsJoined(origins: origins.compactMap(\.stringValue))
+        return hosts.map { "Profile \(profile) · \($0)" } ?? "Profile \(profile)"
+    }
 }
 
 /// A thrown launch error, read as `scan: <code>: <message>` when the engine
@@ -1010,6 +1030,10 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// The last launch error whole (its code and origins), for the footer's detail;
     /// cleared by a start, a confirm request or picking another profile.
     public var launchError: ScanLaunchError?
+    /// A Scan Again the bus refused (Jobs view D13), shown under the card's title row as
+    /// `Unable to scan again: <display>`; cleared by the next successful start, by
+    /// selecting another job, or by Escape. The Profiles footer never shows it.
+    public var scanAgainError: ScanLaunchError?
 
     // Push
     public var lastSeq: [String: UInt64] = [:]
@@ -1124,6 +1148,45 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         let tool = map ? "scan.map" : ScanSurface.startTool
         guard let profile = editedProfile else { return (tool, [:]) }
         return (tool, ["profile": profile.json()])
+    }
+
+    // MARK: Scan Again (Jobs view D13)
+
+    /// nil when Scan Again may be sent for `job`; else why not. The gate is Start Scan's,
+    /// in Start Scan's order: the tool, then the job (missing or not finished), then an L4
+    /// lane with no known Inject entry, then the first target host not in scope.
+    public func scanAgainRefusal(for job: String, scopeHosts: [String], tools: [ToolDescriptor]) -> String? {
+        guard ScanSurface.isOffered(in: tools) else { return "scan.start is not on this bus" }
+        guard let status = statuses[job], status.state.isTerminal else { return "Select a finished job." }
+        if status.lanes.requested.contains(where: \.isL4), l4InjectScopeKnown != true { return scanL4Hint }
+        for origin in status.targets {
+            guard let authority = ScanForm.authority(of: origin), Scope.contains(authority, in: scopeHosts) else {
+                return ScanFormat.outOfScopeText(origin: origin)
+            }
+        }
+        return nil
+    }
+
+    /// What Scan Again sends: `scan.start { profile_name, overrides: { target: { origins } } }`
+    /// from the job's status, so the engine resolves the named profile and runs it against
+    /// the same origins. nil when the status is missing or the job is not finished; the
+    /// caller sends nothing while `scanAgainRefusal` is non-nil.
+    public func scanAgainArguments(for job: String) -> (tool: String, args: [String: JSONValue])? {
+        guard let status = statuses[job], status.state.isTerminal else { return nil }
+        let origins = JSONValue.array(status.targets.map(JSONValue.string))
+        return (ScanSurface.startTool, [
+            "profile_name": .string(status.profileName),
+            "overrides": .object(["target": .object(["origins": origins])]),
+        ])
+    }
+
+    /// The Scan Again verb's help: `Start a new job with profile standard against
+    /// 127.0.0.1:8117` (every host, joined with `, `). Without a profile name the generic
+    /// help stands; without targets the `against` clause is left off.
+    public static func scanAgainHelp(_ status: ScanJobStatus) -> String {
+        guard !status.profileName.isEmpty else { return ScanFormat.scanAgainHelpGeneric }
+        let base = "Start a new job with profile \(status.profileName)"
+        return ScanFormat.hostsJoined(origins: status.targets).map { "\(base) against \($0)" } ?? base
     }
 
     /// The Issues list: `filters` applied, one section per severity in severity
@@ -1283,6 +1346,7 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         confirm = nil
         statusLine = nil
         launchError = nil
+        scanAgainError = nil
         launchInFlight = false
     }
 
@@ -1299,6 +1363,19 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         statusLine = error.display
         confirm = nil
         launchInFlight = false
+    }
+
+    /// A Scan Again the bus refused (Jobs view D13): kept whole for the card's inline
+    /// line; the Profiles footer's `statusLine` and `launchError` are not touched.
+    public mutating func applyScanAgainError(_ error: ScanLaunchError) {
+        scanAgainError = error
+        confirm = nil
+        launchInFlight = false
+    }
+
+    /// Escape on the card takes the inline Scan Again error down.
+    public mutating func clearScanAgainError() {
+        scanAgainError = nil
     }
 
     /// The footer has one line. A line the app writes (`Saved <name>`, the delete
@@ -1384,7 +1461,10 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     // MARK: Selection
 
     public mutating func select(job: String?) {
-        if selectedJob != job { selectedJob = job }
+        if selectedJob != job {
+            selectedJob = job
+            scanAgainError = nil
+        }
     }
 
     public mutating func select(issue: String?) {
@@ -1539,7 +1619,12 @@ public enum ScanFormat {
 
     /// The hosts joined with `, `; nil when none are known.
     static func hosts(_ facts: ScanJobFacts) -> String? {
-        let hosts = hostList(facts)
+        hostsJoined(origins: facts.status?.targets ?? [])
+    }
+
+    /// `host[:port]` of every origin, joined with `, `; nil when there are none.
+    static func hostsJoined(origins: [String]) -> String? {
+        let hosts = origins.map(hostOf(origin:))
         return hosts.isEmpty ? nil : hosts.joined(separator: ", ")
     }
 
