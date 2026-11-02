@@ -33,22 +33,22 @@ use crate::types::{Probe, ProcessKey, Tuple};
 // ---------------------------------------------------------------------------
 
 /// `proc_listpids` selector: every pid on the system (line 51 of the header).
-pub(crate) const PROC_ALL_PIDS: u32 = 1;
+const PROC_ALL_PIDS: u32 = 1;
 /// `proc_pidinfo` flavour: the open-file table as `proc_fdinfo` entries.
-pub(crate) const PROC_PIDLISTFDS: i32 = 1;
+const PROC_PIDLISTFDS: i32 = 1;
 /// `proc_pidinfo` flavour: `proc_bsdinfo` (uid, start time, ...).
-pub(crate) const PROC_PIDTBSDINFO: i32 = 3;
+const PROC_PIDTBSDINFO: i32 = 3;
 /// `proc_pidfdinfo` flavour: `socket_fdinfo` for a socket descriptor.
-pub(crate) const PROC_PIDFDSOCKETINFO: i32 = 3;
+const PROC_PIDFDSOCKETINFO: i32 = 3;
 /// `proc_fdinfo.proc_fdtype` of a socket; the only type ever passed on to
 /// `proc_pidfdinfo` (spec D4: never vnodes).
-pub(crate) const PROX_FDTYPE_SOCKET: u32 = 2;
+const PROX_FDTYPE_SOCKET: u32 = 2;
 /// `socket_info.soi_kind` when `soi_proto` holds a `tcp_sockinfo`.
-pub(crate) const SOCKINFO_TCP: i32 = 2;
+const SOCKINFO_TCP: i32 = 2;
 /// `in_sockinfo.insi_vflag` bit: the address unions hold `in4in6_addr`.
-pub(crate) const INI_IPV4: u8 = 0x1;
+const INI_IPV4: u8 = 0x1;
 /// `in_sockinfo.insi_vflag` bit: the address unions hold `in6_addr`.
-pub(crate) const INI_IPV6: u8 = 0x2;
+const INI_IPV6: u8 = 0x2;
 /// `PROC_PIDPATHINFO_MAXSIZE` = `4 * MAXPATHLEN`: the buffer `proc_pidpath` wants.
 const PID_PATH_BUF: usize = 4096;
 /// `proc_name` writes at most `2 * MAXCOMLEN` bytes; 256 is generous.
@@ -62,7 +62,7 @@ const PID_NAME_BUF: usize = 256;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[allow(non_camel_case_types)]
-pub(crate) struct proc_fdinfo {
+struct proc_fdinfo {
     pub proc_fd: i32,
     pub proc_fdtype: u32,
 }
@@ -72,7 +72,7 @@ pub(crate) struct proc_fdinfo {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[allow(non_camel_case_types)]
-pub(crate) struct in_sockinfo {
+struct in_sockinfo {
     pub insi_fport: i32,
     pub insi_lport: i32,
     pub insi_gencnt: u64,
@@ -93,7 +93,7 @@ pub(crate) struct in_sockinfo {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[allow(non_camel_case_types)]
-pub(crate) struct tcp_sockinfo {
+struct tcp_sockinfo {
     pub tcpsi_ini: in_sockinfo,
     pub tcpsi_state: i32,
     /// `tcpsi_timer[4]`, `tcpsi_mss`, `tcpsi_flags`, `rfu_1`, `tcpsi_tp` (36 bytes).
@@ -110,7 +110,7 @@ pub(crate) struct tcp_sockinfo {
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 #[allow(non_camel_case_types, dead_code)]
-pub(crate) struct socket_info {
+struct socket_info {
     /// `soi_stat` (136) + `soi_so` (8) + `soi_pcb` (8).
     _soi_head: [u8; 152],
     _soi_type: i32,
@@ -130,7 +130,7 @@ pub(crate) struct socket_info {
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 #[allow(non_camel_case_types)]
-pub(crate) struct socket_fdinfo {
+struct socket_fdinfo {
     _pfi: [u8; 24],
     pub psi: socket_info,
 }
@@ -161,8 +161,10 @@ const _: () = assert!(size_of::<libc::proc_bsdinfo>() == 136);
 const _: () = assert!(size_of::<tcp_sockinfo>() <= 528);
 
 // ---------------------------------------------------------------------------
-// Safe wrappers. `find_owners_raw`, `pid_path` and `pid_name` are what
-// `macos::scan::MacScanner` calls; the rest are its building blocks.
+// Safe wrappers. `find_owners_raw`, `find_owners_among_raw`, `pid_path` and
+// `pid_name` are the crate-visible entry points `macos::scan::MacScanner`
+// calls; everything else is a private building block (quality finding Q3:
+// `tcp_socket` on an arbitrary fd must not be reachable from other modules).
 // ---------------------------------------------------------------------------
 
 /// `pid` as the `int` libproc wants; `None` for a value no process can have.
@@ -182,7 +184,7 @@ fn positive_len(rc: libc::c_int) -> Option<usize> {
 /// Every pid on the system, ascending and de-duplicated, via
 /// `proc_listpids(PROC_ALL_PIDS)` with the usual two-call sizing (a size query,
 /// then a buffer with slack for pids forked in between). Empty on any error.
-pub(crate) fn list_pids() -> Vec<u32> {
+fn list_pids() -> Vec<u32> {
     // SAFETY: a null buffer with size 0 is the documented size query: libproc
     // writes nothing and returns the byte count it would need.
     let needed = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
@@ -222,8 +224,9 @@ pub(crate) fn list_pids() -> Vec<u32> {
 
 /// The socket descriptors of `pid` (`PROC_PIDLISTFDS`, filtered to
 /// `PROX_FDTYPE_SOCKET`). `None` when the table cannot be read (`EPERM` for
-/// another user's process, `ESRCH` for a gone one) or is empty; both are skips.
-pub(crate) fn socket_fds(pid: u32) -> Option<Vec<i32>> {
+/// another user's process, `ESRCH` for a gone one) or has no entries at all;
+/// `Some(vec![])` when it has entries but none is a socket.
+fn socket_fds(pid: u32) -> Option<Vec<i32>> {
     let pid = c_pid(pid)?;
     // SAFETY: a null buffer with size 0 is the documented size query; libproc
     // writes nothing and returns the byte count the fd table needs (or <= 0).
@@ -265,7 +268,7 @@ pub(crate) fn socket_fds(pid: u32) -> Option<Vec<i32>> {
 
 /// The four-tuple of one TCP socket, decoded per spec D4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TcpSocket {
+struct TcpSocket {
     pub laddr: IpAddr,
     pub lport: u16,
     pub faddr: IpAddr,
@@ -289,7 +292,7 @@ fn decode_addr(vflag: u8, raw: &[u8; 16]) -> Option<IpAddr> {
 /// The TCP four-tuple behind `fd` of `pid` (`PROC_PIDFDSOCKETINFO`). `None`
 /// unless the kernel wrote the full 792-byte `socket_fdinfo`, `soi_kind` is
 /// `SOCKINFO_TCP`, and both addresses decode.
-pub(crate) fn tcp_socket(pid: u32, fd: i32) -> Option<TcpSocket> {
+fn tcp_socket(pid: u32, fd: i32) -> Option<TcpSocket> {
     let pid = c_pid(pid)?;
     let mut info = socket_fdinfo::ZERO;
     let size = libc::c_int::try_from(size_of::<socket_fdinfo>()).ok()?;
@@ -371,7 +374,7 @@ pub(crate) fn pid_name(pid: u32) -> Option<String> {
 /// The start time of `pid` in microseconds since the epoch
 /// (`PROC_PIDTBSDINFO` → `pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`).
 /// `None` unless the full 136-byte `proc_bsdinfo` was written.
-pub(crate) fn pid_start_micros(pid: u32) -> Option<u64> {
+fn pid_start_micros(pid: u32) -> Option<u64> {
     let pid = c_pid(pid)?;
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
@@ -420,7 +423,8 @@ pub(crate) fn find_owners_raw(
 
 /// The same match over **only** `pids` (F2, 2026-11-01: the coalescer's warm
 /// set), in the order given; a pid whose fd table cannot be read or holds no
-/// socket is reported in `gone`. One `proc_pidinfo(PROC_PIDLISTFDS)` plus one
+/// socket fd (`Probe::gone`'s contract, same as the Linux walk) is reported in
+/// `gone`. One `proc_pidinfo(PROC_PIDLISTFDS)` plus one
 /// `proc_pidfdinfo` per socket fd per pid; no `proc_listpids`.
 pub(crate) fn find_owners_among_raw(
     wanted: &[Tuple],
@@ -450,7 +454,7 @@ fn walk_pids(wanted: &[Tuple], deadline: Instant, skip_pid: Option<u32>, pids: &
         if Some(pid) == skip_pid {
             continue;
         }
-        let Some(fds) = socket_fds(pid) else {
+        let Some(fds) = socket_fds(pid).filter(|fds| !fds.is_empty()) else {
             probe.gone.push(pid);
             continue;
         };
@@ -480,7 +484,7 @@ fn walk_pids(wanted: &[Tuple], deadline: Instant, skip_pid: Option<u32>, pids: &
 #[cfg(test)]
 mod tests {
     use std::mem::{offset_of, size_of};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
 
     use super::{
@@ -597,7 +601,6 @@ mod tests {
         assert_eq!(pid_name(i32::MAX as u32), None);
         assert_eq!(pid_start_micros(i32::MAX as u32), None);
         assert_eq!(socket_fds(i32::MAX as u32), None);
-        let _: Option<SocketAddr> = None;
     }
 
     /// AC9 (Terminal: binds a loopback socket). F2: a warm probe of our own pid

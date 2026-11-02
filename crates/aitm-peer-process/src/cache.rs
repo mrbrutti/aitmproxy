@@ -45,9 +45,7 @@ impl IdentityCache {
         }
     }
 
-    // Only tests read the size today; `#[allow]` rather than `#[cfg(test)]` so the
-    // plan's signature stays available to the resolver.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }

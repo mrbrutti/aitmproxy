@@ -43,6 +43,7 @@ free ports; the bus token is never printed.
 from __future__ import annotations
 
 import os
+import shutil
 import statistics
 import sys
 import tempfile
@@ -284,6 +285,7 @@ def main() -> int:
             core.stop()
         tls_srv.shutdown()
         up.stop()
+        shutil.rmtree(work, ignore_errors=True)
     return 0
 
 

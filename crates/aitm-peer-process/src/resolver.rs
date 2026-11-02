@@ -69,7 +69,6 @@ fn platform_scanner(skip_pid: Option<u32>) -> PlatformScanner {
 /// is skipped: the proxy's accepted socket is the mirror image of every tuple.
 pub struct ProcessResolver {
     inner: Coalescer<PlatformScanner>,
-    limits: Limits,
 }
 
 impl ProcessResolver {
@@ -80,20 +79,15 @@ impl ProcessResolver {
 
     /// Custom limits, own pid skipped.
     pub fn with_limits(limits: Limits) -> Self {
-        Self::build(limits, Some(std::process::id()))
+        Self::for_tests(limits, Some(std::process::id()))
     }
 
-    /// Replace the skipped pid. Tests only: `None` lets a test resolve its own
-    /// sockets; production never reports itself.
+    /// Custom limits **and** skipped pid. Tests only: `skip_pid = None` lets a
+    /// test resolve its own sockets; production never reports itself.
     #[doc(hidden)]
-    pub fn with_skip_pid(self, skip: Option<u32>) -> Self {
-        Self::build(self.limits, skip)
-    }
-
-    fn build(limits: Limits, skip_pid: Option<u32>) -> Self {
+    pub fn for_tests(limits: Limits, skip_pid: Option<u32>) -> Self {
         Self {
-            inner: Coalescer::new(platform_scanner(skip_pid), limits.clone()),
-            limits,
+            inner: Coalescer::new(platform_scanner(skip_pid), limits),
         }
     }
 }
@@ -116,6 +110,8 @@ impl PeerResolver for ProcessResolver {
 #[cfg(test)]
 mod tests {
     use super::ProcessResolver;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::types::Limits;
     use aitm_core::peer::PeerResolver;
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -137,7 +133,7 @@ mod tests {
     #[test]
     fn resolve_names_this_process() {
         let (_l, _c, accepted) = accepted_pair();
-        let resolver = ProcessResolver::new().with_skip_pid(None);
+        let resolver = ProcessResolver::for_tests(Limits::default(), None);
         let got = resolver.resolve(
             accepted.peer_addr().expect("peer"),
             accepted.local_addr().expect("local"),

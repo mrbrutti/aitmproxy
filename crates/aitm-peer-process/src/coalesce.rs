@@ -326,11 +326,10 @@ mod tests {
             }
         }
 
-        fn owned(self, tuple: Tuple, key: ProcessKey, name: &str) -> Self {
+        fn owned(mut self, tuple: Tuple, key: ProcessKey, name: &str) -> Self {
             self.owners.lock().unwrap().insert(tuple, key);
-            let mut this = self;
-            this.names.insert(key, name.to_string());
-            this
+            self.names.insert(key, name.to_string());
+            self
         }
 
         /// The process `pid` exits: every socket it owned is gone.
