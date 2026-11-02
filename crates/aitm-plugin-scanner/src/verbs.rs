@@ -1191,7 +1191,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, SystemTime};
 
     use aitm_core::{
         AgentPolicy, Body, Command, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore,
@@ -1564,16 +1564,27 @@ mod tests {
     }
 
     /// AC T1-1: `scan.start` returns the accepted job at once; the work happens
-    /// in the background.
+    /// in the background. Proven without a clock: the job runs a check that
+    /// cannot end until the job is cancelled, so the verb answering at all,
+    /// with the job's terminal signal still unset, shows it did not wait for
+    /// the work (the old `elapsed() < 2 s` bound tripped on a loaded CI runner;
+    /// amendment 71b).
     #[tokio::test(flavor = "multi_thread")]
     async fn start_returns_a_start_result_immediately() {
-        let h = Harness::new();
+        let h = Harness::with_check(FakeCheck::blocking("fake.blocker"));
+        h.capture("/search?q=1", HeaderMap::new(), "ok");
 
-        let began = Instant::now();
         let result = h.ok("scan.start", &[("target", s("http://scan.test"))]);
-        assert!(began.elapsed() < Duration::from_secs(2));
 
         let job = as_str(obj(&result, "job")).to_string();
+        assert_eq!(
+            h.engine
+                .registry
+                .terminal_signal(&job)
+                .map(|signal| *signal.borrow()),
+            Some(false),
+            "the verb answered while its job was still running"
+        );
         assert_eq!(job.len(), 13, "`{job}` is `scan-<8 hex>`");
         assert!(job.starts_with("scan-"));
         assert!(job[5..].chars().all(|c| c.is_ascii_hexdigit()));
@@ -1585,6 +1596,7 @@ mod tests {
         assert_eq!(as_str(obj(&skipped[0], "lane")), "ws");
         assert_eq!(as_array(obj(obj(&result, "lanes"), "run")).len(), 1);
 
+        h.ok("scan.cancel", &[("job", s(&job))]);
         h.wait_terminal(&job).await;
     }
 
