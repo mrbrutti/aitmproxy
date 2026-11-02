@@ -316,3 +316,234 @@ import Testing
         #expect(!HexDump.lines(preview.bytes).isEmpty)
     }
 }
+
+@Suite struct L4Section2Tests {
+    /// Spec §2: an `l4.flow.get` packet carries `bytes` (standard base64 →
+    /// `Data`), `timestamp` (epoch ms → `Date`), `proto`, `src`/`dst` and
+    /// `src_port`/`dst_port`; the old four fields stay.
+    @Test func testPacketParsesSection2Fields() throws {
+        let json = JSONValue.object([
+            "id": .string("F1"),
+            "kind": .string("capture"),
+            "interface": .string("lo0"),
+            "packets": .array([
+                .object([
+                    "dir": .string("inbound"), "length": .number(2), "injected": .bool(false),
+                    "layers": .array([.string("IPv4"), .string("UDP")]),
+                    "bytes": .string("3q0="),
+                    "timestamp": .number(1_700_000_000_123),
+                    "proto": .string("UDP"),
+                    "src": .string("127.0.0.1"), "dst": .string("127.0.0.1"),
+                    "src_port": .number(40000), "dst_port": .number(9053),
+                ]),
+            ]),
+        ])
+        let flow = try #require(L4Flow(json: json))
+        let packet = try #require(flow.packets.first)
+        #expect(packet.bytes == Data([0xde, 0xad]))
+        let ts = try #require(packet.timestamp)
+        #expect((ts.timeIntervalSince1970 * 1000).rounded() == 1_700_000_000_123)
+        #expect(packet.proto == "UDP")
+        #expect(packet.src == "127.0.0.1")
+        #expect(packet.dst == "127.0.0.1")
+        #expect(packet.srcPort == 40000)
+        #expect(packet.dstPort == 9053)
+        #expect(packet.length == 2)
+        #expect(packet.dir == .inbound)
+        #expect(packet.layers == ["IPv4", "UDP"])
+
+        // The public init keeps working for callers that know only the old four fields.
+        let old = L4Packet(index: 0, dir: .outbound, length: 1, injected: true, layers: ["IPv4"])
+        #expect(old.bytes == nil)
+        #expect(old.timestamp == nil)
+        #expect(old.proto == nil)
+        #expect(old.dstPort == nil)
+    }
+
+    /// The flow-level `dst`/`dst_port` make the target `lo0 → 127.0.0.1:9053`
+    /// (a list row shows its target without reading packets); `started_at`
+    /// (epoch ms) becomes `startedAt`.
+    @Test func testFlowTargetUsesDestination() throws {
+        let json = JSONValue.object([
+            "id": .string("F1"),
+            "kind": .string("capture"),
+            "interface": .string("lo0"),
+            "filter": .string("udp port 9053"),
+            "started_at": .number(1_700_000_000_000),
+            "proto": .string("UDP"),
+            "src": .string("127.0.0.1"), "dst": .string("127.0.0.1"),
+            "src_port": .number(40000), "dst_port": .number(9053),
+            "packet_count": .number(0), "injected_count": .number(0),
+            "packets": .array([]),
+        ])
+        let flow = try #require(L4Flow(json: json))
+        #expect(flow.target == "lo0 → 127.0.0.1:9053")
+        #expect(flow.startedAt == Date(timeIntervalSince1970: 1_700_000_000))
+        #expect(flow.src == "127.0.0.1")
+        #expect(flow.dst == "127.0.0.1")
+        #expect(flow.srcPort == 40000)
+        #expect(flow.dstPort == 9053)
+        #expect(flow.protoName == "UDP")
+        #expect(flow.row(seq: 1, inScope: true).l4?.target == "lo0 → 127.0.0.1:9053")
+    }
+
+    /// An older core's reply (no §2 keys) still parses, with the old
+    /// interface + filter target text.
+    @Test func testOldFlowShapeStillParses() throws {
+        let json = JSONValue.object([
+            "id": .string("a1b2"),
+            "kind": .string("capture"),
+            "interface": .string("lo0"),
+            "filter": .string("udp port 9"),
+            "queue": .null,
+            "packet_count": .number(1),
+            "injected_count": .number(0),
+            "packets": .array([
+                .object(["dir": .string("inbound"), "length": .number(40), "injected": .bool(false),
+                         "layers": .array([.string("IPv4"), .string("UDP")])]),
+            ]),
+        ])
+        let flow = try #require(L4Flow(json: json))
+        #expect(flow.target == "lo0 · udp port 9")
+        #expect(flow.startedAt == nil)
+        #expect(flow.dst == nil)
+        #expect(flow.dstPort == nil)
+        #expect(flow.protoName == nil)
+        #expect(flow.packets.count == 1)
+        #expect(flow.packets[0].bytes == nil)
+        #expect(flow.packets[0].timestamp == nil)
+        #expect(flow.packets[0].dstPort == nil)
+    }
+
+    /// Spec §2 bounded window: list polling asks `limit: 0`, the inspector a
+    /// window of 256 from 0, and against an older core (no `limit` in the
+    /// schema) only `id` is sent.
+    @Test func testFlowGetArgs() {
+        let id = FlowID("F1")
+        #expect(L4Wire.flowGetArgs(id: id, inspect: false, window: false) == ["id": .string("F1")])
+        #expect(L4Wire.flowGetArgs(id: id, inspect: true, window: false) == ["id": .string("F1")])
+        #expect(L4Wire.flowGetArgs(id: id, inspect: false, window: true)
+            == ["id": .string("F1"), "limit": .number(0)])
+        #expect(L4Wire.flowGetArgs(id: id, inspect: true, window: true)
+            == ["id": .string("F1"), "offset": .number(0), "limit": .number(256)])
+    }
+
+    /// `l4.scope.list` entries parse with their `source` provenance; the AC5
+    /// draft builds exactly the five `l4.scope.add` keys; `covers` matches
+    /// interface, CIDR and port range.
+    @Test func testScopeItemsDraftAndCovers() throws {
+        let reply = JSONValue.object([
+            "structuredContent": .array([
+                .object([
+                    "capability": .string("capture"), "cidr": .string("127.0.0.1/32"),
+                    "direction": .string("inbound"), "id": .string("S1"),
+                    "inject_rate": .object(["per_second": .number(0)]),
+                    "interface": .string("lo0"), "ports": .string("9000-9999"),
+                    "source": .string("config"),
+                ]),
+                .object([
+                    "capability": .string("inject"), "cidr": .string("10.0.0.0/8"),
+                    "direction": .string("outbound"), "id": .string("S2"),
+                    "interface": .string("en0"), "source": .string("runtime"),
+                ]),
+            ]),
+        ])
+        let items = L4ScopeItem.list(reply)
+        #expect(items.map(\.id) == ["S1", "S2"])
+        #expect(items[0].cidr == "127.0.0.1/32")
+        #expect(items[0].ports == "9000-9999")
+        #expect(items[0].interface == "lo0")
+        #expect(items[0].direction == "inbound")
+        #expect(items[0].capability == "capture")
+        #expect(items[0].source == "config")
+        #expect(items[1].source == "runtime")
+        #expect(items[1].ports == "all")
+
+        // A bare array (an older core) parses the same; a non-list is empty.
+        #expect(L4ScopeItem.list(.array([.object(["id": .string("S9"), "cidr": .string("::1/128")])])).map(\.id)
+            == ["S9"])
+        #expect(L4ScopeItem.list(.object(["available": .bool(false)])).isEmpty)
+
+        // The AC5 draft → exactly the AC5 keys.
+        let draft = L4ScopeDraft(
+            cidr: "127.0.0.1/32", ports: "9100-9199", interface: "lo0", direction: "inbound",
+            capability: "capture")
+        #expect(draft.args == [
+            "cidr": .string("127.0.0.1/32"), "ports": .string("9100-9199"), "interface": .string("lo0"),
+            "direction": .string("inbound"), "capability": .string("capture"),
+        ])
+        let noPorts = L4ScopeDraft(cidr: "127.0.0.1/32", ports: "", interface: "lo0", direction: "inbound",
+                                   capability: "capture")
+        #expect(noPorts.args == [
+            "cidr": .string("127.0.0.1/32"), "interface": .string("lo0"),
+            "direction": .string("inbound"), "capability": .string("capture"),
+        ])
+
+        // covers: interface, CIDR (IPv4 prefix) and port range.
+        let item = items[0]
+        #expect(item.covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(!item.covers(interface: "lo0", dst: "127.0.0.1", port: 8999))
+        #expect(!item.covers(interface: "en0", dst: "127.0.0.1", port: 9053))
+        #expect(!item.covers(interface: "lo0", dst: "10.0.0.1", port: 9053))
+        #expect(item.covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+        // A /8 entry with all ports covers any host in it on any port.
+        let wide = items[1]
+        #expect(wide.covers(interface: "en0", dst: "10.1.2.3", port: 443))
+        #expect(wide.covers(interface: "en0", dst: "10.255.255.255", port: nil))
+        #expect(!wide.covers(interface: "en0", dst: "11.0.0.1", port: 443))
+        // An IPv6 / unparsable destination matches only a /32-literal of itself.
+        let v6 = L4ScopeItem(
+            id: "S6", cidr: "::1/32", ports: "all", interface: "lo0", direction: "inbound",
+            capability: "capture", source: "config")
+        #expect(v6.covers(interface: "lo0", dst: "::1", port: 9053))
+        #expect(!v6.covers(interface: "lo0", dst: "::2", port: 9053))
+        #expect(!item.covers(interface: "lo0", dst: "::1", port: 9053))
+        // A single-port range.
+        let single = L4ScopeItem(
+            id: "S7", cidr: "127.0.0.1/32", ports: "9053", interface: "lo0", direction: "inbound",
+            capability: "capture", source: "runtime")
+        #expect(single.covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(!single.covers(interface: "lo0", dst: "127.0.0.1", port: 9054))
+    }
+
+    /// AC39: the scope-add control renders only when `tools/list` shows
+    /// `l4.scope.add` with `confirmable: true`.
+    @Test func testSupportsOperatorScopeAdd() {
+        let schema = JSONValue.object(["type": .string("object"), "properties": .object([:])])
+        let confirmable = ToolDescriptor(
+            name: "l4.scope.add", description: "", inputSchema: schema, confirmable: true)
+        let plain = ToolDescriptor(name: "l4.scope.add", description: "", inputSchema: schema, confirmable: false)
+        let other = ToolDescriptor(name: "l4.scope.list", description: "", inputSchema: schema, confirmable: true)
+        #expect(L4Wire.supportsOperatorScopeAdd([other, confirmable]))
+        #expect(!L4Wire.supportsOperatorScopeAdd([other, plain]))
+        #expect(!L4Wire.supportsOperatorScopeAdd([other]))
+        #expect(!L4Wire.supportsOperatorScopeAdd([]))
+        // The default init parameter is false (an existing call site stays unchanged).
+        #expect(!ToolDescriptor(name: "l4.scope.add", description: "", inputSchema: schema).confirmable)
+    }
+
+    /// Spec §2: a UI detects the bounded window from `limit` in the
+    /// `l4.flow.get` inputSchema and omits it against an older core.
+    @Test func testSupportsWindow() {
+        let windowed = ToolDescriptor(
+            name: "l4.flow.get", description: "",
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "id": .object(["type": .string("string")]),
+                    "offset": .object(["type": .string("integer")]),
+                    "limit": .object(["type": .string("integer")]),
+                ]),
+            ]))
+        let old = ToolDescriptor(
+            name: "l4.flow.get", description: "",
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object(["id": .object(["type": .string("string")])]),
+            ]))
+        let list = ToolDescriptor(name: "l4.flow.list", description: "", inputSchema: .object([:]))
+        #expect(L4Wire.supportsWindow([list, windowed]))
+        #expect(!L4Wire.supportsWindow([list, old]))
+        #expect(!L4Wire.supportsWindow([list]))
+    }
+}

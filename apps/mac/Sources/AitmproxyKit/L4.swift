@@ -94,9 +94,11 @@ public enum L4SessionState: String, Sendable, Hashable {
 // MARK: - Packets + flow detail (l4.flow.get)
 
 /// One packet in an L4 flow (`aitm-proto-l4::flow::L4Packet`, as `l4.flow.get`
-/// serializes it): direction, byte length, the decoded layer names, and whether
-/// aitmproxy authored and injected it. `l4.flow.get` carries no raw bytes, so the
-/// hex pane renders from the craft `build()` preview, not from captured packets.
+/// serializes it): direction, byte length, the decoded layer names, whether
+/// aitmproxy authored and injected it, and the l4-parity §2 fields — the on-wire
+/// bytes (present only for a caller the core trusts with them, §2.2), the capture
+/// time, and the decoded protocol / addresses / ports. Every §2 field is optional
+/// so an older core's reply (none of them) still parses.
 public struct L4Packet: Hashable, Sendable, Identifiable {
     public enum Direction: String, Sendable, Hashable { case inbound, outbound }
 
@@ -106,6 +108,16 @@ public struct L4Packet: Hashable, Sendable, Identifiable {
     public let injected: Bool
     /// Decoded layer names, outermost first (`Ethernet` → `IPv4`/`IPv6` → `TCP`/…).
     public let layers: [String]
+    /// The on-wire bytes (`bytes`, standard base64); nil when the core withheld them.
+    public let bytes: Data?
+    /// When the core recorded the packet (`timestamp`, epoch milliseconds).
+    public let timestamp: Date?
+    /// `TCP` / `UDP` / `ICMP` / `ICMPv6`, or nil when undecodable.
+    public let proto: String?
+    public let src: String?
+    public let dst: String?
+    public let srcPort: Int?
+    public let dstPort: Int?
 
     public var id: Int { index }
 
@@ -115,12 +127,23 @@ public struct L4Packet: Hashable, Sendable, Identifiable {
         return "\(names) · \(length) B"
     }
 
-    public init(index: Int, dir: Direction, length: Int, injected: Bool, layers: [String]) {
+    public init(
+        index: Int, dir: Direction, length: Int, injected: Bool, layers: [String],
+        bytes: Data? = nil, timestamp: Date? = nil, proto: String? = nil,
+        src: String? = nil, dst: String? = nil, srcPort: Int? = nil, dstPort: Int? = nil
+    ) {
         self.index = index
         self.dir = dir
         self.length = length
         self.injected = injected
         self.layers = layers
+        self.bytes = bytes
+        self.timestamp = timestamp
+        self.proto = proto
+        self.src = src
+        self.dst = dst
+        self.srcPort = srcPort
+        self.dstPort = dstPort
     }
 
     init?(index: Int, json: JSONValue) {
@@ -130,11 +153,20 @@ public struct L4Packet: Hashable, Sendable, Identifiable {
         self.length = json["length"]?.intValue ?? 0
         self.injected = json["injected"]?.boolValue ?? false
         self.layers = json["layers"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+        self.bytes = json["bytes"]?.stringValue.flatMap { Data(base64Encoded: $0) }
+        self.timestamp = L4Wire.date(epochMillis: json["timestamp"])
+        self.proto = json["proto"]?.stringValue
+        self.src = json["src"]?.stringValue
+        self.dst = json["dst"]?.stringValue
+        self.srcPort = json["src_port"]?.intValue
+        self.dstPort = json["dst_port"]?.intValue
     }
 }
 
-/// An L4 flow's detail (`l4.flow.get`): the bind, the session kind, the packet log
-/// and the counts. Mirrors `WSDetail` for the WebSocket inspector.
+/// An L4 flow's detail (`l4.flow.get`): the bind, the session kind, the packet log,
+/// the counts, and the l4-parity §2 flow-level fields (`started_at` and the first
+/// decodable packet's protocol / addresses / ports, so a list row shows its target
+/// without reading packets). Mirrors `WSDetail` for the WebSocket inspector.
 public struct L4Flow: Hashable, Sendable {
     public let id: FlowID
     public let sessionState: L4SessionState
@@ -144,13 +176,27 @@ public struct L4Flow: Hashable, Sendable {
     public let packetCount: Int
     public let injectedCount: Int
     public let packets: [L4Packet]
+    /// Flow creation (`started_at`, epoch milliseconds); nil from an older core.
+    public let startedAt: Date?
+    /// The flow-level `proto` string the core decoded (`TCP` / `UDP` / …), or nil.
+    public let protoName: String?
+    public let src: String?
+    public let dst: String?
+    public let srcPort: Int?
+    public let dstPort: Int?
 
-    /// The protocol sub-label, classified from the packets' layers.
-    public var proto: L4Proto { L4Proto.fromLayers(packets.first?.layers ?? []) }
+    /// The protocol sub-label: the core's flow-level `proto` when it sent one,
+    /// otherwise classified from the first packet's layers.
+    public var proto: L4Proto {
+        if let protoName { return L4Proto.fromLayers([protoName]) }
+        return L4Proto.fromLayers(packets.first?.layers ?? [])
+    }
 
     public init(
         id: FlowID, sessionState: L4SessionState, interface: String, filter: String? = nil,
-        queue: Int? = nil, packetCount: Int, injectedCount: Int, packets: [L4Packet]
+        queue: Int? = nil, packetCount: Int, injectedCount: Int, packets: [L4Packet],
+        startedAt: Date? = nil, protoName: String? = nil, src: String? = nil, dst: String? = nil,
+        srcPort: Int? = nil, dstPort: Int? = nil
     ) {
         self.id = id
         self.sessionState = sessionState
@@ -160,9 +206,16 @@ public struct L4Flow: Hashable, Sendable {
         self.packetCount = packetCount
         self.injectedCount = injectedCount
         self.packets = packets
+        self.startedAt = startedAt
+        self.protoName = protoName
+        self.src = src
+        self.dst = dst
+        self.srcPort = srcPort
+        self.dstPort = dstPort
     }
 
-    /// Decode an `l4.flow.get` result (`structuredContent`, or a bare object).
+    /// Decode an `l4.flow.get` result (`structuredContent`, or a bare object). The
+    /// §2 keys are optional, so an older core's reply (without them) still parses.
     public init?(json raw: JSONValue) {
         let json = raw["structuredContent"] ?? raw
         guard let id = json["id"]?.stringValue,
@@ -178,11 +231,18 @@ public struct L4Flow: Hashable, Sendable {
         self.packets = packets
         self.packetCount = json["packet_count"]?.intValue ?? packets.count
         self.injectedCount = json["injected_count"]?.intValue ?? packets.filter(\.injected).count
+        self.startedAt = L4Wire.date(epochMillis: json["started_at"])
+        self.protoName = json["proto"]?.stringValue
+        self.src = json["src"]?.stringValue
+        self.dst = json["dst"]?.stringValue
+        self.srcPort = json["src_port"]?.intValue
+        self.dstPort = json["dst_port"]?.intValue
     }
 
-    /// The human-readable L4 target (`iface cidr:port ↕dir` shape; the bind is all
-    /// `l4.flow.get` gives, so we show interface + filter).
+    /// The human-readable L4 target: `<interface> → <dst>:<dstPort>` when the core
+    /// sent the flow-level destination (§2), otherwise the bind's interface + filter.
     public var target: String {
+        if let dst, !dst.isEmpty, let dstPort { return "\(interface) → \(dst):\(dstPort)" }
         if let filter, !filter.isEmpty { return "\(interface) · \(filter)" }
         return interface.isEmpty ? "l4" : interface
     }
@@ -436,6 +496,175 @@ public enum L4Verdict {
     /// `{id: <parked id>}`; Mutate adds `spec` beside it.
     public static func args(parkedID: String) -> [String: JSONValue] {
         ["id": .string(parkedID)]
+    }
+}
+
+// MARK: - Wire capabilities and argument builders (L4PAR-AC25, AC39; spec §2, §3)
+
+/// What the connected core's `tools/list` says the L4 wire supports, and the
+/// argument builders that follow from it. Pure functions over `ToolDescriptor`s,
+/// so a unit test pins each decision without a bus.
+public enum L4Wire {
+    /// True iff `l4.flow.get` declares a `limit` property: the core has the §2
+    /// bounded window (`offset` / `limit`). Against an older core the UI omits both.
+    public static func supportsWindow(_ tools: [ToolDescriptor]) -> Bool {
+        guard let get = tools.first(where: { $0.name == "l4.flow.get" }) else { return false }
+        return get.inputSchema["properties"]?["limit"] != nil
+    }
+
+    /// True iff `l4.scope.add` is listed with `confirmable: true` (spec §3, last
+    /// rule): only then does a UI render its scope-add control. A core without the
+    /// operator confirm path gets no form, not a form that can only fail.
+    public static func supportsOperatorScopeAdd(_ tools: [ToolDescriptor]) -> Bool {
+        tools.contains { $0.name == "l4.scope.add" && $0.confirmable }
+    }
+
+    /// The `l4.flow.get` arguments for one read. Without the window (older core):
+    /// `{id}`. With it, list polling (`inspect: false`) asks `limit: 0` for the
+    /// flow fields alone, and the inspector asks the first window of 256 packets.
+    public static func flowGetArgs(id: FlowID, inspect: Bool, window: Bool) -> [String: JSONValue] {
+        var args: [String: JSONValue] = ["id": .string(id.raw)]
+        guard window else { return args }
+        if inspect {
+            args["offset"] = .number(0)
+            args["limit"] = .number(256)
+        } else {
+            args["limit"] = .number(0)
+        }
+        return args
+    }
+
+    /// An integer epoch-milliseconds value → `Date`; nil for anything else.
+    static func date(epochMillis value: JSONValue?) -> Date? {
+        value?.doubleValue.map { Date(timeIntervalSince1970: $0 / 1000) }
+    }
+}
+
+// MARK: - L4 scope entries and the operator add draft (L4PAR-AC30; spec §3)
+
+/// One `l4.scope.list` entry as the core returns it: the match (cidr, ports,
+/// interface, direction), the capability it authorizes, and its `source`
+/// provenance (`config` from the operator's file, `runtime` added over the bus).
+public struct L4ScopeItem: Hashable, Sendable, Identifiable {
+    public let id: String
+    public let cidr: String
+    /// `lo-hi`, a single port, or `all`. An entry without `ports` matches every port.
+    public let ports: String
+    public let interface: String
+    public let direction: String
+    public let capability: String
+    public let source: String
+
+    public init(
+        id: String, cidr: String, ports: String, interface: String, direction: String,
+        capability: String, source: String
+    ) {
+        self.id = id
+        self.cidr = cidr
+        self.ports = ports
+        self.interface = interface
+        self.direction = direction
+        self.capability = capability
+        self.source = source
+    }
+
+    /// Decode one list entry; nil without an `id` (nothing to show or remove).
+    init?(json: JSONValue) {
+        guard let id = json["id"]?.stringValue else { return nil }
+        self.id = id
+        self.cidr = json["cidr"]?.stringValue ?? ""
+        let ports = json["ports"]?.stringValue?.trimmingCharacters(in: .whitespaces) ?? ""
+        self.ports = ports.isEmpty ? "all" : ports
+        self.interface = json["interface"]?.stringValue ?? ""
+        self.direction = json["direction"]?.stringValue ?? ""
+        self.capability = json["capability"]?.stringValue ?? ""
+        self.source = json["source"]?.stringValue ?? ""
+    }
+
+    /// Parse an `l4.scope.list` reply (a bare array, or `{structuredContent: [...]}`)
+    /// in the core's order. A reply that is not a list yields no entries.
+    public static func list(_ raw: JSONValue) -> [L4ScopeItem] {
+        let json = raw["structuredContent"] ?? raw
+        return (json.arrayValue ?? []).compactMap { L4ScopeItem(json: $0) }
+    }
+
+    /// Whether this entry covers a destination: the same interface, `dst` inside
+    /// `cidr`, and `port` inside `ports` (or `ports` is all, or no port is known).
+    /// The CIDR check is an IPv4 prefix match over the four octets; an IPv6 or
+    /// unparsable `dst` matches only when the entry is literally `<dst>/32`.
+    public func covers(interface: String, dst: String, port: Int?) -> Bool {
+        guard interface == self.interface else { return false }
+        guard Self.cidrContains(cidr, address: dst) else { return false }
+        guard let port else { return true }
+        return Self.portsContain(ports, port: port)
+    }
+
+    static func cidrContains(_ cidr: String, address: String) -> Bool {
+        let parts = cidr.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        let network = String(parts.first ?? "")
+        let prefix = parts.count == 2 ? Int(parts[1]) : 32
+        guard let prefix, (0...32).contains(prefix) else { return false }
+        guard let net = Self.ipv4(network), let addr = Self.ipv4(address) else {
+            // Not IPv4 on one side: only an exact /32 literal of the address matches.
+            return prefix == 32 && network == address
+        }
+        if prefix == 0 { return true }
+        let mask: UInt32 = prefix == 32 ? .max : ~((1 << (32 - UInt32(prefix))) - 1)
+        return (net & mask) == (addr & mask)
+    }
+
+    /// Four dotted decimal octets → a 32-bit value; nil for anything else.
+    static func ipv4(_ text: String) -> UInt32? {
+        let octets = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4 else { return nil }
+        var value: UInt32 = 0
+        for octet in octets {
+            guard !octet.isEmpty, octet.allSatisfy(\.isNumber), let n = UInt32(octet), n <= 255 else { return nil }
+            value = (value << 8) | n
+        }
+        return value
+    }
+
+    static func portsContain(_ ports: String, port: Int) -> Bool {
+        let text = ports.trimmingCharacters(in: .whitespaces)
+        if text.isEmpty || text.lowercased() == "all" { return true }
+        let bounds = text.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let lo = Int(bounds[0].trimmingCharacters(in: .whitespaces)) else { return false }
+        if bounds.count == 1 { return port == lo }
+        guard let hi = Int(bounds[1].trimmingCharacters(in: .whitespaces)) else { return false }
+        return (min(lo, hi)...max(lo, hi)).contains(port)
+    }
+}
+
+/// The operator's scope-add form, as the `l4.scope.add` arguments (AC5): exactly
+/// `cidr`, `ports`, `interface`, `direction`, `capability`; `ports` is omitted when
+/// empty (the core then says `all ports` in its prompt). The core validates every
+/// value and confirms the add over the wire; this only shapes the call.
+public struct L4ScopeDraft: Hashable, Sendable {
+    public var cidr: String
+    public var ports: String
+    public var interface: String
+    public var direction: String
+    public var capability: String
+
+    public init(cidr: String, ports: String, interface: String, direction: String, capability: String) {
+        self.cidr = cidr
+        self.ports = ports
+        self.interface = interface
+        self.direction = direction
+        self.capability = capability
+    }
+
+    public var args: [String: JSONValue] {
+        var args: [String: JSONValue] = [
+            "cidr": .string(cidr),
+            "interface": .string(interface),
+            "direction": .string(direction),
+            "capability": .string(capability),
+        ]
+        let ports = ports.trimmingCharacters(in: .whitespaces)
+        if !ports.isEmpty { args["ports"] = .string(ports) }
+        return args
     }
 }
 
