@@ -428,18 +428,31 @@ impl StdGuard {
             .clear();
     }
 
-    fn is_disabled(&self, host: &str) -> bool {
+    /// Whether `authority` is inside a disable window. An explicit port is one
+    /// service: disabled when its own window or the host-wide window (an
+    /// unported `record_error`) is live. An unported spelling is the host-wide
+    /// view: disabled while any service on that host is, so a disabled target
+    /// is not reachable under a spelling that drops the port.
+    fn is_disabled(&self, authority: &Authority) -> bool {
         if self.host_error_budget == 0 {
             return false;
         }
-        match self
+        let now = Instant::now();
+        let windows = self
             .disabled_until
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(host)
-        {
-            Some(until) => Instant::now() < *until,
-            None => false,
+            .unwrap_or_else(PoisonError::into_inner);
+        let live = |until: &Instant| now < *until;
+        if authority.port == 0 {
+            let prefix = format!("{}:", authority.host);
+            windows
+                .iter()
+                .any(|(key, until)| key.starts_with(&prefix) && live(until))
+        } else {
+            windows.get(&budget_key(authority)).is_some_and(live)
+                || windows
+                    .get(&format!("{}:0", authority.host))
+                    .is_some_and(live)
         }
     }
 }
@@ -467,22 +480,35 @@ fn host_in_scope(host: &str, entry: &str) -> bool {
     }
 }
 
+/// The error-budget / disable-window key of an authority: `host:port`, with the
+/// port as the caller spelled it (the proxy's own client fills the scheme's
+/// default first, see `client.rs`), so each service on a host has its own
+/// budget and a different port is a different target.
+fn budget_key(authority: &Authority) -> String {
+    format!("{}:{}", authority.host, authority.port)
+}
+
 impl ScopeRateGuard for StdGuard {
     fn check_active(&self, host: &str) -> Result<ActionPermit, GuardError> {
         if !self.in_scope(host) {
             return Err(GuardError::OutOfScope(host.to_string()));
         }
-        // Key the throttle, error budget and disable window on the *normalized*
-        // host, the same fold scope matching uses, so `target.example`,
-        // `TARGET.example` and `Target.Example:443` share one bucket/counter and a
-        // disabled host is not reachable under another spelling.
-        let key = match Authority::parse_with_default(host, 0) {
-            Ok(a) => a.host,
+        // The rate throttle is keyed on the *normalized* host (one bucket per
+        // server, whatever the spelling); the error budget and the disable
+        // window are keyed on the normalized `host:port` authority, because two
+        // services on one address are two targets: a budget shared across ports
+        // let one job's erroring target disable another job's target on the same
+        // host (scanner v2 live run, 2026-11-02). Callers pass the authority with
+        // its scheme's default port filled ([`budget_key`]), so `target.example`,
+        // `TARGET.example:443` and `Target.Example` share one counter.
+        let authority = match Authority::parse_with_default(host, 0) {
+            Ok(a) => a,
             Err(_) => return Err(GuardError::OutOfScope(host.to_string())),
         };
-        if self.is_disabled(&key) {
+        if self.is_disabled(&authority) {
             return Err(GuardError::HostDisabled);
         }
+        let key = authority.host;
 
         // Global then per-host rate. A poisoned bucket lock is recovered (its
         // data is still valid) so a panic elsewhere cannot disable throttling.
@@ -583,10 +609,11 @@ impl ScopeRateGuard for StdGuard {
         if self.host_error_budget == 0 {
             return;
         }
-        // Same normalized key as `check_active`, so the budget and disable window
-        // can't be evaded (or double-counted) by spelling the host differently.
+        // Same normalized authority key as `check_active`'s disable check, so
+        // the budget and disable window can't be evaded (or double-counted) by
+        // spelling the host differently.
         let key = match Authority::parse_with_default(host, 0) {
-            Ok(a) => a.host,
+            Ok(a) => budget_key(&a),
             Err(_) => return,
         };
         let mut errors = self
@@ -613,6 +640,46 @@ impl ScopeRateGuard for StdGuard {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(key, until);
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_key_tests {
+    use super::*;
+
+    /// Two services on one host are two targets: exhausting one's error budget
+    /// disables that authority only, and the other is still served. (Before,
+    /// the budget was keyed on the host alone and a full job against the
+    /// vulnerable target on `127.0.0.1:a` disabled the patched one on
+    /// `127.0.0.1:b` for the next job in the same core.)
+    #[test]
+    fn an_exhausted_error_budget_disables_that_authority_only() {
+        let g = StdGuard::new(LimitConfig {
+            per_host_rps: 1000,
+            host_error_budget: 3,
+            ..LimitConfig::default()
+        });
+        g.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        for _ in 0..3 {
+            g.record_error("127.0.0.1:8001");
+        }
+        assert!(
+            matches!(
+                g.check_active("127.0.0.1:8001"),
+                Err(GuardError::HostDisabled)
+            ),
+            "the erroring authority is disabled"
+        );
+        assert!(
+            g.check_active("127.0.0.1:8002").is_ok(),
+            "the other service on the same host is still served"
+        );
+        assert!(
+            matches!(g.check_active("127.0.0.1"), Err(GuardError::HostDisabled)),
+            "the unported spelling is the host-wide view: a disabled service makes it refused"
+        );
     }
 }
 

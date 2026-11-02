@@ -98,6 +98,15 @@ impl PipelineClient {
     }
 }
 
+/// `authority` with `scheme`'s default port filled when it carries none, the
+/// spelling the guard keys its per-service error budget on.
+fn guard_authority(scheme: &str, authority: &str) -> String {
+    match crate::Authority::parse_with_default(authority, crate::Authority::default_port(scheme)) {
+        Ok(a) => format!("{}:{}", a.host, a.port),
+        Err(_) => authority.to_string(),
+    }
+}
+
 impl ProxyClient for PipelineClient {
     fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         // One code path: the shipped behaviour is `send_opts` with the defaults
@@ -111,18 +120,24 @@ impl ProxyClient for PipelineClient {
         opts: SendOptions,
     ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         Box::pin(async move {
+            // The guard keys its error budget per `host:port`; charge it under
+            // the authority with the scheme's default port filled, so
+            // `example.test` and `example.test:443` are one service to it. The
+            // scope/rate check keeps the request's own spelling (its refusal
+            // names what the request said).
+            let authority = guard_authority(&req.scheme, &req.authority);
             // Hold the permit for the whole send (concurrency released on drop).
             let _permit = self.guard.check_active(&req.authority)?;
             let response = match self.sender.send_with(&req, opts.version).await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    // An upstream failure counts against the host's error budget.
-                    self.guard.record_error(&req.authority);
+                    // An upstream failure counts against the target's error budget.
+                    self.guard.record_error(&authority);
                     return Err(e);
                 }
             };
             if response.status >= 500 {
-                self.guard.record_error(&req.authority);
+                self.guard.record_error(&authority);
             }
             let flow = HttpFlow {
                 id: FlowId::new(),
