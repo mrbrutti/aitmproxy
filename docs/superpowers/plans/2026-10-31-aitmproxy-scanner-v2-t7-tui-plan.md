@@ -796,6 +796,7 @@ Kept by the main session during stage 6. One row per finding.
 | 17 | gate | green | workspace gate on `b0f6f181` (round J + main `dd03860a`; `/tmp/claude/t7-gate20.log`): fmt 0, clippy 0, test 0 | push, PR body, panel comment, mergeable check, "255 ready" |
 | 15 | live smoke | run 13 | 55 ok, 1 noted, 0 failed on `b0f6f181`, the same binaries alone right after the gate (`/tmp/claude/t7-live-smoke17`); run 12's two failures gone, confirming the load class; the note is T7-17's `P` on an issue without a PoC | ship |
 | 17 | integration | merged | `a85c440a` merges main `167e74b9` (T2 HTTP lane #223, T8 web Scan surface, testtarget h2 counter; coordinator rule: the head must contain the Rust tip because of the two-line `l4_cua_tui.rs` rename): no conflicts; `crates/aitm-tui` differs from main only by `pub mod scan; pub mod text;` and H19 wording; `CORE_TOOLS` 104 identical to main; `frontends.rs` identical; no TUI logic change, so runs 9-13 stand | `cargo fmt --check`, `cargo test -p aitm-tui`, `cargo test -p aitm --test l4_cua_tui` in the Terminal; push; "255 ready" |
+| 17 | gate | green | on `a85c440a` from the Terminal (`/tmp/claude/t7-gate21.log`): `cargo fmt --check` 0, `cargo test -p aitm-tui` 0 (639 tests incl. `l4_cua_tui`), `cargo test -p aitm --test l4_cua_tui` 0 | push; "255 ready" |
 
 ## Shipped
 
