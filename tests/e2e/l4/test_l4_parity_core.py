@@ -10,8 +10,10 @@ as operator AND as agent and asserted on the core's verbatim replies -- never a 
     inputSchema lists `offset` and `limit`, neither required.
   * AC3: `l4.capture.status` answers operator and agent alike, with no error, the object
     `{available, code, reason, captures}`; when unavailable `code == "needs_privilege"`,
-    `captures == []`, and `l4.capture.start` still errors with `L4 unavailable: ` followed
-    by exactly that `reason`. On macOS the literal reason is quoted and asserted (R_CAP).
+    `captures == []`, and `l4.capture.start` still errors with exactly `L4 unavailable: `
+    followed by that `reason`. The reason is read live, not pinned: it must equal
+    `packet capture is not allowed yet (` + `privilege.capabilities.capture.how.label` + `)`
+    (the privilege spec's §2.4 shape; the `privilege` key rides beside the parity keys).
   * AC4: the same for `l4.intercept.status` (`{available, code, reason, sessions}`,
     `code == "unsupported_platform"` and R_INT on macOS) and `l4.intercept.start`.
   * AC5 (half): every `l4.scope.list` entry carries `source: "config" | "runtime"`, and the
@@ -47,22 +49,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from aitm_e2e import fail, ok, section, skip  # noqa: E402
 from aitm_e2e.bus import BusClient, BusError, ToolError  # noqa: E402
 
-# The 22 verbs the L4 module registers (plan A9 (1), spec AC32). Bundled-catalogue
-# scripts may add more `l4.*` names; this cell asserts the module's, not a total.
+# The 24 `l4.*` verbs the core registers: the L4 module's 22 (plan A9 (1), spec AC32)
+# plus the two always-on privilege verbs (privilege spec §2.2/§2.3, plan P1b.15/P1b.17).
+# Bundled-catalogue scripts may add more `l4.*` names; this cell asserts these, not a total.
 L4_MODULE_TOOLS = (
     "l4.agent.set", "l4.agent.status",
     "l4.capture.start", "l4.capture.status", "l4.capture.stop",
     "l4.craft", "l4.flow.get", "l4.flow.list", "l4.inject",
     "l4.intercept.drop", "l4.intercept.forward", "l4.intercept.list", "l4.intercept.mutate",
     "l4.intercept.revert", "l4.intercept.start", "l4.intercept.status", "l4.intercept.stop",
-    "l4.interfaces", "l4.scope.add", "l4.scope.list", "l4.scope.remove", "l4.send_recv",
+    "l4.interfaces", "l4.privilege", "l4.privilege.request",
+    "l4.scope.add", "l4.scope.list", "l4.scope.remove", "l4.send_recv",
 )
 
-# The unprivileged-rig reasons, verbatim (plan "The rig"; they change when D0 lands and
-# only this cell asserts them literally, spec §1 / plan decision 1).
-R_CAP = ("no read+write access to any /dev/bpf* device (capture/inject needs it; install "
-         "ChmodBPF or run with privilege)")
-R_INT = "in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / NFQUEUE only)"
+# The unprivileged-rig literals. The capture reason is no longer pinned: it is
+# `REASON_PREFIX + privilege.capabilities.capture.how.label + ")"`, read from the live
+# reply (privilege spec §2.4, plan P1b.17). The macOS intercept reason stays literal.
+REASON_PREFIX = "packet capture is not allowed yet ("
+R_INT = "in-path interception is Linux only"
 R_WIDEN = ("runtime L4 scope widening is disabled; declare scope in the `l4.scope` config "
            "block or set `l4.allow_agent_widen`")
 WIDEN_TEXT = "runtime L4 scope widening is disabled"
@@ -139,10 +143,36 @@ def status_shape_errors(reply, payload_key: str) -> list[str]:
     return errs
 
 
-def unavailable_error_matches(error_text: str, reason) -> bool:
-    """True iff a gated verb's error text ends with `L4 unavailable: ` + exactly `reason`
-    (the ToolError text is `<tool>: <message>`; nothing may follow the reason)."""
-    return isinstance(reason, str) and bool(reason) and error_text.endswith(UNAVAILABLE_PREFIX + reason)
+def unavailable_error_matches(error_text: str, start_verb: str, reason) -> bool:
+    """True iff a gated verb's error text is exactly `<start_verb>: L4 unavailable: <reason>`
+    (the ToolError text is `<tool>: <message>`; the message equals the prefix + reason)."""
+    return isinstance(reason, str) and bool(reason) and error_text == f"{start_verb}: {UNAVAILABLE_PREFIX}{reason}"
+
+
+def privilege_capture_label(reply):
+    """`privilege.capabilities.capture.how.label` from a status reply, or None."""
+    priv = reply.get("privilege") if isinstance(reply, dict) else None
+    cap = (priv.get("capabilities") or {}).get("capture") if isinstance(priv, dict) else None
+    how = cap.get("how") if isinstance(cap, dict) else None
+    label = how.get("label") if isinstance(how, dict) else None
+    return label if isinstance(label, str) and label else None
+
+
+def expected_capture_reason(reply):
+    """The reason a needs_privilege capture status must carry, derived from its own
+    `privilege` report: `packet capture is not allowed yet (<how.label>)`; None when the
+    reply carries no label (then the cell fails on the missing privilege report)."""
+    label = privilege_capture_label(reply)
+    return f"{REASON_PREFIX}{label})" if label else None
+
+
+def without_checked_at(reply):
+    """A status reply with `privilege.checked_at` removed: the probe re-runs after 1 s, so
+    two back-to-back reads may legitimately differ only there."""
+    if not isinstance(reply, dict) or not isinstance(reply.get("privilege"), dict):
+        return reply
+    priv = {k: v for k, v in reply["privilege"].items() if k != "checked_at"}
+    return {**reply, "privilege": priv}
 
 
 def optional_params(input_schema: dict, names) -> list[str]:
@@ -202,12 +232,15 @@ def is_needs_confirmation(reply) -> bool:
     return isinstance(reply, dict) and reply.get("status") == "needs_confirmation"
 
 
-def expected_literal_reason(code: str):
-    """The verbatim reason this cell asserts on macOS for an unavailable code; None where
-    no literal is pinned (Linux rigs, or after D0 rewrites the probe strings)."""
-    if sys.platform != "darwin":
-        return None
-    return {"needs_privilege": R_CAP, "unsupported_platform": R_INT}.get(code)
+def expected_literal_reason(code: str, reply):
+    """The reason this cell asserts for an unavailable code: for `needs_privilege` the
+    label-derived text from the reply's own `privilege` report (every OS); for
+    `unsupported_platform` the macOS intercept literal; None where nothing is pinned."""
+    if code == "needs_privilege":
+        return expected_capture_reason(reply)
+    if code == "unsupported_platform" and sys.platform == "darwin":
+        return R_INT
+    return None
 
 
 def default_loopback_interface() -> str:
@@ -231,7 +264,8 @@ def check_status_verb(op, agent, verb: str, start_verb: str, payload_key: str,
     errs = status_shape_errors(rep_op, payload_key)
     expect(not errs, f"{verb} is the spec §1 object {{available, code, reason, {payload_key}}}", errs)
     if st_ag == "ok":
-        expect(rep_ag == rep_op, f"{verb}: the agent reads the same object as the operator",
+        expect(without_checked_at(rep_ag) == without_checked_at(rep_op),
+               f"{verb}: the agent reads the same object as the operator (privilege.checked_at aside)",
                {"operator": rep_op, "agent": rep_ag})
     if errs:
         return rep_op
@@ -239,15 +273,24 @@ def check_status_verb(op, agent, verb: str, start_verb: str, payload_key: str,
     if rep_op["available"] is False:
         expect(rep_op["code"] in unavailable_codes,
                f"{verb}: code is one of {unavailable_codes} on this unprivileged rig", rep_op["code"])
-        literal = expected_literal_reason(rep_op["code"])
-        if literal is not None:
-            print(f"note: {verb} reason, verbatim: {reason!r}", flush=True)
-            expect(reason == literal, f"{verb}: the reason is the rig's verbatim literal", reason)
+        expect(isinstance(rep_op.get("privilege"), dict),
+               f"{verb}: carries the privilege report beside the parity keys", sorted(rep_op.keys()))
+        print(f"note: {verb} reason, verbatim: {reason!r}", flush=True)
+        if rep_op["code"] == "needs_privilege":
+            label = privilege_capture_label(rep_op)
+            print(f"note: {verb} privilege.capabilities.capture.how.label = {label!r}", flush=True)
+            expect(label is not None and reason == f"{REASON_PREFIX}{label})",
+                   f"{verb}: reason == \"packet capture is not allowed yet (\" + how.label + \")\"",
+                   {"reason": reason, "label": label})
+        else:
+            literal = expected_literal_reason(rep_op["code"], rep_op)
+            if literal is not None:
+                expect(reason == literal, f"{verb}: the reason is the verbatim literal {literal!r}", reason)
         st, err = op.try_call(start_verb, {"interface": iface})
         show(f"{start_verb} {{interface: {iface!r}}} (operator)", err)
         expect(st == "error", f"{start_verb} is still refused while unavailable", err)
-        expect(st == "error" and unavailable_error_matches(str(err), reason),
-               f"{start_verb} errors with `{UNAVAILABLE_PREFIX}` + exactly the status reason",
+        expect(st == "error" and unavailable_error_matches(str(err), start_verb, reason),
+               f"{start_verb} error equals `{start_verb}: {UNAVAILABLE_PREFIX}` + the status reason",
                {"error": str(err)[-220:], "reason": reason})
     else:
         expect(rep_op["code"] == "available" and reason is None,
@@ -351,8 +394,8 @@ def main() -> int:
         section("(1) tools/list: the l4.* family and the l4.flow.get window params (AC2 live)")
         print(f"note: {len(names)} l4.* tools: {names}", flush=True)
         missing_mod = [n for n in L4_MODULE_TOOLS if n not in names]
-        expect(not missing_mod, "every L4 module verb is in tools/list", missing_mod)
-        print(f"note: l4.* names beyond the module's 22: {sorted(set(names) - set(L4_MODULE_TOOLS))}", flush=True)
+        expect(not missing_mod, "every L4 module verb and both privilege verbs (24 names) are in tools/list", missing_mod)
+        print(f"note: l4.* names beyond the 24 pinned: {sorted(set(names) - set(L4_MODULE_TOOLS))}", flush=True)
         fg = tool_by_name(tools, "l4.flow.get") or {}
         schema = fg.get("inputSchema") or {}
         show("l4.flow.get inputSchema", schema)
@@ -410,7 +453,7 @@ def main() -> int:
         section("(7) AC34 self-exclusion of the core's own listeners")
         skipped_check("AC34 live: a lo0 capture holds no packet on the bus port",
                       "needs a privileged capture; proven by tests/e2e/l4/test_l4_parity_priv.py "
-                      "(blocked: needs D0 on this Mac)")
+                      "(blocked: needs approval on this Mac)")
     finally:
         for c in (agent, op):
             if c is not None:

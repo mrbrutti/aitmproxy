@@ -37,15 +37,19 @@ use aitm::startup::{self, TermOpts};
 use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{
-    assemble_with_scripts, build_capture_session, self_port_hook, Assembled, Features, ScriptWiring,
+    assemble_with_scripts, build_capture_session, self_port_hook, should_request_at_start,
+    Assembled, Features, ScriptWiring,
 };
-use aitm::{audit_log, config_file, env, operator_token, tui};
+use aitm::{audit_log, config_file, env, operator_token, tui, PromptHold};
 use aitm_core::{
     engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin, NOTHING_DECRYPTED_ADVICE,
 };
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use aitm_plugin_scanner::jobs::ScanServices;
+use aitm_proto_l4::privilege::linux::HoldCount;
+use aitm_proto_l4::privilege::state::{PrivilegeConfig, ProcessLifetime};
+use aitm_proto_l4::PrivilegeState;
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
 use aitm_sysproxy::{Recovery, SystemProxy};
 use aitm_term::error::ErrorReport;
@@ -55,6 +59,19 @@ use tracing::{info, warn};
 
 /// The config file path when `--config` is not given.
 const CONFIG_ENV: &str = "AITM_CONFIG";
+
+/// The privilege state and the prompt hold the shutdown futures consult
+/// (privilege spec §5.5), built together so every arm reads the `HoldCount`
+/// the state raises around a launcher child and cancels the prompt through
+/// the same state (`cancel_prompt`: SIGINT to the child when the Ctrl-C
+/// reached the core alone).
+fn privilege_state_with_hold(cfg: &PrivilegeConfig) -> (Arc<PrivilegeState>, PromptHold) {
+    let hold = HoldCount::default();
+    let state = Arc::new(PrivilegeState::new(cfg).with_sigint_hold(hold.clone()));
+    let cancel_state = Arc::clone(&state);
+    let prompt = PromptHold::new(move || hold.is_held(), move || cancel_state.cancel_prompt());
+    (state, prompt)
+}
 
 /// What the command line asked for, after the `--config` and `--script` splits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,8 +480,31 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
     // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s
     // `Config`; `AITM_L4_*` env overrides win over the file (M5-AC17). It rides the
-    // binary-owned feature set below; `l4_privilege: None` runs the real startup probe.
+    // binary-owned feature set below over the live privilege state built here.
     env::apply_l4(&mut l4, |k| std::env::var(k).ok());
+    // The one shared privilege state (privilege spec §2.1, plan P1b.15): the
+    // scripting engine's `L4Language`, the `l4.*` command module, the status verbs
+    // and `l4.privilege` all read it, so a later approval is seen everywhere without
+    // a restart (L4PRIV-AC7). A one-shot `aitm <verb>` exits before a helper could
+    // serve it, so its lifetime is `OneShot` (spec §2.4); every serving mode is
+    // `Serving`. Building it probes nothing; the first `report()` does.
+    let l4_lifetime = match mode {
+        Mode::Cli(_) => ProcessLifetime::OneShot,
+        Mode::Server
+        | Mode::Tui
+        | Mode::Web
+        | Mode::OperatorToken { .. }
+        | Mode::SysproxyWatchdog { .. } => ProcessLifetime::Serving,
+    };
+    // The SIGINT hold (privilege spec §5.5): the state raises it while a
+    // launcher child (the pkexec prompt) is alive; every shutdown future below
+    // (server, capture session, `aitm tui`) reads it, so a Ctrl-C at the
+    // prompt cancels the prompt and not the core.
+    let (privilege_state, prompt_hold) = privilege_state_with_hold(&PrivilegeConfig {
+        enabled: l4.enabled,
+        l4: l4.privilege.clone(),
+        lifetime: l4_lifetime,
+    });
     // A script's `browser.navigate` decides SSRF under the same policy as the
     // `browser.navigate` command.
     rhai_cfg.ssrf = cfg.browser.ssrf.clone();
@@ -508,10 +548,12 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         guard: Arc::new(aitm_proto_l4::guard::L4Guard::new(&l4)),
         store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
     });
+    // The language's wire verbs hold the state's routed backend (spec §2.1: every
+    // production caller takes `state.backend()`), never a bare `PcapBackend`.
     let l4_language = l4_shared.as_ref().map(|shared| {
         aitm_proto_l4::L4Language::new(
             shared.guard.clone(),
-            Arc::new(aitm_proto_l4::backend::pcap::PcapBackend::new()),
+            privilege_state.backend(),
             shared.store.clone(),
         )
     });
@@ -604,6 +646,10 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     let features = Features {
         l4,
         l4_shared,
+        // The live privilege state built above, so assembly registers the privilege
+        // verbs and gates the module over the SAME state the `L4Language` holds.
+        l4_privilege_state: Some(Arc::clone(&privilege_state)),
+        l4_lifetime,
         macos_capture,
         // Self-exclusion (L4PAR-AC34, spec §2.1): the core's own listener ports the
         // config already names — the web UI port (`aitm web` only) and the agent
@@ -746,6 +792,20 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         web_settings.as_ref().map(|s| s.token.as_str()),
         &env_pairs,
     )?;
+
+    // Spec §2.4 `l4.privilege.request: at_start`: the operator wrote it into the
+    // config, so the serving core asks for the packet-capture privilege itself,
+    // once, when capture needs approval (`should_request_at_start`). Non-blocking:
+    // the platform action is handed off (macOS app) or spawned (Linux pkexec) and
+    // the outcome is logged once; the message is the state's own (a remedy label
+    // or progress text), never a token. A one-shot process returned above.
+    if should_request_at_start(features.l4.privilege.request, &privilege_state.report()) {
+        let requested = privilege_state.request();
+        info!(
+            outcome = requested.outcome.as_str(),
+            "L4 privilege requested at start: {}", requested.message
+        );
+    }
 
     // Pre-bind every service port up front, before obscura is spawned and before
     // any "listening" success line. A port conflict is then ONE clear, actionable
@@ -970,9 +1030,12 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     // or the shutdown signal end the `select!`. When another arm wins, dropping this
     // future tears the session down: its rendezvous guard and sockets remove their
     // files and its pumps see the stop.
+    let capture_hold = prompt_hold.clone();
     let capture_run = async move {
         if let Some(session) = capture_session {
-            session.run(aitm::shutdown_signal()).await;
+            session
+                .run(aitm::shutdown_signal_unless_held(capture_hold))
+                .await;
         }
         std::future::pending::<std::convert::Infallible>().await
     };
@@ -1040,6 +1103,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
                 proxy_listener,
                 browser_listener,
                 on_agent_bound,
+                prompt_hold.clone(),
             ) => result,
             never = capture_run => match never {},
         }
@@ -1163,7 +1227,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             }
             result = web_run => result,
             never = capture_run => match never {},
-            () = aitm::shutdown_signal() => {
+            () = aitm::shutdown_signal_unless_held(prompt_hold) => {
                 info!("shutdown signal received");
                 Ok(())
             }
@@ -1435,7 +1499,8 @@ mod tests {
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
         configured_agent_port, manages_system_proxy, parse_invocation, parse_mode, scan_services,
         split_bus_endpoint_file_arg, split_config_arg, split_script_args, usage_reporter,
-        Invocation, Mode, StartupError, TermOpts, OPERATOR_TOKEN_USAGE,
+        Invocation, Mode, PrivilegeConfig, ProcessLifetime, StartupError, TermOpts,
+        OPERATOR_TOKEN_USAGE,
     };
     use aitm_sysproxy::Recovery;
     use aitm_term::caps::{ColorChoice, Verbosity};
@@ -2209,6 +2274,69 @@ mod tests {
             assert!(bus_endpoint_file.is_none(), "{argv:?}");
             assert!(web_args.is_none(), "{argv:?}");
         }
+    }
+
+    // ---- fix task C 2026-11-01 (p1b panel 2, C2): the prompt hold reaches every arm ----
+
+    /// Spec §5.5 (panel 2): the hold the shutdown arms consult is the one the
+    /// privilege state raises around a launcher child. What this proves: the
+    /// `PromptHold` `main` hands to `shutdown_signal_unless_held` (server,
+    /// capture session and `tui::run`) reads the **same** `HoldCount` the
+    /// state writes, so a token taken through the state flips it and dropping
+    /// the token clears it; and its `cancel` reaches the state (with no
+    /// launcher alive it is a no-op that leaves the hold alone; the SIGINT to
+    /// a live child is proven in `state::tests`). `tui::run` itself needs a
+    /// terminal and a bus, so its arm is pinned by
+    /// `tui_shutdown_arm_consults_the_prompt_hold`.
+    #[test]
+    fn the_prompt_hold_handed_to_the_shutdown_arms_is_the_states() {
+        let (state, prompt) = super::privilege_state_with_hold(&PrivilegeConfig {
+            enabled: false,
+            l4: Default::default(),
+            lifetime: ProcessLifetime::Serving,
+        });
+        assert!(!prompt.is_held(), "no child, no hold");
+        let token = state.sigint_hold().hold();
+        assert!(
+            prompt.is_held(),
+            "a hold raised through the state is seen by the arms' hold"
+        );
+        let second = state.sigint_hold().hold();
+        drop(token);
+        assert!(prompt.is_held(), "any token out keeps the hold");
+        prompt.cancel();
+        assert!(
+            prompt.is_held(),
+            "a cancel with no launcher alive changes nothing"
+        );
+        drop(second);
+        assert!(!prompt.is_held(), "the last token released clears it");
+        prompt.cancel();
+        assert!(!prompt.is_held());
+    }
+
+    /// Tripwire for `crates/aitm/src/tui.rs`: the `aitm tui` select arm awaits
+    /// the hold-consulting shutdown future, never the plain one (spec §5.5,
+    /// panel 2: both serving shutdown futures consult the hold).
+    #[test]
+    fn tui_shutdown_arm_consults_the_prompt_hold() {
+        let run_body = include_str!("tui.rs")
+            .split("pub async fn run(")
+            .nth(1)
+            .expect("tui.rs defines `run`")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module follows `run`");
+        assert!(
+            run_body.contains("crate::shutdown_signal_unless_held("),
+            "the tui select arm must consult the prompt hold"
+        );
+        // Tester (fix-C range): any spelling of the plain future, imported or
+        // path-qualified, is the regression; forbid the bare call outright.
+        assert!(
+            !run_body.contains("shutdown_signal()"),
+            "the plain shutdown future ignores the hold"
+        );
     }
 
     /// Spec D9: the global terminal flags are split off first and ride in the

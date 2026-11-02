@@ -406,6 +406,7 @@ dependencies = [
  "etherparse",
  "futures",
  "nfq",
+ "nix 0.31.3",
  "pcap",
  "pnet_packet",
  "rhai",
@@ -414,6 +415,7 @@ dependencies = [
  "serde_yaml",
  "socket2",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
 ]
 

@@ -113,9 +113,11 @@ captured requests. It is **discovery only** — it never fuzzes or injects.
 A core started with `l4.enabled: true` in `config.yaml` also registers the
 `l4.*` family: raw packet capture, crafting and injection, send/receive, and
 (Linux only) in-path packet interception. Without that line the verbs are not in
-`tools/list`; only the three bundled Rhai scripts `l4.recon`, `l4.tcp_probe` and
-`l4.udp_probe` are, and they need the module to do anything. The family is
-deny-by-default and gated separately from the HTTP tools. What an agent must know:
+`tools/list`; only `l4.privilege`, `l4.privilege.request` (registered on every
+core, see below) and the three bundled Rhai scripts `l4.recon`, `l4.tcp_probe`
+and `l4.udp_probe` are, and the scripts need the module to do anything. The
+family is deny-by-default and gated separately from the HTTP tools. What an
+agent must know:
 
 **Ask the status verbs first.** `l4.capture.status` and `l4.intercept.status`
 always answer (never `L4 unavailable`) with `{available, code, reason,
@@ -137,6 +139,14 @@ When `available` is false, report the `code` and `reason` to the user and stop;
 `l4.capture.start` / `l4.intercept.start` return that same reason as an error.
 Re-read the status verbs instead of remembering them: privilege can change while
 the core runs.
+
+**Privilege is the operator's to grant.** You may read `l4.privilege` (on every
+core, even with L4 off) to learn whether raw capture, injection and
+interception are allowed right now and, when a capability is `needs_approval`,
+what the operator must approve (`capabilities.<name>.how.label`; the status
+verbs carry the same report under `privilege`). Only an operator can call
+`l4.privilege.request`; an agent is refused before anything runs and never
+triggers the OS prompt. Tell the user what the label says and wait.
 
 **Scope and the agent gates.** L4 scope is separate from HTTP scope.
 `l4.scope.list` shows the entries, each with `source: config | runtime`; scope

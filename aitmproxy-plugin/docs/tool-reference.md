@@ -10,7 +10,12 @@ from the command listing the `aitm` binary prints on its usage error
 stderr). It was last regenerated from a build of `main` at 1b79813 run with
 `AITM_CONFIG` pointing at a config that sets `l4.enabled: true`, so the `l4.*`
 family is listed below; the same core's live `tools/list` carried the same 113
-names. The raw listing is kept in `docs/research/mcp-tool-catalog.txt`.
+names. The `l4.privilege` and `l4.privilege.request` rows, the `privilege` key
+in the two status rows and the counts below were added by hand, in the
+generator's format, from the same listing printed by a build of the
+l4-capture-privilege work at 558ec344 (plan P1b.15); the script was not re-run
+because it rewrites this preamble. The raw listing is kept in
+`docs/research/mcp-tool-catalog.txt`.
 
 Tool names are shown in dot form (`flow.list`), as the MCP server exposes them;
 the one-shot `aitm` CLI accepts the same commands space-separated
@@ -20,13 +25,16 @@ JSON arguments, e.g. `{ "id": "<flow-id>" }`. Note that the one-shot CLI runs it
 in-process core and cannot steer a running proxy; drive a live proxy over MCP or
 from the web UI, the TUI or the macOS app.
 
-**113 tools across 25 namespaces.** The 22 `l4.*` module verbs (the `l4.agent`,
+**115 tools across 26 namespaces.** The 22 `l4.*` module verbs (the `l4.agent`,
 `l4.capture`, `l4.flow`, `l4.intercept` and `l4.scope` namespaces plus
 `l4.interfaces`, `l4.craft`, `l4.inject` and `l4.send_recv`) are registered only
-when `config.yaml` sets `l4.enabled: true`; without it a core lists 91 tools, and
-the only `l4.*` names left are the three bundled Rhai scripts (`l4.recon`,
-`l4.tcp_probe`, `l4.udp_probe`), which need the module to do anything. What to
-know about the family:
+when `config.yaml` sets `l4.enabled: true`. Two more, `l4.privilege` and
+`l4.privilege.request`, are registered by the `aitm` binary whether or not L4 is
+enabled, so a frontend can always ask: 24 `l4.*` verbs in all. Without
+`l4.enabled: true` a core lists 93 tools, and the only `l4.*` names left are
+those two and the three bundled Rhai scripts (`l4.recon`, `l4.tcp_probe`,
+`l4.udp_probe`), which need the module to do anything. What to know about the
+family:
 
 - Capture, inject and send/recv need raw-socket privilege (read+write
   `/dev/bpf*` on macOS, `CAP_NET_RAW` on Linux). The in-path `l4.intercept.*`
@@ -38,7 +46,38 @@ know about the family:
   `code` is one of `available`, `needs_privilege`, `unsupported_platform` or
   `not_configured`, `reason` is the text the gated verbs would return after
   `L4 unavailable: ` (null when available), and the payload (`captures` /
-  `sessions`) is `[]` when unavailable.
+  `sessions`) is `[]` when unavailable. When the core knows its privilege
+  state the same object also carries `privilege`, the `l4.privilege` report
+  below.
+- `l4.privilege` (read-only, no parameters, agents may call it) answers even
+  when L4 is off in this core's config, as `{enabled, platform, capabilities,
+  helper, request, checked_at}`: `enabled` is `l4.enabled`; `platform` is
+  `macos`, `linux` or `other`; `capabilities.capture`, `.inject` and
+  `.intercept` are each `{state: "available", via: "process" | "helper"}`,
+  `{state: "needs_approval", reason, how}` or `{state: "unsupported", reason}`,
+  where `how` is `{kind, label, action}` with `kind` one of `app_action` (the
+  Aitmproxy app does it), `os_dialog` (macOS is already waiting for the
+  operator's approval), `package` (install something first) or `pkexec` (a
+  polkit password prompt), `label` the sentence to show, and `action` either
+  `{type: "bus_verb", verb: "l4.privilege.request"}` or `{type: "open_url",
+  url}`, never a shell command; `helper` is `{kind, status, version, detail}`
+  (`kind` one of `macos_bpf_permissions`, `linux_pkexec_helper`,
+  `linux_cap_helper`, `none`; `status` one of `not_installed`, `installed`,
+  `applied`, `running`, `version_mismatch`, `unknown`); `request` is `{state:
+  "pending" | "handed_to_app" | "approved" | "dismissed" | "failed", at,
+  message}` for the last `l4.privilege.request` on this core, or null;
+  `checked_at` is epoch ms.
+- `l4.privilege.request` (no parameters, `confirmable: true`, Sensitive) asks
+  the operating system for packet-capture permission: on macOS the Aitmproxy
+  app is asked to set it up and macOS prompts for approval; on Linux a polkit
+  password prompt starts the packet-capture helper. It returns at once as
+  `{outcome: "already_available" | "pending" | "handed_to_app" |
+  "cannot_prompt", message, privilege}` (`privilege` is the report right after
+  the request); poll `l4.privilege` for the request's progress. Operator and
+  CLI only: an agent (MCP) is refused before anything runs
+  (`l4.privilege.request refused: only an operator can ask for packet-capture
+  permission; an agent never can.`), under every agent policy, and nothing an
+  agent does can raise the OS prompt.
 - `l4.flow.get` takes `offset` (default 0) and `limit` (default 256, clamped to
   4096; `limit: 0` returns the flow fields with `packets: []`); `packet_count`
   is always the total, and when the 4 MiB raw-byte budget stops the window
@@ -219,6 +258,7 @@ know about the family:
 | `l4.recon` | `[--args <json-object>]` | List L4 interfaces and current scope (read-only) |
 | `l4.tcp_probe` | `[--args <json-object>]` | Single TCP SYN to { dst, port, interface } -> open/closed/filtered |
 | `l4.udp_probe` | `[--args <json-object>]` | Single UDP datagram to { dst, port, interface } |
+| `l4.privilege` | — | Report whether this core can capture, inject and intercept raw packets right now, what must be approved first and how (never a shell command), the privileged helper's status, and the progress of the last l4.privilege.request. Read-only; agents may call it. It answers even when L4 is off in this core's config (enabled: false, every capability unsupported). |
 | `l4.interfaces` | — | List the capture-capable network interfaces (read-only). |
 | `l4.craft` | `--spec <value>` | Build a layered PacketSpec into on-wire bytes and a structural summary. Pure: no privilege, no wire. `Some` header fields ship verbatim (a forced-bad checksum/length is preserved); omitted fields auto-complete. |
 | `l4.inject` | `--spec <value> --dst <string> --interface <string> [--port <int>] [--count <int>]` | Inject a crafted PacketSpec to a target as a bounded, rate-capped batch. Guarded (Inject): scope + dangerous-destination denylist + rate/size/count, then the core scope/rate guard. Routes every write through the single send_on_wire choke point. |
@@ -237,7 +277,7 @@ know about the family:
 | --- | --- | --- |
 | `l4.capture.start` | `--interface <string> [--direction <string>]` | Start a scoped, filtered background capture on an interface; returns the Capture flow id. Guarded (Capture): deny-by-default, a scope-derived BPF filter, and a per-packet guard re-check. |
 | `l4.capture.stop` | `--id <string>` | Stop and remove a running capture by its flow id; returns whether one was running. |
-| `l4.capture.status` | — | Report whether capture is available on this core (`available`, `code`, `reason`) and the flow ids of running captures. Always answers, never `L4 unavailable`. |
+| `l4.capture.status` | — | Report whether capture is available on this core (`available`, `code`, `reason`), the flow ids of running captures and, when known, the `privilege` report. Always answers, never `L4 unavailable`. |
 
 ## `l4.flow.*`
 
@@ -257,7 +297,13 @@ know about the family:
 | `l4.intercept.revert` | `--id <string>` | Discard a staged mutation on a parked packet, restoring its original bytes. `false` if nothing was staged. |
 | `l4.intercept.forward` | `--id <string>` | Forward a parked packet through the guarded verdict path — mangled if it was mutated, otherwise the kernel's original. `false` if the id is not parked. |
 | `l4.intercept.drop` | `--id <string>` | Drop a parked packet (verdict Drop). `false` if the id is not parked. |
-| `l4.intercept.status` | — | Report whether in-path interception is available on this core (`available`, `code`, `reason`) and the live interception sessions with their parked-packet counts. Always answers, never `L4 unavailable`. |
+| `l4.intercept.status` | — | Report whether in-path interception is available on this core (`available`, `code`, `reason`), the live interception sessions with their parked-packet counts and, when known, the `privilege` report. Always answers, never `L4 unavailable`. |
+
+## `l4.privilege.*`
+
+| Tool | Parameters | Description |
+| --- | --- | --- |
+| `l4.privilege.request` | — | Ask the operating system for packet-capture permission: on macOS the Aitmproxy app is asked to set it up and macOS prompts for approval; on Linux a polkit password prompt starts the packet-capture helper. Returns at once; poll l4.privilege for the request's progress. Operator and CLI only: an agent is refused before anything runs. |
 
 ## `l4.scope.*`
 
