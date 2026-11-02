@@ -144,27 +144,36 @@ pub fn wrap(s: &str, width: usize, indent: &str) -> Vec<String> {
     lines
 }
 
-/// Defence against terminal escape injection: every `char::is_control()`
-/// character in `s` (C0 including ESC and BEL, DEL, and C1 including U+009B,
-/// the one-byte CSI) becomes U+FFFD, except that `\n`, `\r` and `\t` each
-/// become one space, so a message is always one line. Content strings from
-/// other crates (WARN/ERROR text and fields, `anyhow` chains, Rhai `log.warn`
-/// text, client-supplied authorities inside errors) pass through here as they
-/// enter the reporter; the renderer's own SGR and cursor codes never do.
-/// Clean text is returned borrowed.
-pub fn sanitize(s: &str) -> Cow<'_, str> {
-    if !s.chars().any(char::is_control) {
+/// Defence against terminal escape injection and text-reordering tricks:
+/// every `char::is_control()` character in `s` (C0 including ESC and BEL,
+/// DEL, and C1 including U+009B, the one-byte CSI) and every bidirectional
+/// control that can reorder or hide what follows it (U+061C, U+200E, U+200F,
+/// U+202A–U+202E, U+2066–U+2069; fix task S6) becomes U+FFFD, except that
+/// `\n`, `\r`, `\t` and the line separators U+2028 and U+2029 each become one
+/// space, so a message is always one line. Content strings from other crates
+/// (WARN/ERROR text and fields, `anyhow` chains, Rhai `log.warn` text,
+/// client-supplied authorities inside errors) pass through here as they enter
+/// the reporter; the renderer's own SGR and cursor codes never do. Clean text
+/// is returned borrowed.
+pub(crate) fn sanitize(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(|c| replacement(c).is_some()) {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(
-        s.chars()
-            .map(|c| match c {
-                '\n' | '\r' | '\t' => ' ',
-                c if c.is_control() => '\u{FFFD}',
-                c => c,
-            })
-            .collect(),
-    )
+    Cow::Owned(s.chars().map(|c| replacement(c).unwrap_or(c)).collect())
+}
+
+/// What [`sanitize`] writes for `c`; `None` keeps it as it is.
+fn replacement(c: char) -> Option<char> {
+    match c {
+        '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => Some(' '),
+        c if c.is_control() => Some('\u{FFFD}'),
+        '\u{061C}'
+        | '\u{200E}'
+        | '\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}' => Some('\u{FFFD}'),
+        _ => None,
+    }
 }
 
 /// `path` with a leading `home` replaced by `~` (spec T6); the full path
@@ -413,5 +422,39 @@ mod tests {
         assert_eq!(out.chars().count(), every.chars().count());
         // 65 controls (32 C0, DEL, 32 C1) minus the three line breaks.
         assert_eq!(out.matches('\u{FFFD}').count(), 62);
+
+        // S6: the bidirectional and format controls that reorder or hide
+        // what follows are not `char::is_control()` but are neutralised too:
+        // U+061C, U+200E, U+200F, U+202A–U+202E and U+2066–U+2069 become
+        // U+FFFD; the line separators U+2028 and U+2029 become one space.
+        assert_eq!(sanitize("a\u{202e}b\u{2028}c"), "a\u{FFFD}b c");
+        const BIDI: [char; 12] = [
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ];
+        let bidi: String = BIDI.iter().collect();
+        assert_eq!(sanitize(&bidi), "\u{FFFD}".repeat(12));
+        assert_eq!(sanitize("x\u{2029}y\u{2028}z"), "x y z");
+        // Every control, the bidi set and both separators, each mapped to
+        // exactly one character: 62 + 12 replacements; 3 + 2 spaces from the
+        // line breaks and separators, plus U+0020 itself.
+        let all: String = every
+            .chars()
+            .chain(BIDI)
+            .chain(['\u{2028}', '\u{2029}'])
+            .collect();
+        let out = sanitize(&all);
+        assert_eq!(out.chars().count(), all.chars().count());
+        assert_eq!(out.matches('\u{FFFD}').count(), 74);
+        assert_eq!(out.matches(' ').count(), 6);
+        assert!(
+            out.chars().all(|c| !c.is_control() && !BIDI.contains(&c)),
+            "{out:?}"
+        );
+        // The neighbours of those ranges stay, the zero-width joiner among
+        // them (emoji sequences need U+200D): such text is still borrowed.
+        let kept = "\u{061B}\u{200D}\u{2027}\u{202F}\u{2065}\u{206A}";
+        assert!(matches!(sanitize(kept), Cow::Borrowed(_)));
+        assert_eq!(sanitize(kept), kept);
     }
 }

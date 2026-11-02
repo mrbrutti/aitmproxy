@@ -8,12 +8,17 @@
 //! state machine that draws. The thread starts lazily on the first message
 //! and sleeps on `recv_timeout(100 ms)` only while a phase is live, so the
 //! spinner advances one frame per wake-up and nothing runs when nothing is
-//! live. [`Reporter::card`], [`Reporter::error`], [`Reporter::finish`] and
-//! [`Reporter::finish_and_clear`] block on an acknowledgement (2 s at most);
-//! `finish` closes the channel, joins the thread and leaves the reporter in a
-//! synchronous plain-line mode so a late warning still prints (C10); only
-//! [`Reporter::note`] keeps its `✓` there, for the `stdin closed` line `main`
-//! prints after the serving loop ends.
+//! live. The queue holds 256 messages: a warning or event that finds it full
+//! is dropped and counted (S3); every other message waits for room, and
+//! [`Reporter::card`], [`Reporter::error`], [`Reporter::finish`] and
+//! [`Reporter::finish_and_clear`] then wait for an acknowledgement, each call
+//! 2 s at most in all (C10, S5). A queue still full, or an acknowledgement
+//! still missing, after that means the sink has stalled: the thread is
+//! abandoned, the message is dropped and every later call returns at once
+//! with nowhere to write. Otherwise `finish` closes the channel, joins the
+//! thread and leaves the reporter in a synchronous plain-line mode so a late
+//! warning still prints (C10); only [`Reporter::note`] keeps its `✓` there,
+//! for the `stdin closed` line `main` prints after the serving loop ends.
 //!
 //! The `Renderer` is pure over its inputs: time comes from a [`Clock`], the
 //! terminal width from an injected probe, and every byte goes to one
@@ -61,16 +66,21 @@ use crate::text;
 pub(crate) const FIRST_DRAW_DELAY: Duration = Duration::from_millis(100);
 
 /// How long a blocking call waits for the render thread before giving up on
-/// it (plan C10). A sink that blocks this long is a stalled pipe, and the
+/// it (plan C10): for room in a full queue and for the acknowledgement
+/// together (S5). A sink that blocks this long is a stalled pipe, and the
 /// thread is abandoned rather than freezing startup.
 const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often a non-droppable message re-tries a full queue while it waits
+/// for room (S5).
+const ENQUEUE_POLL: Duration = Duration::from_millis(5);
 
 const THREAD_NAME: &str = "aitm-term";
 
 /// The render queue's capacity (fix task S3). Warnings and events beyond it
 /// are dropped and counted rather than queued without bound: a flood of
 /// per-connection WARNs is attacker-triggerable. Every other message kind
-/// blocks its caller until there is room.
+/// waits for room, `ACK_TIMEOUT` at most (S5).
 const QUEUE_CAPACITY: usize = 256;
 
 /// What the API sends to the render thread.
@@ -152,10 +162,10 @@ struct Renderer {
     /// Warnings and events dropped by `Reporter::send` while the queue was
     /// full, not yet reported (S3); shared with the `Reporter`.
     suppressed: Arc<AtomicUsize>,
-    /// Set by `into_plain` when the renderer was rich: after `finish` every
-    /// line is plain except the note, which keeps its `✓` (spec Open
-    /// question 3; `main` prints it after the serving loop ends).
-    rich_before_finish: bool,
+    /// Set by `into_plain`: after `finish` every line is plain whatever the
+    /// caps say, the note excepted, which keeps its `✓` on a terminal (spec
+    /// Open question 3; `main` prints it after the serving loop ends).
+    finished: bool,
 }
 
 impl Renderer {
@@ -183,12 +193,14 @@ impl Renderer {
             scrolled: 0,
             header_blank: 0,
             frame: 0,
-            rich_before_finish: false,
+            finished: false,
         }
     }
 
+    /// Rich rendering: the caps animate and `finish` has not happened (C6,
+    /// C10).
     fn rich(&self) -> bool {
-        self.caps.animate
+        self.caps.animate && !self.finished
     }
 
     fn quiet(&self) -> bool {
@@ -200,11 +212,11 @@ impl Renderer {
     }
 
     /// After `finish`: plain lines only, on the caller's thread (C10), the
-    /// note excepted (see [`Renderer::note`]). Phases still open keep their
-    /// start time so a late `done` prints its line.
+    /// note excepted (see [`Renderer::note`]). The caps stay as detected;
+    /// only the flag changes. Phases still open keep their start time so a
+    /// late `done` prints its line.
     fn into_plain(mut self) -> Renderer {
-        self.rich_before_finish = self.caps.animate;
-        self.caps.animate = false;
+        self.finished = true;
         self
     }
 
@@ -350,16 +362,17 @@ impl Renderer {
 
     /// `✓ <line>` (rich, the glyph painted Success) or `<line>` (plain): a
     /// success note outside any phase, a done line without a duration. Quiet
-    /// drops it like every other non-warning line. On a terminal that was
-    /// rich before `finish` the glyph form stays: the live region is empty
-    /// by then, so `emit` writes the line straight out, no cursor movement
-    /// and no synchronized update, only the glyph's own SGR when colour is
-    /// on. Every other post-finish line keeps its plain form.
+    /// drops it like every other non-warning line. The glyph form follows
+    /// `caps.animate` alone, not [`Renderer::rich`], so on a terminal it
+    /// stays after `finish`: the live region is empty by then, so `emit`
+    /// writes the line straight out, no cursor movement and no synchronized
+    /// update, only the glyph's own SGR when colour is on. Every other
+    /// post-finish line takes the plain form.
     fn note(&mut self, line: &str) {
         if self.quiet() {
             return;
         }
-        let line = if self.rich() || self.rich_before_finish {
+        let line = if self.caps.animate {
             format!(
                 "{INDENT}{} {line}",
                 paint(&self.caps, Role::Success, self.glyphs.done)
@@ -649,7 +662,9 @@ enum State {
         thread: JoinHandle<Option<Renderer>>,
     },
     /// After `finish`: synchronous plain-line rendering, or nothing when the
-    /// thread was abandoned on a stalled sink (its output is stuck anyway).
+    /// thread was abandoned on a stalled sink, by `shutdown` or by a
+    /// non-droppable send that found the queue full for `ACK_TIMEOUT` (S5);
+    /// its output is stuck anyway.
     Finished(Option<Renderer>),
 }
 
@@ -736,17 +751,20 @@ impl Reporter {
     /// every phase; `false` (one-shot, the default) prints nothing for a
     /// phase that ends within the first-draw delay.
     pub fn checklist(self, on: bool) -> Reporter {
-        {
+        let set = {
             let mut state = self.lock();
             match &mut *state {
                 State::Idle(renderer) | State::Finished(Some(renderer)) => {
                     renderer.checklist = on;
+                    true
                 }
-                State::Running { tx, .. } => {
-                    let _ = tx.send(Msg::Checklist(on));
-                }
-                State::Finished(None) => {}
+                State::Running { .. } | State::Finished(None) => false,
             }
+        };
+        if !set {
+            // The thread owns the renderer: the toggle travels like every
+            // other non-droppable message, bounded (S5).
+            self.send(Msg::Checklist(on));
         }
         self
     }
@@ -838,20 +856,25 @@ impl Reporter {
         self.send(Msg::Event(sanitize_event(ev)));
     }
 
-    /// The ready card; blocks until it is on the sink.
+    /// The ready card; blocks until it is on the sink, `ACK_TIMEOUT` at most.
     pub fn card(&self, card: &Card) {
-        self.send(Msg::Card(sanitize_card(card)));
-        self.send_and_wait(Msg::Flush);
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        self.send_by(Msg::Card(sanitize_card(card)), deadline);
+        self.send_and_wait(Msg::Flush, deadline);
     }
 
     /// The error panel; stops the live region first and blocks until the
-    /// panel is on the sink.
+    /// panel is on the sink, `ACK_TIMEOUT` at most.
     pub fn error(&self, report: &ErrorReport) {
-        self.send(Msg::Error {
-            report: sanitize_report(report),
-            home: self.display_home().map(Path::to_path_buf),
-        });
-        self.send_and_wait(Msg::Flush);
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        self.send_by(
+            Msg::Error {
+                report: sanitize_report(report),
+                home: self.display_home().map(Path::to_path_buf),
+            },
+            deadline,
+        );
+        self.send_and_wait(Msg::Flush, deadline);
     }
 
     /// Stops the ticker and joins the render thread, keeping every line on
@@ -884,7 +907,16 @@ impl Reporter {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Hands `msg` to the render thread, starting it on the first message;
+    /// a non-droppable message waits for room `ACK_TIMEOUT` at most.
     fn send(&self, msg: Msg) {
+        self.send_by(msg, Instant::now() + ACK_TIMEOUT);
+    }
+
+    /// [`Reporter::send`] with the instant a non-droppable message stops
+    /// waiting for room in a full queue (S5), so a call that sends twice
+    /// (`card`, `error`) is bounded as a whole.
+    fn send_by(&self, msg: Msg, deadline: Instant) {
         let mut state = self.lock();
         if matches!(&*state, State::Idle(_)) {
             start_thread(&mut state);
@@ -902,9 +934,18 @@ impl Reporter {
                     }
                     Err(TrySendError::Disconnected(msg)) => msg,
                 },
-                msg => match tx.send(msg) {
-                    Ok(()) => return,
-                    Err(mpsc::SendError(msg)) => msg,
+                // Every other kind waits for room until `deadline` (S5). A
+                // queue still full then sits behind a sink that has stalled
+                // for `ACK_TIMEOUT`: the thread is abandoned as `shutdown`
+                // abandons it, the message is dropped, and later output has
+                // nowhere to go.
+                msg => match send_until(tx, msg, deadline) {
+                    Enqueued::Sent => return,
+                    Enqueued::Full => {
+                        *state = State::Finished(None);
+                        return;
+                    }
+                    Enqueued::Disconnected(msg) => msg,
                 },
             },
             State::Finished(Some(renderer)) => {
@@ -925,16 +966,19 @@ impl Reporter {
     }
 
     /// Sends a message that acknowledges and waits for the acknowledgement,
-    /// `ACK_TIMEOUT` at most. A synchronous renderer has already acknowledged
-    /// by the time `send` returns; a dropped message disconnects at once.
-    fn send_and_wait(&self, make: fn(SyncSender<()>) -> Msg) {
+    /// until `deadline` at most for the two together. A synchronous renderer
+    /// has already acknowledged by the time `send_by` returns; a dropped
+    /// message disconnects at once.
+    fn send_and_wait(&self, make: fn(SyncSender<()>) -> Msg, deadline: Instant) {
         let (ack, acked) = mpsc::sync_channel(1);
-        self.send(make(ack));
-        let _ = acked.recv_timeout(ACK_TIMEOUT);
+        self.send_by(make(ack), deadline);
+        let _ = acked.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     }
 
     /// `finish` and `finish_and_clear`: the last message, then close the
     /// channel and join the thread, then switch to synchronous plain lines.
+    /// The last message waits for room and for its acknowledgement
+    /// `ACK_TIMEOUT` at most in all (S5).
     fn shutdown(&self, last: fn(SyncSender<()>) -> Msg) {
         let mut state = self.lock();
         let previous = std::mem::replace(&mut *state, State::Finished(None));
@@ -945,10 +989,12 @@ impl Reporter {
                 State::Finished(Some(renderer.into_plain()))
             }
             State::Running { tx, thread } => {
+                let deadline = Instant::now() + ACK_TIMEOUT;
                 let (ack, acked) = mpsc::sync_channel(1);
-                let sent = tx.send(last(ack)).is_ok();
+                let sent = matches!(send_until(&tx, last(ack), deadline), Enqueued::Sent);
                 drop(tx);
-                if sent && acked.recv_timeout(ACK_TIMEOUT).is_ok() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if sent && acked.recv_timeout(remaining).is_ok() {
                     State::Finished(thread.join().ok().flatten().map(Renderer::into_plain))
                 } else {
                     // Stalled sink or dead thread: abandon it rather than
@@ -1024,6 +1070,37 @@ fn sanitize_path(path: &Path) -> PathBuf {
     match text::sanitize(&path.display().to_string()) {
         Cow::Borrowed(_) => path.to_path_buf(),
         Cow::Owned(cleaned) => PathBuf::from(cleaned),
+    }
+}
+
+/// The outcome of [`send_until`].
+enum Enqueued {
+    /// The message is in the queue.
+    Sent,
+    /// The queue was still full at the deadline; the message is dropped.
+    Full,
+    /// The render thread is gone; the message comes back for synchronous
+    /// handling.
+    Disconnected(Msg),
+}
+
+/// `try_send` repeated every `ENQUEUE_POLL` until it succeeds, the thread is
+/// gone, or `deadline` passes with the queue still full (S5): the one way a
+/// non-droppable message enters the queue, so no caller blocks on it for
+/// longer than `ACK_TIMEOUT`.
+fn send_until(tx: &SyncSender<Msg>, mut msg: Msg, deadline: Instant) -> Enqueued {
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => return Enqueued::Sent,
+            Err(TrySendError::Full(back)) => {
+                if Instant::now() >= deadline {
+                    return Enqueued::Full;
+                }
+                msg = back;
+                std::thread::sleep(ENQUEUE_POLL);
+            }
+            Err(TrySendError::Disconnected(back)) => return Enqueued::Disconnected(back),
+        }
     }
 }
 
@@ -2670,8 +2747,9 @@ mod tests {
     // ---- fix task (panel pass 1): S1 escape injection, Q4 error panel,
     // F4 leading blank line ----
 
-    /// S1: a WARN whose field carries an OSC title change, a BEL and a line
-    /// break, through the real `UiLayer` → reporter → render thread path.
+    /// S1 / AC-W1-31: a WARN whose field carries an OSC title change, a BEL,
+    /// a C1 CSI (U+009B, `ESC [` in one byte; Sp13) and a line break, through
+    /// the real `UiLayer` → reporter → render thread path.
     #[test]
     fn a_warn_event_carrying_osc_bel_and_newline_renders_as_one_clean_line() {
         use crate::tracing_layer::UiLayer;
@@ -2686,7 +2764,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(UiLayer::new(reporter.events(), tracing::Level::WARN));
         tracing::subscriber::with_default(subscriber, || {
-            tracing::warn!(error = %"a\x1b]0;x\x07b\n c", "boom");
+            tracing::warn!(error = %"a\x1b]0;x\x07b\u{9b}2J\n c", "boom");
         });
         reporter.finish();
 
@@ -2699,6 +2777,10 @@ mod tests {
         assert!(
             !bytes.contains(&0x07),
             "no BEL may reach the sink: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{9b}'),
+            "no C1 CSI may reach the sink: {text:?}"
         );
         assert_eq!(
             text::strip_sgr(&text).matches('\n').count(),
@@ -2714,7 +2796,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "{BEGIN}{CLR}  \x1b[33m!\x1b[0m boom\x1b[2m · error=a\u{FFFD}]0;x\u{FFFD}b  c\x1b[0m\n{END}"
+                "{BEGIN}{CLR}  \x1b[33m!\x1b[0m boom\x1b[2m · error=a\u{FFFD}]0;x\u{FFFD}b\u{FFFD}2J  c\x1b[0m\n{END}"
             )
         );
     }
@@ -3323,5 +3405,122 @@ mod tests {
             reporter.display_path(Path::new("/Users/other/x.log")),
             "/Users/other/x.log"
         );
+    }
+    // ---- fix task (panel pass 2): S5 bounded sends, Q14 `finished` flag,
+    // Sp13 AC-W1-31 literal ----
+
+    /// Q14: `into_plain` records that the renderer finished and leaves the
+    /// caps it was built with untouched; `rich()` reads both, `note` reads
+    /// `caps.animate` alone for its glyph form. The bytes out are unchanged.
+    #[test]
+    fn into_plain_leaves_the_caps_untouched_and_turns_rich_off() {
+        let caps = rich_caps(true, true);
+        let sink = SharedSink::new();
+        let r = renderer(caps, Verbosity::Normal, true, FakeClock::new(), &sink);
+        assert!(r.rich());
+        let mut r = r.into_plain();
+        assert!(r.finished);
+        assert!(!r.rich(), "a finished renderer draws plain lines");
+        assert_eq!(
+            r.caps, caps,
+            "into_plain must record a flag, not rewrite the caps"
+        );
+        // Post-finish: a warning in plain form, the note with its glyph.
+        r.handle(Msg::Warn("late".to_string()));
+        r.handle(Msg::Note("stdin closed".to_string()));
+        assert_eq!(
+            sink.text(),
+            "warning: late\n  \x1b[32m✓\x1b[0m stdin closed\n"
+        );
+
+        // A renderer that was never rich stays plain through and through.
+        let sink = SharedSink::new();
+        let r = renderer(
+            Caps::plain(),
+            Verbosity::Normal,
+            true,
+            FakeClock::new(),
+            &sink,
+        );
+        let mut r = r.into_plain();
+        assert!(!r.rich());
+        assert_eq!(r.caps, Caps::plain());
+        r.handle(Msg::Note("stdin closed".to_string()));
+        assert_eq!(sink.text(), "stdin closed\n");
+    }
+
+    /// S5: a non-droppable message (the card here) on a full queue waits for
+    /// room `ACK_TIMEOUT` at most. A sink stalled for that long is a dead
+    /// pipe, so the render thread is abandoned as `shutdown` abandons it: the
+    /// call returns, its message is dropped, every later call returns at
+    /// once, and the thread drains what was queued when the sink moves again.
+    #[test]
+    fn a_blocking_message_on_a_full_queue_returns_after_the_ack_timeout_and_abandons_the_thread() {
+        let (sink, entered) = GatedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        reporter.warn("first");
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the render thread must reach the sink");
+        // The thread is inside the write of `first`; fill the queue exactly.
+        for i in 2..=QUEUE_CAPACITY + 1 {
+            reporter.warn(&format!("w{i}"));
+        }
+        assert_eq!(
+            reporter.inner.suppressed.load(Ordering::Relaxed),
+            0,
+            "the queue holds exactly QUEUE_CAPACITY warnings"
+        );
+
+        // `card` runs on another thread so that a regression to an
+        // unbounded block fails this test instead of hanging it.
+        let (returned, returned_rx) = mpsc::channel();
+        let blocked = reporter.clone();
+        let started = Instant::now();
+        let caller = std::thread::spawn(move || {
+            blocked.card(&bus_card());
+            let _ = returned.send(started.elapsed());
+        });
+        let elapsed = returned_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("card() must return within 3 s on a stalled sink with a full queue");
+        caller.join().expect("the caller thread must not panic");
+        assert!(
+            elapsed >= ACK_TIMEOUT,
+            "card() gave up before the 2 s bound: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        assert!(
+            matches!(&*reporter.lock(), State::Finished(None)),
+            "the stalled thread is abandoned"
+        );
+
+        // Afterwards nothing blocks and nothing panics.
+        let started = Instant::now();
+        reporter.warn("late");
+        reporter.phase("p").done("d");
+        reporter.note("n");
+        reporter.error(&port_report());
+        reporter.finish();
+        reporter.finish_and_clear();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no call may wait on an abandoned thread"
+        );
+        assert_eq!(reporter.inner.suppressed.load(Ordering::Relaxed), 0);
+
+        // The sink moves again: the abandoned thread drains the queued
+        // warnings and exits. The card never arrives, nor does anything
+        // sent after the abandonment.
+        sink.open();
+        let mut expected = String::from("warning: first\n");
+        for i in 2..=QUEUE_CAPACITY + 1 {
+            expected.push_str(&format!("warning: w{i}\n"));
+        }
+        let drained = Instant::now();
+        while sink.inner.text() != expected && drained.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(sink.inner.text(), expected);
     }
 }
