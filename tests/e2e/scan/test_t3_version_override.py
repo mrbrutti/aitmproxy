@@ -116,9 +116,15 @@ def main() -> None:
                 # Loud, never green: the hook is amendment 39's lane contract.
                 skip(f"http lane crate does not report crawl errors (amendment 39 hook not wired; "
                      f"probes={probes2}, crawl={crawl2}); the T3 half of AC T3-2 passed above")
-            check(st2.get("stopped_reason") is None and not error_text,
-                  f"an all-failed crawl is not an early stop: stopped_reason and error are null "
-                  f"(observed {st2.get('stopped_reason')!r}, {error_text[:80]!r})")
+            # 39b: the crawl's failure is not a job failure (`error` null). With
+            # amendment 38 the origin-scoped checks still run on `<origin>/` and
+            # their probes fail the same way, so the per-host ladder (amendment
+            # 40: transport errors count) may legitimately end the job
+            # `stopped_reason: errors`; a crawl-only failure ends `done` with
+            # both null. Either way the cause is on `crawl.errors`/`last_error`.
+            check(st2.get("stopped_reason") in (None, "errors") and not error_text,
+                  f"an all-failed crawl is not a job failure: error is null, stopped_reason is null or "
+                  f"the ladder's 'errors' (observed {st2.get('stopped_reason')!r}, {error_text[:80]!r})")
             check(int(crawl2.get("errors") or 0) > 0 and int(crawl2.get("pages") or 0) == 0,
                   f"crawl.errors counted every failed request and no page was fetched "
                   f"(observed errors={crawl2.get('errors')!r}, pages={crawl2.get('pages')!r})")
