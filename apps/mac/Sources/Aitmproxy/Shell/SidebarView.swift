@@ -196,7 +196,9 @@ struct SidebarView: View {
         let group = FlowGroup.client(key)
         let selected = session.page == .apps && session.group == group
         let pinned = session.isPinned(group)
-        let expanded = session.expandedApps.contains(key)
+        // The chevron reads open whenever domain rows are showing: toggled open, or every match while
+        // a query is typed (Tester M3 — spec D4 shows the hosts while querying, D5 draws the chevron).
+        let expanded = session.expandedApps.contains(key) || (querying && !domains(under: key).isEmpty)
         return HStack(spacing: 0) {
             Button {
                 session.toggleExpanded(key)
@@ -276,7 +278,7 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(help ?? "")
+        .help(help ?? title)
         .contextMenu {
             Button(pinned ? "Unpin \(noun)" : "Pin \(noun)") { pinned ? session.unpin(group) : session.pin(group) }
         }
