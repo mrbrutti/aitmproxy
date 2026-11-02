@@ -426,7 +426,7 @@ Merging main 167e74b9 (T2's `aitm-scan-http` takes the http slot) made `test_t3_
 Also found on the merged build, not PR 2's, reported to the coordinator:
 - `test_t3_version_override.py`: T2's crawler calls neither `report_crawl_error` nor `report_forms_submitted`, so 39b has no signal on the real lane; the cell SKIPs 77 loudly when `lane_source == crate && crawl.errors == 0` (hand-off: T2 lane wires the amendment-39/53 hooks).
 - `test_t1_finding_link`, `test_t2_mutable_points`, `test_t2_session_reuse` ("the second job in the same core sends nothing to its own target"): aitm-core's `StdGuard` keys throttle, error budget and disable window on `Authority.host` with the port dropped, and its client charges every upstream failure and 5xx to it; two targets on 127.0.0.1 share one budget, a full 2000-probe job exhausts it and the next job's probes are `HostDisabled` → ladder → `stopped_reason: errors`. Measured: P alone 2000/0 errors; P after a 60-probe V clean; P after a full V 10 errors, stopped. Proposed amendment: key budget + disable window by normalized authority (host:port).
-- `test_t1_contract` (`scan.discover` `max_pages: 2` → `pages_crawled 4`): T2's crawler reads `crawl.max_pages` only as "0 = no crawl"; the bound is not applied (T2 lane).
+- `test_t1_contract` (`scan.discover` `max_pages: 2` → `pages_crawled 4`): T2's crawlers each stop at `attempts >= limits.max_pages` (`crawl/client.rs:146`, `crawl/browser.rs:573`), so with more than one crawler per origin, or attempts counted as pages, `crawl.pages` exceeds the profile's bound (T2 lane accounting; `scan.discover` reports `status.crawl.pages` unchanged).
 
 ### Task 6: bookkeeping and docs wording
 
