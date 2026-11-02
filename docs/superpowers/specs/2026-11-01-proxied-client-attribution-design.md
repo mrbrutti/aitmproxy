@@ -175,9 +175,14 @@ let local = stream.local_addr().ok();
 let attribution = peer::start_attribution(inner.peer_resolver.as_ref(), peer, local);
 ```
 
-`start_attribution` returns `Some(tokio::task::spawn_blocking(move || r.resolve(peer, local)))`
-only when a resolver is set, `local` is known and `is_loopback_peer(peer.ip())`; else `None`
-(no task). After the peek:
+`start_attribution` returns `Some(tokio::task::spawn_blocking(..))` only when a resolver is set,
+`local` is known, `is_loopback_peer(peer.ip())`, and one of `MAX_IN_FLIGHT = 64` process-wide
+in-flight slots is free (a `tokio::sync::Semaphore` behind a `OnceLock`; security finding S1,
+2026-11-01: 64 tasks each parked for up to the 250 ms scan deadline stay far below tokio's 512
+blocking threads); else `None` (no task). The permit travels into the task and is released when it
+returns, however it ends. Inside the task `resolve` runs under `catch_unwind`: a resolver panic
+costs that connection its identity (`None`) and nothing else (Q1 / T-F1, 2026-11-01). After the
+peek:
 
 ```rust
 let peer_identity = peer::finish_attribution(attribution, peer::ATTRIBUTION_BUDGET).await;
@@ -200,7 +205,11 @@ scanner).** One scan runs at a time. `resolve` registers its `Tuple { client: pe
 in a pending set under a `Mutex`; if no scan is running the caller becomes the **leader**: it
 snapshots every pending tuple, runs one scan that matches all of them, writes each result, notifies
 a `Condvar`, and if new tuples arrived meanwhile loops as leader again (subject to the rate limit).
-A non-leader waits on the `Condvar` until its tuple has a result or `scan_deadline` passes.
+A non-leader waits on the `Condvar` until its tuple has a result or `scan_deadline` passes. If the
+scanner panics while a leader is inside it, a drop guard (`ScanGuard`) writes `None` for every
+tuple in that batch, clears the scanning flag and wakes the waiters, so the next caller leads a
+fresh scan instead of waiting out its deadline behind a scan that is not running (tester finding
+T-F1, 2026-11-01).
 
 **Rate limit (Architect's call): a token bucket of capacity 20, refilled at 20 tokens/s** (amended
 2026-11-01, F2; was 10 / 10, see the amendment below). A full scan consumes a token. A caller
@@ -227,7 +236,9 @@ connections within milliseconds) is one or two scans.
 > `Limits::default()` is therefore (250 ms, 20, 20, 256); the warm capacity is a crate constant,
 > not a knob (D6).
 
-**Scan deadline (Architect's call): 250 ms wall clock**, checked between pids; on expiry the scan
+**Scan deadline (Architect's call): 250 ms wall clock**, checked between pids and, inside one pid,
+every 64 socket fds (`FD_DEADLINE_STRIDE`, security finding S3, 2026-11-01: one process with tens
+of thousands of sockets cannot carry the walk past the deadline on its own); on expiry the scan
 ends and every tuple it did not match resolves `None`. This bounds a pathological host (tens of
 thousands of fds) and the blocking-pool occupancy.
 
@@ -300,8 +311,11 @@ looks the same on every platform. This divergence is accepted and recorded here.
 **`sanitize(raw: &str) -> Option<String>`:** remove every scalar for which `char::is_control()` is
 true (Unicode Cc) and every scalar in these format (Cf) ranges: U+00AD, U+061C, U+180E,
 U+200B–U+200F, U+202A–U+202E, U+2060–U+2064, U+2066–U+2069, U+FEFF, U+FFF9–U+FFFB, U+E0001,
-U+E0020–U+E007F; trim ASCII whitespace; `None` if empty or if the result exceeds 256 bytes
-(dropped, not truncated — a 257-byte "name" is not a name). Applied before caching and before the
+U+E0020–U+E007F, and every non-ASCII whitespace scalar (`char::is_whitespace` and not
+`is_ascii_whitespace`: NBSP, the Zs block, U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR;
+security finding S2, 2026-11-01); trim the remaining whitespace (`char::is_whitespace`); `None` if
+empty or if the result exceeds 256 bytes (dropped, not truncated — a 257-byte "name" is not a
+name). Applied before caching and before the
 string leaves the crate.
 
 Never: a path, argv, `cmdline`, `environ`, `KERN_PROCARGS2`, the private `responsibility_*` SPI.
@@ -340,13 +354,15 @@ docstring rewritten to say what it now proves. The new positive proof lives in
 
 ### D9. Logging and privacy posture
 
-- The core logs presence only (`resolved` bool at `debug`); the leaf crate has no tracing
-  dependency and returns values (amended 2026-11-01, panel P7). Never the identity string above
-  `debug`, never a path or pid at any level in `aitm-core`.
+- The core logs presence (`resolved` bool at `debug`), one `warn` carrying only the loopback peer
+  address when a resolver panics inside its blocking task (once per process, then `debug`; S6),
+  and one `debug` when the task is cancelled (runtime shutdown); the leaf crate has no tracing
+  dependency and returns values (amended 2026-11-01, panel P7 and Q1). Never the identity string
+  above `debug`, never a path or pid at any level in `aitm-core`.
 - Same-user only by construction: the kernel refuses other users' fd tables; we never escalate,
   never ask for a helper, never read `/proc/<pid>/cmdline`.
 - The identity is text chosen by whoever built the client binary: bounded (≤ 256 bytes), scrubbed
-  of control/format scalars, stored as data, shown by UIs that already treat `source_app` as
+  of control, format and non-ASCII whitespace scalars, stored as data, shown by UIs that already treat `source_app` as
   untrusted text (Kit: `tooltipText`, `sanitized`; prior spec anti-goals). It never reaches a
   scope, guard, passthrough or routing decision.
 - The audit ring and session files already carry `source_app`; nothing new is persisted.
@@ -416,7 +432,7 @@ docstring rewritten to say what it now proves. The new positive proof lives in
    client `TcpStream::connect`, `accept()`; `MacScanner { skip_pid: None }.find_owners(&[Tuple { client: accepted.peer_addr(), proxy: accepted.local_addr() }], deadline)`
    returns that tuple mapped to `ProcessKey { pid: std::process::id(), .. }`; the same on
    `[::1]:0`; and through the public `ProcessResolver::resolve(peer, local)` (own pid not skipped
-   via `with_skip_pid(None)` test hook) the identity is `Some(s)` with
+   via the `ProcessResolver::for_tests(Limits::default(), None)` test hook) the identity is `Some(s)` with
    `s.starts_with("aitm_peer_process")` (the test binary's basename). A tuple whose client port is
    a closed socket resolves `None`.
 10. **AC10 (e2e, curl).** `tests/e2e/proxy/test_client_attribution.py` (`# e2e: tier=T1 surface=proxy`,
@@ -441,10 +457,9 @@ docstring rewritten to say what it now proves. The new positive proof lives in
     with `scan_deadline = 1 ms` and a scanner that sleeps 50 ms, `resolve` returns `None`.
 15. **AC15 (cache).** Two resolutions mapping to the same `ProcessKey` call `identity` once; a key
     with the same pid and a different `start` calls it again; inserting 257 keys evicts the first.
-16. **AC16 (wording).** `grep -rn "null for a proxied" crates docs` finds nothing outside
-    `apps/mac/**` and `docs/research/**`; the scope is `crates` and `docs/design`; the archival
-    2026-10-31 specs/plans and this spec quoting the phrase are exempt (amended 2026-11-01, panel
-    P1); `schemas_declare_source_app_and_capture_interface` and
+16. **AC16 (wording).** `grep -rn "null for a proxied" crates docs/design` finds nothing (amended
+    2026-11-01, panel P1: the archival 2026-10-31 spec/plan and this spec/plan, which quote the
+    phrase, are outside the scope); `schemas_declare_source_app_and_capture_interface` and
     `flow_get_and_table_report_source_app` pass unchanged; the e2e flow cell (D8) passes against
     the new core.
 17. **AC17 (gates and proof).** Rust gate green; `cargo test -p aitm-peer-process` and the
@@ -460,7 +475,8 @@ docstring rewritten to say what it now proves. The new positive proof lives in
 - The `Condvar` vs. `std::sync::mpsc` mechanics of the coalescer, as long as AC14 holds and a
   non-leader never spins.
 - How `skip_pid` is threaded for the self-resolution tests (a `#[cfg(test)]`-only constructor or a
-  `pub fn with_skip_pid(Option<u32>)`), as long as production always skips its own pid.
+  `pub fn with_skip_pid(Option<u32>)`), as long as production always skips its own pid — the
+  builder chose `#[doc(hidden)] pub fn for_tests(limits, skip_pid)`.
 - Which errno values are logged at `debug`; none are returned.
 - Whether `finish_attribution` lives in `peer.rs` or `proxy.rs`.
 - The exact doc-comment sentences under D7, keeping "proxied" in the two `ParamDef` descriptions.

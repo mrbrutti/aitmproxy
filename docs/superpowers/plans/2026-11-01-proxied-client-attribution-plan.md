@@ -111,7 +111,7 @@ gates while a wave is in flight, full gate before the panel.
       pub(crate) fn new(cap: usize) -> Self;
       pub(crate) fn get(&self, key: &ProcessKey) -> Option<Option<String>>;   // outer None = miss
       pub(crate) fn insert(&mut self, key: ProcessKey, identity: Option<String>);  // FIFO evict at cap
-      pub(crate) fn len(&self) -> usize;
+      #[cfg(test)] pub(crate) fn len(&self) -> usize;  // Q4
   }
   // coalesce.rs
   pub(crate) struct Coalescer<S: SocketScanner> { scanner: S, limits: Limits, state: Mutex<State>, wake: Condvar }
@@ -149,7 +149,9 @@ gates while a wave is in flight, full gate before the panel.
   `a_targeted_miss_falls_through_to_one_full_scan`,
   `warm_set_keeps_the_sixteen_most_recently_matched_pids`,
   `a_pid_whose_probe_finds_no_sockets_leaves_the_warm_set`; the bucket tests use two pids so the
-  second lookup is a warm miss.
+  second lookup is a warm miss. `lead_scan` holds a `ScanGuard` whose `Drop` writes `None` for the
+  batch, clears `scanning` and notifies on unwind (T-F1); tests
+  `a_scanner_panic_does_not_wedge_later_callers`, `a_waiter_is_released_when_the_leader_panics`.
 
 ### Task 3: macOS libproc FFI wrappers, layout pins, raw self-resolution
 
@@ -166,18 +168,20 @@ gates while a wave is in flight, full gate before the panel.
   `socket_fdinfo` (792 bytes: `_pfi: [u8; 24]`, `_psi_head: [u8; 208]`, `soi_kind: i32`,
   `_pad: i32`, `soi_proto: [u8; 552]`). Constants `PROC_ALL_PIDS: u32 = 1`,
   `PROC_PIDFDSOCKETINFO: i32 = 3`, `SOCKINFO_TCP: i32 = 2`, `INI_IPV4: u8 = 1`, `INI_IPV6: u8 = 2`.
-  Safe wrappers (each `Option`/`Vec`, fail-closed):
+  Safe wrappers (each `Option`/`Vec`, fail-closed). Only `find_owners_raw`, `find_owners_among_raw`,
+  `pid_path`, `pid_name` are `pub(crate)`; every other wrapper, mirror and constant below is private
+  to `ffi.rs` (Q3, 2026-11-01):
   ```rust
-  pub(crate) fn list_pids() -> Vec<u32>;                               // proc_listpids(PROC_ALL_PIDS), two-call sizing
-  pub(crate) fn socket_fds(pid: u32) -> Option<Vec<i32>>;              // PROC_PIDLISTFDS, filtered to PROX_FDTYPE_SOCKET; None on EPERM/ESRCH
-  pub(crate) struct TcpSocket { pub laddr: IpAddr, pub lport: u16, pub faddr: IpAddr, pub fport: u16 }
-  pub(crate) fn tcp_socket(pid: u32, fd: i32) -> Option<TcpSocket>;    // PROC_PIDFDSOCKETINFO; None unless soi_kind == SOCKINFO_TCP and the full 792 bytes were written; ports via port_from_libproc; addresses per insi_vflag
+  fn list_pids() -> Vec<u32>;                                          // proc_listpids(PROC_ALL_PIDS), two-call sizing
+  fn socket_fds(pid: u32) -> Option<Vec<i32>>;                         // PROC_PIDLISTFDS, filtered to PROX_FDTYPE_SOCKET; None on EPERM/ESRCH
+  struct TcpSocket { laddr: IpAddr, lport: u16, faddr: IpAddr, fport: u16 }
+  fn tcp_socket(pid: u32, fd: i32) -> Option<TcpSocket>;               // PROC_PIDFDSOCKETINFO; None unless soi_kind == SOCKINFO_TCP and the full 792 bytes were written; ports via port_from_libproc; addresses per insi_vflag
   pub(crate) fn pid_path(pid: u32) -> Option<String>;                  // proc_pidpath into a 4096-byte buffer
   pub(crate) fn pid_name(pid: u32) -> Option<String>;                  // proc_name into a 256-byte buffer
-  pub(crate) fn pid_start_micros(pid: u32) -> Option<u64>;             // PROC_PIDTBSDINFO → pbi_start_tvsec*1_000_000 + pbi_start_tvusec
+  fn pid_start_micros(pid: u32) -> Option<u64>;                        // PROC_PIDTBSDINFO → pbi_start_tvsec*1_000_000 + pbi_start_tvusec
   pub(crate) fn find_owners_raw(wanted: &[Tuple], deadline: Instant, skip_pid: Option<u32>) -> HashMap<Tuple, ProcessKey>;
   ```
-  `find_owners_raw`: pids ascending, skip `skip_pid`, deadline checked per pid, `socket_fds` →
+  `find_owners_raw`: pids ascending, skip `skip_pid`, deadline checked per pid and every 64 fds within a pid (`FD_DEADLINE_STRIDE` in `types.rs`, S3), `socket_fds` →
   `tcp_socket` → `tuple_matches`; first match per tuple wins; `pid_start_micros` only for matched
   pids (`start` = 0 if it fails, still a match).
 - **Test:** `#[cfg(target_os = "macos")] mod tests`:
@@ -208,12 +212,14 @@ gates while a wave is in flight, full gate before the panel.
   impl LinuxScanner { pub(crate) fn new() -> Self; }  // root = /proc; uid via std::os::unix::fs::MetadataExt on /proc/self (no libc dep); own pid skipped
   impl LinuxScanner { pub(crate) fn with_root(root: PathBuf, uid: u32, skip_pid: Option<u32>) -> Self; }  // any procfs root: a fixture tree in tests
   impl SocketScanner for LinuxScanner {
-      fn find_owners(..)  // read <root>/net/tcp and tcp6, parse_tcp_row, match wanted by (local==client, remote==proxy) after canonical(); row.uid must equal self.uid; inode → walk <root>/[0-9]+/fd ascending, readlink, fd_socket_inode == inode; skip skip_pid; deadline per pid; ProcessKey.start from parse_stat_starttime(<root>/<pid>/stat)
+      fn find_owners(..)  // read <root>/net/tcp and tcp6, parse_tcp_row, match wanted by (local==client, remote==proxy) after canonical(); row.uid must equal self.uid; inode → walk <root>/[0-9]+/fd ascending, readlink, fd_socket_inode == inode; skip skip_pid; deadline per pid and every 64 fds within a pid (`FD_DEADLINE_STRIDE` in `types.rs`, S3); ProcessKey.start from parse_stat_starttime(<root>/<pid>/stat)
       fn identity(..)     // exe_basename(readlink <root>/<pid>/exe) else <root>/<pid>/comm trimmed
   }
   ```
 - **Test:** the parsers are Task 1's. Here: fixture tests over a fake `/proc` under `$TMPDIR`
-  (`linux::scan::tests`, 13 at the panel: a same-uid row is matched, another uid's row is never
+  (`linux::scan::tests`, 16 after the fix range; the four added: a probe with no matching row
+  walks nothing (Q6), a malformed row does not abort the table, two tuples of one process share one
+  key, the fd walk of one pid stops at an expired deadline (S5). At the panel: a same-uid row is matched, another uid's row is never
   matched, the lowest pid wins and `skip_pid` is honoured, a missing `stat` still matches with
   `start == 0`, an expired deadline finds nothing, an empty `/proc` does not panic, an unreadable
   fd dir is skipped, identity via `exe` then `comm`, a vanished pid is `None`, a malformed row does
@@ -251,7 +257,7 @@ gates while a wave is in flight, full gate before the panel.
   impl ProcessResolver {
       pub fn new() -> Self;                                   // Limits::default(), skip own pid
       pub fn with_limits(limits: Limits) -> Self;
-      #[doc(hidden)] pub fn with_skip_pid(self, skip: Option<u32>) -> Self;   // tests only
+      #[doc(hidden)] pub fn for_tests(limits: Limits, skip_pid: Option<u32>) -> Self;   // tests only; with_limits(l) = build(l, Some(own pid)) (Q5/Q10, 2026-11-01)
   }
   impl Default for ProcessResolver
   impl aitm_core::peer::PeerResolver for ProcessResolver {
@@ -266,7 +272,7 @@ gates while a wave is in flight, full gate before the panel.
     `identity_for_path("/nonexistent/Foo.app/Contents/MacOS/Foo") == Some("Foo")` (bundle read
     fails → basename).
   - `resolve_names_this_process` (Terminal): listener `127.0.0.1:0`, connect, accept;
-    `ProcessResolver::new().with_skip_pid(None).resolve(accepted.peer_addr()?, accepted.local_addr()?)`
+    `ProcessResolver::for_tests(Limits::default(), None).resolve(accepted.peer_addr()?, accepted.local_addr()?)`
     `== Some(s)` with `s.starts_with("aitm_peer_process")`.
   - `resolve_skips_own_pid_in_production_shape` (Terminal): the same pair with
     `ProcessResolver::new()` → `None` (our own socket is the only owner and it is skipped).
@@ -275,9 +281,13 @@ gates while a wave is in flight, full gate before the panel.
   and clippy/fmt clean for the package.
 - **Amendment 2026-11-01 (F2):** `MacScanner::find_owners_among` delegates to
   `ffi::find_owners_among_raw(wanted, deadline, skip_pid, pids)`, the per-pid body of
-  `find_owners_raw` factored into `walk_pids`; a pid whose `socket_fds` is `None` is `gone`.
-  `LinuxScanner::find_owners_among` reads the tables as before and walks only the given
-  `/proc/<pid>` dirs (`walk_pids(.., report_gone = true)`). Tests: `ffi::tests::
+  `find_owners_raw` factored into `walk_pids`; a pid whose `socket_fds` is `None` **or empty** is
+  `gone` (`Probe::gone` contract: fd table unreadable or no socket fd at all, same on both
+  platforms; Q2, 2026-11-01). `LinuxScanner::find_owners_among` reads the tables as before and
+  walks only the given `/proc/<pid>` dirs through the shared per-pid body
+  `owners_of_pid(pid, &mut inodes, deadline, &mut owners) -> PidWalk { Socketless, Walked, Expired }`;
+  only the probe pushes `Socketless` to `gone`, and a probe whose tuples have no table row walks no
+  pid (Q6, Q7, 2026-11-01). Tests: `ffi::tests::
   a_targeted_probe_reports_unreadable_pids_gone` (sandbox: pid 1 EPERM and `i32::MAX` ESRCH are
   `gone`), `ffi::tests::warm_probe_names_this_process_without_a_full_scan` (Terminal),
   `linux::scan::tests::a_targeted_probe_walks_only_the_given_pids_and_reports_the_idle_ones`
@@ -300,6 +310,8 @@ gates while a wave is in flight, full gate before the panel.
   pub const ATTRIBUTION_BUDGET: Duration = Duration::from_millis(25);
   pub fn is_loopback_peer(ip: IpAddr) -> bool;
   pub(crate) fn start_attribution(resolver: Option<&Arc<dyn PeerResolver>>, peer: SocketAddr, local: Option<SocketAddr>) -> Option<JoinHandle<Option<String>>>;
+  pub(crate) const MAX_IN_FLIGHT: usize = 64;  // S1 (2026-11-01): process-wide in-flight cap; start_attribution → None when no permit
+  fn start_attribution_with(slots: &Arc<tokio::sync::Semaphore>, ..)  // the form tests drive with their own pool; resolve runs under catch_unwind (Q1)
   pub(crate) async fn finish_attribution(task: Option<JoinHandle<Option<String>>>, budget: Duration) -> Option<String>;
   // proxy.rs
   struct ProxyInner { .., peer_resolver: Option<Arc<dyn PeerResolver>> }
@@ -312,8 +324,9 @@ gates while a wave is in flight, full gate before the panel.
   let peer_identity = peer::finish_attribution(attribution, peer::ATTRIBUTION_BUDGET).await;
   // hint: peer_identity, capture_interface: None  (comment rewritten per D7 and the tunnel_authority invariant)
   ```
-  `tracing::debug!` on a resolved identity's presence (`resolved = identity.is_some()`), never the
-  string.
+  `tracing::debug!` on a resolved identity's presence (`resolved = identity.is_some()`),
+  `tracing::warn!(%peer, ..)` once per process when the resolver panics (then `debug!`),
+  `tracing::debug!` on a join error; never the string, never a pid or path.
 - **Test:**
   - `peer::tests::loopback_classification`: the eight `is_loopback_peer` literals of AC1.
   - `peer::tests::non_loopback_peer_spawns_no_task` (sandbox, `#[tokio::test]`): `CountingResolver`
@@ -321,6 +334,9 @@ gates while a wave is in flight, full gate before the panel.
     `127.0.0.1:5000`, `[::1]:5000`, `[::ffff:127.0.0.1]:5000` → `Some`, awaited count `3`.
   - `peer::tests::finish_within_budget_flattens`: task returning `Some("x")` → `Some("x")`; task
     sleeping 200 ms with budget 10 ms → `None` in under 100 ms.
+  - `peer::tests::the_sixty_fifth_concurrent_attribution_is_refused_without_a_spawn`,
+    `peer::tests::in_flight_cap_is_sixty_four`,
+    `peer::tests::a_panicking_resolver_yields_none_not_an_error` (S1, Q1, 2026-11-01).
   - `proxy::tests::resolver_result_reaches_the_hint` (Terminal): `RecordingModule` (claims all,
     stores `hint.clone()` in a `Mutex<Option<NextLayerHint>>`), resolver returning
     `Some("curl-test")`, `Proxy::run_on(TcpListener::bind("127.0.0.1:0"))` in a task, connect, write
