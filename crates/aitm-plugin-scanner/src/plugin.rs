@@ -132,6 +132,9 @@ impl Plugin for ScannerPlugin {
             late: Arc::clone(&self.late),
             lanes: self.lanes.clone(),
             native_checks: self.native_checks.clone(),
+            // Spec amendment 24: the three shipped passive checks are the
+            // engine's own, in the catalogue whatever lane holds the http slot.
+            passive_checks: crate::interim_lane::shipped_passive_checks(),
             script_checks: Arc::clone(&self.script_checks),
             // Call B2: the interim lane is built unconditionally but used only
             // while no lane crate supplies an HTTP lane. `lanes_for_run`
@@ -377,8 +380,10 @@ mod tests {
     /// T1a's `filled_slots_register_no_extra_verb`, re-pinned for T1b: the
     /// slots now *are* the verb surface. A lane crate's lane displaces the
     /// interim one (call B2), so this plugin's catalogue is the test lane's
-    /// checks (none) plus the one native check — and the manual surface is
-    /// exactly that check's `check.test.check` (spec D4, call B8).
+    /// checks (none), the one native check, and the three passive checks the
+    /// engine itself ships whatever lane holds the http slot (spec amendment
+    /// 24) — and the manual surface is exactly those four `check.<id>`s
+    /// (spec D4, call B8).
     ///
     /// Every new name here lands on the integration-shared contract lists,
     /// which Task 19 re-pins.
@@ -396,6 +401,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "check.cookie-flag",
+                "check.reflection",
+                "check.security-header",
                 "check.test.check",
                 "scan.cancel",
                 "scan.checks",
