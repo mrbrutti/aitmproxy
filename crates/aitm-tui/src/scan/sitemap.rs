@@ -187,6 +187,11 @@ pub struct SitemapState {
     /// The lists reached [`SITEMAP_TOTAL_LIMIT`] (G17): the summary says
     /// so and no further page is asked for.
     pub limit_reached: bool,
+    /// The job the last `scan.sitemap` reply named as the map's (umbrella
+    /// amendment 27: `{}` returns the newest job's map and says which; fix
+    /// round H, H61), cut like every other string; `None` until a reply
+    /// names one (an older core never does). The summary head reads it.
+    pub job: Option<JobId>,
     pub node_cursor: usize,
     /// The Points cursor as an offset within the selected node's points
     /// (fix round G, G24): the shared walk runs over
@@ -236,6 +241,14 @@ impl SitemapState {
         } else {
             self.nodes = result.nodes;
             self.points = result.points;
+        }
+        // The reply names the job it chose (H61); an appended page that does
+        // not keeps the first page's.
+        if let Some(mut job) = result.job {
+            cut(&mut job);
+            self.job = Some(job);
+        } else if !append {
+            self.job = None;
         }
         let mut error = None;
         self.next_cursor = match result.next_cursor {
@@ -362,11 +375,15 @@ impl SitemapState {
     }
 
     /// The summary line the view draws first (D11: `12 nodes · 2 points of
-    /// node-1 · n next page`): the node count, the selected node's point
-    /// count and id, the paging hint only while a next page exists, and
-    /// `limit reached` once the lists hit [`SITEMAP_TOTAL_LIMIT`] (G17).
+    /// node-1 · n next page`): the node count, the map's job when the reply
+    /// named one (`· job <id>`; H61), the selected node's point count and
+    /// id, the paging hint only while a next page exists, and `limit
+    /// reached` once the lists hit [`SITEMAP_TOTAL_LIMIT`] (G17).
     pub fn summary(&self) -> String {
         let mut text = format!("{} nodes", self.nodes.len());
+        if let Some(job) = &self.job {
+            text.push_str(&format!(" · job {job}"));
+        }
         if let Some(node) = self.selected_node() {
             let n = self.node_points(self.node_cursor).len();
             text.push_str(&format!(" · {n} points of {}", node.id));

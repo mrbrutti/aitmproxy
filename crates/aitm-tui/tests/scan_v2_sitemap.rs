@@ -925,3 +925,37 @@ fn enter_opens_the_point_under_the_cursor_in_group_order() {
     assert_eq!(app.mode, Mode::Inspector, "{}", toast(&app));
     assert_eq!(app.selected.as_deref(), Some(POINT_B), "p-b's own flow");
 }
+
+/// Fix round H, H61 (umbrella amendment 27): `scan.sitemap {}` returns the
+/// newest job's map and names the job it chose; when the reply carries
+/// `job`, the Site map summary head reads `<n> nodes · job <id>` before
+/// the rest of the line. A reply without `job` (an older core) keeps the
+/// head as it was.
+#[test]
+fn the_summary_head_names_the_maps_job_when_the_reply_carries_it() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
+    let mut page = fixture("scan.sitemap.json");
+    page["job"] = json!(JOB);
+    let _ = app.on_bus(sitemap_reply(page));
+    assert_eq!(app.scan.sitemap.job.as_deref(), Some(JOB));
+    let text = screen(&app);
+    assert!(
+        line_with(
+            &text,
+            "1 nodes · job scan-1a2b3c4d · 2 points of node-1 · n next page"
+        )
+        .is_some(),
+        "the head names the map's job: {text}"
+    );
+
+    let mut older = app_with(TOOLS);
+    let _ = older.update(Action::ScanTab(ScanTab::SiteMap));
+    let _ = older.on_bus(sitemap_reply(fixture("scan.sitemap.json")));
+    assert_eq!(older.scan.sitemap.job, None);
+    let text = screen(&older);
+    assert!(
+        line_with(&text, "1 nodes · 2 points of node-1 · n next page").is_some(),
+        "no job on the wire, no job on the head: {text}"
+    );
+}
