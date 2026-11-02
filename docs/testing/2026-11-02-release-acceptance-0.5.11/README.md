@@ -78,7 +78,54 @@ lock and Matt's yes-list arrive.
 None. The run added no Scope host (CLI-5's host never reached the core). The three hosts in
 Scope belong to the attribution session's checklist.
 
-## Run 2 — window half
+## Run 2 — read-only half re-run on the fixed runner, 2026-11-02 03:00Z (`run-2-readonly-6765dee0/`)
+
+Same installed build, after the stage-6 panel's fix round (runner at `6765dee0`). The app had
+been relaunched again (core pid 16734, still 0.5.11) and Scope was **empty** again (the
+attribution session's checklist had finished and cleaned up), so the extension claimed nothing.
+Verdict **fail** (exit 1): CLI-4, CLI-5, CLI-10, MAC-9b. Every spec step id now has a row
+(`run-2-readonly-6765dee0/README.md` is the runner's own skeleton; `run.log` the full transcript).
+
+| # | Result | Observed | Bus truth | Explains |
+|---|---|---|---|---|
+| CLI-4 | **FAIL** | one-shot `"listening": false`, `"version": "0.5.10"` beside the running 0.5.11 core | `listening true` | `claude/cli-oneshot-live-core` (open) |
+| CLI-5 | **FAIL** | exit 0, host echoed; running core's `scope.list` stays `[]`; nothing to remove | `scope.list []` | same |
+| CLI-9 `aitm proxy system status` | SKIP (status read) | `"state": "off"`, `"managed_by_us": false` — agrees with `scutil`; `set`/`unset` need Matt's yes | `proxy.system.status state off` | — |
+| CLI-10 `aitm flow list` | **FAIL** | exit 0, `[]` from its own in-process core while the running core has 5 flows | `flow.table` 5 rows | same as CLI-4 |
+| CLI-7, N4-CLI | PASS | as run 1 | — | log noise: #271 |
+| CLI-0 | SKIP | release run only; brew upgrade is Matt's | — | — |
+| CLI-1/2/3/6/8 | SKIP | ports held by the app's core | — | #271 expected FAIL for 1/2/3 |
+| MAC-1 | PASS | bundle 0.5.11, core 0.5.11 pid 16734 | `listening true`, start marker present | — |
+| MAC-0, N3/N4/N5-MAC | SKIP | release-run only; CA stays trusted; plain 8080 listener needs a yes; Settings ▸ Bus is a hand | — | — |
+| MAC-2/3/4, N2-MAC, MAC-5, MAC-7, MAC-13, N1-MAC | SKIP | need the window (MAC-7 now reads the word "All Apps is on" on the page instead of passing from the bus) | `capture.status` on, attached | N1: #274 merged after the tag, unreleased |
+| MAC-6, MAC-15, MAC-14, MAC-16 | SKIP | yes / nothing to restore / not quit | — | — |
+| MAC-8, MAC-10/11/12 | BLOCKED | MAC-5 and a route | — | — |
+| MAC-9a | BLOCKED | no extension-captured rows this time: All Apps on but Scope empty → the extension claims nothing (run 1 saw 9 attributed rows while Scope had hosts) | `capture.status flows_handed_off` unchanged | — |
+| MAC-9b | **FAIL** | 5 proxied rows, 0 with `source_app` | `flow.table source_app null ×5` | missing feature (core-name-the-client-app) |
+| N5-TUI | PASS | exact refusal sentence; TUI stays open | — | — |
+| N4-TUI | PASS | `aitm tui` on the held port: `cannot start: the proxy port 127.0.0.1:8080 is already in use.` before any screen, exit 1, no alternate screen | 8080 held by the app's core | — |
+| N4-WEB | PASS | `aitm web`: same panel, exit 1, no card first | — | — |
+| N5-CLI, N5-WEB | SKIP | CLI-6's refusal; judged in the web cell when `aitm web` runs | — | — |
+| TUI-1…8, 5a/5b, N1/N2/N3-TUI, TUI-9/10 | SKIP | port 8080 held; n/a rows | — | — |
+| WEB-1…8, 6a–d, N1/N2/N3/N5-WEB, WEB-9/10 | SKIP | port 8080 held; n/a rows | — | — |
+
+Restore proof: `state-before.txt` == `state-after.txt` (volatile columns stripped): identical.
+Secret leak check: 2 known secret values from the embedded core's config + token shapes: none.
+Leftovers: none (no host reached any core).
+
+| Journey | PASS | FAIL | SKIP | BLOCKED | ERROR |
+|---|---|---|---|---|---|
+| CLI | 2 | 3 | 7 | 0 | 0 |
+| MAC | 1 | 1 | 16 | 5 | 0 |
+| NEGATIVES | 3 | 0 | 2 | 0 | 0 |
+| TUI | 0 | 0 | 14 | 0 | 0 |
+| WEB | 0 | 0 | 17 | 0 | 0 |
+
+**Verdict after run 2: `fail`** — owners: `claude/cli-oneshot-live-core` (CLI-4/5/10), #271 (CLI-1/2 when
+the ports are free; log noise now), proxied-flow attribution (MAC-9b). Everything else `incomplete`
+pending the window half.
+
+## Run 3 — window half
 
 Pending: display lock after the attribution session's Task 8; yes-list requested from Matt
 (MAC-1/16 quit + relaunch, MAC-6/15, MAC-7/14 not needed while All Apps is on, Safari visits,
