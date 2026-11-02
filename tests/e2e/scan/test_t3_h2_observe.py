@@ -20,7 +20,9 @@ full issue mentions "no reset-rate mitigation"); zero issues for
 negatives, and each of the three answers "rejected" through its manual
 `check.<id>` verb, which is how the cell shows the variants were written); the
 five checks open exactly five raw h2 connections on the `tls` listener beside the
-job client's pooled one, whose per-connection request counters sorted are
+job client's pooled one (told apart by the crawl's `GET /` on it; a raw connection
+that also carries `GET /` -- the rapid-reset heads aimed at `/` on T2's lane -- is
+recognised by its eight-request shape), whose per-connection request counters sorted are
 `[0, 0, 0, 0, 8]` as hyper really counts them (a rejected header block never
 becomes a request; the eight cancelled rapid-reset heads do) and none above 8;
 and the issue set on P equals the issue set on V.
@@ -118,11 +120,23 @@ def run_on(op, target, label: str) -> tuple[list, list]:
        f"issues={(status.get('issues') or {}).get('total')!r}")
     # The connections the job client pooled are the ones that carried the crawl's
     # `GET /`; every other h2 connection opened during the job is a raw probe.
-    pooled = {e.get("conn_id") for e in target.logs.scanner_requests(seq0)
-              if e.get("path") == "/" and e.get("listener") == "tls"}
-    conns = [c for c in target.logs.conns()
-             if c.get("listener") == "tls" and c.get("alpn") == "h2"
-             and int(c.get("opened_ms", 0)) >= t0 and c.get("conn_id") not in pooled]
+    # One raw connection can carry `GET /` too: the rapid-reset probe sends its
+    # eight cancelled heads to the point the origin-scoped check attached to,
+    # which on T2's lane is `/` itself. That connection is told apart by its
+    # shape -- exactly eight dispatched requests (or eight HEADERS streams where
+    # the target counts them), the driver's pre-dial cap -- which the crawl of a
+    # four-page site never reaches, so the rule holds on the interim lane and on
+    # T2's alike.
+    def raw_shaped(c) -> bool:
+        return int(c.get("requests", 0)) == 8 or (c.get("streams") is not None and int(c["streams"]) == 8)
+    all_conns = [c for c in target.logs.conns()
+                 if c.get("listener") == "tls" and c.get("alpn") == "h2"
+                 and int(c.get("opened_ms", 0)) >= t0]
+    carried_root = {e.get("conn_id") for e in target.logs.scanner_requests(seq0)
+                    if e.get("path") == "/" and e.get("listener") == "tls"}
+    pooled = {c.get("conn_id") for c in all_conns
+              if c.get("conn_id") in carried_root and not raw_shaped(c)}
+    conns = [c for c in all_conns if c.get("conn_id") not in pooled]
     check(len(pooled) >= 1,
           f"{label}: the job client pooled at least one h2 connection for the crawl (observed {sorted(pooled)})")
     return issues(op, "operator", job=job), conns
