@@ -110,14 +110,10 @@ const EXPECTED_TOOLS: [&str; 92] = [
     "scan.profile.save",
     "scan.profile.delete",
     "scan.session.preview",
-    // One manual verb per registered check (spec D3 `check.<id>`): the interim HTTP
-    // lane's two active checks and three passive checks. The three interim passive
-    // ids go away with T2's integration.
-    "check.xss-reflected",
-    "check.open-redirect",
-    "check.reflection",
-    "check.security-header",
-    "check.cookie-flag",
+    // One manual verb per registered check (spec D3 `check.<id>`). The HTTP
+    // lane (`aitm-scan-http`, T2) replaced the interim lane, whose five
+    // `check.<id>` verbs left with it; HTTP check verbs return with T3's
+    // native checks (`aitm-scan-checks-http`, PR 2a), which re-pins this list.
     // The T4 WS lane's eight checks (`aitm-scan-ws`), each with its `check.<id>`
     // manual verb once the lane registers with the engine.
     "check.cswsh",
