@@ -179,11 +179,14 @@ fn first_line(err: &anyhow::Error) -> String {
 /// serde's type-mismatch messages quote the offending scalar — `invalid type:
 /// string "<token>", expected usize` — so a value mis-indented under a key of
 /// another type (an operator token under `limits:`, say) would be echoed to
-/// stderr by the `config not read` warning. The payload between serde's own
-/// delimiters (`"…"` for a string, `` `…` `` for an integer, a boolean or a
-/// floating point) becomes `…`; the field path before it and the `expected …`
-/// clause after it stay, which is what the operator needs to find the line.
-/// A message that quotes no scalar passes through unchanged.
+/// stderr by the `config not read` warning; its enum mismatch quotes the
+/// value raw — `` unknown variant `<token>`, expected `agent` or `operator` ``
+/// — and `mcp.stdio_role` sits next to `mcp.operator_token`. The payload
+/// between serde's own delimiters (`"…"` for a string, `` `…` `` for an
+/// integer, a boolean, a floating point or a variant) becomes `…`; the field
+/// path before it and the `expected …` clause after it stay, which is what
+/// the operator needs to find the line. A message that quotes no value passes
+/// through unchanged (`unknown field` quotes a key).
 fn redact_scalars(line: &str) -> String {
     const KINDS: [&str; 2] = ["invalid type: ", "invalid value: "];
     const SHAPES: [(&str, &str); 4] = [
@@ -192,22 +195,35 @@ fn redact_scalars(line: &str) -> String {
         ("boolean `", "`"),
         ("floating point `", "`"),
     ];
+    const VARIANT_CLOSERS: [&str; 2] = ["`, expected ", "`, there are no variants"];
     let mut out = line.to_string();
     for kind in KINDS {
         for (open, close) in SHAPES {
-            let opener = format!("{kind}{open}");
-            let Some(at) = out.find(&opener) else {
-                continue;
-            };
-            let start = at + opener.len();
-            // The payload is `Debug`-escaped (its own quotes are `\"`), so the
-            // last `<close>, expected ` on the line is the clause after it.
             let closer = format!("{close}, expected ");
-            let end = out[start..].rfind(&closer).map_or(out.len(), |i| start + i);
-            out.replace_range(start..end, "…");
+            redact_between(&mut out, &format!("{kind}{open}"), &[closer.as_str()]);
         }
     }
+    redact_between(&mut out, "unknown variant `", &VARIANT_CLOSERS);
     out
+}
+
+/// Replaces with `…` what `line` holds between the first `opener` and the
+/// last of the `closers` after it; nothing changes when `opener` is absent.
+fn redact_between(line: &mut String, opener: &str, closers: &[&str]) {
+    let Some(at) = line.find(opener) else {
+        return;
+    };
+    let start = at + opener.len();
+    // The real closer follows the payload, and the payload (Debug-escaped for
+    // strings, raw for variants) may itself contain a false closer, so take
+    // the last match, not the first. With no closer at all, redact to end of
+    // line: better to lose the position than echo the value.
+    let end = closers
+        .iter()
+        .filter_map(|closer| line[start..].rfind(*closer))
+        .max()
+        .map_or(line.len(), |i| start + i);
+    line.replace_range(start..end, "…");
 }
 
 /// `Settings` defaults, field by field (the type has no `Default`): what help
@@ -942,6 +958,12 @@ mod tests {
             line("limits.max_body_bytes: invalid type: floating point `1.5`, expected usize"),
             "limits.max_body_bytes: invalid type: floating point `…`, expected usize"
         );
+        // A string payload that forges the closer (`\", expected ` inside the
+        // Debug-escaped text): the real closer is the last one.
+        assert_eq!(
+            line("k: invalid type: string \"foo\\\", expected bar\", expected usize"),
+            "k: invalid type: string \"…\", expected usize"
+        );
     }
 
     /// A message that quotes no scalar passes through `first_line` unchanged.
@@ -962,5 +984,67 @@ mod tests {
         );
         // Only the first line of the root cause, as before.
         assert_eq!(line("first\nsecond"), "first");
+    }
+
+    // ---- fix S4 (panel pass 3): the config warning echoes no enum value ----
+
+    /// serde's enum mismatch quotes the operator's value raw — `unknown
+    /// variant `<token>`, expected `agent` or `operator`` — and
+    /// `mcp.stdio_role` is a sibling of `mcp.operator_token`, so a token on
+    /// the wrong line would reach stderr through the `config not read`
+    /// warning. The field path and the `expected …` clause stay.
+    #[test]
+    fn config_warning_redacts_the_unknown_variant() {
+        let config = TempConfig::new("redact-variant", "mcp:\n  stdio_role: optoken-test-abc\n");
+        let (reporter, sink) = reporter();
+        let settings = settings_for_help(Some(&config.path), &reporter);
+        reporter.finish();
+        assert_eq!(
+            settings.core.mcp.stdio_role,
+            aitm_core::Config::default().mcp.stdio_role
+        );
+        let warned = sink.text();
+        assert_eq!(warned.lines().count(), 1, "{warned:?}");
+        assert!(warned.contains("mcp.stdio_role"), "{warned:?}");
+        assert!(warned.contains("expected"), "{warned:?}");
+        assert!(
+            !warned.contains("optoken-test-abc"),
+            "the value is echoed: {warned:?}"
+        );
+        assert!(warned.contains("unknown variant `…`"), "{warned:?}");
+        // The literal shapes: two variants, several, none; a raw payload that
+        // forges either closer; no closer at all (redacted to end of line).
+        let line = |msg: &str| first_line(&anyhow::anyhow!("{msg}"));
+        assert_eq!(
+            line("mcp.stdio_role: unknown variant `optoken-x`, expected `agent` or `operator`"),
+            "mcp.stdio_role: unknown variant `…`, expected `agent` or `operator`"
+        );
+        assert_eq!(
+            line(
+                "k: unknown variant `optoken-y`, expected one of `a`, `b`, `c` at line 2 column 20"
+            ),
+            "k: unknown variant `…`, expected one of `a`, `b`, `c` at line 2 column 20"
+        );
+        assert_eq!(
+            line("k: unknown variant `optoken-z`, there are no variants"),
+            "k: unknown variant `…`, there are no variants"
+        );
+        assert_eq!(
+            line("k: unknown variant `a`, expected `b`, expected `agent` or `operator`"),
+            "k: unknown variant `…`, expected `agent` or `operator`"
+        );
+        assert_eq!(
+            line("k: unknown variant `a`, there are no variants`, expected `agent`"),
+            "k: unknown variant `…`, expected `agent`"
+        );
+        assert_eq!(
+            line("k: unknown variant `optoken-w`"),
+            "k: unknown variant `…"
+        );
+        // A key, not a value: `unknown field` still passes through.
+        assert_eq!(
+            line("unknown field `stdio_rol`, expected one of `transport`, `stdio_role`"),
+            "unknown field `stdio_rol`, expected one of `transport`, `stdio_role`"
+        );
     }
 }
