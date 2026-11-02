@@ -379,6 +379,13 @@ struct Correlation {
     /// fields (identification, checksum, a zero source address) but never the
     /// transport, so this is the part of our own frame that comes back verbatim.
     stimulus_transport: Vec<u8>,
+    /// For an ICMP / ICMPv6 stimulus that is an informational **request** the
+    /// protocol pairs with a reply (echo 8 → 0, timestamp 13 → 14; ICMPv6 echo
+    /// 128 → 129), the key the reply must carry: the paired type with the
+    /// request's identifier and sequence. `None` for every other stimulus —
+    /// and then no frame is the reply of an ICMP stimulus, only an error
+    /// quoting it can be its reaction.
+    stimulus_icmp_reply: Option<IcmpKey>,
     /// Whether the one same-host, portless self-echo has been consumed. The
     /// kernel delivers our injected frame to the capture exactly once per
     /// `send_recv`, so [`Correlation::is_own_stimulus`] claims at most one
@@ -410,8 +417,14 @@ impl Correlation {
     ) -> Self {
         // One decode of the stimulus, over the same parser every captured frame
         // goes through, so the two sides of every comparison are delimited alike.
-        let (stimulus_ends, stimulus_transport) = decode_reply(&stimulus)
-            .map(|info| (info.ends, info.transport.to_vec()))
+        let (stimulus_ends, stimulus_transport, stimulus_icmp_reply) = decode_reply(&stimulus)
+            .map(|info| {
+                (
+                    info.ends,
+                    info.transport.to_vec(),
+                    info.icmp_key.and_then(IcmpKey::reply_key),
+                )
+            })
             .unwrap_or_default();
         Self {
             dst,
@@ -421,6 +434,7 @@ impl Correlation {
             stimulus,
             stimulus_ends,
             stimulus_transport,
+            stimulus_icmp_reply,
             portless_echo_seen: std::cell::Cell::new(false),
         }
     }
@@ -489,10 +503,15 @@ impl Correlation {
         self.stimulus_ends.src.filter(|a| !a.is_unspecified())
     }
 
-    /// The stimulus's own source port, when it states one. Port 0 is the craft
-    /// layer's "unset", so it constrains nothing.
+    /// The stimulus's own source port, when it has one (TCP / UDP). Port 0 is
+    /// a real port here, not "unset": the raw path puts the frame on the wire
+    /// verbatim (a header-included socket rewrites no transport field), so a
+    /// stimulus sent from port 0 is answered **to port 0** and a reply to any
+    /// other local port is someone else's. Only an unspecified *address*
+    /// (`0.0.0.0` / `::`, which the kernel does fill) relaxes a pin, in
+    /// [`Correlation::our_addr`].
     fn our_port(&self) -> Option<u16> {
-        self.stimulus_ends.src_port.filter(|p| *p != 0)
+        self.stimulus_ends.src_port
     }
 
     /// Whether the frame comes **from** the address and port we probed: the
@@ -533,10 +552,37 @@ impl Correlation {
         info.ends.proto.unwrap_or(L4Proto::Raw) == self.proto
     }
 
+    /// Whether the frame has the **shape of a reply** over the stimulus's
+    /// protocol. For TCP, UDP and a raw protocol that is
+    /// [`Correlation::is_our_proto`] alone (the ports and addresses are pinned
+    /// by the caller). For an ICMP / ICMPv6 stimulus the protocol is not
+    /// enough: ICMP has no ports, so on loopback every ICMP frame between the
+    /// two addresses would pass, including an ICMP error about someone else's
+    /// datagram (the kernel's port-unreachable for any UDP traffic on `lo`).
+    /// The reply to an ICMP message is its **informational twin** — the paired
+    /// type carrying the request's identifier and sequence (RFC 792 defines the
+    /// two fields for exactly this matching) — and an ICMP *error* is never a
+    /// reply: it is a reaction through the quote test or nothing. An ICMP
+    /// stimulus with no paired reply type (a crafted error, a type etherparse
+    /// does not name) has no reply shape at all, so only silence or a quoting
+    /// error can be observed for it.
+    fn is_our_protos_reply(&self, info: &ReplyInfo<'_>) -> bool {
+        if !self.is_our_proto(info) {
+            return false;
+        }
+        match self.proto {
+            L4Proto::Icmp | L4Proto::IcmpV6 => {
+                matches!((self.stimulus_icmp_reply, info.icmp_key), (Some(want), Some(got)) if want == got)
+            }
+            _ => true,
+        }
+    }
+
     /// The reversed five-tuple — the **only** shape a reply to our stimulus can
     /// have: from the address and port we probed, back to the address and port
     /// we sent from, over the stimulus's protocol. For a portless stimulus
-    /// (ICMP, an unknown IP protocol) that is addresses and protocol alone.
+    /// (ICMP, an unknown IP protocol) that is addresses and protocol — and, for
+    /// ICMP, the informational twin ([`Correlation::is_our_protos_reply`]).
     ///
     /// "Same host" is deliberately not enough. On loopback every frame's source
     /// address is 127.0.0.1, so accepting a frame on its source address alone
@@ -545,7 +591,9 @@ impl Correlation {
     /// packet lane scored every case `clean`/`protocol_error` and never once
     /// observed the silence a crash shows up as (task 4b, rig run 9).
     fn is_reversed_tuple(&self, info: &ReplyInfo<'_>) -> bool {
-        self.is_from_the_target(info) && self.is_addressed_to_us(info) && self.is_our_proto(info)
+        self.is_from_the_target(info)
+            && self.is_addressed_to_us(info)
+            && self.is_our_protos_reply(info)
     }
 
     /// The two frames that are a reaction to our stimulus without being a reply
@@ -564,17 +612,22 @@ impl Correlation {
     /// comes from a router that is not the target.
     ///
     /// (b) a TCP reset from the port we probed back to the port we sent from —
-    /// a closed TCP port's answer. Sequence and ack numbers are not checked
-    /// (a kernel RST to a crafted SYN need not be in any window we track), but
-    /// the endpoints are: a reset belonging to another loopback conversation is
-    /// not ours.
+    /// a closed TCP port's answer **to a TCP stimulus**. Sequence and ack
+    /// numbers are not checked (a kernel RST to a crafted SYN need not be in
+    /// any window we track), but the endpoints and the stimulus's protocol
+    /// are: a reset belonging to another loopback conversation is not ours,
+    /// and a UDP probe cannot be reset, so a RST on a UDP stimulus's ports is
+    /// another conversation's whatever its ports say.
     fn is_reaction_to_our_stimulus(&self, info: &ReplyInfo<'_>) -> bool {
         if let Some(quote) = info.icmp_quote {
             if self.quote_is_our_stimulus(&quote) {
                 return true;
             }
         }
-        info.tcp_rst && self.is_from_the_target(info) && self.is_addressed_to_us(info)
+        self.proto == L4Proto::Tcp
+            && info.tcp_rst
+            && self.is_from_the_target(info)
+            && self.is_addressed_to_us(info)
     }
 
     /// Whether an ICMP error's quoted inner packet is the stimulus we sent:
@@ -619,7 +672,9 @@ impl Correlation {
     /// port is free. It is still not "any frame from that host" — on loopback
     /// that would admit every unrelated conversation.
     fn is_reply_from_host(&self, info: &ReplyInfo<'_>, host: IpAddr) -> bool {
-        info.ends.src == Some(host) && self.is_addressed_to_us(info) && self.is_our_proto(info)
+        info.ends.src == Some(host)
+            && self.is_addressed_to_us(info)
+            && self.is_our_protos_reply(info)
     }
 
     /// The two `Other` shapes under [`ReplyMatch::FromHost`], with the target
@@ -638,7 +693,10 @@ impl Correlation {
                 return true;
             }
         }
-        info.tcp_rst && info.ends.src == Some(host) && self.is_addressed_to_us(info)
+        self.proto == L4Proto::Tcp
+            && info.tcp_rst
+            && info.ends.src == Some(host)
+            && self.is_addressed_to_us(info)
     }
 
     /// Whether a decoded frame travels in the stimulus's **own direction** —
@@ -721,6 +779,79 @@ struct ReplyInfo<'a> {
     /// stimulus, which is what keeps the kernel's port-unreachable for the
     /// *target's* reply (same addresses, reversed ports) out of the result.
     icmp_quote: Option<PacketEndpoints>,
+    /// The key of an ICMP **informational** message — its type with the
+    /// identifier and sequence the protocol defines for pairing a request with
+    /// its reply. `None` for an ICMP error, a type etherparse does not name
+    /// and every non-ICMP transport. An ICMP stimulus's reply must carry the
+    /// key [`IcmpKey::reply_key`] derives from the stimulus's own.
+    icmp_key: Option<IcmpKey>,
+}
+
+/// An ICMP / ICMPv6 informational message's correlation key: type, identifier
+/// and sequence. Only the request/reply pairs the protocol defines are keyed —
+/// ICMPv4 echo (8 / 0) and timestamp (13 / 14), ICMPv6 echo (128 / 129) —
+/// read through `etherparse`'s typed ICMP slices, never by offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IcmpKey {
+    /// Whether the message is ICMPv6 (the type spaces overlap: 0 and 8 mean
+    /// other things in ICMPv6).
+    v6: bool,
+    icmp_type: u8,
+    id: u16,
+    seq: u16,
+}
+
+impl IcmpKey {
+    /// The key the reply to this message must carry, when this message is a
+    /// request the protocol pairs with a reply type: the paired type with the
+    /// same identifier and sequence. `None` for a reply or an unpaired type.
+    fn reply_key(self) -> Option<IcmpKey> {
+        use etherparse::{icmpv4, icmpv6};
+        let reply_type = match (self.v6, self.icmp_type) {
+            (false, icmpv4::TYPE_ECHO_REQUEST) => icmpv4::TYPE_ECHO_REPLY,
+            (false, icmpv4::TYPE_TIMESTAMP) => icmpv4::TYPE_TIMESTAMP_REPLY,
+            (true, icmpv6::TYPE_ECHO_REQUEST) => icmpv6::TYPE_ECHO_REPLY,
+            _ => return None,
+        };
+        Some(IcmpKey {
+            icmp_type: reply_type,
+            ..self
+        })
+    }
+}
+
+/// The [`IcmpKey`] of an ICMP informational message, or `None` for an error,
+/// an unpaired type or a non-ICMP transport.
+fn icmp_key(transport: &Option<TransportSlice<'_>>) -> Option<IcmpKey> {
+    use etherparse::{Icmpv4Type, Icmpv6Type};
+    match transport {
+        Some(TransportSlice::Icmpv4(icmp)) => {
+            let (id, seq) = match icmp.icmp_type() {
+                Icmpv4Type::EchoRequest(h) | Icmpv4Type::EchoReply(h) => (h.id, h.seq),
+                Icmpv4Type::TimestampRequest(m) | Icmpv4Type::TimestampReply(m) => (m.id, m.seq),
+                _ => return None,
+            };
+            Some(IcmpKey {
+                v6: false,
+                icmp_type: icmp.type_u8(),
+                id,
+                seq,
+            })
+        }
+        Some(TransportSlice::Icmpv6(icmp)) => {
+            let (id, seq) = match icmp.icmp_type() {
+                Icmpv6Type::EchoRequest(h) | Icmpv6Type::EchoReply(h) => (h.id, h.seq),
+                _ => return None,
+            };
+            Some(IcmpKey {
+                v6: true,
+                icmp_type: icmp.type_u8(),
+                id,
+                seq,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Decode a captured frame to its correlation fields. `None` for a frame with no
@@ -744,6 +875,7 @@ fn decode_reply(frame: &[u8]) -> Option<ReplyInfo<'_>> {
         tcp_rst,
         transport,
         icmp_quote: icmp_quote(&parsed.transport),
+        icmp_key: icmp_key(&parsed.transport),
     })
 }
 
@@ -897,6 +1029,9 @@ mod tests {
         g
     }
 
+    /// The hermetic UDP stimulus: from port 40000 (the port [`udp_reply`]
+    /// answers to — a stimulus that stated no source port would go on the
+    /// wire from port 0 and be answered there) to `dst:dst_port`.
     fn udp_packet(dst: &str, dst_port: u16, payload: &[u8]) -> PacketSpec {
         PacketSpec {
             layers: vec![
@@ -905,6 +1040,7 @@ mod tests {
                     ..Ipv4Spec::default()
                 }),
                 Layer::Udp(UdpSpec {
+                    src_port: Some(40000),
                     dst_port: Some(dst_port),
                     ..UdpSpec::default()
                 }),
@@ -1172,7 +1308,9 @@ mod tests {
     /// and any `l4.send_recv` caller with a ready frame) correlates by the protocol
     /// *decoded from those bytes*, not by the spec's layer list (which says `Raw`).
     /// The reversed five-tuple UDP echo is therefore `Response`, and a TCP RST
-    /// from the target to the same stimulus is still `Other`.
+    /// from the target to a raw-wrapped TCP SYN is still `Other` (a RST answers
+    /// a TCP stimulus only — for the UDP frame it is `Ignore`, pinned by
+    /// `a_reset_is_a_reaction_only_to_a_tcp_stimulus`).
     #[test]
     fn raw_wrapped_frame_correlates_by_its_decoded_protocol() {
         // The frame the lane would replay: IPv4/UDP 127.0.0.1:40000 -> 127.0.0.1:9.
@@ -1249,12 +1387,24 @@ mod tests {
         );
         assert_eq!(g.in_flight(), 0);
 
-        // A TCP RST from the target to the same stimulus is a reaction, not the reply.
+        // A TCP RST from the target to a raw-wrapped TCP SYN (127.0.0.1:40000 ->
+        // :9, decoded as TCP from the bytes) is a reaction, not the reply.
+        let syn = tcp_syn_to(9);
+        let raw_syn_spec = SendRecvSpec {
+            packet: PacketSpec {
+                layers: vec![Layer::Raw(syn.clone())],
+            },
+            dst: "127.0.0.1".parse().unwrap(),
+            dst_port: Some(9),
+            interface: IFACE.to_string(),
+            timeout: Duration::from_secs(10),
+            expect: ReplyMatch::FiveTuple,
+        };
         let g = send_recv_guard();
         let backend = MockBackend::with_replies(vec![tcp_rst_reply("127.0.0.1", 9)]);
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let (_flow_id, outcome) = send_recv(&g, backend, store, raw_spec(ReplyMatch::FiveTuple))
-            .expect("authorized send_recv runs");
+        let (_flow_id, outcome) =
+            send_recv(&g, backend, store, raw_syn_spec).expect("authorized send_recv runs");
         match outcome {
             SendRecvOutcome::Other(p) => {
                 assert_eq!(p.decoded.layers, vec!["IPv4", "TCP"]);
@@ -3116,9 +3266,23 @@ mod tests {
     /// header with next-header 58 over `type, code, checksum, rest-of-header`
     /// and `body` — the quoted packet for an error, the echo data for a ping.
     fn icmp6_from_to(src: &str, dst: &str, ty: u8, code: u8, body: &[u8]) -> Vec<u8> {
+        icmp6_with_rest(src, dst, ty, code, [0, 0, 0, 0], body)
+    }
+
+    /// [`icmp6_from_to`] with an explicit rest-of-header word — for an echo,
+    /// the identifier and sequence (`[id_hi, id_lo, seq_hi, seq_lo]`).
+    fn icmp6_with_rest(
+        src: &str,
+        dst: &str,
+        ty: u8,
+        code: u8,
+        rest: [u8; 4],
+        body: &[u8],
+    ) -> Vec<u8> {
         use crate::craft::Ipv6Spec;
         use std::net::Ipv6Addr;
-        let mut icmp = vec![ty, code, 0, 0, 0, 0, 0, 0];
+        let mut icmp = vec![ty, code, 0, 0];
+        icmp.extend_from_slice(&rest);
         icmp.extend_from_slice(body);
         PacketSpec {
             layers: vec![
@@ -3215,6 +3379,292 @@ mod tests {
             matches!(c.classify(&unreachable), Classified::Other),
             "an ICMPv6 unreachable quoting our ping is the reaction"
         );
+    }
+
+    /// [`icmp_echo`] with an explicit identifier/sequence word, so a reply can
+    /// carry another identifier or sequence than the request.
+    fn icmp_echo_with(src: &str, dst: &str, icmp_type: u8, rest_of_header: u32) -> Vec<u8> {
+        use crate::craft::IcmpSpec;
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                    dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Icmp(IcmpSpec {
+                    icmp_type: Some(icmp_type),
+                    code: Some(0),
+                    rest_of_header: Some(rest_of_header),
+                    checksum: None,
+                }),
+                Layer::Raw(b"ping".to_vec()),
+            ],
+        }
+        .build()
+        .expect("icmp builds")
+    }
+
+    /// The lane's loopback ping as `send_recv` correlates it: the
+    /// [`icmp_echo`] request 127.0.0.1 -> 127.0.0.1 (id `0x1234`, seq 1),
+    /// portless, protocol ICMP.
+    fn ping_correlation(expect: ReplyMatch) -> Correlation {
+        Correlation::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            L4Proto::Icmp,
+            expect,
+            icmp_echo("127.0.0.1", "127.0.0.1", 8),
+        )
+    }
+
+    /// The two modes a ping correlates under; `Any` takes whatever answers by
+    /// the operator's explicit choice and is not under test here.
+    fn strict_loopback_modes() -> [ReplyMatch; 2] {
+        [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+        ]
+    }
+
+    /// Security panel minor 2 (amendment 66), the portless edge the packet
+    /// lane never reaches but `l4.send` with an ICMP stimulus does: for a ping
+    /// the reversed "tuple" used to be addresses and protocol alone, so **any**
+    /// ICMP frame from the target to us that was not our own echo was the
+    /// `Response` — including an ICMP error quoting someone else's datagram,
+    /// which fails the quote test and then passes the address test. On
+    /// loopback that is every kernel port-unreachable for anyone's UDP
+    /// traffic. An ICMP *error* type is never a reply to a ping: it is `Other`
+    /// through the quote test or nothing.
+    ///
+    /// Mutation: drop the twin-type test from the ICMP reply rule and the
+    /// error reads `Response` in both modes.
+    #[test]
+    fn an_icmp_error_from_the_target_is_not_the_reply_to_our_ping() {
+        let stimulus = icmp_echo("127.0.0.1", "127.0.0.1", 8);
+        let someone_elses = udp_from_to("127.0.0.1", 53, "127.0.0.1", 34567, b"not-ours");
+        let unreachable = icmp_from("127.0.0.1", 3, 3, &someone_elses);
+        for expect in strict_loopback_modes() {
+            let c = ping_correlation(expect);
+            assert!(
+                matches!(c.classify(&unreachable), Classified::Ignore),
+                "{expect:?}: an ICMP error quoting another datagram is not the echo reply"
+            );
+        }
+
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![stimulus.clone(), unreachable]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend,
+            store.clone(),
+            raw_portless_spec(&stimulus, ReplyMatch::FiveTuple, Duration::from_millis(80)),
+        )
+        .expect("authorized send_recv runs");
+        assert!(
+            matches!(outcome, SendRecvOutcome::NoResponse { .. }),
+            "expected silence, got {outcome:?}"
+        );
+        assert_eq!(
+            store.get(flow_id).expect("flow present").packets.len(),
+            1,
+            "the stimulus alone; neither the self-echo nor the foreign error is recorded"
+        );
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// The reply to an echo request is the echo reply **with the same
+    /// identifier and sequence** (RFC 792: the two fields exist to match the
+    /// pair). A reply carrying another identifier or another sequence belongs
+    /// to someone else's ping and is `Ignore`d; so is another echo *request*
+    /// addressed to us, which is a peer pinging us, not an answer.
+    ///
+    /// Mutation: compare the type alone and the first two cases read
+    /// `Response`.
+    #[test]
+    fn an_echo_reply_with_another_identifier_is_ignored() {
+        let other_id = icmp_echo_with("127.0.0.1", "127.0.0.1", 0, 0x1235_0001);
+        let other_seq = icmp_echo_with("127.0.0.1", "127.0.0.1", 0, 0x1234_0002);
+        for expect in strict_loopback_modes() {
+            let c = ping_correlation(expect);
+            assert!(
+                matches!(c.classify(&other_id), Classified::Ignore),
+                "{expect:?}: an echo reply with another identifier is another ping's"
+            );
+            assert!(
+                matches!(c.classify(&other_seq), Classified::Ignore),
+                "{expect:?}: an echo reply with another sequence is another ping's"
+            );
+        }
+
+        // Off loopback the direction tells our echo from a peer's request, so a
+        // type-8 frame from the target with our very id/seq is not consumed as
+        // our self-echo — and it is still not the reply.
+        let request = icmp_echo("10.0.0.1", "10.0.0.2", 8);
+        let c = Correlation::new(
+            "10.0.0.2".parse().unwrap(),
+            None,
+            L4Proto::Icmp,
+            ReplyMatch::FiveTuple,
+            request,
+        );
+        let peer_request = icmp_echo("10.0.0.2", "10.0.0.1", 8);
+        assert!(
+            matches!(c.classify(&peer_request), Classified::Ignore),
+            "the target pinging us back is not its echo reply"
+        );
+    }
+
+    /// The positive the twin rule must keep: the echo reply (type 0) with our
+    /// identifier and sequence is the `Response` in both strict modes, and
+    /// end to end behind the loopback self-echo.
+    #[test]
+    fn the_echo_reply_with_our_identifier_and_sequence_is_the_response() {
+        let stimulus = icmp_echo("127.0.0.1", "127.0.0.1", 8);
+        let reply = icmp_echo("127.0.0.1", "127.0.0.1", 0);
+        for expect in strict_loopback_modes() {
+            let c = ping_correlation(expect);
+            assert!(
+                matches!(c.classify(&reply), Classified::Response),
+                "{expect:?}: the echo reply with our id/seq is the response"
+            );
+            assert_portless_response(
+                &stimulus,
+                vec![stimulus.clone(), reply.clone()],
+                &reply,
+                expect,
+            );
+        }
+    }
+
+    /// The ICMPv6 twin of the rule: a ping on `::1` (type 128) is answered by
+    /// a type-129 echo reply with its identifier and sequence; an ICMPv6
+    /// error from the target quoting someone else's datagram is `Ignore`, and
+    /// so is a type-129 reply carrying another identifier.
+    #[test]
+    fn an_icmpv6_error_is_not_the_reply_to_our_ping() {
+        let ping = icmp6_with_rest("::1", "::1", 128, 0, [0x12, 0x34, 0, 1], b"ping");
+        let someone_elses = udp6_from_to("::1", 53, "::1", 34567, b"not-ours");
+        let unreachable = icmp6_from_to("::1", "::1", 1, 4, &someone_elses);
+        let other_id = icmp6_with_rest("::1", "::1", 129, 0, [0x12, 0x35, 0, 1], b"ping");
+        let reply = icmp6_with_rest("::1", "::1", 129, 0, [0x12, 0x34, 0, 1], b"ping");
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("::1".parse().unwrap()),
+        ] {
+            let c = Correlation::new(
+                "::1".parse().unwrap(),
+                None,
+                L4Proto::IcmpV6,
+                expect,
+                ping.clone(),
+            );
+            assert!(
+                matches!(c.classify(&unreachable), Classified::Ignore),
+                "{expect:?}: an ICMPv6 error quoting another datagram is not our echo reply"
+            );
+            assert!(
+                matches!(c.classify(&other_id), Classified::Ignore),
+                "{expect:?}: a v6 echo reply with another identifier is another ping's"
+            );
+            assert!(
+                matches!(c.classify(&reply), Classified::Response),
+                "{expect:?}: the v6 echo reply with our id/seq is the response"
+            );
+        }
+    }
+
+    /// Security panel minor 2 (amendment 66), the second edge: a UDP stimulus
+    /// crafted with source port 0 is legal on the wire and the raw path sends
+    /// it verbatim (no kernel rewrite under `IP_HDRINCL`), so a reply comes
+    /// back **to port 0** and nowhere else. Port 0 used to read as "unset",
+    /// which dropped the destination-port test and accepted a reply to any
+    /// local port. Port 0 is a real port: the reply to port 40000 is `Ignore`,
+    /// the reply to port 0 from the target port is the `Response`, and an
+    /// ICMP error is ours only when its quote carries source port 0.
+    ///
+    /// Mutation: restore `.filter(|p| *p != 0)` in `our_port` and the two
+    /// negative cases read `Response` / `Other`.
+    #[test]
+    fn a_stimulus_with_source_port_zero_still_pins_the_reply_port() {
+        let stimulus = udp_from_to("127.0.0.1", 0, "127.0.0.1", 9, b"probe");
+        let to_another_port = udp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, b"probe");
+        let to_port_zero = udp_from_to("127.0.0.1", 9, "127.0.0.1", 0, b"probe");
+        let quoting_another_port = icmp_from(
+            "127.0.0.1",
+            3,
+            3,
+            &udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe"),
+        );
+        let quoting_ours = icmp_from("127.0.0.1", 3, 3, &stimulus);
+        for expect in strict_loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                Some(9),
+                L4Proto::Udp,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&stimulus), Classified::Ignore),
+                "{expect:?}: the self-echo of a port-0 stimulus is still ours"
+            );
+            assert!(
+                matches!(c.classify(&to_another_port), Classified::Ignore),
+                "{expect:?}: a reply to port 40000 is not addressed to our port 0"
+            );
+            assert!(
+                matches!(c.classify(&to_port_zero), Classified::Response),
+                "{expect:?}: the reply to port 0 from the target port is the response"
+            );
+            assert!(
+                matches!(c.classify(&quoting_another_port), Classified::Ignore),
+                "{expect:?}: an error quoting source port 40000 is not about our port-0 datagram"
+            );
+            assert!(
+                matches!(c.classify(&quoting_ours), Classified::Other),
+                "{expect:?}: an error quoting our port-0 datagram is the reaction"
+            );
+        }
+    }
+
+    /// Security panel minor 2 (amendment 66), the third edge: a TCP reset is
+    /// a closed **TCP** port's answer. For a UDP stimulus 40000 -> 9 a RST
+    /// 9 -> 40000 used to be `Other` (the RST arm never asked the stimulus's
+    /// protocol); it is `Ignore` — a UDP probe cannot be reset — and the
+    /// await keeps waiting. The same RST for a TCP SYN to port 9 stays the
+    /// reaction.
+    ///
+    /// Mutation: drop the `L4Proto::Tcp` test from the RST arm and the UDP
+    /// cases read `Other`.
+    #[test]
+    fn a_reset_is_a_reaction_only_to_a_tcp_stimulus() {
+        let rst = tcp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, 0x14);
+        for expect in strict_loopback_modes() {
+            assert!(
+                matches!(lane_correlation(expect).classify(&rst), Classified::Ignore),
+                "{expect:?}: a RST is not a reaction to a UDP stimulus"
+            );
+        }
+        let tcp = Correlation::new(
+            "127.0.0.1".parse().unwrap(),
+            Some(9),
+            L4Proto::Tcp,
+            ReplyMatch::FiveTuple,
+            tcp_syn_to(9),
+        );
+        assert!(
+            matches!(tcp.classify(&rst), Classified::Other),
+            "the same RST answers a TCP SYN"
+        );
+
+        let (outcome, packets) = lane_run(vec![rst], Duration::from_millis(80));
+        assert!(
+            matches!(outcome, SendRecvOutcome::NoResponse { .. }),
+            "expected silence, got {outcome:?}"
+        );
+        assert_eq!(packets, 1, "the stimulus alone");
     }
 
     /// C3 (security): a stimulus whose crafted IP destination is a denylisted host,
