@@ -399,6 +399,12 @@ Every manual `check.<rhai-id>` returned "the engine must hand a shared probe hos
 
 **Amendment 63 (recorded, not done here):** the interim discovery sets no `PointTrait`s, so `wants_traits` checks (path-traversal: filename, ssrf: url) run only under `speed: thorough`; T2's insertion points v2 (#223) replaces the interim discovery, so `discover.rs` is left alone.
 
+### Task 13: `test_t3_h2_observe.py` tells pooled connections apart by the `host` header (e2e-only, consequence of amendment 38)
+
+**Files:** `tests/e2e/scan/test_t3_h2_observe.py` only (orchestrator; D12 exception for a `tests/e2e/**` edit, T3 informed — the cell is T3's).
+
+Live run on `c6092927` (cells17: 20 pass / 17 skip / 1 fail): the cell counted 4 raw h2 connections instead of 5. Dump of the target log (`/tmp/claude/t1b/proof/out/h2_dump.log`): all five checks ran on five raw connections (c-2…c-6), issues correct (`settings-observe`, `rapid-reset-mitigation`), `checks.done 5`, `probes.sent 9`. The cell classified any connection that carried `GET /` as the job client's pooled connection; since amendment 38 the five checks' baselines are `GET <origin>/` on the pooled connection and the raw rapid-reset probe's eight stream heads are `GET /` too (the check cuts `:path` from the origin item's URL `<origin>/`, where it used to cut `/search` from a captured point), so the rapid-reset connection was mis-filed as pooled. Fix: pooled = connections whose request rows carry a `host` header (the job client sends one on every request; a raw probe stream writes pseudo-headers only — every c-6 row has an empty header map, every c-1 row has `host`). Engine untouched.
+
 ### Task 6: bookkeeping and docs wording
 
 - **Satisfies:** workflow stage-7 record keeping; amendment 39/40 operator docs.

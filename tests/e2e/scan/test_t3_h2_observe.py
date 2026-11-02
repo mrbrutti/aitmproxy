@@ -71,7 +71,7 @@ RAPID_RESET_PHRASE = "no reset-rate mitigation"
 # it counts as a request (0), and the rapid-reset probe's eight cancelled
 # request heads are counted (8). The job client's own pooled h2 connection (the
 # crawl and the checks' baselines) is not a raw-probe connection and is told
-# apart by the `GET /` the crawl fetched on it.
+# apart by the `host` header the job client puts on every request it sends.
 EXPECTED_REQUESTS = [0, 0, 0, 0, 8]
 JOB_TIMEOUT = 600.0
 
@@ -105,10 +105,15 @@ def run_on(op, target, label: str) -> tuple[list, list]:
     status = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
     ok(f"{label}: job ended state={status.get('state')!r} "
        f"issues={(status.get('issues') or {}).get('total')!r}")
-    # The connections the job client pooled are the ones that carried the crawl's
-    # `GET /`; every other h2 connection opened during the job is a raw probe.
+    # The connections the job client pooled are the ones that carried its
+    # requests (the crawl, and since amendment 38 each check's `GET <origin>/`
+    # baseline); every other h2 connection opened during the job is a raw probe.
+    # Told apart by the headers: the job client sends a `host` header on every
+    # request, a raw probe stream writes pseudo-headers only (the rapid-reset
+    # probe's eight `GET /` heads carry none), so `path == "/"` alone no longer
+    # discriminates (T1b follow-up PR 2 live run, 2026-11-02).
     pooled = {e.get("conn_id") for e in target.logs.scanner_requests(seq0)
-              if e.get("path") == "/" and e.get("listener") == "tls"}
+              if e.get("listener") == "tls" and "host" in (e.get("headers") or {})}
     conns = [c for c in target.logs.conns()
              if c.get("listener") == "tls" and c.get("alpn") == "h2"
              and int(c.get("opened_ms", 0)) >= t0 and c.get("conn_id") not in pooled]
