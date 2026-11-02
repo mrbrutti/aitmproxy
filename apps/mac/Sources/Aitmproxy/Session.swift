@@ -194,7 +194,13 @@ final class Session {
     /// tests) use the well-known `CoreID.fixture`. The seam for multi-core: a second
     /// connection is additive because every stored flow already carries its originating id.
     let activeCoreID = CoreID()
-    var scopeHosts: [String] = []
+    var scopeHosts: [String] = [] {
+        // The core's list is the fact: a host it now lists is no longer an add in flight (S-081).
+        didSet { scopeAdds.confirm(listed: scopeHosts) }
+    }
+    /// Scope adds the operator typed that the core has not listed yet: sending, queued for
+    /// replay after a core restart, or failed with the core's reason (S-081).
+    var scopeAdds = ScopeAddQueue()
     /// The macOS system proxy's endpoint half as the core reports it: the facts' `state`, one source
     /// (`BusService.refreshProxyStatus()` and the set/unset replies write the facts; Session+SystemProxy.swift).
     /// nil = unknown (never rendered as off): no facts, or a verb word that names no endpoint
