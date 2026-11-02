@@ -24,6 +24,14 @@
 //! (all default-bodied) on 2026-10-31, then [`ProbeHost::baseline_peer_addr`],
 //! [`JobCtx::report_session_canary`], [`JobCtx::report_session_browser_partial`]
 //! and [`ProbeHost::charge`] (default-bodied too) on 2026-11-01.
+//!
+//! **One recorded exception (spec amendment 72b, 2026-11-02).** Once every lane
+//! implemented them, [`ProbeHost::client`], [`ProbeHost::captured`] and
+//! [`ProbeHost::charge`] lost their default bodies, so a lane that forgets one no
+//! longer builds: the compiler is the contract. That change was made with every
+//! in-tree implementation updated in the same commit, under the coordinator's
+//! cross-crate ruling; it is not a licence for further required methods.
+//! [`ProbeHost::shared`] and [`ProbeHost::baseline_peer_addr`] keep their defaults.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

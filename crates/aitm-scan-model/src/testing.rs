@@ -117,9 +117,11 @@ impl JobCtx for NullJob {
 
 /// A [`ProbeHost`] whose every I/O method errors. Budget 3, marker `aitm7f3a`.
 ///
-/// It inherits the default bodies of [`ProbeHost::client`],
-/// [`ProbeHost::shared`] and [`ProbeHost::captured`], which is what makes it the
-/// stub those defaults are tested through.
+/// It inherits the default bodies of [`ProbeHost::shared`] and
+/// [`ProbeHost::baseline_peer_addr`], which is what makes it the stub those
+/// defaults are tested through; [`ProbeHost::client`], [`ProbeHost::captured`] and
+/// [`ProbeHost::charge`] are required since amendment 72b, so it spells out the
+/// answers the defaults used to give (`None`, `None`, `budget_left() >= units`).
 pub struct NullHost {
     profile: ScanProfile,
 }
