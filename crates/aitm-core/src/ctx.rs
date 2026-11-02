@@ -36,6 +36,21 @@ pub trait ProxyClient: Send + Sync {
         let _ = opts;
         self.send(req)
     }
+
+    /// Send `req` as a **scanner probe** (spec amendment 80). A probe exists to
+    /// provoke the target, so a 5xx *answer* is a completed exchange and must
+    /// not count toward the host's error budget; a transport failure or a
+    /// timeout still does, and still disables the host. Proxied and reissued
+    /// traffic keeps [`ProxyClient::send_opts`]'s semantics. The default cannot
+    /// tell the two apart and falls back to `send_opts`; `PipelineClient`
+    /// overrides it.
+    fn send_probe(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        self.send_opts(req, opts)
+    }
 }
 
 /// Where to click in the browser.
