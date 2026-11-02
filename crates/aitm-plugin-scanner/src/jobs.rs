@@ -1024,6 +1024,13 @@ pub fn start(
         is_agent: caller.is_agent(),
         started_by,
     };
+    // The answer is the queued record as written (spec D5 "Start": write
+    // `state: queued`, spawn, return), taken BEFORE the worker is spawned: on
+    // the multi-thread runtime a spawned job can already be `running` or even
+    // `done` by the time this function reads the status back (CI, main run on
+    // 179bc01f: `start_returns_queued_within_the_call_and_the_job_reaches_done`
+    // read a non-queued state; amendment 71c).
+    let snapshot = status.read().unwrap_or_else(|e| e.into_inner()).clone();
     // The worker is detached on purpose: it owns its own cancellation token
     // (`scan.cancel`) and ends by moving the entry to a terminal state, so
     // there is nothing a retained `JoinHandle` could do that the token does
@@ -1033,7 +1040,6 @@ pub fn start(
         .rt
         .spawn(async move { crate::worker::run_job(engine_for_worker, ctx).await });
 
-    let snapshot = status.read().unwrap_or_else(|e| e.into_inner()).clone();
     Ok(StartResult {
         job,
         status: snapshot,

@@ -496,10 +496,13 @@ impl ProxyClient for JobClient {
             loop {
                 attempt += 1;
                 let started = Instant::now();
+                // A probe, not a reissue (spec amendment 80): the proxy's
+                // breaker charges its error budget for transport failures
+                // and timeouts only; a 5xx answer is what a probe is for.
                 let sent = bounded_await(
                     self.budget.deadline,
                     &self.budget.cancel,
-                    self.inner.send_opts(req.clone(), opts.clone()),
+                    self.inner.send_probe(req.clone(), opts.clone()),
                 )
                 .await;
                 let outcome = match sent {
@@ -616,6 +619,9 @@ mod tests {
     struct StubClient {
         queue: Mutex<VecDeque<Outcome>>,
         calls: AtomicUsize,
+        /// How many sends arrived through `send_probe` (amendment 80) rather
+        /// than `send_opts`.
+        probes: AtomicUsize,
         seen: Mutex<Vec<SendOptions>>,
     }
 
@@ -624,12 +630,17 @@ mod tests {
             Arc::new(Self {
                 queue: Mutex::new(outcomes.into_iter().collect()),
                 calls: AtomicUsize::new(0),
+                probes: AtomicUsize::new(0),
                 seen: Mutex::new(Vec::new()),
             })
         }
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn probes(&self) -> usize {
+            self.probes.load(Ordering::SeqCst)
         }
 
         fn seen(&self) -> Vec<SendOptions> {
@@ -644,6 +655,15 @@ mod tests {
     impl ProxyClient for StubClient {
         fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
             self.send_opts(req, SendOptions::default())
+        }
+
+        fn send_probe(
+            &self,
+            req: HttpRequest,
+            opts: SendOptions,
+        ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            self.send_opts(req, opts)
         }
 
         fn send_opts(
@@ -730,9 +750,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn probes_go_out_through_send_probe_not_send_opts() {
+        let stub = StubClient::new(vec![Outcome::Ok(500), Outcome::Ok(200)]);
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            loose_budget(10),
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            lenient_hosts(),
+        );
+        for _ in 0..2 {
+            client
+                .send(req_to("ex.test"))
+                .await
+                .expect("the stub answers");
+        }
+        assert_eq!(stub.calls(), 2);
+        assert_eq!(
+            stub.probes(),
+            2,
+            "every job-client send reaches the proxy client as a probe"
+        );
+    }
+
     /// Spec D5 "Budget and pacing": one `probes` budget per job, one unit per
     /// stimulus, and the probe that would overdraw it is refused before it
     /// reaches the sender.
+    /// Spec amendment 80: the job client sends every probe through
+    /// `ProxyClient::send_probe`, so the proxy's breaker does not count a 5xx
+    /// answer against the target's error budget (a probe is meant to provoke
+    /// one); it still charges transport failures and timeouts on that path.
     #[tokio::test]
     async fn charges_one_unit_per_send_and_stops_at_budget() {
         let stub = StubClient::new(vec![Outcome::Ok(200), Outcome::Ok(200), Outcome::Ok(200)]);

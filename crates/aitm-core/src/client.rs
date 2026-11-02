@@ -98,6 +98,15 @@ impl PipelineClient {
     }
 }
 
+/// `authority` with `scheme`'s default port filled when it carries none, the
+/// spelling the guard keys its per-service error budget on.
+fn guard_authority(scheme: &str, authority: &str) -> String {
+    match crate::Authority::parse_with_default(authority, crate::Authority::default_port(scheme)) {
+        Ok(a) => a.to_string(),
+        Err(_) => authority.to_string(),
+    }
+}
+
 impl ProxyClient for PipelineClient {
     fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         // One code path: the shipped behaviour is `send_opts` with the defaults
@@ -110,19 +119,61 @@ impl ProxyClient for PipelineClient {
         req: HttpRequest,
         opts: SendOptions,
     ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        self.send_inner(req, opts, SendKind::Proxied)
+    }
+
+    /// Spec amendment 80: a probe's 5xx answer is a completed exchange, not an
+    /// upstream failure; only transport failures and timeouts charge the
+    /// host's error budget on this path.
+    fn send_probe(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        self.send_inner(req, opts, SendKind::Probe)
+    }
+}
+
+/// Which breaker semantics a send gets (spec amendment 80).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendKind {
+    /// Proxied or reissued traffic: a 5xx answer charges the host's error
+    /// budget like an upstream failure does.
+    Proxied,
+    /// A scanner probe: a 5xx answer is a completed exchange; only an upstream
+    /// failure or a timeout charges the budget.
+    Probe,
+}
+
+impl PipelineClient {
+    /// The one send path behind [`ProxyClient::send_opts`] and
+    /// [`ProxyClient::send_probe`]: `kind` says whether a 5xx answer charges
+    /// the host's error budget. An upstream failure always charges it.
+    fn send_inner(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+        kind: SendKind,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         Box::pin(async move {
+            // The guard keys its error budget and disable window per authority
+            // (host + port); ask and charge it under the authority with the
+            // scheme's default port filled, so `example.test` and
+            // `example.test:443` are one service to it and an unported request
+            // is not refused by another port's window.
+            let authority = guard_authority(&req.scheme, &req.authority);
             // Hold the permit for the whole send (concurrency released on drop).
-            let _permit = self.guard.check_active(&req.authority)?;
+            let _permit = self.guard.check_active(&authority)?;
             let response = match self.sender.send_with(&req, opts.version).await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    // An upstream failure counts against the host's error budget.
-                    self.guard.record_error(&req.authority);
+                    // An upstream failure counts against the target's error budget.
+                    self.guard.record_error(&authority);
                     return Err(e);
                 }
             };
-            if response.status >= 500 {
-                self.guard.record_error(&req.authority);
+            if kind == SendKind::Proxied && response.status >= 500 {
+                self.guard.record_error(&authority);
             }
             let flow = HttpFlow {
                 id: FlowId::new(),
@@ -396,6 +447,19 @@ mod tests {
 
     /// A sender whose connection dies mid-send, the way a dropped upstream TCP
     /// connection surfaces to the client.
+    /// An upstream that answers every request 503: a completed exchange that
+    /// is also a server error.
+    struct ServerErrorSender;
+    impl RequestSender for ServerErrorSender {
+        fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+            Box::pin(async {
+                let mut resp = ok_response();
+                resp.status = 503;
+                Ok(resp)
+            })
+        }
+    }
+
     struct DroppingSender;
 
     impl RequestSender for DroppingSender {
@@ -404,10 +468,121 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_probe_s_5xx_answers_leave_the_host_enabled_but_its_transport_failures_disable_it() {
+        let budget = 3;
+        let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
+            host_error_budget: budget,
+            per_host_rps: 1000,
+            ..Default::default()
+        }));
+        guard.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let store = Arc::new(MemFlowStore::new());
+
+        // N 5xx answers through the probe path: the host stays enabled.
+        let answering =
+            PipelineClient::new(store.clone(), guard.clone(), Arc::new(ServerErrorSender));
+        for _ in 0..budget {
+            let flow = answering
+                .send_probe(req("ex.test"), SendOptions::default())
+                .await
+                .expect("a 5xx is an answer");
+            assert_eq!(flow.response.as_ref().map(|r| r.status), Some(503));
+        }
+        assert!(
+            guard.check_active("ex.test").is_ok(),
+            "5xx answers to probes do not charge the error budget"
+        );
+
+        // N transport failures through the same path: the host is disabled.
+        let dropping = PipelineClient::new(store.clone(), guard.clone(), Arc::new(DroppingSender));
+        for _ in 0..budget {
+            dropping
+                .send_probe(req("ex.test"), SendOptions::default())
+                .await
+                .expect_err("the upstream dropped");
+        }
+        assert!(
+            matches!(
+                guard.check_active("ex.test"),
+                Err(crate::error::GuardError::HostDisabled)
+            ),
+            "transport failures on probes still disable the host"
+        );
+
+        // The proxied path keeps today's semantics: 5xx answers charge it.
+        let guard2 = Arc::new(StdGuard::new(crate::config::LimitConfig {
+            host_error_budget: budget,
+            per_host_rps: 1000,
+            ..Default::default()
+        }));
+        guard2.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let proxied = PipelineClient::new(store, guard2.clone(), Arc::new(ServerErrorSender));
+        for _ in 0..budget {
+            proxied
+                .send_opts(req("ex.test"), SendOptions::default())
+                .await
+                .expect("a 503 is an answer on the proxied path too");
+        }
+        assert!(
+            matches!(
+                guard2.check_active("ex.test"),
+                Err(crate::error::GuardError::HostDisabled)
+            ),
+            "proxied/reissued 5xx answers still charge the budget"
+        );
+    }
+
     /// Tester: an upstream that drops mid-send stores no half-flow and still
     /// charges the host's error budget — the bulk `record: Never` path must not
     /// become a way to hammer a dead host for free. With a budget of one, the
     /// single failure disables the host, which is how the charge is observed.
+    /// Spec amendment 74: the client asks and charges the guard under the
+    /// authority with the scheme's default port filled, so an https request to
+    /// `ex.test` is the service `ex.test:443` — and `ex.test:8080` is another.
+    /// A bracketed IPv6 authority folds to the same key the guard reads back.
+    #[tokio::test]
+    async fn the_budget_is_charged_under_the_scheme_default_port() {
+        for (authority, same, other) in [
+            ("ex.test", "ex.test:443", "ex.test:8080"),
+            ("[::1]", "[::1]:443", "[::1]:8080"),
+        ] {
+            let store = Arc::new(MemFlowStore::new());
+            let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
+                host_error_budget: 1,
+                per_host_rps: 1000,
+                ..Default::default()
+            }));
+            guard.add_scope(ScopeEntry {
+                host: authority.into(),
+            });
+            let client = PipelineClient::new(store, guard.clone(), Arc::new(DroppingSender));
+            client
+                .send_opts(req(authority), SendOptions::default())
+                .await
+                .expect_err("the upstream dropped");
+            assert!(
+                matches!(
+                    guard.check_active(same),
+                    Err(crate::error::GuardError::HostDisabled)
+                ),
+                "{authority}: the failure was charged under {same}"
+            );
+            assert!(
+                guard.check_active(other).is_ok(),
+                "{authority}: {other} is another service and stays enabled"
+            );
+        }
+    }
+
+    /// Spec amendment 80: a scanner probe's 5xx answer is a completed exchange
+    /// and never charges the host's error budget, while a transport failure on
+    /// the same path still does (and still disables the host). The proxied
+    /// path (`send_opts`) keeps charging 5xx answers.
     #[tokio::test]
     async fn send_opts_upstream_drop_stores_nothing_and_charges_the_error_budget() {
         for record in [RecordPolicy::Always, RecordPolicy::Never] {
@@ -448,17 +623,6 @@ mod tests {
     /// the error budget, so an unrecorded bulk run cannot outrun the breaker.
     #[tokio::test]
     async fn send_opts_never_still_charges_a_5xx() {
-        struct ServerErrorSender;
-        impl RequestSender for ServerErrorSender {
-            fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
-                Box::pin(async {
-                    let mut resp = ok_response();
-                    resp.status = 503;
-                    Ok(resp)
-                })
-            }
-        }
-
         let store = Arc::new(MemFlowStore::new());
         let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
             host_error_budget: 1,
@@ -502,7 +666,9 @@ mod tests {
             .expect_err("other.test is not in scope");
         assert_eq!(
             err.downcast_ref::<crate::error::GuardError>(),
-            Some(&crate::error::GuardError::OutOfScope("other.test".into()))
+            Some(&crate::error::GuardError::OutOfScope(
+                "other.test:443".into()
+            ))
         );
     }
 

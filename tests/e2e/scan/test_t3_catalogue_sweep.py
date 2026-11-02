@@ -100,7 +100,14 @@ def script_ids() -> dict:
 
 def run_standard(op, target) -> tuple[list, int, dict]:
     seq0 = target.logs.reset()
-    job = start_job(op, "operator", target=target.base)["job"]
+    # The sweep runs the whole bundled catalogue (fifteen scripts plus the
+    # natives and the passives, ~1050 items) against the seeded target; the
+    # default 2000-probe budget ends the job at ~975 items with the late
+    # classes (open-redirect) unreached now that neither the ladder nor the
+    # proxy breaker cuts it short (amendments 40 and 80; T1b PR 2b live run,
+    # 2026-11-02). Size the budget to the catalogue; the ceiling is 20 000.
+    job = start_job(op, "operator", target=target.base,
+                    overrides={"budget": {"probes": 8000}})["job"]
     status = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
     ok(f"{target.mode}: job ended state={status.get('state')!r} "
        f"stopped_reason={status.get('stopped_reason')!r} "

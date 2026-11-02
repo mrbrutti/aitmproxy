@@ -373,12 +373,12 @@ pub struct StdGuard {
     max_concurrency: u32,
     in_flight: Arc<AtomicU32>,
     host_error_budget: u32,
-    host_errors: Mutex<HashMap<String, u32>>,
+    host_errors: Mutex<HashMap<Authority, u32>>,
     backoff: crate::config::BackoffConfig,
     /// Per-host: how many times it has been disabled (drives exponential backoff).
-    disable_count: Mutex<HashMap<String, u32>>,
+    disable_count: Mutex<HashMap<Authority, u32>>,
     /// Per-host: the instant a disabled host becomes eligible again.
-    disabled_until: Mutex<HashMap<String, Instant>>,
+    disabled_until: Mutex<HashMap<Authority, Instant>>,
 }
 
 impl StdGuard {
@@ -428,18 +428,31 @@ impl StdGuard {
             .clear();
     }
 
-    fn is_disabled(&self, host: &str) -> bool {
+    /// Whether `authority` is inside a disable window. Windows are keyed on
+    /// the [`Authority`] itself (host + port; port `0` is the host-wide window an
+    /// unported `record_error` writes). An explicit port is one service:
+    /// disabled when its own window or the host-wide one is live. An unported
+    /// spelling is the host-wide view: disabled while any service on that host
+    /// is, so a disabled target is not reachable under a spelling that drops
+    /// the port. Expired windows are dropped on the way.
+    fn is_disabled(&self, authority: &Authority) -> bool {
         if self.host_error_budget == 0 {
             return false;
         }
-        match self
+        let now = Instant::now();
+        let mut windows = self
             .disabled_until
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(host)
-        {
-            Some(until) => Instant::now() < *until,
-            None => false,
+            .unwrap_or_else(PoisonError::into_inner);
+        windows.retain(|_, until| now < *until);
+        if authority.port == 0 {
+            windows.keys().any(|key| key.host == authority.host)
+        } else {
+            windows.contains_key(authority)
+                || windows.contains_key(&Authority {
+                    host: authority.host.clone(),
+                    port: 0,
+                })
         }
     }
 }
@@ -472,17 +485,23 @@ impl ScopeRateGuard for StdGuard {
         if !self.in_scope(host) {
             return Err(GuardError::OutOfScope(host.to_string()));
         }
-        // Key the throttle, error budget and disable window on the *normalized*
-        // host, the same fold scope matching uses, so `target.example`,
-        // `TARGET.example` and `Target.Example:443` share one bucket/counter and a
-        // disabled host is not reachable under another spelling.
-        let key = match Authority::parse_with_default(host, 0) {
-            Ok(a) => a.host,
+        // The rate throttle is keyed on the *normalized* host (one bucket per
+        // server, whatever the spelling); the error budget and the disable
+        // window are keyed on the normalized `Authority` (host + port), because
+        // two services on one address are two targets: a budget shared across
+        // ports let one job's erroring target disable another job's target on
+        // the same host (scanner v2 live run, 2026-11-02). `record_error` callers
+        // pass the authority with its scheme's default port filled, so
+        // `target.example`, `TARGET.example:443` and `Target.Example` share one
+        // counter; an unported `check_active` is the host-wide view.
+        let authority = match Authority::parse_with_default(host, 0) {
+            Ok(a) => a,
             Err(_) => return Err(GuardError::OutOfScope(host.to_string())),
         };
-        if self.is_disabled(&key) {
+        if self.is_disabled(&authority) {
             return Err(GuardError::HostDisabled);
         }
+        let key = authority.host;
 
         // Global then per-host rate. A poisoned bucket lock is recovered (its
         // data is still valid) so a panic elsewhere cannot disable throttling.
@@ -583,10 +602,12 @@ impl ScopeRateGuard for StdGuard {
         if self.host_error_budget == 0 {
             return;
         }
-        // Same normalized key as `check_active`, so the budget and disable window
-        // can't be evaded (or double-counted) by spelling the host differently.
+        // Same normalized authority key as `check_active`'s disable check, so
+        // the budget and disable window can't be evaded (or double-counted) by
+        // spelling the host differently.
+        // Port 0 (no port in the spelling) is the host-wide window.
         let key = match Authority::parse_with_default(host, 0) {
-            Ok(a) => a.host,
+            Ok(a) => a,
             Err(_) => return,
         };
         let mut errors = self
@@ -613,6 +634,108 @@ impl ScopeRateGuard for StdGuard {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(key, until);
         }
+    }
+}
+
+#[cfg(test)]
+mod authority_key_tests {
+    use super::*;
+
+    /// Two services on one host are two targets: exhausting one's error budget
+    /// disables that authority only, and the other is still served. (Before,
+    /// the budget was keyed on the host alone and a full job against the
+    /// vulnerable target on `127.0.0.1:a` disabled the patched one on
+    /// `127.0.0.1:b` for the next job in the same core.)
+    #[test]
+    fn an_exhausted_error_budget_disables_that_authority_only() {
+        let g = StdGuard::new(LimitConfig {
+            per_host_rps: 1000,
+            host_error_budget: 3,
+            ..LimitConfig::default()
+        });
+        g.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        for _ in 0..3 {
+            g.record_error("127.0.0.1:8001");
+        }
+        assert!(
+            matches!(
+                g.check_active("127.0.0.1:8001"),
+                Err(GuardError::HostDisabled)
+            ),
+            "the erroring authority is disabled"
+        );
+        assert!(
+            g.check_active("127.0.0.1:8002").is_ok(),
+            "the other service on the same host is still served"
+        );
+        assert!(
+            matches!(g.check_active("127.0.0.1"), Err(GuardError::HostDisabled)),
+            "the unported spelling is the host-wide view: a disabled service makes it refused"
+        );
+    }
+
+    /// An error charged under an unported spelling is host-wide: every port of
+    /// that host is disabled (the pre-existing "disabled under every spelling"
+    /// contract, in the direction `tests/guard.rs` does not cover).
+    #[test]
+    fn an_unported_disable_covers_every_port_of_the_host() {
+        let g = StdGuard::new(LimitConfig {
+            per_host_rps: 1000,
+            host_error_budget: 1,
+            ..LimitConfig::default()
+        });
+        g.add_scope(ScopeEntry {
+            host: "target.example".into(),
+        });
+        g.record_error("target.example");
+        for spelling in [
+            "target.example:443",
+            "target.example:8080",
+            "target.example",
+        ] {
+            assert!(
+                matches!(g.check_active(spelling), Err(GuardError::HostDisabled)),
+                "{spelling} is disabled by the host-wide window"
+            );
+        }
+    }
+
+    /// IPv6 authorities key by host and port, never by a string prefix: `::1`
+    /// and `::1:2` are different hosts, and a bracketed spelling folds to the
+    /// same key as the unbracketed one.
+    #[test]
+    fn ipv6_authorities_are_keyed_by_host_and_port_not_by_prefix() {
+        let g = StdGuard::new(LimitConfig {
+            per_host_rps: 1000,
+            host_error_budget: 1,
+            ..LimitConfig::default()
+        });
+        g.add_scope(ScopeEntry {
+            host: "[::1]".into(),
+        });
+        g.add_scope(ScopeEntry {
+            host: "[::1:2]".into(),
+        });
+        g.record_error("[::1:2]:443");
+        assert!(
+            matches!(g.check_active("[::1:2]:443"), Err(GuardError::HostDisabled)),
+            "the erroring IPv6 authority is disabled"
+        );
+        assert!(
+            g.check_active("[::1]:443").is_ok() && g.check_active("[::1]").is_ok(),
+            "a different IPv6 host that merely shares a prefix is still served"
+        );
+        g.record_error("[::1]:8443");
+        assert!(
+            matches!(g.check_active("[::1]:8443"), Err(GuardError::HostDisabled)),
+            "a bracketed spelling folds to the same key"
+        );
+        assert!(
+            g.check_active("[::1]:443").is_ok(),
+            "another port of the same IPv6 host is a different service"
+        );
     }
 }
 
