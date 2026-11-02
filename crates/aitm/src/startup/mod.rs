@@ -24,7 +24,7 @@ pub mod card;
 pub mod errors;
 pub mod log;
 
-pub use args::{pre_boot, split_term_args, version_line, PreBoot, TermOpts, SYNOPSIS};
+pub use args::{pre_boot, split_term_args, version_line, PreBoot, TermOpts};
 
 /// Write `text` to stdout and flush it, through one lock and `write_all`
 /// (never `print!`, which panics on a closed pipe and bypasses the no-bypass

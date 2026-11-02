@@ -166,15 +166,16 @@ fn registry_failure(err: &anyhow::Error) -> ErrorReport {
 /// The first line of the error's root cause: `load_settings`'s context
 /// layers (`in config file <path>`, `parsing config YAML`) only repeat the
 /// path the warning already names; the cause is the line the operator needs,
-/// with any scalar serde quoted in it redacted ([`redact_scalars`]).
+/// with any scalar serde quoted in it redacted ([`redact_scalars`]). The
+/// whole cause is redacted first, then its first line taken (security S5):
+/// a raw variant payload may span lines, and the closer on a later line
+/// must still end the redaction so the `expected …` clause survives.
 fn first_line(err: &anyhow::Error) -> String {
-    redact_scalars(
-        err.root_cause()
-            .to_string()
-            .lines()
-            .next()
-            .unwrap_or_default(),
-    )
+    redact_scalars(&err.root_cause().to_string())
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// serde's type-mismatch messages quote the offending scalar — `invalid type:
@@ -183,15 +184,17 @@ fn first_line(err: &anyhow::Error) -> String {
 /// stderr by the `config not read` warning; its enum mismatch quotes the
 /// value raw — `` unknown variant `<token>`, expected `agent` or `operator` ``
 /// — and `mcp.stdio_role` sits next to `mcp.operator_token`. The payload
-/// between serde's own delimiters (`"…"` for a string, `` `…` `` for an
-/// integer, a boolean, a floating point or a variant) becomes `…`; the field
-/// path before it and the `expected …` clause after it stay, which is what
-/// the operator needs to find the line. A message that quotes no value passes
-/// through unchanged (`unknown field` quotes a key).
+/// between serde's own delimiters (`"…"` for a string, `'…'` for a
+/// character, `` `…` `` for an integer, a boolean, a floating point or a
+/// variant) becomes `…`; the field path before it and the `expected …`
+/// clause after it stay, which is what the operator needs to find the line.
+/// A message that quotes no value passes through unchanged (`unknown field`
+/// quotes a key).
 fn redact_scalars(line: &str) -> String {
     const KINDS: [&str; 2] = ["invalid type: ", "invalid value: "];
-    const SHAPES: [(&str, &str); 4] = [
+    const SHAPES: [(&str, &str); 5] = [
         ("string \"", "\""),
+        ("character '", "'"),
         ("integer `", "`"),
         ("boolean `", "`"),
         ("floating point `", "`"),
@@ -1048,6 +1051,32 @@ mod tests {
         assert_eq!(
             line("unknown field `stdio_rol`, expected one of `transport`, `stdio_role`"),
             "unknown field `stdio_rol`, expected one of `transport`, `stdio_role`"
+        );
+    }
+
+    // ---- fix S5 (plan Task 15, item 9b): redact first, then the first line ----
+
+    /// A raw variant payload may span lines, so the root cause is redacted
+    /// whole before its first line is taken: the closer on a later line is
+    /// still found and the `expected …` clause after it kept, where
+    /// first-line-then-redact lost the clause. The `character` shape serde
+    /// quotes (`invalid type: character 'x'`) joins the redacted scalars.
+    #[test]
+    fn first_line_redacts_the_whole_cause_before_taking_its_first_line() {
+        let line = |msg: &str| first_line(&anyhow::anyhow!("{msg}"));
+        assert_eq!(
+            line(
+                "mcp.stdio_role: unknown variant `optoken-1\noptoken-2`, expected `agent` or `operator`"
+            ),
+            "mcp.stdio_role: unknown variant `…`, expected `agent` or `operator`"
+        );
+        assert_eq!(
+            line("k: invalid type: character 'x', expected usize at line 2 column 5"),
+            "k: invalid type: character '…', expected usize at line 2 column 5"
+        );
+        assert_eq!(
+            line("k: invalid value: character 'y', expected a digit"),
+            "k: invalid value: character '…', expected a digit"
         );
     }
 }

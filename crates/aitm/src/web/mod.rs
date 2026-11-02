@@ -28,6 +28,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use aitm_mcp::McpServer;
+use aitm_term::error::ErrorReport;
 
 pub use http::{router, serve, serve_until};
 
@@ -42,23 +43,9 @@ pub const TOKEN_ENV: &str = "AITM_WEB_TOKEN";
 /// Set to `1` to allow a non-loopback bind without TLS (warned, not refused).
 pub const INSECURE_BIND_ENV: &str = "AITM_WEB_INSECURE_BIND";
 
-/// Usage text for `aitm web --help`.
-pub const USAGE: &str = "\
-Usage: aitm [--config <path>] web [--listen <addr>] [--token <token>] [--no-open]
-
-Run the proxy (as `aitm` does) and also serve the web operator UI.
-
-Options:
-  --listen <addr>   Bind address for the UI and its /bus bridge
-                    [default: 127.0.0.1:8082; env: AITM_WEB_LISTEN]
-  --token <token>   Bridge token the UI must present as its first message
-                    [default: generated; env: AITM_WEB_TOKEN]
-  --no-open         Do not open a browser (accepted; nothing is opened yet)
-  -h, --help        Print this help
-
-Non-loopback addresses are refused until TLS for remote access lands (F15);
-use an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
-";
+/// The one `Usage:` line of `aitm web` (plan C48): the cause line of its
+/// usage errors; the page is `help::pages::web`.
+pub const USAGE_LINE: &str = crate::help::pages::WEB_USAGE_LINE;
 
 /// Shared by every connection: the bus to relay into and the bridge tokens to
 /// demand. Both tokens are the bridge's own ephemeral per-run tokens, NOT the
@@ -83,7 +70,9 @@ pub struct WebState {
 /// `aitm web …` after argument parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebCommand {
-    /// `--help`: print [`USAGE`] and exit.
+    /// `--help`: the page is `help::pages::web`, answered by `main` as
+    /// `Mode::Help` (`help::request::parse` sees the flag before this parser
+    /// runs, so this variant is unreachable in practice).
     Help,
     /// Run the server with these (unresolved) options.
     Run(WebArgs),
@@ -113,7 +102,9 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<WebCommand> {
                 } else if let Some(v) = other.strip_prefix("--token=") {
                     out.token = Some(v.to_owned());
                 } else {
-                    anyhow::bail!("unknown argument to `aitm web`: {other}\n\n{USAGE}");
+                    return Err(usage_error(format!(
+                        "unknown argument to `aitm web`: {other}"
+                    )));
                 }
             }
         }
@@ -124,7 +115,18 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<WebCommand> {
 fn value_of<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> anyhow::Result<String> {
     it.next()
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
+        .ok_or_else(|| usage_error(format!("{flag} requires a value")))
+}
+
+/// A typed usage error of `aitm web` (plan C36, M-W2-5): `what` as the
+/// headline, [`USAGE_LINE`] as its cause, `aitm web --help` as its pointer;
+/// `startup::errors::report_for` passes it through as built (exit 2).
+fn usage_error(what: String) -> anyhow::Error {
+    anyhow::Error::new(
+        ErrorReport::usage(what)
+            .with_why(vec![USAGE_LINE.to_string()])
+            .with_command("aitm web --help"),
+    )
 }
 
 /// Resolved `aitm web` settings.
@@ -261,11 +263,37 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// Plan C36 / M-W2-5: every `aitm web` usage error is a typed report —
+    /// the headline, the one `Usage:` line as its cause and `aitm web --help`
+    /// as its pointer — so `startup::errors::report_for` passes it through
+    /// as built (exit 2).
     #[test]
     fn bad_arguments_are_errors() {
-        assert!(parse_args(&args(&["--listen"])).is_err());
-        assert!(parse_args(&args(&["--bogus"])).is_err());
-        assert!(parse_args(&args(&["extra"])).is_err());
+        let report = |argv: &[&str]| {
+            let err = parse_args(&args(argv)).unwrap_err();
+            err.downcast_ref::<ErrorReport>()
+                .unwrap_or_else(|| panic!("{argv:?}: not a typed usage report: {err}"))
+                .clone()
+        };
+        let expected = |what: &str| {
+            ErrorReport::usage(what)
+                .with_why(vec![
+                    "Usage: aitm [--config <path>] web [--listen <addr>] [--token <token>] [--no-open]"
+                        .to_string(),
+                ])
+                .with_command("aitm web --help")
+        };
+        assert_eq!(report(&["--listen"]), expected("--listen requires a value"));
+        assert_eq!(report(&["--token"]), expected("--token requires a value"));
+        assert_eq!(
+            report(&["--bogus"]),
+            expected("unknown argument to `aitm web`: --bogus")
+        );
+        assert_eq!(
+            report(&["extra"]),
+            expected("unknown argument to `aitm web`: extra")
+        );
+        assert_eq!(report(&["extra"]).exit_code(), 2);
     }
 
     #[test]

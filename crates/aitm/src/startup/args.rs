@@ -200,9 +200,6 @@ fn parse_color(value: &str) -> Result<ColorChoice, String> {
 pub enum PreBoot {
     /// `--version`, `-V`, `version`: print [`version_line`] and exit 0.
     Version,
-    /// returned by nothing since wave 2; T15 deletes it together with
-    /// `main.rs`'s match arm
-    Help,
 }
 
 /// The pre-boot fast path: the first token, after stepping over `--config <p>`
@@ -240,44 +237,6 @@ pub fn pre_boot(argv: &[String]) -> Option<PreBoot> {
 pub fn version_line() -> String {
     format!("aitm {}", env!("CARGO_PKG_VERSION"))
 }
-
-/// Wave 1's static `aitm --help` text (spec M3's wave-1 block, with the
-/// package version in place of the mock-up's). Printed by nothing since wave
-/// 2: [`pre_boot`] no longer answers help and [`crate::help`] builds the pages
-/// from the schema-only registry (plan C32). Still declared only because
-/// `main.rs`'s `PreBoot::Help` arm names it; T15 deletes it together with
-/// that arm and the variant.
-pub const SYNOPSIS: &str = concat!(
-    "aitm ",
-    env!("CARGO_PKG_VERSION"),
-    " — intercepting proxy for authorized security testing\n",
-    "\n",
-    "Usage:\n",
-    "  aitm                      run the proxy with the MCP agent transport\n",
-    "  aitm web [options]        run the proxy and the web operator UI\n",
-    "  aitm tui                  run the proxy and the terminal operator UI\n",
-    "  aitm <group> <verb> [--flag <value>]...\n",
-    "                            run one command and exit\n",
-    "  aitm operator-token generate [--force]\n",
-    "\n",
-    "Groups:\n",
-    "  agent  browser  ca  capture  check  config  findings  flow  map  poc\n",
-    "  proxy  request  scan  scope  script  session  tls  ws\n",
-    "\n",
-    "Options:\n",
-    "  --config <path>           config file (env AITM_CONFIG)\n",
-    "  --script <path>           load an extra Rhai script (repeatable)\n",
-    "  -v, -vv                   show INFO / DEBUG tracing on stderr\n",
-    "  -q                        errors only\n",
-    "  --color <auto|always|never>\n",
-    "  --version, -V             print the version and exit\n",
-    "  --help, -h                print this help\n",
-    "\n",
-    "Learn more:\n",
-    "  aitm web --help           the web UI's options\n",
-    "  Nothing is decrypted until a host is in Scope.  aitm scope add --host <host>\n",
-    "  Trust the CA:  aitm ca install\n",
-);
 
 #[cfg(test)]
 mod tests {

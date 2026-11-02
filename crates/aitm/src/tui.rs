@@ -43,8 +43,10 @@ use tracing::{info, warn};
 
 use crate::wire::{BoundHook, Governance, Http1Sender};
 
-/// The usage line printed (exit status 2) when `tui` is given arguments.
-pub const USAGE: &str = "usage: aitm [--config <path>] tui (takes no further arguments)";
+/// The `Usage:` line of `aitm tui` (plan C48): the cause line of the usage
+/// error (exit 2) when `tui` is given arguments; the page is
+/// `help::pages::tui`.
+pub const USAGE: &str = crate::help::pages::TUI_USAGE_LINE;
 
 /// Environment variable naming an explicit log file for `aitm tui`.
 pub const LOG_PATH_ENV: &str = "AITM_TUI_LOG";
