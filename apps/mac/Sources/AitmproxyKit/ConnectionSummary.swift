@@ -243,17 +243,19 @@ public struct CoreCaptureStatus: Hashable, Sendable {
     }
 
     /// The fold of the verb's reply: `provider.state == attached`, TCP + UDP handoffs of the current
-    /// attachment, and the core's reason when it has one. One mapping, so the lane never reads the
-    /// raw reply.
+    /// attachment (saturating — two wire counts must never trap the app), and the core's reason when
+    /// it has one, under the Kit's wire-text rule for advice (`DecryptStatus.displayAdvice`: blank is
+    /// nil, one line, cut at 512). One mapping, so the lane never reads the raw reply.
     public init(_ status: CaptureStatus) {
         let feederReason: String? = switch status.feeder {
         case .off(let reason): reason
-        case .bindFailed(let reason): reason.isEmpty ? nil : reason
+        case .bindFailed(let reason): reason
         case .listening, .unknown: nil
         }
+        let (sum, overflow) = status.tcpHandedOff.addingReportingOverflow(status.udpHandedOff)
         self.init(providerAttached: status.providerAttached,
-                  flowsHandedOff: status.tcpHandedOff + status.udpHandedOff,
-                  reason: status.capabilityReason ?? feederReason)
+                  flowsHandedOff: overflow ? Int.max : sum,
+                  reason: (status.capabilityReason ?? feederReason).flatMap(DecryptStatus.displayAdvice))
     }
 }
 
@@ -462,12 +464,14 @@ public struct ConnectionSummary: Hashable, Sendable {
         case .on:
             var detail = "extension on · \(hosts)"
             if let coreCapture {
-                // The core's reason joins the detail when it has one ("macos_capture.enabled is
-                // false" while the app's switch still reads on), so the card says why, not just that.
-                let why = coreCapture.reason.map { " · \($0)" } ?? ""
-                detail = coreCapture.providerAttached
-                    ? "attached · \(hosts) · \(coreCapture.flowsHandedOff) flows handed off"
-                    : "extension on · \(hosts) · core not attached\(why)"
+                if coreCapture.providerAttached {
+                    detail = "attached · \(hosts) · \(coreCapture.flowsHandedOff) flows handed off"
+                } else {
+                    // The core's reason joins the detail when it has one ("macos_capture.enabled is
+                    // false" while the app's switch still reads on), so the card says why, not just that.
+                    let why = coreCapture.reason.map { " · \($0)" } ?? ""
+                    detail = "extension on · \(hosts) · core not attached\(why)"
+                }
             }
             let attached = coreCapture?.providerAttached ?? true
             return ConnectionLane(kind: .capture, state: attached ? .ok : .warning,

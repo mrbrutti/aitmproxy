@@ -420,7 +420,11 @@ Embedded… (opens Settings ▸ Bus).
   pushed, flows handed off) is proposed as a separate card; `ConnectionSummary.make` takes an
   optional `coreCapture: CoreCaptureStatus?` that, when present, overrides the detail line and
   turns "capture on" into "capture on · attached · n flows handed off". Tunnel status stays the
-  fallback.
+  fallback. *(Folded 2026-11-02, F-1..F-4 below: the verb shipped in v0.5.5 (#200); the app polls it
+  about every 2 s from an embedded core that lists it; `CoreCaptureStatus.reason` carries the core's
+  `capability_reason` (else `feeder.reason`) under the Kit's wire-advice rule, and the "on, core not
+  attached" detail appends it — "extension on · n hosts in scope · core not attached · macos_capture.enabled
+  is false" — so the card says why. The word itself is R3-1's "all apps on · n hosts in scope".)*
 - **Scope persistence is app-side** (persist-scope session): hosts saved in the app store and
   restored into the embedded config / re-pushed on connect. The Status page keeps reading
   `scope.list` as the truth; no change here.
@@ -568,6 +572,24 @@ item, PR #200's verb shipped in v0.5.5; last unit in the mac order after attribu
 |---|---|---|
 | F-1 | The All Apps lane read only the app's tunnel status; the core's attach state and handoff count (`capture.status`) were decoded by `AitmproxyKit/CaptureStatus.swift` but never polled or shown | FIXED — `BusService.refreshCaptureStatus` reads the verb on the first tick and every 4th (~2 s), only from an embedded core that lists it, change-guarded into `Session.captureStatus` (nil on an external/older core, a failed read, or no connection); `Session+Connection` passes `CoreCaptureStatus(status)` as `make(coreCapture:)` |
 | F-2 | `CoreCaptureStatus` had no mapping from the verb's reply and no room for the core's reason | FIXED — `init(_ status: CaptureStatus)`: `provider.state == attached`, TCP + UDP handoffs, `reason = capability_reason ?? feeder.reason`; the "on, core not attached" detail appends the reason ("… · core not attached · macos_capture.enabled is false"); the attached detail is unchanged ("attached · n hosts in scope · m flows handed off"). Kit test pins the four shapes (attached, gate off, bind failed, awaiting) with literal JSON |
-| F-3 | `FlowSummary.swift` still said `source_app` is "nil for a proxied flow" after PR #283 taught the core to name proxied clients | FIXED — three comments |
-| F-4 | Live proof of the attached row needs the installed notarized app (a dev bundle embeds no extension, so its core answers `feeder off · "macos_capture.enabled is false"`) | The dev-bundle proof shows the verb polled on the bus and that reply folded into the lane; the attached/handed-off row is proven by the acceptance runner's MAC journeys on the next installed build |
+| F-3 | `FlowSummary.swift` still said `source_app` is "nil for a proxied flow" after PR #283 taught the core to name proxied clients | FIXED — three comments; outside this spec's §6 (attribution is a non-goal here), ACCEPTED as a comment-only ripple of #283 |
+| F-4 | Live proof: a dev bundle embeds no extension, so its advice is `.unsupported` and the lane reads "no extension" before the `.on` branch that reads `coreCapture` — the fold is NOT observable on a dev bundle's screen | What the dev-bundle run (2026-11-02, Aitmproxy-fold + the installed 0.5.13 core) honestly shows: real curl traffic through its proxy; its core's `capture.status` = `feeder_off / "macos_capture.enabled is false"`; the toolbar switch's AX help "All Apps capture is not in this build" (the fallback); the live self-test on a real external core passing the new "no capture fact for an external core" check. The installed 0.5.13 core, read read-only over its bus with the extension on, answered `approved_attached · provider attached · scope_tokens ["wikipedia.org"] · handoffs 0` — the shape the mapping turns into "attached · 1 host in scope · 0 flows handed off". **BLOCKING before Shipped:** the acceptance runner's window pass on the next installed build captures (a) the Status card reading "attached · n hosts in scope · m flows handed off" after a real in-scope Safari visit (m ≥ 1) and (b) the "on, core not attached · <reason>" detail — reachable on the real app for under 3 s after Proxy ▸ Restart Core with All Apps on (the provider re-attaches within ~3 s), so the runner polls the card at 500 ms during that window or records that the window was missed. Owner: orchestrator's acceptance runner (requested 2026-11-02). |
+
+Panel on PR #303 (range dcc71166..d770ad65; security PASS, quality PASS, spec FAIL → fixed below):
+
+| # | Reviewer | Sev | Finding | Disposition |
+|---|---|---|---|---|
+| P3-1 | Spec | Important | F-4 claimed a dev-bundle observation the code cannot produce; no live evidence in range | FIXED — F-4 rewritten to what was shown, with the installed-build rows as a blocking item and owner |
+| P3-2 | Security | Minor | `tcpHandedOff + udpHandedOff` could trap on two huge wire counts | FIXED — `addingReportingOverflow`, saturates to `Int.max`; Kit test with the two-huge-counts literal |
+| P3-3 | Security | Minor | The core's `reason` reached three surfaces with no one-line/length rule | FIXED — mapped through `DecryptStatus.displayAdvice` (blank → nil, newlines → spaces, cut at 512); Kit test |
+| P3-4 | Quality | Minor | Cadence comment cited a spec requirement that does not exist | FIXED — the comment gives the real reason (in-memory read; attach/detach visible within ~2 s) |
+| P3-5 | Quality | Minor | The who-is-asked policy was written three times | FIXED — policy lives on `refreshCaptureStatus`; call site and `Session.captureStatus` point at it |
+| P3-6 | Quality | Minor | The session write after the await was not ownership-guarded | FIXED — `refreshCaptureStatus(generation:)` guards `generation == runGeneration` after the call, as `refreshL4State` does |
+| P3-7 | Quality | Minor | `.bindFailed("")` and `.unknown` mapping branches untested; bind-failed asserted on `reason` only | FIXED — new test `coreCaptureStatusMappingIsTotalOverTheWire`; bind-failed compared as a whole value |
+| P3-8 | Quality | Minor | Third spelling of "does the core list verb X" | FIXED — `BusService.lists(_:in:)`, used by the capture read and `pollsL4` |
+| P3-9 | Quality | Minor | `why` computed on the attached path | FIXED — built inside the not-attached branch |
+| P3-10 | Spec | Minor | `reason` and the reason suffix were not in the spec body | FIXED — the Facts item carries the sentence |
+| P3-11 | Spec | Minor | `FlowSummary.swift` comment edits are outside this spec | ACCEPTED — F-3 |
+| P3-12 | Spec | Minor | Declared vs touched files: `CaptureStatus.swift` and `CaptureStatusTests.swift` declared but untouched; `SelfTest+Live.swift` touched, declared late | ACCEPTED — recorded here; the live check is within §6's self-test family and runs over the real bus |
+| P3-13 | Spec | Minor | No plan task; F-rows written by the implementing commit before the panel | ACCEPTED — the orchestrator granted the claims and the spec file; dispositions now follow the panel |
 

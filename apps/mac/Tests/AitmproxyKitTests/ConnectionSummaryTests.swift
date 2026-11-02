@@ -185,12 +185,36 @@ import Testing
         // feeder that is simply not yet attached has no reason and the detail stays bare.
         let bindFailed = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(
             #"{"enabled":true,"feeder":{"state":"bind_failed","reason":"cannot bind the capture sockets (address in use)"},"capability":"degraded"}"#))))
-        #expect(bindFailed.reason == "cannot bind the capture sockets (address in use)")
+        #expect(bindFailed == CoreCaptureStatus(providerAttached: false, flowsHandedOff: 0,
+                                                reason: "cannot bind the capture sockets (address in use)"))
         let awaiting = CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(
             #"{"enabled":true,"feeder":{"state":"listening"},"capability":"awaiting_provider"}"#))))
         #expect(awaiting == CoreCaptureStatus(providerAttached: false, flowsHandedOff: 0, reason: nil))
         #expect(make(capability: .capturing, hosts: 1, coreCapture: awaiting).capture.detail
                 == "extension on · 1 host in scope · core not attached")
+    }
+
+    /// The mapping is total over the wire: a bind failure with no reason and a state this build does
+    /// not know carry no reason (never a bare " · " on the detail); two huge counts saturate instead of
+    /// trapping; a reason with newlines or over 512 characters follows the Kit's advice rule (one line,
+    /// cut), and a blank reason is nil.
+    @Test func coreCaptureStatusMappingIsTotalOverTheWire() throws {
+        func core(_ json: String) throws -> CoreCaptureStatus {
+            CoreCaptureStatus(try #require(CaptureStatus(json: JSONValue.parse(json))))
+        }
+        #expect(try core(#"{"enabled":true,"feeder":{"state":"bind_failed"},"capability":"degraded"}"#).reason == nil)
+        #expect(try core(#"{"enabled":true,"feeder":{"state":"paused"},"capability":"snoozing"}"#)
+                == CoreCaptureStatus(providerAttached: false, flowsHandedOff: 0, reason: nil))
+        let huge = try core(#"{"enabled":true,"feeder":{"state":"listening"},"provider":{"state":"attached"},"flows_handed_off":{"tcp":9223372036854774784,"udp":9223372036854774784},"capability":"capturing"}"#)
+        #expect(huge.flowsHandedOff == Int.max)
+        let long = String(repeating: "x", count: 600)
+        let noisy = try core(#"{"enabled":false,"feeder":{"state":"off","reason":"line one\nline two"},"capability":"feeder_off","capability_reason":"\#(long)"}"#)
+        #expect(noisy.reason?.count == 512)
+        let multiline = try core(#"{"enabled":false,"feeder":{"state":"off","reason":"line one\nline two"},"capability":"feeder_off"}"#)
+        #expect(multiline.reason == "line one line two")
+        #expect(try core(#"{"enabled":false,"feeder":{"state":"off","reason":"   "},"capability":"feeder_off"}"#).reason == nil)
+        #expect(make(capability: .capturing, hosts: 1, coreCapture: multiline).capture.detail
+                == "extension on · 1 host in scope · core not attached · line one line two")
     }
 
     // MARK: Overall + steps
