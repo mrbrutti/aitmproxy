@@ -18,6 +18,10 @@ final class BusService: FlowActions {
     /// The L4 status, scope and parked reads run on one poll tick in this many (l4-parity plan,
     /// unit (d) amendment 6: the same ~5 s cadence as `ca.status`; spec §1 says re-read, never cache).
     static let l4StatusEveryTicks = 10
+    /// `capture.status` is read on one poll tick in this many (about every 2 s). Faster than the
+    /// `ca.status` / L4 cadence because the verb is an in-memory read on the core (no process spawn),
+    /// and an attach or detach should reach the All Apps switch within a couple of seconds.
+    static let captureStatusEveryTicks = 4
 
     @ObservationIgnored private var client: BusClient?
     @ObservationIgnored private var runTask: Task<Void, Never>?
@@ -187,6 +191,8 @@ final class BusService: FlowActions {
             session.forgetCATrust()
             // Likewise the system-proxy facts: the route and the menu title must not keep a gone core's word.
             session.forgetSystemProxy()
+            // And the core's capture account: with no core there is no attach state to show.
+            session.captureStatus = nil
             // And the L4 facts (l4-parity spec §1: never cached for the session): a new core is
             // re-read from `.pending`, and no stale scope or parked packet shows under a failed badge.
             session.l4CaptureAvailability = .pending
@@ -212,6 +218,11 @@ final class BusService: FlowActions {
             // from any other client (agent, TUI, web) reaches the toolbar's Proxy switch within
             // one poll, and a relaunch against an already-paused core starts out saying so.
             await refreshProxyStatus()
+            // Same: the capture read below goes through `self.client`.
+            guard owns() else { return }
+            // The core's capture account (`capture.status`): the first tick and every 4th; the policy
+            // of who is asked lives on `refreshCaptureStatus`.
+            if tick % Self.captureStatusEveryTicks == 0 { await refreshCaptureStatus(generation: generation) }
             // Same: `refreshCAStatus` reaches the bus through `session.commandRunner`, which reads `self.client`.
             guard owns() else { return }
             // CA trust is the OS store's fact (spec D17.5, D17.10): read on the first tick and every
@@ -386,6 +397,29 @@ final class BusService: FlowActions {
         }
     }
 
+    /// `capture.status` → `Session.captureStatus`, the core's account of the All Apps path: whether a
+    /// provider is attached and how many flows it handed off (the All Apps lane's detail and its
+    /// "on, core not attached" warning read it). Only an embedded core that lists the verb is asked;
+    /// anything else — an external core, an older core, a failed read — publishes nil, so the lane
+    /// falls back to the app's tunnel status rather than showing a stale attach state.
+    private func refreshCaptureStatus(generation: Int) async {
+        guard let client, session.embeddedCoreActive, Self.lists("capture.status", in: tools) else {
+            if session.captureStatus != nil { session.captureStatus = nil }
+            return
+        }
+        let status = (try? await client.call("capture.status")).flatMap(CaptureStatus.init)
+        // The write is the owner's: a run retired during the call must not publish a gone core's state.
+        guard generation == runGeneration else { return }
+        // Change-guarded like every other per-tick write here.
+        if session.captureStatus != status { session.captureStatus = status }
+    }
+
+    /// Whether the core advertises `name` in `tools/list` (the one spelling of "does this core have
+    /// verb X" for the per-tick reads).
+    private static func lists(_ name: String, in tools: [ToolDescriptor]) -> Bool {
+        tools.contains { $0.name == name }
+    }
+
     /// `l4.capture.status` / `l4.intercept.status` → the two availabilities, `l4.scope.list` → the
     /// L4 scope, `l4.intercept.list` → the parked packets (only while intercept is available, spec §4:
     /// the UI does not poll it otherwise), and `tools/list`'s `confirmable` on `l4.scope.add` → whether
@@ -433,7 +467,7 @@ final class BusService: FlowActions {
     /// True iff the core advertises both halves of the live L4 list poll, `l4.flow.list` and
     /// `l4.flow.get` (feature-detected from `tools/list`; a core without the L4 family is never asked).
     private static func pollsL4(_ tools: [ToolDescriptor]) -> Bool {
-        tools.contains { $0.name == "l4.flow.list" } && tools.contains { $0.name == "l4.flow.get" }
+        lists("l4.flow.list", in: tools) && lists("l4.flow.get", in: tools)
     }
 
     // MARK: FlowActions
