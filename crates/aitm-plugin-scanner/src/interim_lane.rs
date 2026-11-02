@@ -369,9 +369,25 @@ impl Lane for InterimHttpLane {
         point: &InsertionPoint,
         job: Arc<dyn JobCtx>,
     ) -> anyhow::Result<Box<dyn ProbeHost>> {
-        let flow_ref = point
-            .flow
-            .ok_or_else(|| anyhow::anyhow!("interim lane: point `{}` carries no flow", point.id))?;
+        let Some(flow_ref) = point.flow else {
+            // Amendment 38: an origin item stands for a whole origin, not for
+            // anything a request carried, so it has no captured flow to host.
+            // The lane serves it over a synthesized `GET <origin>/` instead;
+            // any other flowless point is still an error.
+            let flow = origin_request(point).ok_or_else(|| {
+                anyhow::anyhow!("interim lane: point `{}` carries no flow", point.id)
+            })?;
+            return Ok(Box::new(InterimProbeHost {
+                point: point.clone(),
+                flow,
+                legacy: None,
+                synthetic: true,
+                job,
+                baseline: OnceCell::new(),
+                baseline_peer: Mutex::new(None),
+                held: Mutex::new(Vec::new()),
+            }));
+        };
         let Some(Flow::Http(flow)) = job.store().get(flow_ref.0) else {
             return Err(anyhow::anyhow!(
                 "interim lane: the captured flow behind point `{}` is no longer in the store",
@@ -395,7 +411,8 @@ impl Lane for InterimHttpLane {
         Ok(Box::new(InterimProbeHost {
             point: point.clone(),
             flow,
-            legacy,
+            legacy: Some(legacy),
+            synthetic: false,
             job,
             baseline: OnceCell::new(),
             baseline_peer: Mutex::new(None),
@@ -442,6 +459,56 @@ impl Lane for InterimHttpLane {
     }
 }
 
+/// The `GET <origin>/` flow an origin item is hosted over (amendment 38), or
+/// `None` when the point is not an origin item or its URL is not an origin.
+///
+/// The request is the bare minimum: no headers and no body. The job client
+/// applies the profile's version policy and the D7 session material to it on
+/// the way out, exactly as it does for a captured point's baseline. The flow
+/// has no response and no server connection: it describes a request that has
+/// not been sent yet.
+fn origin_request(point: &InsertionPoint) -> Option<HttpFlow> {
+    if !point.id.starts_with("origin:") {
+        return None;
+    }
+    let parsed = url::Url::parse(point.url.as_deref()?).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let authority = match parsed.port_or_known_default() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Some(HttpFlow {
+        id: FlowId::new(),
+        request: HttpRequest {
+            method: "GET".to_string(),
+            scheme: parsed.scheme().to_string(),
+            authority,
+            path: "/".to_string(),
+            version: aitm_core::HttpVersion::Http11,
+            headers: HeaderMap::new(),
+            body: aitm_core::Body::Empty,
+            timestamp: SystemTime::now(),
+        },
+        response: None,
+        client_conn: aitm_core::ConnInfo {
+            peer: std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            ),
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: aitm_core::FlowMeta::default(),
+        intercept: aitm_core::InterceptState::Observed,
+    })
+}
+
 /// The [`ProbeHost`] the interim lane builds for one insertion point.
 ///
 /// It owns the job (so the check can outlive the lane's borrow), the captured
@@ -449,7 +516,13 @@ impl Lane for InterimHttpLane {
 pub struct InterimProbeHost {
     point: InsertionPoint,
     flow: HttpFlow,
-    legacy: InjectionPoint,
+    /// The v1 point [`ProbeHost::probe`] injects into, or `None` for an origin
+    /// item (amendment 38), which has nothing to inject into.
+    legacy: Option<InjectionPoint>,
+    /// Whether [`InterimProbeHost::flow`] was synthesized for an origin item
+    /// rather than captured from the wire, so [`ProbeHost::captured`] does not
+    /// offer it as traffic that happened.
+    synthetic: bool,
     job: Arc<dyn JobCtx>,
     baseline: OnceCell<ProbeResponse>,
     baseline_peer: Mutex<Option<SocketAddr>>,
@@ -517,13 +590,19 @@ impl ProbeHost for InterimProbeHost {
 
     fn probe<'a>(&'a self, payload: &'a Payload) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
-            let example = self.legacy.example.as_str();
+            let Some(legacy) = self.legacy.as_ref() else {
+                return Err(anyhow::anyhow!(
+                    "interim lane: origin host `{}`: no insertion point to inject into",
+                    self.point.id
+                ));
+            };
+            let example = legacy.example.as_str();
             let value = match payload.mode {
                 PayloadMode::Replace => payload.value.clone(),
                 PayloadMode::Prefix => format!("{}{example}", payload.value),
                 PayloadMode::Suffix => format!("{example}{}", payload.value),
             };
-            let req = crate::inject::mutate_request(&self.flow.request, &self.legacy, &value)
+            let req = crate::inject::mutate_request(&self.flow.request, legacy, &value)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "interim lane: point `{}` cannot be mutated in its captured request",
@@ -609,6 +688,11 @@ impl ProbeHost for InterimProbeHost {
     }
 
     fn captured(&self) -> Option<HttpFlow> {
+        // A synthesized origin request is not traffic the scan observed, so a
+        // passive check must not read it as a capture (amendment 38).
+        if self.synthetic {
+            return None;
+        }
         Some(self.flow.clone())
     }
 
@@ -1655,6 +1739,19 @@ mod tests {
         InterimHttpLane::new(ScannerConfig::default())
     }
 
+    /// The one origin item [`crate::scheduler::plan`] builds for `origins` and
+    /// `points`, so these tests run against the real amendment-38 shape rather
+    /// than a hand-written copy of it.
+    fn origin_item(origins: &[&str], points: &[InsertionPoint]) -> InsertionPoint {
+        let profile = ScanProfile {
+            target: target(origins),
+            ..ScanProfile::default()
+        };
+        let mut items = crate::scheduler::plan(points, &[], &[], &profile).origin_points;
+        assert_eq!(items.len(), 1, "one origin in the set");
+        items.remove(0)
+    }
+
     /// A job whose crawl is off (`max_pages: 0`, spec D2), for the tests that
     /// are about the probes or the mapping of what the store already holds:
     /// discovery sends nothing, so the stub client's call count is the
@@ -2614,6 +2711,88 @@ mod tests {
             .expect("a point that is not in its request cannot be hosted");
         assert!(err.to_string().contains("no longer present"), "{err}");
 
+        assert_eq!(client.calls(), 0);
+    }
+
+    /// Amendment 38: an origin item ([`crate::scheduler::SchedulePlan::origin_points`])
+    /// carries no captured flow, so the lane hosts it over a synthesized
+    /// `GET <origin>/`. That request is the baseline; there is no insertion
+    /// point behind it, so `probe` is refused; and nothing was captured, so
+    /// `captured` is empty.
+    #[tokio::test]
+    async fn an_origin_point_gets_a_host_whose_baseline_is_get_root() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let origin = origin_item(&[ORIGIN], &[]);
+        assert_eq!(origin.id, "origin:http://target.test:80");
+
+        let host = lane()
+            .probe_host_for(&origin, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("an origin item is hosted");
+
+        let baseline = host.baseline().await.expect("the stub answers");
+        assert_eq!(baseline.status, Some(200));
+        assert_eq!(client.calls(), 1, "the baseline is one request");
+        let (req, opts) = client.seen().last().cloned().expect("a send");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.scheme, "http");
+        assert_eq!(req.authority, "target.test:80");
+        assert_eq!(req.path, "/");
+        assert!(req.headers.get("cookie").is_none(), "no headers of its own");
+        assert!(
+            matches!(opts.record, RecordPolicy::Never),
+            "{:?}",
+            opts.record
+        );
+
+        let err = host
+            .probe(&payload("anything"))
+            .await
+            .expect_err("an origin host has nothing to inject into");
+        assert!(err.to_string().contains("no insertion point"), "{err}");
+        assert_eq!(client.calls(), 1, "the refused probe sent nothing");
+
+        assert!(
+            host.captured().is_none(),
+            "the flow was synthesized, not captured"
+        );
+    }
+
+    /// The degenerate origin key: a point with neither a site node nor a
+    /// parsable URL gives `point:<id>`, so the origin item's URL is not an
+    /// origin at all. It takes the same error path as any other flowless
+    /// point instead of being hosted over a nonsense request.
+    #[tokio::test]
+    async fn an_origin_item_whose_url_is_not_an_origin_cannot_be_hosted() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let nowhere = InsertionPoint {
+            id: "p9".to_string(),
+            lane: LaneKind::Http,
+            kind: InsertionKind::Query,
+            name: "q".to_string(),
+            path: None,
+            example: None,
+            flow: None,
+            site_node: None,
+            traits: Vec::new(),
+            frequency: 1,
+            method: Some("GET".to_string()),
+            url: None,
+        };
+        let origin = origin_item(&[], &[nowhere]);
+        assert_eq!(origin.id, "origin:point:p9");
+        assert_eq!(origin.url.as_deref(), Some("point:p9/"));
+
+        let err = lane()
+            .probe_host_for(&origin, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .err()
+            .expect("an origin item without an origin cannot be hosted");
+        assert!(err.to_string().contains("carries no flow"), "{err}");
         assert_eq!(client.calls(), 0);
     }
 

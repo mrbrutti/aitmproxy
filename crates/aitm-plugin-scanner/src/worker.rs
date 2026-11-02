@@ -729,6 +729,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
     let run = RunCtx {
         engine: &engine,
         job: &job,
+        plan: &plan,
         profile: &profile,
         status: &status,
         progress,
@@ -795,6 +796,9 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
 struct RunCtx<'a> {
     engine: &'a Arc<Engine>,
     job: &'a str,
+    /// The plan the items came from, so an item's index resolves to a
+    /// discovered point or to an origin item (amendment 38).
+    plan: &'a SchedulePlan,
     profile: &'a ScanProfile,
     status: &'a Arc<RwLock<JobStatus>>,
     progress: &'a Progress,
@@ -815,6 +819,12 @@ struct RunCtx<'a> {
 }
 
 impl RunCtx<'_> {
+    /// The insertion point an item names: a discovered point, or the origin
+    /// item an index past `points.len()` addresses (amendment 38).
+    fn point_of(&self, item: &ScheduleItem) -> Option<&InsertionPoint> {
+        self.plan.point_at(self.points, item.point)
+    }
+
     /// Copy the live meters onto the status.
     fn sync(&self) {
         sync_counters(
@@ -855,7 +865,7 @@ impl RunCtx<'_> {
         if self.runtime.session_is_lost() && self.profile.session.on_lost == OnLost::Stop {
             return Some(StoppedReason::SessionLost);
         }
-        if let Some(point) = item.and_then(|item| self.points.get(item.point)) {
+        if let Some(point) = item.and_then(|item| self.point_of(item)) {
             let host = host_of_point(point);
             if !host.is_empty() && self.meter.ladder_state(&host) == LadderState::Tripped {
                 return Some(StoppedReason::Errors);
@@ -901,7 +911,7 @@ impl RunCtx<'_> {
         item: &ScheduleItem,
         owed: &mut std::collections::HashMap<usize, usize>,
     ) {
-        let Some(point) = self.points.get(item.point) else {
+        let Some(point) = self.point_of(item) else {
             return;
         };
         let meta = item.check.meta().clone();
@@ -1177,6 +1187,11 @@ impl RunCtx<'_> {
 
     /// One item finished: the check counter rises, and the point's counter
     /// rises with the last item that named it.
+    ///
+    /// An origin item is an item like any other — it is in `points.queued` and
+    /// `checks.scheduled`, and it bumps `checks.done` here — but it is not a
+    /// discovered insertion point, so it never bumps `points.audited`
+    /// (amendment 38).
     fn item_done(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
         let last = match owed.get_mut(&point) {
             Some(left) => {
@@ -1187,7 +1202,7 @@ impl RunCtx<'_> {
         };
         let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
         bump(&mut status.checks.done, 1);
-        if last {
+        if last && point < self.points.len() {
             bump(&mut status.points.audited, 1);
         }
     }
@@ -1625,6 +1640,128 @@ mod tests {
         CrawlErrorKind, JobEvent, JobNotification, JobState, JobStatus, L4Counters, LaneKind,
         OnLost, Phase, RecordProbes, StoppedReason,
     };
+
+    /// A [`FakeCheck`] re-labelled `scope: origin` (amendment 38), recording
+    /// the id of every point it was run against.
+    ///
+    /// `FakeCheck`'s own metadata is `scope: point` and it lives in
+    /// `jobs::test_support`, which this task does not write; the wrapper keeps
+    /// the scripted behaviour and changes only the one field the scheduler
+    /// reads here.
+    struct OriginScoped {
+        inner: Arc<FakeCheck>,
+        meta: aitm_scan_model::CheckMeta,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl OriginScoped {
+        fn new(id: &str) -> Arc<Self> {
+            let inner = FakeCheck::new(id, "demo", FakeRun::clean());
+            let mut meta = aitm_scan_model::Check::meta(inner.as_ref()).clone();
+            meta.scope = aitm_scan_model::CheckScope::Origin;
+            Arc::new(Self {
+                inner,
+                meta,
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// The point ids the check was run against, in order.
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    impl aitm_scan_model::Check for OriginScoped {
+        fn meta(&self) -> &aitm_scan_model::CheckMeta {
+            &self.meta
+        }
+
+        fn run<'a>(
+            &'a self,
+            point: &'a aitm_scan_model::InsertionPoint,
+            host: &'a dyn aitm_scan_model::ProbeHost,
+        ) -> futures::future::BoxFuture<'a, aitm_scan_model::Verdict> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(point.id.clone());
+            self.inner.run(point, host)
+        }
+    }
+
+    /// Amendment 38 (spec D4/D8): an origin-scoped HTTP check runs once per
+    /// target origin even when the crawl discovered no insertion point at all,
+    /// and it is run against the origin item, not against a discovered point.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_origin_scoped_check_runs_on_an_origin_without_points() {
+        let check = OriginScoped::new("fake.origin");
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_points(Vec::new())
+                .with_check(Arc::clone(&check) as Arc<dyn aitm_scan_model::Check>),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        assert_eq!(status.points.found, 0, "the lane discovered nothing");
+        assert_eq!(status.points.audited, 0, "an origin is not a point");
+        assert_eq!(status.points.queued, 1, "the origin item is queued");
+        assert_eq!(status.checks.scheduled, 1);
+        assert_eq!(status.checks.done, 1);
+        assert_eq!(
+            check.seen(),
+            vec!["origin:http://scan.test:80".to_string()],
+            "the check ran once, against the origin item"
+        );
+    }
+
+    /// Amendment 38: an origin item is counted in `points.queued` and
+    /// `checks.scheduled` like any other item, but never in `points.audited` —
+    /// that counter is about discovered insertion points.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn origin_items_do_not_count_as_audited_points() {
+        let origin = OriginScoped::new("fake.origin");
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
+                .with_check(Arc::clone(&origin) as Arc<dyn aitm_scan_model::Check>),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.points.found, 2);
+        assert_eq!(status.points.audited, 2, "the two discovered points");
+        assert_eq!(
+            status.checks.scheduled, 3,
+            "one point check per point plus one origin item"
+        );
+        assert_eq!(status.points.queued, 3);
+        assert_eq!(status.checks.done, 3);
+        assert_eq!(
+            origin.seen(),
+            vec!["origin:http://scan.test:80".to_string()]
+        );
+    }
 
     /// AC T1-1 (spec D3/D5): `scan.start` returns while the job is still
     /// queued, and the worker takes it all the way to `done` on its own.
