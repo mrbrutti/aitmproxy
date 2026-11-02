@@ -100,8 +100,13 @@ pub trait ProbeHost: Send + Sync {
     /// [`ProbeHost::probe`].
     fn probe_raw(&self, req: RawProbe) -> BoxFuture<'_, anyhow::Result<ProbeResponse>>;
 
-    /// The job's collision-resistant marker token, for a check that needs a
+    /// A fresh collision-resistant marker token, for a check that needs a
     /// value it can recognise again (a reflection canary, a callback label).
+    ///
+    /// **Every call mints a new token.** It is never a key: two calls on one
+    /// host return two different strings, so per-job state keyed on it misses
+    /// every lookup (amendment 57). A lane that needs the stable per-job key
+    /// uses [`JobCtx::job_id`] on the context it was handed.
     fn marker(&self) -> String;
 
     /// Probes still affordable for this point. Zero means send nothing more.
@@ -185,7 +190,9 @@ pub trait ProbeHost: Send + Sync {
 /// browser, the in-memory session material and the job's budget, deadline and
 /// cancellation state. The engine implements it; a lane only reads it.
 pub trait JobCtx: Send + Sync {
-    /// The job's identifier, as it appears in results and push lines.
+    /// The job's identifier, as it appears in results and push lines. Stable
+    /// for the life of the job: this is the key for any per-job state a lane
+    /// holds (amendment 57; [`JobCtx::marker`] is not).
     fn job_id(&self) -> &str;
 
     /// The profile the job is running under.
@@ -229,7 +236,12 @@ pub trait JobCtx: Send + Sync {
     /// Whether the job was cancelled. A lane polls this inside every loop.
     fn cancelled(&self) -> bool;
 
-    /// The job's collision-resistant marker token (see [`ProbeHost::marker`]).
+    /// A fresh collision-resistant marker token (see [`ProbeHost::marker`]).
+    ///
+    /// **Every call mints a new token.** It is never a key: use it as a canary
+    /// value, not to index per-job state — two calls return two different
+    /// strings. The stable per-job key is [`JobCtx::job_id`], which returns
+    /// the same value for the life of the job (amendment 57).
     fn marker(&self) -> String;
 
     /// Report the L4 lane's running counters — cases sent, crashes, failed

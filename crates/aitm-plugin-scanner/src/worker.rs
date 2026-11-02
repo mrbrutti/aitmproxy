@@ -33,11 +33,12 @@ use aitm_core::{
     BrowserDriver, CommandHost, Flow, FlowId, FlowStore, HttpFlow, ProxyClient, ScopeRateGuard,
 };
 use aitm_scan_model::{
-    scan_error, Canary, CheckMeta, Confidence, CrawlErrorKind, Discovery, Evidence, InsertionPoint,
-    IssueLocation, IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters,
-    L4Location, L4Transport, Lane, LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse,
-    RawProbe, RecordProbes, ScanErrorCode, ScanProfile, SessionMaterial, SessionMode,
-    SessionStatus, SiteNode, StoppedReason, Technique, UseBrowser, Verdict, JOB_KIND_SCAN,
+    scan_error, Canary, CheckErrorSample, CheckMeta, Confidence, CrawlErrorKind, Discovery,
+    Evidence, InsertionPoint, IssueLocation, IssueTarget, JobCtx, JobEvent, JobNotification,
+    JobState, JobStatus, L4Counters, L4Location, L4Transport, Lane, LaneKind, OnLost, Outcome,
+    Payload, ProbeHost, ProbeResponse, RawProbe, RecordProbes, ScanErrorCode, ScanProfile,
+    SessionMaterial, SessionMode, SessionStatus, SiteNode, StoppedReason, Technique, UseBrowser,
+    Verdict, JOB_KIND_SCAN, MAX_CHECK_ERROR_SAMPLES,
 };
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -271,6 +272,14 @@ pub struct JobRuntime {
     /// Forms the crawl submitted (`JobCtx::report_forms_submitted`), folded
     /// into `crawl.forms_submitted` by `sync_counters` (amendment 53).
     forms_submitted: AtomicU64,
+    /// Check runs that ended in an `Outcome::Error` verdict, folded into
+    /// `checks.errors` by `sync_counters` (amendment 58).
+    check_errors: AtomicU64,
+    /// The first [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` error
+    /// pairs, each with the first point it was seen on, folded into
+    /// `checks.error_samples` by `sync_counters` (amendment 58). The detail is
+    /// stored scrubbed and bounded, so what is deduped is what is shown.
+    check_error_samples: Mutex<Vec<CheckErrorSample>>,
 }
 
 impl JobRuntime {
@@ -283,6 +292,50 @@ impl JobRuntime {
     fn mark_session_lost(&self) {
         self.session_lost.store(true, Ordering::SeqCst);
         self.with_session(|session| session.lost = true);
+    }
+
+    /// One check run ended in an `Outcome::Error` verdict (amendment 58): the
+    /// error counter rises, and a `(check, detail)` pair not sampled yet is
+    /// kept (up to [`MAX_CHECK_ERROR_SAMPLES`]) and logged **once** — never
+    /// per probe, never per repeat. The detail is scrubbed first and cut like
+    /// an evidence excerpt (spec amendment 16: scrub, then bound), so neither
+    /// the sample nor the log line can carry a credential a runner echoed.
+    /// Past the cap a new distinct pair is counted but neither kept nor
+    /// logged.
+    fn note_check_error(&self, check: &str, point: &str, detail: &str) {
+        self.check_errors.fetch_add(1, Ordering::SeqCst);
+        let detail = Evidence::excerpt(&util::scrub(detail));
+        let mut samples = self
+            .check_error_samples
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if samples.len() >= MAX_CHECK_ERROR_SAMPLES
+            || samples
+                .iter()
+                .any(|s| s.check == check && s.detail == detail)
+        {
+            return;
+        }
+        tracing::warn!(
+            target: "aitm::scanner",
+            job = %self.job,
+            check = %check,
+            point = %point,
+            "the check reported an error: {detail}",
+        );
+        samples.push(CheckErrorSample {
+            check: check.to_string(),
+            point: point.to_string(),
+            detail,
+        });
+    }
+
+    /// The error samples kept so far (amendment 58).
+    fn check_error_samples(&self) -> Vec<CheckErrorSample> {
+        self.check_error_samples
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Budget units lanes charged outside an HTTP send.
@@ -416,6 +469,8 @@ impl JobCtx for JobRuntime {
         self.budget.cancel.is_cancelled()
     }
 
+    /// A new token on every call (amendment 57): the per-job counter steps,
+    /// so no two calls on one job agree. Not a key — `job_id()` is.
     fn marker(&self) -> String {
         crate::util::marker(self.markers.fetch_add(1, Ordering::SeqCst))
     }
@@ -637,6 +692,8 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         last_crawl_error: Mutex::new(None),
         forms_skipped: AtomicU64::new(0),
         forms_submitted: AtomicU64::new(0),
+        check_errors: AtomicU64::new(0),
+        check_error_samples: Mutex::new(Vec::new()),
     });
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
 
@@ -976,9 +1033,10 @@ impl RunCtx<'_> {
                 }
                 return;
             }
+            // The error path below counts, samples and logs it once per
+            // distinct panic text (amendment 58).
             Err(payload) => {
                 let detail = format!("the check panicked: {}", panic_text(payload.as_ref()));
-                tracing::warn!(target: "aitm::scanner", job = %self.job, check = %meta.id, "{detail}");
                 Verdict {
                     outcome: Outcome::Error,
                     confidence: Confidence::Tentative,
@@ -992,6 +1050,12 @@ impl RunCtx<'_> {
         };
         if !matches!(verdict.outcome, Outcome::Vulnerable) {
             self.note_lane_text(&verdict.detail);
+        }
+        // Amendment 58: an `error` verdict is counted, sampled and logged;
+        // `inconclusive` is a verdict like `clean` and leaves no trace here.
+        if verdict.outcome == Outcome::Error {
+            self.runtime
+                .note_check_error(&meta.id, &point.id, &verdict.detail);
         }
         for (verdict, new) in issues_from_verdict(self.job, point, &meta, &verdict, self.nodes) {
             self.record_issue(new, &verdict, &meta, &host).await;
@@ -1497,6 +1561,16 @@ fn sync_counters(
         runtime.forms_submitted.load(Ordering::SeqCst),
     );
     raise(
+        &mut guarded.checks.errors,
+        runtime.check_errors.load(Ordering::SeqCst),
+    );
+    // The sample list only ever grows (to its cap) on the runtime, so a
+    // longer reading is the newer one and never walks the status backwards.
+    let samples = runtime.check_error_samples();
+    if samples.len() > guarded.checks.error_samples.len() {
+        guarded.checks.error_samples = samples;
+    }
+    raise(
         &mut guarded.probes.rate_waits,
         meter.rate_waits.load(Ordering::SeqCst),
     );
@@ -1772,6 +1846,125 @@ mod tests {
         assert_eq!(
             origin.seen(),
             vec!["origin:http://scan.test:80".to_string()]
+        );
+    }
+
+    /// Amendment 58 (T5's inert lane): a check that answers `Outcome::Error`
+    /// is counted on `checks.errors` once per run, and its first distinct
+    /// `(check, detail)` pair is kept on `checks.error_samples` naming the
+    /// check and the first point it failed on — one sample for two points,
+    /// not two. The run is still `done`, still counted, and reports no issue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_erroring_check_is_counted_sampled_and_logged() {
+        let h = Harness::new().with_lane(FakeLane::http().with_check(FakeCheck::new(
+            "fake.error",
+            "demo",
+            FakeRun::error("runner missing"),
+        )));
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        assert_eq!(status.checks.scheduled, 2);
+        assert_eq!(
+            status.checks.done, 2,
+            "an erroring run is still a finished run"
+        );
+        assert_eq!(
+            status.checks.errors, 2,
+            "one error per point the check ran on"
+        );
+        assert_eq!(
+            status.checks.error_samples,
+            vec![aitm_scan_model::CheckErrorSample {
+                check: "fake.error".to_string(),
+                point: "p1".to_string(),
+                detail: "runner missing".to_string(),
+            }],
+            "one sample per distinct (check, detail), naming the first point"
+        );
+        assert_eq!(status.issues.total, 0, "an error is not an issue");
+    }
+
+    /// Amendment 58: a sample's detail goes through `util::scrub` before it is
+    /// stored (a credential a runner echoed never reaches `scan.status`), and
+    /// the job keeps at most eight distinct samples — a ninth distinct detail
+    /// is counted in `checks.errors` but not kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_error_samples_are_scrubbed_and_capped_at_eight() {
+        const DETAILS: [&str; 9] = [
+            "runner missing: token=abc123",
+            "detail two",
+            "detail three",
+            "detail four",
+            "detail five",
+            "detail six",
+            "detail seven",
+            "detail eight",
+            "detail nine",
+        ];
+        let mut lane = FakeLane::http();
+        for (i, detail) in DETAILS.iter().enumerate() {
+            lane = lane.with_check(FakeCheck::new(
+                &format!("fake.error{i}"),
+                "demo",
+                FakeRun::error(detail),
+            ));
+        }
+        let h = Harness::new().with_lane(lane);
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.checks.errors, 18, "nine checks over two points");
+        assert_eq!(
+            status.checks.error_samples.len(),
+            aitm_scan_model::MAX_CHECK_ERROR_SAMPLES,
+            "the ninth distinct detail is not kept: {:?}",
+            status.checks.error_samples
+        );
+        let scrubbed = status
+            .checks
+            .error_samples
+            .iter()
+            .find(|s| s.check == "fake.error0")
+            .expect("the first check's sample is kept");
+        assert_eq!(scrubbed.point, "p1");
+        assert_eq!(scrubbed.detail, "runner missing: token=[redacted]");
+        assert!(!scrubbed.detail.contains("abc123"));
+        let kept: std::collections::BTreeSet<&str> = status
+            .checks
+            .error_samples
+            .iter()
+            .map(|s| s.detail.as_str())
+            .collect();
+        assert_eq!(kept.len(), 8, "every kept sample is a distinct detail");
+        let missing: Vec<&str> = DETAILS[1..]
+            .iter()
+            .copied()
+            .filter(|d| !kept.contains(d))
+            .collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "exactly one of the nine details is dropped"
         );
     }
 
@@ -2482,8 +2675,34 @@ mod tests {
             last_crawl_error: Mutex::new(None),
             forms_skipped: AtomicU64::new(0),
             forms_submitted: AtomicU64::new(0),
+            check_errors: AtomicU64::new(0),
+            check_error_samples: Mutex::new(Vec::new()),
         };
         (runtime, status)
+    }
+
+    /// Amendment 57 (T5/T6 keyed per-job state on `marker()` and missed every
+    /// lookup): `JobCtx::marker` mints a fresh token on every call, while
+    /// `JobCtx::job_id` is the stable per-job key and is the status's `job`.
+    #[test]
+    fn markers_are_fresh_per_call_and_job_id_is_stable() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee7", 1);
+
+        let first = runtime.marker();
+        let second = runtime.marker();
+        assert_ne!(first, second, "every marker() call is a new token");
+        assert_eq!(first.len(), second.len(), "same shape, different value");
+
+        let id = runtime.job_id().to_string();
+        assert_eq!(runtime.job_id(), id, "job_id() is stable across calls");
+        assert_eq!(runtime.job_id(), "scan-0c0ffee7");
+        assert_eq!(
+            status.read().unwrap_or_else(|e| e.into_inner()).job,
+            id,
+            "job_id() is the status's job"
+        );
     }
 
     /// T7/T2 live runs (2026-11-01): a crawl error a lane reports through

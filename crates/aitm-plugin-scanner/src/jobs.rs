@@ -1303,6 +1303,8 @@ pub(crate) mod test_support {
         /// it probes, as a non-HTTP stimulus does (a WebSocket frame, an L4
         /// case, a browser navigation).
         pub(crate) charge: u32,
+        /// The verdict's `detail` text.
+        pub(crate) detail: &'static str,
     }
 
     impl FakeRun {
@@ -1312,12 +1314,24 @@ pub(crate) mod test_support {
                 probes: 1,
                 payload: PROBE_PAYLOAD,
                 charge: 0,
+                detail: "fake check",
             }
         }
 
         pub(crate) fn vulnerable() -> Self {
             Self {
                 outcome: Outcome::Vulnerable,
+                ..Self::clean()
+            }
+        }
+
+        /// A run that sends nothing and answers `Outcome::Error` carrying
+        /// `detail`, as a check whose runner is missing does (amendment 58).
+        pub(crate) fn error(detail: &'static str) -> Self {
+            Self {
+                outcome: Outcome::Error,
+                probes: 0,
+                detail,
                 ..Self::clean()
             }
         }
@@ -1532,7 +1546,7 @@ pub(crate) mod test_support {
                         return verdict(Outcome::Error, &e.to_string());
                     }
                 }
-                let mut out = verdict(run.outcome, "fake check");
+                let mut out = verdict(run.outcome, run.detail);
                 out.poc_hint = self.hint.clone();
                 let mut rest = self.locations.iter();
                 if let Some(first) = rest.next() {
@@ -1542,7 +1556,7 @@ pub(crate) mod test_support {
                     });
                     out.more = rest
                         .map(|path| {
-                            let mut sibling = verdict(run.outcome, "fake check");
+                            let mut sibling = verdict(run.outcome, run.detail);
                             sibling.location = Some(aitm_scan_model::VerdictLocation {
                                 path: Some(path.clone()),
                                 name: None,

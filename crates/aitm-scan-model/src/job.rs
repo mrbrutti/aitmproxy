@@ -227,6 +227,33 @@ pub struct CheckCounters {
     pub done: u64,
     /// The ids of the checks running right now (bounded to 8 by the engine).
     pub running: Vec<String>,
+    /// Check runs that ended in an `error` verdict — the check could not say
+    /// whether the point is vulnerable (a missing runner, a refused budget, a
+    /// panic). Additive (amendment 58): absent on an older record, read as 0.
+    pub errors: u64,
+    /// The first [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` error
+    /// pairs of the job, so an operator sees *why* a lane was inert instead
+    /// of a bare counter. Additive (amendment 58): absent, read as empty.
+    pub error_samples: Vec<CheckErrorSample>,
+}
+
+/// The most entries `CheckCounters.error_samples` keeps per job (amendment
+/// 58). Distinct `(check, detail)` pairs past the cap are counted in
+/// `checks.errors` but not sampled.
+pub const MAX_CHECK_ERROR_SAMPLES: usize = 8;
+
+/// One sampled `error` verdict (amendment 58): which check, the first point it
+/// failed on, and its detail — scrubbed and bounded like an evidence excerpt
+/// by the engine before it is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct CheckErrorSample {
+    /// The check's id (`CheckMeta.id`).
+    pub check: String,
+    /// The id of the first insertion point the pair was seen on.
+    pub point: String,
+    /// The verdict's detail, scrubbed and cut to an excerpt.
+    pub detail: String,
 }
 
 /// Issue counters (spec D5).
@@ -459,6 +486,41 @@ mod tests {
         .expect("serializes");
         assert_eq!(json["forms_skipped"], 4);
         assert_eq!(json["errors"], 1);
+    }
+
+    /// Amendment 58: `checks.errors` and `checks.error_samples` are additive
+    /// — a record written before them parses to 0 / empty — and a sample
+    /// round-trips by name with its three fields.
+    #[test]
+    fn check_counters_additive_fields_default_to_zero() {
+        let old: CheckCounters = serde_json::from_str(r#"{"scheduled":4,"done":4,"running":[]}"#)
+            .expect("a record without the additive fields parses");
+        assert_eq!(
+            old,
+            CheckCounters {
+                scheduled: 4,
+                done: 4,
+                ..CheckCounters::default()
+            }
+        );
+        assert_eq!(old.errors, 0);
+        assert!(old.error_samples.is_empty());
+
+        let json = serde_json::to_value(CheckCounters {
+            errors: 2,
+            error_samples: vec![CheckErrorSample {
+                check: "http.xss".into(),
+                point: "p1".into(),
+                detail: "runner missing".into(),
+            }],
+            ..CheckCounters::default()
+        })
+        .expect("serializes");
+        assert_eq!(json["errors"], 2);
+        assert_eq!(json["error_samples"][0]["check"], "http.xss");
+        assert_eq!(json["error_samples"][0]["point"], "p1");
+        assert_eq!(json["error_samples"][0]["detail"], "runner missing");
+        assert_eq!(MAX_CHECK_ERROR_SAMPLES, 8);
     }
 
     #[test]

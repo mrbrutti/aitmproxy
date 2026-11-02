@@ -663,6 +663,8 @@ impl ProbeHost for InterimProbeHost {
         })
     }
 
+    /// Fresh on every call, straight from the job context (amendment 57): a
+    /// canary value, never a key. `JobCtx::job_id` is the per-job key.
     fn marker(&self) -> String {
         self.job.marker()
     }
