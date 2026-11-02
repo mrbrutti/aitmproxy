@@ -809,6 +809,10 @@ impl<'a> Run<'a> {
                     Ok(value) => Submitted::from_value(&value),
                     Err(err) => {
                         self.collect();
+                        // Amendment 39b: a submission the browser fails counts
+                        // into `crawl.errors` like a page it cannot load.
+                        self.job
+                            .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                         tracing::debug!(
                             target: "scan",
                             job = self.job.job_id(),
@@ -949,6 +953,10 @@ impl<'a> Run<'a> {
             .await;
             if let Err(err) = clicked {
                 self.collect();
+                // Amendment 39b: a click the browser fails counts into
+                // `crawl.errors` like a page it cannot load.
+                self.job
+                    .report_crawl_error(self.origin.as_str(), crawl_error_token(&err));
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -2560,6 +2568,110 @@ mod tests {
         assert_eq!(
             *job.inner.crawl_errors.lock().unwrap(),
             vec![(ROOT.to_string(), "timeout".to_string())]
+        );
+    }
+
+    /// [`pages`] behind a driver whose tagged submit eval, or whose click,
+    /// fails with a fixed error; everything else is the double's own.
+    struct FailingInteractionBrowser {
+        inner: FakeBrowser,
+        submit_fails: Option<&'static str>,
+        click_fails: Option<&'static str>,
+    }
+
+    impl BrowserDriver for FailingInteractionBrowser {
+        fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            self.inner.navigate(url)
+        }
+
+        fn click(&self, target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            match self.click_fails {
+                Some(text) => Box::pin(async move { Err(anyhow::anyhow!(text)) }),
+                None => self.inner.click(target),
+            }
+        }
+
+        fn type_text(&self, selector: &str, text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.inner.type_text(selector, text)
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            self.inner.screenshot()
+        }
+
+        fn eval(&self, expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            if let Some(text) = self.submit_fails {
+                if expr.contains(SUBMIT_FORM_MARKER) {
+                    return Box::pin(async move { Err(anyhow::anyhow!(text)) });
+                }
+            }
+            self.inner.eval(expr)
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            self.inner.get_dom()
+        }
+    }
+
+    /// Amendment 39b: a form submission the browser fails is reported to the
+    /// job with the crawl origin and one closed reason token, like a page it
+    /// cannot load; the crawl goes on to the page's click.
+    #[tokio::test]
+    async fn failed_form_submission_is_reported_to_the_job() {
+        let job = JobWithDriver {
+            inner: FakeJob::new(
+                ScanProfile::default(),
+                Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+            ),
+            driver: Arc::new(FailingInteractionBrowser {
+                inner: pages(),
+                submit_fails: Some("connection reset by peer"),
+                click_fails: None,
+            }),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a submission the browser fails is skipped, not fatal");
+        assert_eq!(report.forms_submitted, 0);
+        assert_eq!(report.clicks, 1);
+
+        assert_eq!(
+            *job.inner.crawl_errors.lock().unwrap(),
+            vec![(ROOT.to_string(), "transport".to_string())]
+        );
+    }
+
+    /// Amendment 39b: a click the browser fails is reported to the job with
+    /// the crawl origin and one closed reason token; the form before it was
+    /// submitted and the crawl goes on.
+    #[tokio::test]
+    async fn failed_click_is_reported_to_the_job() {
+        let job = JobWithDriver {
+            inner: FakeJob::new(
+                ScanProfile::default(),
+                Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+            ),
+            driver: Arc::new(FailingInteractionBrowser {
+                inner: pages(),
+                submit_fails: None,
+                click_fails: Some("tls handshake failed"),
+            }),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a click the browser fails is skipped, not fatal");
+        assert_eq!(report.forms_submitted, 1);
+        assert_eq!(report.clicks, 0);
+
+        assert_eq!(
+            *job.inner.crawl_errors.lock().unwrap(),
+            vec![(ROOT.to_string(), "tls".to_string())]
         );
     }
 
