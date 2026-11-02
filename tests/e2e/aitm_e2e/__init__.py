@@ -88,11 +88,25 @@ def pause(instruction: str) -> None:
 
     Only valid under --manual (is_manual()); a scenario that needs a human must
     tag itself `# e2e: tier=manual` and the runner skips it unless --manual.
+    Reads from stdin when it is a terminal; otherwise (a backgrounded cell, a
+    pipe) it falls back to /dev/tty and says which it used, so the operator's
+    Enter reaches the step even when the runner redirected stdin.
     """
     if not is_manual():
         skip(f"manual step requires --manual: {instruction}")
-    print(f"\n  >>> MANUAL: {instruction}\n  >>> press Enter when done ...", flush=True)
+    stream = sys.stdin
+    source = "stdin"
+    if stream is None or stream.closed or not stream.isatty():
+        try:
+            stream = open("/dev/tty", encoding="utf-8")  # noqa: SIM115 — closed below
+            source = "/dev/tty (stdin is not a terminal)"
+        except OSError as e:
+            fail(f"manual step needs an interactive operator: stdin is not a terminal and /dev/tty is not available ({e})")
+    print(f"\n  >>> MANUAL: {instruction}\n  >>> press Enter when done (reading {source}) ...", flush=True)
     try:
-        input()
-    except EOFError:
-        fail("manual step needs an interactive operator but stdin is closed")
+        line = stream.readline()
+    finally:
+        if source != "stdin":
+            stream.close()
+    if line == "":
+        fail(f"manual step needs an interactive operator but {source} reached EOF")

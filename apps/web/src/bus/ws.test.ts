@@ -2,6 +2,7 @@
 // `initialize` reply and compares it to the client-side `expect` carried in the launch-URL
 // fragment. `expect` is never sent to the server; it only drives the mismatch warning.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { confirmGuarded } from '~/panels/l4/inject';
 import { createWsBus } from './ws';
 import type { BusRole } from './types';
 
@@ -655,5 +656,75 @@ describe('createWsBus auth failure', () => {
 
     // A non-auth close is a transient blip, not an auth failure: it must still schedule a reconnect.
     expect(client.state()).toBe('reconnecting');
+  });
+});
+
+// Unit (c) pin (plan 2026-10-31-l4-parity-fixes; spec §3 confirm-over-the-wire, §4 Forward/Drop keep the
+// dialog). Unit (b) found the TUI client pruning every argument its tool's inputSchema did not declare —
+// and no schema declares `_confirm` (the server strips it before schema enforcement) — so the confirmed
+// re-issue went out bare and the core answered a second `needs_confirmation` forever. It also found the
+// confirm reply bound to one shared pending slot rather than to the request that caused it. These two
+// tests drive the REAL web client and read the wire: `_confirm` stays on the frame verbatim, and a reply
+// is matched to its own JSON-RPC id, never to whichever call happens to be waiting.
+describe('createWsBus confirm handshake (unit (c) pin)', () => {
+  let clients: ReturnType<typeof createWsBus>[] = [];
+  beforeEach(() => {
+    FakeWebSocket.last = null;
+    FakeWebSocket.count = 0;
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+  });
+  afterEach(() => {
+    for (const c of clients) c.close();
+    clients = [];
+    vi.unstubAllGlobals();
+  });
+
+  it('confirmed_reissue_keeps_the_confirm_key_on_the_wire', async () => {
+    const client = await connectWith({ role: 'operator' });
+    clients.push(client);
+    const sock = FakeWebSocket.last!;
+
+    const result = confirmGuarded(client.call, 'l4.intercept.forward', { id: 'P1' }, 'tok-1');
+
+    const frame = await toolCallSent(sock, 'l4.intercept.forward');
+    const params = frame.params as { name: string; arguments: Record<string, unknown> };
+    expect(params).toEqual({ name: 'l4.intercept.forward', arguments: { id: 'P1', _confirm: 'tok-1' } });
+    expect(Object.keys(params.arguments)).toEqual(['id', '_confirm']);
+    // Exactly one forward went out: the client did not strip `_confirm` and re-send a bare call.
+    expect(frames(sock).filter((m) => m.method === 'tools/call' && m.params?.name === 'l4.intercept.forward')).toHaveLength(1);
+
+    sock.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { structuredContent: { forwarded: true } } }) + '\n' });
+    expect(await outcome(result)).toEqual({ ok: { kind: 'done', result: { forwarded: true } } });
+  });
+
+  it('confirm_reply_is_bound_to_the_request_that_caused_it', async () => {
+    const client = await connectWith({ role: 'operator' });
+    clients.push(client);
+    const sock = FakeWebSocket.last!;
+
+    const a = confirmGuarded(client.call, 'l4.intercept.drop', { id: 'P1' }, 'tok-2');
+    const b = client.call('l4.flow.list');
+    const { id: aId } = await toolCallSent(sock, 'l4.intercept.drop');
+    const { id: bId } = await toolCallSent(sock, 'l4.flow.list');
+    expect(typeof aId).toBe('number');
+    expect(typeof bId).toBe('number');
+    expect(aId).not.toBe(bId);
+
+    // A reply for an id no request sent: nothing resolves, nothing throws, the bus stays open.
+    expect(() => sock.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', id: 9999, result: { structuredContent: { dropped: true } } }) + '\n' })).not.toThrow();
+    expect(await outcome(a, 50)).toBe('hung');
+    expect(await outcome(b, 50)).toBe('hung');
+    expect(client.state()).toBe('open');
+    expect(client.lastError()).toBe(null);
+
+    // Out of order: the `needs_confirmation` envelope lands on B's id first. It must not be attributed to
+    // A (the confirming call), which would read it as a stale token and refuse.
+    const envelope = { status: 'needs_confirmation', prompt: 'Confirm?', confirm_token: 'other' };
+    sock.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', id: bId, result: { structuredContent: envelope } }) + '\n' });
+    expect(await outcome(a, 50)).toBe('hung');
+    expect(await outcome(b)).toEqual({ ok: envelope });
+
+    sock.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', id: aId, result: { structuredContent: { dropped: true } } }) + '\n' });
+    expect(await outcome(a)).toEqual({ ok: { kind: 'done', result: { dropped: true } } });
   });
 });
