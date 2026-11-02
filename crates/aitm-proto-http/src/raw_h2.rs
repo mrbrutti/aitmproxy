@@ -27,7 +27,9 @@
 //!
 //! * the check has already called `host.baseline()`, so the guarded job client
 //!   passed the scope gate for this authority before any raw byte was written;
-//! * the raw connection goes to **that same authority** and no other;
+//! * the raw connection goes to **that same authority** and no other — and,
+//!   when the check hands over [`RawH2Target::addr`], to exactly the address
+//!   that baseline came from, with no second name lookup;
 //! * the request carries **no** session material — no `cookie`,
 //!   `authorization`, `proxy-authorization` or `set-cookie` field, which
 //!   [`RawH2Client::probe`] refuses outright;
@@ -438,6 +440,20 @@ pub struct RawH2Target {
     pub scheme: String,
     /// `host[:port]`; the scheme's default port applies when none is given.
     pub authority: String,
+    /// The address the caller already validated — for the observe checks, the
+    /// peer the guarded baseline response actually came from
+    /// (`ProbeHost::baseline_peer_addr`, plan amendment A5 / T3-7).
+    ///
+    /// `Some(addr)`: the driver does **not** consult the resolver at all and
+    /// dials exactly `addr`, so a record that flipped between the baseline
+    /// and the probe cannot move the connection (the DNS-rebinding window).
+    /// The SSRF and live-scope gate still runs, on that one address, and its
+    /// port must be the authority's port or the probe is refused before the
+    /// dial.
+    ///
+    /// `None`: the name is resolved and every answer is gated, exactly as
+    /// before.
+    pub addr: Option<SocketAddr>,
 }
 
 /// What the probe does once the SETTINGS exchange is done.
@@ -606,10 +622,12 @@ impl RawH2Client {
     /// Enforce the SSRF policy against `scope` on every probe: refuse a
     /// private, loopback or metadata address unless an in-scope IP literal
     /// lifts it, exactly as [`crate::sender::HttpSender::with_ssrf`] does for
-    /// the reissue path. The check runs on every address the target resolved
-    /// to, immediately before the dial, so a short-TTL record flipped after
-    /// the check already passed `host.baseline()` cannot steer an
-    /// accept-any probe at an internal address.
+    /// the reissue path. The check runs on every address the probe might go
+    /// to — every address the target resolved to, or the single
+    /// [`RawH2Target::addr`] the caller pre-validated — immediately before
+    /// the dial, so neither a short-TTL record flipped after the check
+    /// already passed `host.baseline()` nor an address a caller handed over
+    /// can steer an accept-any probe at an internal address.
     ///
     /// Opt-in: a client built without this behaves exactly as before. Every
     /// live caller (the checks crate's raw h2 runner) is expected to configure
@@ -644,11 +662,13 @@ impl RawH2Client {
     ///
     /// Returns an error — before any byte is written — when the plan asks for
     /// more than [`MAX_RAW_STREAMS`] streams, when its mode opens more streams
-    /// than it declares, when it carries a forbidden header, or when the target
-    /// is unusable (bad scheme, bad authority, no address). After that it
-    /// errors only on a transport failure, or when `RAW_TOTAL_TIMEOUT` runs
-    /// out before a connection exists (there is nothing to observe); a peer
-    /// that resets, goes away or says nothing is an observation, not an error.
+    /// than it declares, when it carries a forbidden header, when the target
+    /// is unusable (bad scheme, bad authority, no address), or when its
+    /// pre-validated [`RawH2Target::addr`] is on a port other than the
+    /// authority's. After that it errors only on a transport failure, or when
+    /// `RAW_TOTAL_TIMEOUT` runs out before a connection exists (there is
+    /// nothing to observe); a peer that resets, goes away or says nothing is
+    /// an observation, not an error.
     pub async fn probe(&self, plan: &RawH2Plan) -> Result<RawH2Observation> {
         let encoded = validate_and_encode(plan)?;
         let streams = encoded.len();
@@ -669,6 +689,18 @@ impl RawH2Client {
         let (host, port) = split_authority(&plan.target.authority, &scheme)?;
         let authority = aitm_core::Authority::new(&host, port).to_string();
 
+        // A pre-validated address on another port is not the peer the
+        // caller's baseline reported, whatever else it is: refused here,
+        // before the gate and before the dial (plan amendment A5, T3-7).
+        if let Some(addr) = plan.target.addr {
+            if addr.port() != port {
+                anyhow::bail!(
+                    "raw h2 probe: the pre-validated address {addr} is not on the port of \
+                     authority {authority}"
+                );
+            }
+        }
+
         let mut obs = RawH2Observation {
             settings: Vec::new(),
             streams: vec![StreamOutcome::Timeout; streams],
@@ -683,12 +715,25 @@ impl RawH2Client {
         // `https` target). A cap that fires before then observed nothing.
         let mut connected = false;
         let outcome = tokio::time::timeout(RAW_TOTAL_TIMEOUT, async {
-            // The resolve is *inside* the cap: a name server that never answers
-            // must not hold the probe open past the whole-probe deadline.
-            let ips = self.resolver.resolve(host.clone(), port).await?;
-            // Then the gate, on every address this name answered, immediately
-            // before the dial — so the address the driver connects to is one
-            // the operator's policy and scope actually allow.
+            // A caller that already validated an address (the observe
+            // checks hand over the peer their guarded baseline answered
+            // from) is dialled there and the name is never looked up: no
+            // second resolve, so no window for a record to flip between the
+            // baseline and the probe (plan amendment A5, T3-7).
+            //
+            // Otherwise the resolve runs, *inside* the cap: a name server
+            // that never answers must not hold the probe open past the
+            // whole-probe deadline.
+            let ips = match plan.target.addr {
+                Some(addr) => vec![addr.ip()],
+                None => self.resolver.resolve(host.clone(), port).await?,
+            };
+            // Then the gate, on every address in hand — the one the caller
+            // pre-validated, or every address this name answered —
+            // immediately before the dial, so the address the driver
+            // connects to is one the operator's policy and scope actually
+            // allow. A pre-validated address is not exempt: it is checked
+            // the same way (spec reviewer, PR 2a F9 range).
             // The live scope permit is held until the conversation ends, so
             // the connection is paced and counted as one active egress and a
             // scope change during the probe is seen on the next one.
@@ -696,11 +741,14 @@ impl RawH2Client {
                 Some(gate) => Some(gate.check_live("raw h2 probe", &authority, &host, &ips)?),
                 None => None,
             };
-            let addr = ips
-                .into_iter()
-                .next()
-                .map(|ip| SocketAddr::new(ip, port))
-                .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
+            let addr = match plan.target.addr {
+                Some(addr) => addr,
+                None => ips
+                    .into_iter()
+                    .next()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .ok_or_else(|| anyhow!("no address for {host}:{port}"))?,
+            };
             let mut stream = self.connect(addr, &host, tls).await?;
             connected = true;
             let result = converse(&mut *stream, plan, &encoded, &mut obs).await;
@@ -1229,6 +1277,7 @@ mod tests {
             target: RawH2Target {
                 scheme: "https".into(),
                 authority: "origin.test".into(),
+                addr: None,
             },
             headers: vec![RawHeader::new("x-token", "secret")],
             mode: RawH2Mode::Blocks(vec![vec![RawHeader::raw(b"x-other", b"hush")]]),
@@ -1589,21 +1638,29 @@ mod driver_tests {
         }
     }
 
-    /// Hands out the one duplex client half and counts dial attempts.
+    /// Hands out the one duplex client half and records every dial attempt
+    /// with the address it was asked for.
     struct CountingDialer {
         stream: Mutex<Option<DuplexStream>>,
         calls: AtomicUsize,
+        addrs: Mutex<Vec<SocketAddr>>,
     }
 
     impl CountingDialer {
         fn calls(&self) -> usize {
             self.calls.load(AtomicOrdering::SeqCst)
         }
+
+        /// The addresses the driver asked for, in order.
+        fn addrs(&self) -> Vec<SocketAddr> {
+            self.addrs.lock().expect("dialer addresses").clone()
+        }
     }
 
     impl Dialer for CountingDialer {
-        fn dial(&self, _addr: SocketAddr) -> BoxFuture<'static, Result<Box<dyn ProbeStream>>> {
+        fn dial(&self, addr: SocketAddr) -> BoxFuture<'static, Result<Box<dyn ProbeStream>>> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.addrs.lock().expect("dialer addresses").push(addr);
             let next = self
                 .stream
                 .lock()
@@ -1635,6 +1692,7 @@ mod driver_tests {
         let dialer = Arc::new(CountingDialer {
             stream: Mutex::new(Some(client_half)),
             calls: AtomicUsize::new(0),
+            addrs: Mutex::new(Vec::new()),
         });
         let client = RawH2Client::new(TlsVerify::AcceptAny)
             .with_dialer(dialer.clone())
@@ -1660,6 +1718,7 @@ mod driver_tests {
             target: RawH2Target {
                 scheme: "http".to_string(),
                 authority: "origin.test:80".to_string(),
+                addr: None,
             },
             headers: vec![
                 RawHeader::new(":method", "GET"),
@@ -2098,6 +2157,7 @@ mod driver_tests {
         let dialer = Arc::new(CountingDialer {
             stream: Mutex::new(Some(client_half)),
             calls: AtomicUsize::new(0),
+            addrs: Mutex::new(Vec::new()),
         });
         let client = RawH2Client::new(verify)
             .with_dialer(dialer.clone())
@@ -2538,6 +2598,162 @@ mod driver_tests {
             "{err}"
         );
         assert_eq!(dialer.calls(), 0, "a refused probe never dials");
+    }
+
+    // ---------------------------------------------------------------
+    // T3-7 (plan amendment A5): the pre-validated address
+    // ---------------------------------------------------------------
+
+    /// Answers loopback like [`LoopbackResolver`] and counts how many times it
+    /// was asked, so a test can say the name was *not* looked up.
+    #[derive(Default)]
+    struct CountingResolver {
+        calls: AtomicUsize,
+    }
+
+    impl CountingResolver {
+        fn calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl HostResolver for CountingResolver {
+        fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]) })
+        }
+    }
+
+    /// The same plan as [`plan`], carrying the address the caller's baseline
+    /// already validated.
+    fn plan_at(addr: SocketAddr, mode: RawH2Mode, streams: u8) -> RawH2Plan {
+        let mut plan = plan(mode, streams);
+        plan.target.addr = Some(addr);
+        plan
+    }
+
+    /// The address a caller's baseline reported. Documentation space
+    /// (RFC 5737), on the authority's own port.
+    const BASELINE_PEER: &str = "203.0.113.7:80";
+
+    /// T3-7: a plan that carries the address its baseline came from is dialled
+    /// at exactly that address and the name is never looked up again, so a
+    /// record that flipped between the baseline and the probe cannot move the
+    /// connection (the DNS-rebinding window).
+    #[tokio::test]
+    async fn a_pre_validated_address_is_dialled_and_the_name_is_not_resolved() {
+        let (client, dialer, log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        let resolver = Arc::new(CountingResolver::default());
+        let client = client.with_resolver(resolver.clone());
+        let addr: SocketAddr = BASELINE_PEER.parse().expect("a literal address");
+
+        let obs = client
+            .probe(&plan_at(addr, RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Headers { status: Some(200) }]
+        );
+        assert_eq!(dialer.addrs(), vec![addr]);
+        assert_eq!(resolver.calls(), 0, "the resolver must not be consulted");
+        settled(&log, |l| l.headers_streams == vec![1]).await;
+    }
+
+    /// T3-7: the address being pre-validated by the caller does not excuse it
+    /// from the driver's own gate. The SSRF half refuses a private address the
+    /// caller handed over, and the live-scope half refuses a host the scope
+    /// does not hold — both before any dial, with the same two messages the
+    /// resolve path produces.
+    #[tokio::test]
+    async fn the_gate_still_runs_on_a_pre_validated_address() {
+        use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
+
+        // The scope holds the host, so only the address can refuse this one.
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
+        let guard = Arc::new(StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "origin.test".into(),
+        });
+        let client = client.with_ssrf(SsrfPolicy::default(), guard);
+        let private = SocketAddr::new(PRIVATE, 80);
+
+        let err = client
+            .probe(&plan_at(private, RawH2Mode::SingleRequest, 1))
+            .await
+            .expect_err("a private address is refused however it arrived");
+
+        assert!(err.to_string().contains("SSRF"), "unexpected error: {err}");
+        assert_eq!(dialer.calls(), 0, "a refused probe never dials");
+
+        // The other half: the operator scoped the address itself, which
+        // lifts the policy block, but the live scope does not hold the host.
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
+        let addr: SocketAddr = BASELINE_PEER.parse().expect("a literal address");
+        let guard = Arc::new(StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: addr.ip().to_string(),
+        });
+        let client = client.with_ssrf(SsrfPolicy::default(), guard);
+
+        let err = client
+            .probe(&plan_at(addr, RawH2Mode::SingleRequest, 1))
+            .await
+            .expect_err("a host outside the live scope is refused");
+
+        assert!(
+            err.to_string()
+                .starts_with("scope: refusing raw h2 probe to origin.test:80"),
+            "{err}"
+        );
+        assert_eq!(dialer.calls(), 0, "a refused probe never dials");
+    }
+
+    /// T3-7: an address on a different port than the authority is not the
+    /// baseline's peer, whatever it is, so the probe is refused and the error
+    /// names both. Nothing is dialled and no gate is consulted.
+    #[tokio::test]
+    async fn a_pre_validated_address_on_another_port_is_refused_naming_both() {
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
+        let other_port: SocketAddr = "203.0.113.7:8443".parse().expect("a literal address");
+
+        let err = client
+            .probe(&plan_at(other_port, RawH2Mode::SingleRequest, 1))
+            .await
+            .expect_err("an address on another port is refused");
+
+        assert_eq!(
+            err.to_string(),
+            "raw h2 probe: the pre-validated address 203.0.113.7:8443 is not on the port of \
+             authority origin.test:80"
+        );
+        assert_eq!(dialer.calls(), 0, "a refused plan never dials");
+    }
+
+    /// T3-7: a plan without an address keeps the resolve path exactly as it
+    /// was — one lookup, and the dial goes to what the name answered.
+    #[tokio::test]
+    async fn a_plan_without_an_address_still_resolves_the_name() {
+        let (client, dialer, log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        let resolver = Arc::new(CountingResolver::default());
+        let client = client.with_resolver(resolver.clone());
+
+        let obs = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Headers { status: Some(200) }]
+        );
+        assert_eq!(resolver.calls(), 1, "the name is looked up exactly once");
+        assert_eq!(
+            dialer.addrs(),
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80)]
+        );
+        settled(&log, |l| l.headers_streams == vec![1]).await;
     }
 
     /// SEC-1: without `with_ssrf` the driver behaves exactly as before — the
