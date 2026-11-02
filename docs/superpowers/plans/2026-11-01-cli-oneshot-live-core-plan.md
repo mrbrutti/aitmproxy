@@ -304,6 +304,12 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| T1–T10, T12 | tester pass 1 (a9163884) | Important | `remote::render` rebuilt the core's answer with the strict `from_json`: fifteen commands declare `result: Object([])` and many optional fields answer `null`, so `aitm proxy status`, `config get`, `capture status`, `flow detail`… printed an error against a healthy core (probe `tester_every_read_only_live_verb_renders_through_its_declared_schema`) | fixed in e5549c3a: three-step rebuild (untyped object → structural; strict with schema-optional nulls stripped for the retry and restored as `Value::Null`; structural fallback with a content-free `debug!`); probe un-ignored, three literal unit tests |
+| T1 | tester pass 1 | Minor (observation a) | a leftover `<pid>.json.tmp` after a crash plus pid reuse made `create_new` fail, so a core served without a pointer | fixed in e5549c3a: `remove_stale_tmp` (regular file owned by the run dir's owner only; symlinks left alone) |
+| T8/T10 | tester pass 1 | Minor (observation c) | the run dir was created even on the explicit `--bus`/`AITM_BUS` path | fixed in e5549c3a: `Resolver.owner_uid` is a lazy seam called only when the pointer dir is consulted (plan shape amended 4cca76dc) |
+| T13 | tester pass 1 | Minor (observation b) | `PointerContext.config` must be ABSOLUTE (a relative `--config` would canonicalize against the one-shot's cwd) | carried into Task 13's brief |
+| D2/D9 | tester pass 1 | Minor (observation d) | loopback transport + `port: 0` + no endpoint file + `enabled: false` + no token → R1 whose fix starts an Off core; the next one-shot gets R6 with the true fix | accepted by the session lead 2026-11-01 (autonomous mode): a misconfiguration that two panels explain in order; recorded in the spec's D9 shape sentence as an edge |
+| T1–T10, T12 | tester pass 1 | — | +40 tests (token absent from 120 panels and every Debug; umask-proof 0600; FIFO/symlink/0000 edges; explicit path consults nothing; handshake/call mapping in-process; unknown-verb round trip; parity shapes), 17/17 mutations killed (3 only by tester tests), every D10 function pinned | tests committed a9163884 |
 
 ## Shipped
 
