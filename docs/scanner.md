@@ -82,7 +82,9 @@ Its crawl has three modes, and the lane picks one per origin:
   extracts, plus one navigation per `<form>` when `crawl.submit_forms` is set
   (a GET form becomes a query, a POST form a body). Every fetch goes through
   the job's own client, so it is paced, scoped and charged to the one job
-  budget like a probe. This is a fallback, not "nothing is fetched".
+  budget like a probe. This is a fallback, not "nothing is fetched". Every
+  request that fails is counted in `crawl.errors`, and a crawl that made
+  requests and fetched no page at all names why on `crawl.last_error`.
 - **No crawl at all** when `crawl.max_pages: 0`. That one setting turns every
   crawl off; the lane maps and audits only what the proxy has already
   captured for the origin.
@@ -209,7 +211,8 @@ budget:
   max_issues: 1024
   check_timeout_s: 60
   per_host_errors:
-    consecutive: 10           # consecutive errors from one host trip the breaker
+    consecutive: 10           # consecutive transport errors or timeouts from
+                              # one host trip the breaker; a 5xx is an answer
     ratio: 0.5                # or this error-to-probe ratio
 http:
   version: auto               # auto | h1 | h2 | h2c
@@ -231,6 +234,14 @@ l4:
 A `checks.include`/`exclude` entry is a check id, a check class, or
 `lane:<lane>`. An entry that names nothing the catalogue holds is refused with
 `unknown_check`, quoting the entry.
+
+`budget.per_host_errors` counts only probes that got **no answer**: connect and
+transport errors, a guard refusal other than a rate limit, and a per-probe
+timeout. A 5xx is an answer — it is handed to the check and it resets the host's
+consecutive run — so a target that errors on every payload never trips the
+breaker (amendment 40). A host that does trip is dropped for the rest of the
+job, and a job that stops because the next item's host is tripped reports
+`stopped_reason: errors`, as before.
 
 ### Where profiles come from
 
@@ -394,9 +405,15 @@ captures, and `issue:<id>` on the flows re-recorded as an issue's evidence.
 
 Three reading notes from the 2026-11-01 live runs: `elapsed_ms` is live while
 the job runs (wall time since `started_at`, fixed at the terminal transition);
-`crawl.errors` counts crawls of an origin that failed outright (a browser crawl
-that timed out or was refused, after which the client crawl stands in), so a job
-that ran on fewer points than it could have says so; `poc_ref` on an issue is
+`crawl.errors` counts both a crawl of an origin that failed outright (a browser
+crawl that timed out or was refused, after which the client crawl stands in) and
+every single client-crawl request that failed, so a job that ran on fewer points
+than it could have says so, and when a crawl made requests and fetched no page
+at all `crawl.last_error` carries one of `h2_not_negotiated`, `connect_refused`,
+`tls`, `timeout`, `transport` or `other` (amendment 39; a partial failure leaves
+it unset). That is a reading, not a verdict: the job still runs its passive
+checks over what it captured and ends `done`, with `stopped_reason` and `error`
+untouched. `poc_ref` on an issue is
 present only when `findings.dir` is set, because the reproduction's
 `FindingRecord` is what it points at (no findings dir, no record, no `poc_ref`).
 
@@ -521,7 +538,14 @@ fn load(reg) {
 `needs_baseline` (false), `wants_traits` (null — when set, the check is
 scheduled only on points carrying one of those traits, and the restriction is
 ignored at `speed: thorough`), `targets_session` (false), `scope` (`point`, or
-`node` to run once per site-map node, or `origin` to run once per origin). A
+`node` to run once per site-map node, or `origin` to run once per origin). An
+origin-scoped HTTP check runs once per origin whether or not any insertion point
+was discovered there (amendment 38): the origins are the profile's targets plus
+every origin a surviving point belongs to, each scheduled as a synthesized
+`GET <origin>/` item that the interim HTTP lane serves with a probe host over
+that request. An origin is not a point, so no point gate applies to it —
+`audit.kinds`, `wants_traits`, the frequent-point rule and the session rule are
+not consulted and only the check's `intensity` can leave it out. A
 script may **not** declare `origin`: aitm records where the script came from
 (`native`, `bundled` or `custom`). A missing or mistyped meta key is a **load
 error naming the key**, not a default — the catalogue cannot schedule what it
