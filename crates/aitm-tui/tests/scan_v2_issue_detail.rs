@@ -919,3 +919,60 @@ fn an_update_naming_another_issue_is_not_folded() {
     );
     assert_eq!(app.scan.issues.error, None, "and clears the error");
 }
+
+/// Fix round H, H60 (`Issue.location.l4`, T1b's final head): an issue
+/// found on the L4 lane renders its L4 point as its own `l4` detail line,
+/// `ip:port/proto · grammar · field_path · mutation`, each optional part
+/// only when present, right under `location`, which keeps the HTTP form
+/// alone. The fixture issue with the full L4 location reads every part;
+/// with only the target it reads `ip:port/proto`.
+#[test]
+fn an_l4_location_renders_its_own_detail_line() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let mut issue = fixture("scan.issue.json");
+    issue["location"]["l4"] = json!({
+        "ip": "127.0.0.1",
+        "port": 7000,
+        "proto": "tcp",
+        "grammar": "dns",
+        "field_path": "q.name",
+        "mutation": "flip",
+    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
+    let text = screen(&app);
+    assert_eq!(
+        detail_line(&text, "127.0.0.1:7000/tcp"),
+        "l4          127.0.0.1:7000/tcp · dns · q.name · flip",
+        "the l4 line: {text}"
+    );
+    assert_eq!(
+        detail_line(&text, "location"),
+        "location    GET /search · query q",
+        "the location line keeps the HTTP form alone"
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let location = lines
+        .iter()
+        .position(|l| l.contains("location    GET /search"))
+        .expect("the location row");
+    assert!(
+        lines[location + 1].contains("l4          127.0.0.1:7000/tcp"),
+        "l4 sits right under location:\n{text}"
+    );
+
+    let mut issue = fixture("scan.issue.json");
+    issue["location"]["l4"] = json!({ "ip": "10.0.0.7", "port": 5353, "proto": "udp" });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
+    let text = screen(&app);
+    assert_eq!(
+        detail_line(&text, "10.0.0.7:5353/udp"),
+        "l4          10.0.0.7:5353/udp",
+        "only the target when the optional parts are absent: {text}"
+    );
+    assert!(
+        !text.contains("· l4 "),
+        "the inline form on the location line is gone: {text}"
+    );
+}

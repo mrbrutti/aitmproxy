@@ -789,7 +789,8 @@ pub type DetailLine = (&'static str, String);
 
 /// The Detail pane's lines for a read issue (spec D11, plan task 8), split
 /// where the walkable flow list sits (fix round F, F1): `before_flows` is
-/// class, check id and lane; the target; the location; the description;
+/// class, check id and lane; the target; the location (and the `l4` point
+/// under it when the issue has one, H60); the description;
 /// the evidence (`payload`, `matched`, the timing table, the diff lengths,
 /// the L4 fields) when present; `after_flows` is the PoC and finding refs,
 /// remediation and note when present, then occurrences with first and last
@@ -824,6 +825,9 @@ pub fn issue_detail_lines(read: &ReadIssue) -> DetailLines {
         ),
     ));
     before.push(("location", location_text(issue)));
+    if let Some(l4) = &issue.location.l4 {
+        before.push(("l4", l4_location_text(l4)));
+    }
     before.push(("description", issue.description.clone()));
     let ev = &issue.evidence;
     if let Some(p) = &ev.payload {
@@ -895,6 +899,7 @@ fn detail_line_counts(read: &ReadIssue) -> (usize, usize) {
     let issue = &read.issue;
     let ev = &issue.evidence;
     let before = BEFORE_FIXED_LINES
+        + usize::from(issue.location.l4.is_some())
         + usize::from(ev.payload.is_some())
         + usize::from(ev.matched.is_some())
         + ev.timing.as_ref().map_or(0, timing_line_count)
@@ -914,8 +919,9 @@ fn detail_line_count(read: &ReadIssue) -> usize {
 }
 
 /// `METHOD path_template · kind name`, then the request path when it is
-/// not the template, the JSON field path, the WebSocket path and the L4
-/// point (`ip:port/proto`, grammar, field, mutation) when present.
+/// not the template, the JSON field path and the WebSocket path when
+/// present. The L4 point is its own `l4` line ([`l4_location_text`]; fix
+/// round H, H60).
 fn location_text(issue: &Issue) -> String {
     let loc = &issue.location;
     let mut text = match &loc.method {
@@ -932,27 +938,24 @@ fn location_text(issue: &Issue) -> String {
     if let Some(w) = &loc.ws_path {
         text.push_str(&format!(" · ws {w}"));
     }
-    if let Some(l4) = &loc.l4 {
-        text.push_str(&format!(" · l4 {}", l4_location_text(l4)));
-    }
     text
 }
 
-/// `ip:port/proto`, then the grammar, field path and mutation when set.
+/// The `l4` detail line (fix round H, H60): `ip:port/proto`, then the
+/// grammar, field path and mutation, each only when present, joined by
+/// ` · `. Every part was cut by [`bound_issue`].
 fn l4_location_text(l4: &L4Location) -> String {
     let proto = match l4.proto {
         L4Transport::Tcp => "tcp",
         L4Transport::Udp => "udp",
     };
     let mut text = format!("{}:{}/{proto}", l4.ip, l4.port);
-    if let Some(g) = &l4.grammar {
-        text.push_str(&format!(" grammar {g}"));
-    }
-    if let Some(f) = &l4.field_path {
-        text.push_str(&format!(" field {f}"));
-    }
-    if let Some(m) = &l4.mutation {
-        text.push_str(&format!(" mutation {m}"));
+    for part in [&l4.grammar, &l4.field_path, &l4.mutation]
+        .into_iter()
+        .flatten()
+    {
+        text.push_str(" · ");
+        text.push_str(part);
     }
     text
 }
