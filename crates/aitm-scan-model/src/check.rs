@@ -8,6 +8,7 @@
 //! because a hint is an in-process instruction to the PoC builder, not a result
 //! (spec D2, Architect's call 23).
 
+use aitm_core::redact::scrub_text_wide;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::FlowRef;
@@ -109,6 +110,32 @@ pub struct Verdict {
     pub more: Vec<Verdict>,
 }
 
+impl Verdict {
+    /// Scrub every free-text field a check may have copied from a response, in
+    /// place: `detail`, the [`Evidence`] (through [`Evidence::scrub`]), and the
+    /// same for every `more` sibling (amendment 67, call C5).
+    ///
+    /// One rule for both consumers: the Rhai bridge applies it where a script's
+    /// verdict is built, the manual `check.<id>` path applies it before the
+    /// verdict reaches the bus caller. The scrubber is `aitm_core::redact::
+    /// scrub_text_wide`, and the scrub is idempotent — `[redacted]` has nothing
+    /// left to redact — so a verdict the bridge already scrubbed comes through
+    /// the manual path unchanged.
+    pub fn scrub(&mut self) {
+        self.detail = scrub_text_wide(&self.detail);
+        self.evidence.scrub();
+        for sibling in &mut self.more {
+            sibling.scrub();
+        }
+    }
+
+    /// [`Verdict::scrub`] by value.
+    pub fn scrubbed(mut self) -> Self {
+        self.scrub();
+        self
+    }
+}
+
 /// The part of an issue location a verdict may override (coordinator item (g)).
 ///
 /// An absent field keeps the point's value; a check that found `/.git/` sets
@@ -147,8 +174,9 @@ pub struct ControlHint {
 
 /// The proof carried by a verdict and, later, by an issue (spec D2).
 ///
-/// Every string here is bounded and already scrubbed by the caller: the model
-/// only enforces the bound, through [`Evidence::excerpt`].
+/// Every string here is bounded and scrubbed before it travels: a check hands
+/// the raw text, and [`Evidence::scrub`] (reached through [`Verdict::scrub`])
+/// scrubs it and then bounds `matched` through [`Evidence::excerpt`].
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Evidence {
@@ -176,10 +204,23 @@ pub struct Evidence {
 }
 
 impl Evidence {
+    /// Scrub the two free-text fields in place: `payload` is scrubbed;
+    /// `matched` is scrubbed **then** bounded to [`MAX_EXCERPT_BYTES`]
+    /// (amendment 16's order: a cut before the scrub could leave a fragment of
+    /// a credential the scrubber no longer recognises).
+    pub fn scrub(&mut self) {
+        self.payload = self.payload.as_deref().map(scrub_text_wide);
+        self.matched = self
+            .matched
+            .as_deref()
+            .map(|text| Self::excerpt(&scrub_text_wide(text)));
+    }
+
     /// A copy of `text` cut to at most [`MAX_EXCERPT_BYTES`] bytes, never
     /// splitting a character.
     ///
-    /// This is a bound, not a scrub: the caller passes text that has already been
+    /// This is a bound, not a scrub: [`Evidence::scrub`] scrubs first and then
+    /// calls this; a caller using it directly passes text that has already been
     /// through `aitm_core::redact` / `scrub_text_wide`.
     pub fn excerpt(text: &str) -> String {
         if text.len() <= MAX_EXCERPT_BYTES {
@@ -539,6 +580,78 @@ mod tests {
         }"#;
         let err = serde_json::from_str::<CheckMeta>(json).expect_err("an unknown scope is refused");
         assert!(err.to_string().contains("everywhere"), "{err}");
+    }
+
+    /// Amendment 67 (call C5): one shared scrub for both consumers. `detail`
+    /// is scrubbed at the root and in every `more` sibling, `evidence.matched`
+    /// is scrubbed **then** bounded (amendment 16: the exact 256-byte literal
+    /// the bridge test pins — cut first, the scrub would leave 249 bytes), and
+    /// the scrub is idempotent so a verdict the bridge scrubbed comes through
+    /// the manual path unchanged.
+    #[test]
+    fn verdict_scrub_covers_detail_evidence_and_siblings() {
+        let verdict = Verdict {
+            outcome: Outcome::Vulnerable,
+            confidence: Confidence::Firm,
+            evidence: Evidence {
+                payload: Some("q=1&access_token=tok-123".into()),
+                matched: Some(format!(
+                    "{} Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi",
+                    "a".repeat(230)
+                )),
+                ..Evidence::default()
+            },
+            detail: "echo: Authorization: Bearer abc.def.ghi".into(),
+            poc_hint: None,
+            location: None,
+            more: vec![Verdict {
+                outcome: Outcome::Vulnerable,
+                confidence: Confidence::Firm,
+                evidence: Evidence {
+                    payload: Some("sid=s3cr3t".into()),
+                    matched: Some("Cookie: sid=s3cr3t-cookie".into()),
+                    ..Evidence::default()
+                },
+                detail: "sibling Cookie: sid=s3cr3t".into(),
+                poc_hint: None,
+                location: None,
+                more: Vec::new(),
+            }],
+        };
+
+        let once = verdict.clone().scrubbed();
+        assert_eq!(once.detail, "echo: Authorization: [redacted]");
+        assert_eq!(
+            once.evidence.payload.as_deref(),
+            Some("q=1&access_token=[redacted]")
+        );
+        let matched = once.evidence.matched.as_deref().expect("matched is kept");
+        assert_eq!(matched.len(), MAX_EXCERPT_BYTES);
+        assert_eq!(
+            matched,
+            format!("{} Cookie: [redacted]; Autho", "a".repeat(230))
+        );
+        assert!(!matched.contains("s3cr3t"), "{matched:?}");
+        assert_eq!(once.more.len(), 1);
+        assert_eq!(once.more[0].detail, "sibling Cookie: [redacted]");
+        assert_eq!(
+            once.more[0].evidence.matched.as_deref(),
+            Some("Cookie: [redacted]")
+        );
+        assert_eq!(
+            once.more[0].evidence.payload.as_deref(),
+            Some("sid=[redacted]")
+        );
+        // Untouched: the scrub is about free text only.
+        assert_eq!(once.outcome, Outcome::Vulnerable);
+        assert_eq!(once.confidence, Confidence::Firm);
+
+        // In-place form agrees with the by-value form, and twice is once.
+        let mut in_place = verdict;
+        in_place.scrub();
+        assert_eq!(in_place, once);
+        in_place.scrub();
+        assert_eq!(in_place, once, "scrub is idempotent");
     }
 
     /// Coordinator item (g) (2026-11-01): the multi-verdict contract is

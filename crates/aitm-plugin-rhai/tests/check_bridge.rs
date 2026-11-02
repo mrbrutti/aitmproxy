@@ -541,6 +541,31 @@ async fn scrubbed_evidence_matched_is_still_bounded() {
     );
 }
 
+/// Amendment 67 (call C5): `detail` is scrubbed with the same `scrub_text_wide`
+/// as the evidence, at the root, in every sibling of the array form, and in the
+/// plain-string form (which puts the whole string in `detail`). The bridge and
+/// the manual `check.<id>` path share one `Verdict::scrub`, so a bearer token a
+/// closure echoes into its prose reaches neither the job path nor the bus caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detail_is_scrubbed_at_the_root_in_siblings_and_in_the_string_form() {
+    let (verdict, _host) = verdict_of(
+        r#"[ #{ outcome: "clean", detail: "echo: Authorization: Bearer abc.def.ghi" },
+            #{ outcome: "clean", detail: "sibling Cookie: sid=s3cr3t" } ]"#,
+        200,
+        "body",
+    )
+    .await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+    assert_eq!(verdict.detail, "echo: Authorization: [redacted]");
+    assert_eq!(verdict.more.len(), 1);
+    assert_eq!(verdict.more[0].detail, "sibling Cookie: [redacted]");
+
+    let (verdict, _host) = verdict_of(r#""saw Authorization: Bearer x""#, 200, "body").await;
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert_eq!(verdict.detail, "saw Authorization: [redacted]");
+}
+
 /// What every `ProbeHost` method below returns: the model's `BoxFuture` spelled
 /// with std types, because this crate does not depend on `futures`.
 type ProbeFuture<'a> = Pin<

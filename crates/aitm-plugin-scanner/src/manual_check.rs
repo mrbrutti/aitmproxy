@@ -31,8 +31,8 @@ use aitm_core::{
     ProxyClient, Registry, Sensitivity, TypeDesc, Value,
 };
 use aitm_scan_model::{
-    scan_error, Check, Evidence, InsertionKind, JobCtx, LaneKind, ProfileTarget, ScanErrorCode,
-    ScanProfile, SessionMaterial, Verdict,
+    scan_error, Check, InsertionKind, JobCtx, LaneKind, ProfileTarget, ScanErrorCode, ScanProfile,
+    SessionMaterial,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -247,39 +247,12 @@ impl Command for ManualCheck {
         // The verdict goes straight back to the bus caller, so it gets the
         // scrub the job path's worker applies when it files an issue (spec
         // D8.1, amendment 56); a native check that echoes a credential from a
-        // response leaks nothing through `check.<id>`.
-        result_of(&scrubbed(verdict))
+        // response leaks nothing through `check.<id>`. `Verdict::scrubbed` is
+        // the model's one shared rule (amendment 67): `detail` and evidence,
+        // root and every sibling, scrub then bound; idempotent, so a Rhai
+        // verdict the bridge already scrubbed comes through unchanged.
+        result_of(&verdict.scrubbed())
     }
-}
-
-/// `verdict` with its `detail` and evidence — and every `more` sibling's —
-/// scrubbed through [`util::scrub`] and `matched` bounded, in that order
-/// (amendment 16): a cut before the scrub could leave a credential fragment
-/// the scrubber no longer recognises. Idempotent, so a Rhai verdict the bridge
-/// already scrubbed comes through unchanged.
-fn scrubbed(mut verdict: Verdict) -> Verdict {
-    scrub_verdict(&mut verdict);
-    verdict.more.iter_mut().for_each(scrub_verdict);
-    verdict
-}
-
-/// Scrub one [`Verdict`]'s own free text in place: its `detail` and its
-/// [`Evidence`]. `detail` can echo a response snippet just like `matched` (the
-/// bridge's plain-string verdict form puts the whole string there); the job
-/// path never emits it, the manual path does, so it is scrubbed here too. One
-/// rule for the root and every sibling, so neither place can be missed.
-fn scrub_verdict(verdict: &mut Verdict) {
-    verdict.detail = util::scrub(&verdict.detail);
-    scrub_evidence(&mut verdict.evidence);
-}
-
-/// Scrub one [`Evidence`]'s two free-text fields in place.
-fn scrub_evidence(evidence: &mut Evidence) {
-    evidence.matched = evidence
-        .matched
-        .as_deref()
-        .map(|text| Evidence::excerpt(&util::scrub(text)));
-    evidence.payload = evidence.payload.as_deref().map(util::scrub);
 }
 
 /// The request a manual run probes: `url` with `param` set to `value`.
