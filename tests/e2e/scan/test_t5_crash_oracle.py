@@ -99,6 +99,9 @@ def sha256_hex(data: bytes) -> str:
 def packet_profile(ip: str, port: int, proto: str, l4_opts: dict) -> dict:
     return {
         "name": "e2e-t5-crash-oracle",
+        # The packet lane's checks are `intrusive` (spec D8.4): below that the engine
+        # schedules none of them (operator-only, amendment 13).
+        "intensity": "intrusive",
         "lanes": ["l4_packet"],
         "target": {"origins": [], "l4": [{"ip": ip, "port": port, "proto": proto}]},
         "l4": dict(l4_opts),
