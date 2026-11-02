@@ -348,6 +348,24 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
 - **Done when:** the three tests are green, `cargo test -p aitm-scan-model -p aitm-plugin-scanner` green, docs/scanner.md's status field list names `crawl.forms_submitted` as written by any lane through the hook (Task 6 docs coder or this task, one writer).
 - **Ownership:** runs after Task 1b (same `worker.rs`/`interim_lane.rs`), before Task 5.
 
+### Task 8: per-job random nonce in `util::marker` (amendment 55, security Minor from T3's 2b panel)
+
+**Added 2026-11-01.** `util::marker(counter)` is `aitm` + an 8-hex per-job counter starting at zero, so every job's first marker is `aitm00000000`; the converted Rhai checks (ssti/cmdi/crlf/xxe/cors/header-reflection) use `probe.marker()` as their canary, so a target that knows aitmproxy can forge a Vulnerable verdict by echoing `aitm0000000N`.
+
+- **Rule:** markers stay `aitm` + 8 hex (every pin and every script matcher keeps working), but the 8 hex mix a per-job random seed with the counter (e.g. `counter ^ seed` or a keyed hash truncated to 32 bits) so two jobs' first markers differ and a job's markers stay unique (a bijection of the counter per job; no collision within a job).
+- **Files:** `crates/aitm-plugin-scanner/src/util.rs` (`marker(seed, counter)`; `marker_seed()` from `rand`/`getrandom` or `std::collections::hash_map::RandomState`-derived u32 — whatever the crate already depends on, no new dependency unless unavoidable), `worker.rs` (`JobRuntime` holds the seed; `ProbeHost::marker` uses it), `manual_check.rs` (its scratch host mints a seed per invocation), the interim lane's `ProbeHost::marker` impl if separate.
+- **Tests (red first):** `util::tests::markers_keep_the_shape_and_differ_across_seeds` (regex `^aitm[0-9a-f]{8}$`; two seeds → different first markers; 1,000 counters under one seed → 1,000 distinct markers); `worker::tests::two_jobs_first_markers_differ` (two jobs on one engine, their first markers differ; the second marker of one job differs from its first).
+- **Ownership:** after Task 7 (worker.rs); `util.rs` has no other writer.
+
+### Task 9: scrub `Evidence.matched` on the Rhai bridge and the manual path (amendment 56, security Minor from T3's 2b panel)
+
+**Added 2026-11-01.** D8.1 / amendment 16: the Rhai bridge bounds `evidence.matched` but does not scrub it, and the manual `check.<id>` path returns the verdict to the bus caller unscrubbed; the job path scrubs in `worker.rs` only.
+
+- **Rule:** `Evidence.matched` (and `payload`) are scrubbed with `aitm_core::redact::scrub_text_wide` where the verdict is built, so both the job path and the manual path emit scrubbed evidence; the worker's scrub stays (idempotent).
+- **Files:** `crates/aitm-plugin-rhai/src/check_bridge.rs` (where the verdict map becomes `Verdict`: scrub `matched`/`payload` after the excerpt bound), `crates/aitm-plugin-scanner/src/manual_check.rs` (scrub the returned verdict's evidence before `result_of`, covering native checks too).
+- **Tests (red first):** `check_bridge` test: a closure returning `matched` containing `Cookie: sid=s3cr3t` and `Authorization: Bearer abc.def` yields `matched` with both values redacted and the bound still applied; `manual_check::tests::manual_verdict_evidence_is_scrubbed`: a native check whose evidence echoes a bearer token returns a redacted `matched` through `check.<id>`.
+- **Ownership:** `check_bridge.rs` (aitm-plugin-rhai, T1b row) and `manual_check.rs`; no overlap with Tasks 1b/7; can run in parallel with them.
+
 ### Task 6: bookkeeping and docs wording
 
 - **Satisfies:** workflow stage-7 record keeping; amendment 39/40 operator docs.
