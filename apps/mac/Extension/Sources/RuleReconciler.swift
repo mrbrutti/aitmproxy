@@ -1,0 +1,739 @@
+import Foundation
+
+// MARK: - Rule reconciler (spec 2026-11-01-ne-tcp-only-catch-all-design, Design B, C)
+//
+// The bookkeeping behind the provider's in-place `setTunnelNetworkSettings` re-apply:
+// which `ProviderRuleSet` is installed, which one is wanted, whether an apply is in
+// flight. It coalesces: at most one apply in flight plus one pending set, so a burst of
+// Scope pushes applies at most the LAST distinct set, and nothing is applied while the
+// wanted set equals the installed one (a core restart with no UDP target scoped applies
+// nothing; with one scoped, exactly two applications: TCP-only, then TCP + UDP).
+//
+// The `apply` is injected so the self-check drives every transition with a fake; the
+// provider's `apply` is the only place `NETransparentProxyNetworkSettings` is built.
+// Nothing here is on the claim path: `CoreLink.current()` decides every flow, and
+// detach is fail-open before any rule work begins (NE-AC5).
+//
+// Failure semantics (spec B): an error leaves `installed` as it was -- the kernel keeps
+// the previous rules as far as we know -- and is reported once. The set that failed is
+// NOT retried by itself (no timer, no loop); the next scope change tries again. A newer
+// set that arrived during the failed flight is applied right away, like after a success.
+
+/// Coalescing apply state. NOT thread-safe by itself: the owner calls every method, and
+/// delivers every apply completion, on one serial queue (the provider's `rulesQueue`).
+final class RuleReconciler {
+    enum Event: Equatable {
+        /// The apply completed without error; this set is now `installed`.
+        case applied(ProviderRuleSet)
+        /// The apply completed with an error; `kept` (the previous `installed`, nil when
+        /// nothing had been installed yet) stays.
+        case applyFailed(wanted: ProviderRuleSet, kept: ProviderRuleSet?, message: String)
+    }
+
+    /// Install `wanted`, with `reasserting` set around the call iff asked, and deliver the
+    /// result ON THE OWNER'S QUEUE exactly once.
+    typealias Apply = (_ wanted: ProviderRuleSet, _ reasserting: Bool,
+                       _ completion: @escaping (Error?) -> Void) -> Void
+
+    private let apply: Apply
+    private let onEvent: (Event) -> Void
+
+    /// The last set whose apply completed without error; nil before the startup apply
+    /// lands and after `stop()`.
+    private(set) var installed: ProviderRuleSet?
+    private var pending: ProviderRuleSet = .tcpOnly
+    private var inFlight = false
+    /// Idle until `begin`; set again by `stop()`.
+    private var stopped = true
+    /// Bumped by `stop()`. An apply completion whose generation no longer matches belongs
+    /// to a tunnel that is gone and is ignored entirely.
+    private var generation: UInt64 = 0
+    /// `begin` callers waiting for the next apply's result.
+    private var startupCompletions: [(Error?) -> Void] = []
+
+    init(apply: @escaping Apply, onEvent: @escaping (Event) -> Void) {
+        self.apply = apply
+        self.onEvent = onEvent
+    }
+
+    /// Startup (spec Design C). Clears `stopped`, leaves `pending` as the hook last set
+    /// it (a Scope that reached the queue before `begin` is applied right after the
+    /// startup apply), and applies `.tcpOnly` WITHOUT `reasserting` (the session is not
+    /// Connected yet). On a first `begin`, `completion` receives that apply's result; a
+    /// reconcile apply's error never answers it. A second `begin` without a `stop()` in
+    /// between (Tahoe FB21464147, `startProxy` called twice): with a set installed the
+    /// session is live, so the completion is answered with nil at once and the
+    /// installed set stays; with the startup apply still in flight it waits for that
+    /// same result; with a reconcile apply in flight and nothing installed (a failed
+    /// startup without `stop()`) it is parked: if that reconcile lands a set, the parked
+    /// completion is answered `nil` then (the session is live); if it fails, a fresh
+    /// `.tcpOnly` startup apply follows and answers with its own result (vectors F, H, I
+    /// of `ruleReconcilerStartupAndStop`).
+    func begin(completion: @escaping (Error?) -> Void) {
+        stopped = false
+        if installed != nil {
+            completion(nil)
+            applyIfNeeded(reasserting: true)
+            return
+        }
+        startupCompletions.append(completion)
+        if inFlight { return }
+        startApply(.tcpOnly, reasserting: false, startup: true)
+    }
+
+    /// A scope transition (the `CoreLink.onScopeChange` hook). The wanted set becomes
+    /// `ProviderRuleSet.wanted(for:)`; it is applied with `reasserting` iff it differs
+    /// from the installed one and nothing is in flight, else it waits as the pending set.
+    func reconcile(for scope: ScopeMatcher?) {
+        pending = ProviderRuleSet.wanted(for: scope)
+        applyIfNeeded(reasserting: true)
+    }
+
+    /// `stopProxy`: forget everything. A late `reconcile` (the hook the detach fires)
+    /// applies nothing; an in-flight completion becomes stale and is ignored; a later
+    /// `begin` starts over. A `startProxy` completion still parked is answered once,
+    /// now, with `ECANCELED` (spec C as amended: never dropped), so the framework never
+    /// waits on a tunnel that is gone.
+    func stop() {
+        stopped = true
+        installed = nil
+        pending = .tcpOnly
+        inFlight = false
+        generation &+= 1
+        // Answer LAST, with the parked list already cleared inside `answerStartup`: the
+        // provider's startup completion calls `stop()` back synchronously on this path
+        // (its error branch mirrors `stopProxy`), so `stop()` is re-entered here. The
+        // nested call is harmless -- every field above is already in its stopped state,
+        // its extra `generation` bump keeps the same flight stale, and it finds nothing
+        // parked -- so the completion runs exactly once (vector J).
+        answerStartup(with: NSError(domain: NSPOSIXErrorDomain, code: Int(ECANCELED)))
+    }
+
+    private func applyIfNeeded(reasserting: Bool) {
+        guard !stopped, !inFlight, pending != installed else { return }
+        startApply(pending, reasserting: reasserting, startup: false)
+    }
+
+    /// One apply of `wanted`. `startup` tags the apply `begin` started: only that apply's
+    /// completion answers `startupCompletions`.
+    private func startApply(_ wanted: ProviderRuleSet, reasserting: Bool, startup: Bool) {
+        inFlight = true
+        let gen = generation
+        apply(wanted, reasserting) { [weak self] error in
+            guard let self, gen == self.generation, !self.stopped else { return }
+            self.inFlight = false
+            if let error {
+                self.onEvent(.applyFailed(wanted: wanted, kept: self.installed,
+                                          message: String(describing: error)))
+            } else {
+                self.installed = wanted
+                self.onEvent(.applied(wanted))
+            }
+            if startup {
+                self.answerStartup(with: error)
+            } else if !self.startupCompletions.isEmpty {
+                // A `begin` arrived during this reconcile apply with nothing installed
+                // (a failed startup not followed by `stop()`). Its result never answers
+                // the startup: a live set answers nil now; otherwise a fresh startup
+                // apply follows and answers with its own result.
+                if self.installed != nil {
+                    self.answerStartup(with: nil)
+                } else {
+                    self.startApply(.tcpOnly, reasserting: false, startup: true)
+                    return
+                }
+            }
+            // Coalescing: the LAST pending set is applied now if it still differs from the
+            // installed one. After a failure only a set that arrived DURING the flight is
+            // tried; the set that just failed waits for the next scope change.
+            if error == nil || self.pending != wanted {
+                self.applyIfNeeded(reasserting: true)
+            }
+        }
+    }
+
+    private func answerStartup(with error: Error?) {
+        let waiting = startupCompletions
+        startupCompletions.removeAll()
+        waiting.forEach { $0(error) }
+    }
+}
+
+// MARK: - Self-checks (spec 2026-11-01-ne-tcp-only-catch-all-design, Design B, C; run by apps/mac/tools/ne-selfcheck.sh)
+
+#if DEBUG
+extension HandoffSelfCheck {
+    /// The fake `apply` both reconciler groups drive: records `(wanted, reasserting)` per
+    /// apply in `applied`, parks each completion in `completions` so the check delivers
+    /// every result by hand, and collects each `onEvent` in `events`. It holds no
+    /// reference to the reconciler it feeds, so there is no cycle.
+    private final class FakeApply {
+        private let r: Recorder
+        private(set) var applied: [(ProviderRuleSet, Bool)] = []
+        private(set) var completions: [(Error?) -> Void] = []
+        private(set) var events: [RuleReconciler.Event] = []
+
+        init(_ r: Recorder) { self.r = r }
+
+        func makeReconciler() -> RuleReconciler {
+            RuleReconciler(
+                apply: { wanted, reasserting, completion in
+                    self.applied.append((wanted, reasserting))
+                    self.completions.append(completion)
+                },
+                onEvent: { self.events.append($0) })
+        }
+
+        /// `(summary, reasserting); …` for every apply so far (diagnostics).
+        func trail() -> String {
+            applied.map { "(\($0.0.summary), \($0.1))" }.joined(separator: "; ")
+        }
+
+        /// True iff `applied` has exactly `i + 1` entries and the last is `(set, reasserting)`.
+        func lastApply(_ i: Int, _ set: ProviderRuleSet, _ reasserting: Bool) -> Bool {
+            applied.count == i + 1 && applied[i] == (set, reasserting)
+        }
+
+        /// True iff `results` is exactly one `NSPOSIXErrorDomain` / `ECANCELED` error: how
+        /// `stop()` answers a `startProxy` completion still parked (spec C as amended).
+        static func answeredOnceWithCancellation(_ results: [Error?]) -> Bool {
+            guard results.count == 1, let error = results[0] as NSError? else { return false }
+            return error.domain == NSPOSIXErrorDomain && error.code == Int(ECANCELED)
+        }
+
+        /// Deliver the `i`th parked completion with `error`. A completion that was never
+        /// parked is a failure under `label`, never a silent skip.
+        func complete(_ i: Int, _ error: Error?, _ label: String) {
+            guard i < completions.count else {
+                r.fail("FAIL \(label): completion \(i) was never parked (have \(completions.count))")
+                return
+            }
+            completions[i](error)
+        }
+    }
+
+    /// Design B/C of spec 2026-11-01-ne-tcp-only-catch-all-design, pinned against a fake
+    /// `apply` that records `(wanted, reasserting)` and parks each completion so the check
+    /// drives every transition by hand: startup applies `.tcpOnly` without `reasserting`;
+    /// "no change" applies nothing; a change during a flight is coalesced to the LAST
+    /// pending set and applied right after with `reasserting`; an apply error keeps
+    /// `installed` and is retried only on the next scope change, never by itself;
+    /// `stop()` resets the state, drops late reconciles and makes an in-flight completion
+    /// stale; `begin` after `stop()` starts over (Tahoe double-`startProxy` tolerance).
+    static func ruleReconciler(_ r: Recorder) {
+        let fake = FakeApply(r)
+        let reconciler = fake.makeReconciler()
+        var startupResults: [Error?] = []
+
+        let m1 = ScopeMatcher(spec: "example.com 198.51.100.7")
+        let m2 = ScopeMatcher(spec: "198.51.100.7 203.0.113.9:4433")
+        let w1 = ProviderRuleSet.wanted(for: m1)
+        let w2 = ProviderRuleSet.wanted(for: m2)
+        r.check("ruleReconciler: w1 has the one bare-IP target",
+              w1.udpTargets == [ProviderRuleSet.UDPTarget("198.51.100.7", nil)], "\(w1.udpTargets)")
+        r.check("ruleReconciler: w1 and w2 differ", w1 != w2)
+        r.check("ruleReconciler: nothing installed before begin", reconciler.installed == nil)
+
+        // 1. begin: one apply of .tcpOnly without reasserting; nothing installed yet; the
+        //    startup completion waits for the apply's result.
+        reconciler.begin { startupResults.append($0) }
+        r.check("ruleReconciler: 1 begin applies once", fake.applied.count == 1, "\(fake.applied.count)")
+        r.check("ruleReconciler: 1 begin applies (.tcpOnly, reasserting false)",
+              fake.lastApply(0, .tcpOnly, false), fake.trail())
+        r.check("ruleReconciler: 1 installed still nil during the startup apply", reconciler.installed == nil)
+        r.check("ruleReconciler: 1 startup completion not called yet", startupResults.isEmpty, "\(startupResults.count)")
+
+        // 2. The startup apply succeeds.
+        fake.complete(0, nil, "ruleReconciler: 2")
+        r.check("ruleReconciler: 2 installed == .tcpOnly", reconciler.installed == .tcpOnly,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("ruleReconciler: 2 startup completion called once with nil",
+              startupResults.count == 1 && startupResults[0] == nil,
+              "\(startupResults.map { String(describing: $0) })")
+        r.check("ruleReconciler: 2 events == [.applied(.tcpOnly)]", fake.events == [.applied(.tcpOnly)], "\(fake.events)")
+
+        // 3. No change: nothing applied.
+        reconciler.reconcile(for: nil)
+        r.check("ruleReconciler: 3 reconcile(nil) with tcpOnly installed applies nothing",
+              fake.applied.count == 1, "\(fake.applied.count)")
+
+        // 4. A change: one apply with reasserting.
+        reconciler.reconcile(for: m1)
+        r.check("ruleReconciler: 4 reconcile(m1) applies", fake.applied.count == 2, "\(fake.applied.count)")
+        r.check("ruleReconciler: 4 applied[1] == (w1, true)", fake.lastApply(1, w1, true), fake.trail())
+
+        // 5. Changes during the flight are coalesced: nothing new is applied yet.
+        reconciler.reconcile(for: m2)
+        reconciler.reconcile(for: nil)
+        r.check("ruleReconciler: 5 reconciles in flight apply nothing", fake.applied.count == 2, "\(fake.applied.count)")
+        r.check("ruleReconciler: 5 installed unchanged in flight", reconciler.installed == .tcpOnly)
+
+        // 6. The flight lands: installed = w1, then ONLY the last pending set (tcpOnly) is
+        //    applied; m2 was coalesced away.
+        fake.complete(1, nil, "ruleReconciler: 6")
+        r.check("ruleReconciler: 6 installed == w1", reconciler.installed == w1,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("ruleReconciler: 6 the last pending set is applied next", fake.applied.count == 3, "\(fake.applied.count)")
+        r.check("ruleReconciler: 6 applied[2] == (.tcpOnly, true), m2 coalesced away",
+              fake.lastApply(2, .tcpOnly, true), fake.trail())
+        r.check("ruleReconciler: 6 events so far", fake.events == [.applied(.tcpOnly), .applied(w1)], "\(fake.events)")
+
+        // 7. That lands too: installed = tcpOnly and nothing further.
+        fake.complete(2, nil, "ruleReconciler: 7")
+        r.check("ruleReconciler: 7 installed == .tcpOnly", reconciler.installed == .tcpOnly)
+        r.check("ruleReconciler: 7 nothing more applied", fake.applied.count == 3, "\(fake.applied.count)")
+
+        // 8. An apply error keeps `installed`, reports kept + wanted + the error text, and
+        //    does NOT retry by itself (spec B: "never retries on a timer; the next scope
+        //    change triggers the next attempt").
+        reconciler.reconcile(for: m1)
+        r.check("ruleReconciler: 8 reconcile(m1) applies", fake.applied.count == 4, "\(fake.applied.count)")
+        fake.complete(3, NSError(domain: "test", code: 1), "ruleReconciler: 8")
+        r.check("ruleReconciler: 8 installed kept at .tcpOnly after the error", reconciler.installed == .tcpOnly,
+              "\(String(describing: reconciler.installed?.summary))")
+        if case .applyFailed(let wanted, let kept, let message)? = fake.events.last {
+            r.check("ruleReconciler: 8 applyFailed.wanted == w1", wanted == w1, wanted.summary)
+            r.check("ruleReconciler: 8 applyFailed.kept == .tcpOnly", kept == .tcpOnly, "\(String(describing: kept?.summary))")
+            r.check("ruleReconciler: 8 applyFailed.message names the error", message.contains("test"), message)
+        } else {
+            r.fail("FAIL ruleReconciler: 8 events.last is not .applyFailed: \(String(describing: fake.events.last))")
+        }
+        r.check("ruleReconciler: 8 a failed apply is not retried by itself", fake.applied.count == 4, "\(fake.applied.count)")
+
+        // 9. The next scope change retries.
+        reconciler.reconcile(for: m1)
+        r.check("ruleReconciler: 9 the next change retries", fake.applied.count == 5, "\(fake.applied.count)")
+        r.check("ruleReconciler: 9 applied[4] == (w1, true)", fake.lastApply(4, w1, true), fake.trail())
+        fake.complete(4, nil, "ruleReconciler: 9")
+        r.check("ruleReconciler: 9 installed == w1 after the retry", reconciler.installed == w1)
+
+        // 10. stop: installed reset; a late reconcile (the detach hook) is dropped.
+        reconciler.stop()
+        r.check("ruleReconciler: 10 stop resets installed", reconciler.installed == nil,
+              "\(String(describing: reconciler.installed?.summary))")
+        reconciler.reconcile(for: nil)
+        r.check("ruleReconciler: 10 reconcile after stop applies nothing", fake.applied.count == 5, "\(fake.applied.count)")
+
+        // 11. begin again (Tahoe double-startProxy tolerance): a fresh startup apply.
+        var secondStart: [Error?] = []
+        reconciler.begin { secondStart.append($0) }
+        r.check("ruleReconciler: 11 begin after stop applies again", fake.applied.count == 6, "\(fake.applied.count)")
+        r.check("ruleReconciler: 11 applied[5] == (.tcpOnly, false)", fake.lastApply(5, .tcpOnly, false), fake.trail())
+
+        // 12. stop() answers the startup completion still parked from step 11 exactly
+        //    once, with ECANCELED (never dropped). The in-flight completion it made stale
+        //    is ignored even after a new begin: it must neither install, nor report, nor
+        //    answer the new startup, nor answer the cancelled one a second time.
+        reconciler.stop()
+        r.check("ruleReconciler: 12 stop answers the parked startup once with NSPOSIXErrorDomain/ECANCELED",
+              FakeApply.answeredOnceWithCancellation(secondStart), "\(secondStart.map { String(describing: $0) })")
+        var thirdStart: [Error?] = []
+        reconciler.begin { thirdStart.append($0) }
+        r.check("ruleReconciler: 12 begin after a stop mid-flight applies anew", fake.applied.count == 7, "\(fake.applied.count)")
+        let eventsBeforeStale = fake.events.count
+        fake.complete(5, nil, "ruleReconciler: 12 stale")   // the stale one from step 11
+        r.check("ruleReconciler: 12 stale completion installs nothing", reconciler.installed == nil,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("ruleReconciler: 12 stale completion reports nothing", fake.events.count == eventsBeforeStale,
+              "\(fake.events.count) vs \(eventsBeforeStale)")
+        r.check("ruleReconciler: 12 stale completion does not answer the new startup", thirdStart.isEmpty,
+              "\(thirdStart.count)")
+        r.check("ruleReconciler: 12 the stale completion does not answer the cancelled startup again",
+              secondStart.count == 1, "\(secondStart.count)")
+        fake.complete(6, nil, "ruleReconciler: 12 live")
+        r.check("ruleReconciler: 12 the live completion installs .tcpOnly", reconciler.installed == .tcpOnly)
+        r.check("ruleReconciler: 12 the live completion answers the new startup with nil",
+              thirdStart.count == 1 && thirdStart[0] == nil, "\(thirdStart.map { String(describing: $0) })")
+        r.check("ruleReconciler: 12 the live completion reports .applied(.tcpOnly)",
+              fake.events.last == .applied(.tcpOnly), "\(String(describing: fake.events.last))")
+
+        // 13. A NEWER pending set that arrived during a flight that then FAILS is applied
+        //    right after (spec B: the completion re-runs the check against pendingWanted);
+        //    only the set that just failed is left for the next scope change.
+        reconciler.reconcile(for: m2)
+        r.check("ruleReconciler: 13 reconcile(m2) applies", fake.applied.count == 8, "\(fake.applied.count)")
+        reconciler.reconcile(for: m1)
+        r.check("ruleReconciler: 13 reconcile(m1) in flight applies nothing yet", fake.applied.count == 8, "\(fake.applied.count)")
+        fake.complete(7, NSError(domain: "test", code: 2), "ruleReconciler: 13")
+        r.check("ruleReconciler: 13 installed kept at .tcpOnly after the failed w2",
+              reconciler.installed == .tcpOnly, "\(String(describing: reconciler.installed?.summary))")
+        r.check("ruleReconciler: 13 the newer pending set (w1) is applied after the failure",
+              fake.lastApply(8, w1, true), fake.trail())
+        fake.complete(8, nil, "ruleReconciler: 13")
+        r.check("ruleReconciler: 13 installed == w1", reconciler.installed == w1)
+        r.check("ruleReconciler: 13 nothing further applied", fake.applied.count == 9, "\(fake.applied.count)")
+    }
+
+    /// Tester (stage 5) vectors around `begin` and `stop()` (spec Design B, C), on a
+    /// fresh reconciler with the same fake `apply`:
+    ///  A. a `reconcile` BEFORE `begin` applies nothing (`stopped` starts true) and
+    ///     installs nothing, but its set is kept as `pending`; `begin` then installs
+    ///     TCP-only first, without `reasserting`, and the pre-begin set is applied right
+    ///     after it with `reasserting` (fix F1: `begin` no longer resets `pending`);
+    ///  B. a `reconcile` DURING the startup flight is coalesced and applied right after it
+    ///     with `reasserting` (spec C: "a Scope that arrives before the startup apply
+    ///     completes is coalesced as pendingWanted and applied right after");
+    ///  C. a second `begin` without `stop()` (Tahoe FB21464147) while a UDP set is
+    ///     installed applies nothing, answers its completion with nil at once and keeps
+    ///     the installed set (fix F1; spec C as amended);
+    ///  D. after `stop()`: a hook carrying a UDP set is dropped (plan step 10 covers nil
+    ///     only), a startup completion still parked is answered once with ECANCELED by
+    ///     `stop()` itself (fix F2), a late completion of a pre-stop apply -- success or
+    ///     error -- neither installs nor reports nor answers anything, and nothing
+    ///     further is applied;
+    ///  E. a `begin` after all that starts over cleanly;
+    ///  F. a second `begin` while a RECONCILE apply is in flight with nothing installed
+    ///     (startup failed, no `stop()`) is never answered by that reconcile's result: a
+    ///     fresh startup apply follows and answers it; the pending set is applied after;
+    ///  G. the provider's failed-startup sequence (fix F3): `begin` fails, `stop()` runs,
+    ///     then the detach that `handoff.stop()` fires reconciles nil -- nothing is
+    ///     applied, installed or reported; a later UDP set is dropped too.
+    ///  H. (Tester, round 2) two `begin`s during the startup flight share one apply and
+    ///     are each answered once with its result (success, failure, or `stop()`'s
+    ///     ECANCELED); a `begin` during a reconcile flight with a set installed is
+    ///     answered nil at once and the flight lands without answering it again.
+    ///  I. (Tester, round 2) a reconcile apply that lands SUCCESSFULLY while a second
+    ///     `begin` is parked (failed startup, no `stop()`) answers it nil at that moment;
+    ///     no fresh startup apply follows (spec C, round-2 amendment).
+    ///  J. (fix R2-3) a parked startup completion that calls `stop()` back from INSIDE
+    ///     the `stop()` answering it (the provider's error branch on the ECANCELED arm)
+    ///     runs exactly once; the nested `stop()` finds nothing parked and nothing
+    ///     further is applied, installed or reported; a later `begin` starts over.
+    static func ruleReconcilerStartupAndStop(_ r: Recorder) {
+        let fake = FakeApply(r)
+        let reconciler = fake.makeReconciler()
+        let m1 = ScopeMatcher(spec: "example.com 198.51.100.7")
+        let w1 = ProviderRuleSet.wanted(for: m1)
+        let tcpOnly = ProviderRuleSet.tcpOnly
+        let g = "ruleReconciler/startup-stop"
+
+        // A. Before begin nothing moves, whatever the set; begin then installs TCP-only.
+        reconciler.reconcile(for: nil)
+        reconciler.reconcile(for: m1)
+        r.check("\(g): A reconcile before begin applies nothing", fake.applied.isEmpty, fake.trail())
+        r.check("\(g): A nothing installed before begin", reconciler.installed == nil)
+        r.check("\(g): A no event before begin", fake.events.isEmpty, "\(fake.events)")
+        var startupA: [Error?] = []
+        reconciler.begin { startupA.append($0) }
+        r.check("\(g): A begin applies (.tcpOnly, false) first", fake.lastApply(0, tcpOnly, false), fake.trail())
+        fake.complete(0, nil, "\(g): A")
+        r.check("\(g): A installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("\(g): A startup answered once with nil",
+              startupA.count == 1 && startupA[0] == nil, "\(startupA.map { String(describing: $0) })")
+        r.check("\(g): A the pre-begin set (w1) is applied right after startup with reasserting",
+              fake.lastApply(1, w1, true), fake.trail())
+        r.check("\(g): A installed == .tcpOnly until that lands", reconciler.installed == tcpOnly)
+        fake.complete(1, nil, "\(g): A")
+        r.check("\(g): A installed == w1", reconciler.installed == w1)
+        r.check("\(g): A startup still answered exactly once", startupA.count == 1, "\(startupA.count)")
+        reconciler.reconcile(for: m1)
+        r.check("\(g): A the Scope push carrying the same set applies nothing", fake.applied.count == 2, fake.trail())
+
+        // B. A Scope during the startup flight is coalesced and applied right after it.
+        reconciler.stop()
+        var startupB: [Error?] = []
+        reconciler.begin { startupB.append($0) }
+        r.check("\(g): B begin applies (.tcpOnly, false)", fake.lastApply(2, tcpOnly, false), fake.trail())
+        reconciler.reconcile(for: nil)   // serve start
+        reconciler.reconcile(for: m1)    // the Scope frame
+        r.check("\(g): B reconciles during the startup flight apply nothing yet", fake.applied.count == 3, fake.trail())
+        r.check("\(g): B nothing installed during the startup flight", reconciler.installed == nil)
+        fake.complete(2, nil, "\(g): B")
+        r.check("\(g): B startup answered once with nil",
+              startupB.count == 1 && startupB[0] == nil, "\(startupB.map { String(describing: $0) })")
+        r.check("\(g): B the coalesced Scope set is applied right after startup with reasserting",
+              fake.lastApply(3, w1, true), fake.trail())
+        r.check("\(g): B installed == .tcpOnly until that lands", reconciler.installed == tcpOnly)
+        fake.complete(3, nil, "\(g): B")
+        r.check("\(g): B installed == w1", reconciler.installed == w1)
+        r.check("\(g): B events end [.applied(.tcpOnly), .applied(w1)]",
+              Array(fake.events.suffix(2)) == [.applied(tcpOnly), .applied(w1)], "\(fake.events.suffix(2))")
+
+        // C. A second begin WITHOUT stop while w1 is installed (Tahoe FB21464147): a live
+        //    session has nothing to install; the completion is answered at once and the
+        //    installed UDP rule stays.
+        var startupC: [Error?] = []
+        let eventsBeforeC = fake.events.count
+        reconciler.begin { startupC.append($0) }
+        r.check("\(g): C a second begin without stop applies nothing", fake.applied.count == 4, fake.trail())
+        r.check("\(g): C the second startup is answered at once, exactly once, with nil",
+              startupC.count == 1 && startupC[0] == nil, "\(startupC.map { String(describing: $0) })")
+        r.check("\(g): C installed stays w1", reconciler.installed == w1,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("\(g): C no event for the no-op begin", fake.events.count == eventsBeforeC,
+              "\(fake.events.count) vs \(eventsBeforeC)")
+        reconciler.reconcile(for: m1)
+        r.check("\(g): C a Scope push with the same set still applies nothing", fake.applied.count == 4, fake.trail())
+
+        // D1. stop() with a SUCCEEDING apply in flight: the late completion is inert, and
+        //     a hook carrying a UDP set after stop is dropped.
+        reconciler.reconcile(for: nil)
+        r.check("\(g): D1 reconcile(nil) applies (.tcpOnly, true)", fake.lastApply(4, tcpOnly, true), fake.trail())
+        reconciler.stop()
+        r.check("\(g): D1 stop resets installed", reconciler.installed == nil)
+        let eventsBeforeD1 = fake.events.count
+        fake.complete(4, nil, "\(g): D1")
+        r.check("\(g): D1 late success completion installs nothing", reconciler.installed == nil,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("\(g): D1 late success completion reports nothing", fake.events.count == eventsBeforeD1,
+              "\(fake.events.count) vs \(eventsBeforeD1)")
+        r.check("\(g): D1 late success completion applies nothing further", fake.applied.count == 5, fake.trail())
+        reconciler.reconcile(for: m1)
+        r.check("\(g): D1 a hook carrying a UDP set after stop applies nothing", fake.applied.count == 5, fake.trail())
+        r.check("\(g): D1 still nothing installed", reconciler.installed == nil)
+
+        // D2. stop() with the STARTUP apply in flight answers the parked startup once with
+        //     ECANCELED; the apply then FAILS late: no .applyFailed, no second answer.
+        var startupD: [Error?] = []
+        reconciler.begin { startupD.append($0) }
+        r.check("\(g): D2 begin after stop applies (.tcpOnly, false)", fake.lastApply(5, tcpOnly, false), fake.trail())
+        r.check("\(g): D2 the startup is parked until its apply lands", startupD.isEmpty, "\(startupD.count)")
+        reconciler.stop()
+        r.check("\(g): D2 stop answers the parked startup once with NSPOSIXErrorDomain/ECANCELED",
+              FakeApply.answeredOnceWithCancellation(startupD), "\(startupD.map { String(describing: $0) })")
+        let eventsBeforeD2 = fake.events.count
+        fake.complete(5, NSError(domain: "test", code: 3), "\(g): D2")
+        r.check("\(g): D2 late error completion reports nothing", fake.events.count == eventsBeforeD2,
+              "\(fake.events.count) vs \(eventsBeforeD2)")
+        r.check("\(g): D2 late error completion does not answer the cancelled startup again",
+              startupD.count == 1, "\(startupD.map { String(describing: $0) })")
+        r.check("\(g): D2 nothing installed", reconciler.installed == nil)
+        r.check("\(g): D2 nothing further applied", fake.applied.count == 6, fake.trail())
+
+        // E. A begin after all that starts over cleanly.
+        var startupE: [Error?] = []
+        reconciler.begin { startupE.append($0) }
+        r.check("\(g): E begin applies (.tcpOnly, false)", fake.lastApply(6, tcpOnly, false), fake.trail())
+        fake.complete(6, nil, "\(g): E")
+        r.check("\(g): E installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("\(g): E startup answered once with nil",
+              startupE.count == 1 && startupE[0] == nil, "\(startupE.map { String(describing: $0) })")
+        r.check("\(g): E last event is .applied(.tcpOnly)", fake.events.last == .applied(tcpOnly),
+              "\(String(describing: fake.events.last))")
+        r.check("\(g): E every apply parked exactly one completion",
+              fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
+
+        // F. Startup fails and the reconciler is NOT stopped (the provider does stop it;
+        //    the class must stay coherent regardless): a hook reconcile applies w1 with
+        //    reasserting; a second begin during that flight parks; the reconcile's error
+        //    does not answer it; a startup apply follows, answers it, and pending w1 is
+        //    applied after that.
+        reconciler.stop()
+        var startupF1: [Error?] = []
+        reconciler.begin { startupF1.append($0) }
+        r.check("\(g): F begin applies (.tcpOnly, false)", fake.lastApply(7, tcpOnly, false), fake.trail())
+        fake.complete(7, NSError(domain: "test", code: 4), "\(g): F")
+        r.check("\(g): F the failed startup answers its completion once with the error",
+              startupF1.count == 1 && (startupF1[0] as NSError?)?.code == 4, "\(startupF1.map { String(describing: $0) })")
+        r.check("\(g): F nothing installed after the failed startup", reconciler.installed == nil)
+        reconciler.reconcile(for: m1)
+        r.check("\(g): F a reconcile after the failed startup applies (w1, true)", fake.lastApply(8, w1, true), fake.trail())
+        var startupF2: [Error?] = []
+        reconciler.begin { startupF2.append($0) }
+        r.check("\(g): F a second begin during the reconcile flight applies nothing", fake.applied.count == 9, fake.trail())
+        r.check("\(g): F that begin is not answered yet", startupF2.isEmpty, "\(startupF2.count)")
+        fake.complete(8, NSError(domain: "test", code: 5), "\(g): F")
+        r.check("\(g): F the reconcile's error does not answer the second begin", startupF2.isEmpty,
+              "\(startupF2.map { String(describing: $0) })")
+        r.check("\(g): F a fresh startup apply (.tcpOnly, false) follows the failed reconcile",
+              fake.lastApply(9, tcpOnly, false), fake.trail())
+        fake.complete(9, nil, "\(g): F")
+        r.check("\(g): F the second begin is answered once with nil by the startup apply",
+              startupF2.count == 1 && startupF2[0] == nil, "\(startupF2.map { String(describing: $0) })")
+        r.check("\(g): F installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("\(g): F the pending w1 is applied right after", fake.lastApply(10, w1, true), fake.trail())
+        fake.complete(10, nil, "\(g): F")
+        r.check("\(g): F installed == w1", reconciler.installed == w1)
+        r.check("\(g): F every apply parked exactly one completion",
+              fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
+
+        // G. The provider's failed-startup sequence: the startup apply fails, the error
+        //    branch stops the reconciler before the link, and the detach hook's
+        //    reconcile(nil) must then be inert (contrast F, where no stop() ran).
+        reconciler.stop()
+        var startupG: [Error?] = []
+        reconciler.begin { startupG.append($0) }
+        r.check("\(g): G begin applies (.tcpOnly, false)", fake.lastApply(11, tcpOnly, false), fake.trail())
+        fake.complete(11, NSError(domain: "test", code: 6), "\(g): G")
+        r.check("\(g): G the failed startup answers its completion once with the error",
+              startupG.count == 1 && (startupG[0] as NSError?)?.code == 6, "\(startupG.map { String(describing: $0) })")
+        if case .applyFailed(let wanted, let kept, _)? = fake.events.last {
+            r.check("\(g): G .applyFailed(wanted: .tcpOnly, kept: nil) reported once", wanted == tcpOnly && kept == nil,
+                  "\(wanted.summary), \(String(describing: kept?.summary))")
+        } else {
+            r.fail("FAIL \(g): G last event is not .applyFailed: \(String(describing: fake.events.last))")
+        }
+        reconciler.stop()
+        let eventsBeforeG = fake.events.count
+        reconciler.reconcile(for: nil)   // the detach hook fired by handoff.stop()
+        r.check("\(g): G a detach-driven reconcile(nil) after the failed startup + stop applies nothing",
+              fake.applied.count == 12, fake.trail())
+        reconciler.reconcile(for: m1)
+        r.check("\(g): G a UDP set after that applies nothing either", fake.applied.count == 12, fake.trail())
+        r.check("\(g): G nothing installed", reconciler.installed == nil)
+        r.check("\(g): G nothing reported", fake.events.count == eventsBeforeG, "\(fake.events.count) vs \(eventsBeforeG)")
+        r.check("\(g): G the startup completion was not answered again", startupG.count == 1, "\(startupG.count)")
+
+        // H. Tester (round 2). Two `begin`s during the STARTUP flight (Tahoe FB21464147
+        //    before the first apply lands): one apply, both completions parked, both
+        //    answered exactly once with that apply's result -- success and failure; a
+        //    `begin` during a RECONCILE flight with a set installed is answered nil at
+        //    once, applies nothing, and the flight lands as usual without answering it
+        //    again; `stop()` with TWO parked startups answers each once with ECANCELED.
+        reconciler.stop()
+        var startupH1: [Error?] = []
+        var startupH2: [Error?] = []
+        reconciler.begin { startupH1.append($0) }
+        reconciler.begin { startupH2.append($0) }
+        r.check("\(g): H two begins during the startup flight apply once", fake.lastApply(12, tcpOnly, false), fake.trail())
+        r.check("\(g): H both startups are parked until the apply lands",
+              startupH1.isEmpty && startupH2.isEmpty, "\(startupH1.count), \(startupH2.count)")
+        fake.complete(12, nil, "\(g): H")
+        r.check("\(g): H both startups answered once with nil",
+              startupH1.count == 1 && startupH1[0] == nil && startupH2.count == 1 && startupH2[0] == nil,
+              "\(startupH1.map { String(describing: $0) }) / \(startupH2.map { String(describing: $0) })")
+        r.check("\(g): H installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("\(g): H nothing further applied", fake.applied.count == 13, fake.trail())
+        reconciler.reconcile(for: m1)
+        r.check("\(g): H reconcile(m1) applies (w1, true)", fake.lastApply(13, w1, true), fake.trail())
+        var startupH3: [Error?] = []
+        let eventsBeforeH3 = fake.events.count
+        reconciler.begin { startupH3.append($0) }
+        r.check("\(g): H a begin during a reconcile flight with a set installed is answered nil at once",
+              startupH3.count == 1 && startupH3[0] == nil, "\(startupH3.map { String(describing: $0) })")
+        r.check("\(g): H that begin applies nothing", fake.applied.count == 14, fake.trail())
+        r.check("\(g): H that begin reports nothing", fake.events.count == eventsBeforeH3, "\(fake.events.count) vs \(eventsBeforeH3)")
+        r.check("\(g): H installed stays .tcpOnly until the flight lands", reconciler.installed == tcpOnly)
+        fake.complete(13, nil, "\(g): H")
+        r.check("\(g): H the flight lands: installed == w1", reconciler.installed == w1)
+        r.check("\(g): H the landing answers no startup again",
+              startupH1.count == 1 && startupH2.count == 1 && startupH3.count == 1,
+              "\(startupH1.count), \(startupH2.count), \(startupH3.count)")
+        r.check("\(g): H events end [.applied(.tcpOnly), .applied(w1)]",
+              Array(fake.events.suffix(2)) == [.applied(tcpOnly), .applied(w1)], "\(fake.events.suffix(2))")
+        r.check("\(g): H nothing further applied after the landing", fake.applied.count == 14, fake.trail())
+        // Failure variant: both parked startups get the startup apply's error, once each.
+        reconciler.stop()
+        var startupH4: [Error?] = []
+        var startupH5: [Error?] = []
+        reconciler.begin { startupH4.append($0) }
+        reconciler.begin { startupH5.append($0) }
+        r.check("\(g): H (failure) two begins apply once", fake.lastApply(14, tcpOnly, false), fake.trail())
+        fake.complete(14, NSError(domain: "test", code: 7), "\(g): H (failure)")
+        r.check("\(g): H (failure) both startups answered once with the error",
+              startupH4.count == 1 && (startupH4[0] as NSError?)?.code == 7
+                  && startupH5.count == 1 && (startupH5[0] as NSError?)?.code == 7,
+              "\(startupH4.map { String(describing: $0) }) / \(startupH5.map { String(describing: $0) })")
+        r.check("\(g): H (failure) nothing installed", reconciler.installed == nil)
+        r.check("\(g): H (failure) the failed startup set is not retried by itself", fake.applied.count == 15, fake.trail())
+        // stop() with two parked startups: each answered once with ECANCELED; the stale
+        // completion answers neither again.
+        reconciler.stop()
+        var startupH6: [Error?] = []
+        var startupH7: [Error?] = []
+        reconciler.begin { startupH6.append($0) }
+        reconciler.begin { startupH7.append($0) }
+        r.check("\(g): H (stop) two begins apply once", fake.lastApply(15, tcpOnly, false), fake.trail())
+        reconciler.stop()
+        r.check("\(g): H (stop) both parked startups answered once with NSPOSIXErrorDomain/ECANCELED",
+              FakeApply.answeredOnceWithCancellation(startupH6) && FakeApply.answeredOnceWithCancellation(startupH7),
+              "\(startupH6.map { String(describing: $0) }) / \(startupH7.map { String(describing: $0) })")
+        let eventsBeforeH7 = fake.events.count
+        fake.complete(15, nil, "\(g): H (stop) stale")
+        r.check("\(g): H (stop) the stale completion answers neither startup again",
+              startupH6.count == 1 && startupH7.count == 1, "\(startupH6.count), \(startupH7.count)")
+        r.check("\(g): H (stop) the stale completion installs nothing", reconciler.installed == nil)
+        r.check("\(g): H (stop) the stale completion reports nothing", fake.events.count == eventsBeforeH7,
+              "\(fake.events.count) vs \(eventsBeforeH7)")
+        r.check("\(g): H every apply parked exactly one completion",
+              fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
+
+        // I. Tester (round 2; spec C as amended by the round-2 spec review): a set becomes
+        //    installed while a second `begin` is parked -- a RECONCILE apply landing
+        //    first, after a failed startup without `stop()` -- answers that completion
+        //    nil at that moment; no fresh startup apply follows (contrast F, where the
+        //    reconcile failed), and the only event is the reconcile's own `.applied(w1)`.
+        reconciler.stop()
+        var startupI1: [Error?] = []
+        reconciler.begin { startupI1.append($0) }
+        r.check("\(g): I begin applies (.tcpOnly, false)", fake.lastApply(16, tcpOnly, false), fake.trail())
+        fake.complete(16, NSError(domain: "test", code: 8), "\(g): I")
+        r.check("\(g): I the failed startup answers its completion once with the error",
+              startupI1.count == 1 && (startupI1[0] as NSError?)?.code == 8, "\(startupI1.map { String(describing: $0) })")
+        r.check("\(g): I nothing installed after the failed startup", reconciler.installed == nil)
+        reconciler.reconcile(for: m1)
+        r.check("\(g): I a reconcile after the failed startup applies (w1, true)", fake.lastApply(17, w1, true), fake.trail())
+        var startupI2: [Error?] = []
+        reconciler.begin { startupI2.append($0) }
+        r.check("\(g): I a second begin during that reconcile flight parks and applies nothing",
+              startupI2.isEmpty && fake.applied.count == 18, "\(startupI2.count) answered; \(fake.trail())")
+        let eventsBeforeI = fake.events.count
+        fake.complete(17, nil, "\(g): I")
+        r.check("\(g): I the reconcile lands: installed == w1", reconciler.installed == w1,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("\(g): I the parked begin is answered nil at that moment",
+              startupI2.count == 1 && startupI2[0] == nil, "\(startupI2.map { String(describing: $0) })")
+        r.check("\(g): I no fresh startup apply follows", fake.applied.count == 18, fake.trail())
+        r.check("\(g): I exactly one event, .applied(w1)",
+              fake.events.count == eventsBeforeI + 1 && fake.events.last == .applied(w1), "\(fake.events.suffix(2))")
+        r.check("\(g): I the first (failed) startup is not answered again", startupI1.count == 1, "\(startupI1.count)")
+        reconciler.reconcile(for: m1)
+        r.check("\(g): I a Scope push with the same set applies nothing", fake.applied.count == 18, fake.trail())
+        r.check("\(g): I every apply parked exactly one completion",
+              fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
+
+        // J. (fix R2-3) The provider's startup completion re-enters `stop()`: its error
+        //    branch mirrors `stopProxy` (`reconciler.stop()`, then `handoff.stop()`) and
+        //    runs on the ECANCELED arm too, i.e. synchronously INSIDE the `stop()` that
+        //    is answering it. `stop()` answers LAST, with the parked list already
+        //    cleared, so the nested call finds nothing to answer: the completion runs
+        //    exactly once with ECANCELED, nothing further is applied, installed or
+        //    reported, the stale flight stays inert, and a later `begin` starts over.
+        reconciler.stop()
+        var startupJ: [Error?] = []
+        var nestedStops = 0
+        reconciler.begin { error in
+            startupJ.append(error)
+            // What `TransparentProxyProvider.startProxy`'s error branch does. The bound exists
+            // for the regression this vector guards: an `answerStartup` that invokes before it
+            // clears the list re-enters here without end (stack overflow, exit 139, and every
+            // group's result lost -- the Recorder prints only at the end), so the bound stops
+            // the recursion and the pins below name the failure instead. Correct code reaches 1.
+            if error != nil && nestedStops < 8 {
+                nestedStops += 1
+                reconciler.stop()
+            }
+        }
+        r.check("\(g): J begin applies (.tcpOnly, false)", fake.lastApply(18, tcpOnly, false), fake.trail())
+        r.check("\(g): J the startup is parked until its apply lands", startupJ.isEmpty && nestedStops == 0,
+              "\(startupJ.count) answers, \(nestedStops) nested stops")
+        let eventsBeforeJ = fake.events.count
+        reconciler.stop()
+        r.check("\(g): J the completion re-entered stop() exactly once", nestedStops == 1, "\(nestedStops)")
+        r.check("\(g): J the parked startup is answered exactly once with NSPOSIXErrorDomain/ECANCELED despite the nested stop()",
+              FakeApply.answeredOnceWithCancellation(startupJ), "\(startupJ.map { String(describing: $0) })")
+        r.check("\(g): J nothing further applied", fake.applied.count == 19, fake.trail())
+        r.check("\(g): J nothing installed", reconciler.installed == nil,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("\(g): J nothing reported", fake.events.count == eventsBeforeJ, "\(fake.events.count) vs \(eventsBeforeJ)")
+        fake.complete(18, nil, "\(g): J stale")
+        r.check("\(g): J the stale startup completion answers nothing again",
+              startupJ.count == 1 && nestedStops == 1, "\(startupJ.count) answers, \(nestedStops) nested stops")
+        r.check("\(g): J the stale completion installs nothing", reconciler.installed == nil,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("\(g): J the stale completion reports nothing", fake.events.count == eventsBeforeJ,
+              "\(fake.events.count) vs \(eventsBeforeJ)")
+        var startupJ2: [Error?] = []
+        reconciler.begin { startupJ2.append($0) }
+        r.check("\(g): J a begin after the nested stop starts over with (.tcpOnly, false)",
+              fake.lastApply(19, tcpOnly, false), fake.trail())
+        fake.complete(19, nil, "\(g): J")
+        r.check("\(g): J that begin is answered once with nil",
+              startupJ2.count == 1 && startupJ2[0] == nil, "\(startupJ2.map { String(describing: $0) })")
+        r.check("\(g): J installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("\(g): J the cancelled startup is not answered by the new flight", startupJ.count == 1, "\(startupJ.count)")
+        r.check("\(g): J every apply parked exactly one completion",
+              fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
+    }
+}
+#endif
