@@ -98,6 +98,7 @@ def sha256_hex(data: bytes) -> str:
 
 def packet_profile(ip: str, port: int, proto: str, l4_opts: dict) -> dict:
     return {
+        "name": "e2e-t5-crash-oracle",
         "lanes": ["l4_packet"],
         "target": {"origins": [], "l4": [{"ip": ip, "port": port, "proto": proto}]},
         "l4": dict(l4_opts),

@@ -77,6 +77,7 @@ def loopback_interface() -> str:
 
 def packet_profile(ip: str, port: int, l4_opts: dict) -> dict:
     return {
+        "name": "e2e-t5-pins-dryrun",
         "lanes": ["l4_packet"],
         "target": {"origins": [], "l4": [{"ip": ip, "port": port, "proto": "udp"}]},
         "l4": dict(l4_opts),

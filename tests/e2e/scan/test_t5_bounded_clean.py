@@ -124,6 +124,7 @@ def main() -> int:
 
         section(f"act: a bounded packet-lane job -- {CASES} cases, liveness every {LIVENESS_EVERY}")
         profile = {
+            "name": "e2e-t5-bounded-clean",
             "lanes": ["l4_packet"],
             "target": {"origins": [], "l4": [{"ip": ip, "port": port, "proto": proto}]},
             # One insertion point: with the default IPv4/UDP field table the lane
