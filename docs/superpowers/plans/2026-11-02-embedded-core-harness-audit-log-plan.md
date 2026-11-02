@@ -125,14 +125,19 @@ root, rustfmt the leaf file only if needed): (a) tests only, (b) production.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| 1 | security | Minor | S-1: two definitions of "harness run" (`harnessAuditLogFile` matched `APP_LIVE == "1"`, `SettingsDomain.select` any non-empty `APP_LIVE`); `APP_LIVE=true` isolated the defaults suite but not the audit | fixed in the round-1 fix commit (spec Amendment 1: non-empty rule for both variables) |
-| 1 | security | Minor | S-2: U+0085 / U+2028 / U+2029 pass the newline guard; libyaml folds NEL inside a double-quoted scalar (no injection, no token exposure) | fixed in the round-1 fix commit (`yamlDoubleQuoted` refuses them; NEL test) |
+| 1 | security | Minor | S-1: two definitions of "harness run" (`harnessAuditLogFile` matched `APP_LIVE == "1"`, `SettingsDomain.select` any non-empty `APP_LIVE`); `APP_LIVE=true` isolated the defaults suite but not the audit | fixed in 59f7d042 (round-1 fix) (spec Amendment 1: non-empty rule for both variables) |
+| 1 | security | Minor | S-2: U+0085 / U+2028 / U+2029 pass the newline guard; libyaml folds NEL inside a double-quoted scalar (no injection, no token exposure) | fixed in 59f7d042 (round-1 fix) (`yamlDoubleQuoted` refuses them; NEL test) |
 | 1 | security | Minor | S-3: a relative `APP_STORE` is resolved against the cwd, not refused | accepted by the orchestrator for Matt 2026-11-02 (autonomous mode): operator-controlled input, same as `Store.url`, the core hardens the resolved path, `snap-dev.sh` passes an absolute store; flagged in the PR body |
-| 1 | quality | Minor | Q-1: `yaml()` doc comment said "both paths" with three spliced paths | fixed in the round-1 fix commit |
-| 1 | quality | Minor | Q-2: Swift pin test hand-spelled the Rust literal instead of deriving it from the asserted fragment | fixed in the round-1 fix commit |
-| 1 | quality | Minor | Q-3: `harnessAuditLogFile` doc comment claimed the same predicate as `SettingsDomain` while it differed | fixed in the round-1 fix commit (resolved with S-1) |
-| 2 | quality | Minor | Q-4: golden default-document test named after the moment it was written | fixed in the round-1 fix commit (renamed `default_config_is_exactly_this_document`) |
-| 1 | spec | Minor | P-1: AC4's `\r` half not exercised on `auditLogFile` | fixed in the round-1 fix commit |
+| 1 | quality | Minor | Q-1: `yaml()` doc comment said "both paths" with three spliced paths | fixed in 59f7d042 (round-1 fix) |
+| 1 | quality | Minor | Q-2: Swift pin test hand-spelled the Rust literal instead of deriving it from the asserted fragment | fixed in 59f7d042 (round-1 fix) |
+| 1 | quality | Minor | Q-3: `harnessAuditLogFile` doc comment claimed the same predicate as `SettingsDomain` while it differed | fixed in 59f7d042 (round-1 fix) (resolved with S-1) |
+| 2 | quality | Minor | Q-4: golden default-document test named after the moment it was written | fixed in 59f7d042 (round-1 fix) (renamed `default_config_is_exactly_this_document`) |
+| 1 | spec | Minor | P-1: AC4's `\r` half not exercised on `auditLogFile` | fixed in 59f7d042 (round-1 fix) |
+| fix 1 | security | — | round 2: no findings; S-1/S-2 verified fixed, five-scalar set equals libyaml's break set | — |
+| fix 1 | quality | Minor | Q2-1: `ConfigError` case docs still say "newline" though they fire on U+0085/U+2028/U+2029 | fixed in 2b2fdb16 (round-2 fix) |
+| fix 1 | quality | Minor | Q2-2: host-list Unicode line-break refusal inherited but untested | fixed in 2b2fdb16 (round-2 fix) (NEL host case) |
+| fix 1 | spec | Minor | P2-1: AC4's U+2029 case not exercised through `yaml()` on `auditLogFile` | fixed in 2b2fdb16 (round-2 fix) |
+| fix 2 | security, quality, spec | — | round 3 on `59f7d042..2b2fdb16`: PASS, PASS, PASS, no findings; the branch has no open finding (S-3 accepted) | — |
 
 ## Shipped
 
