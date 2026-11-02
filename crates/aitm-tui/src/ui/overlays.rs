@@ -10,10 +10,11 @@ use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::app::{App, PaletteKind, BUILTIN_COMMANDS};
 use crate::model::{clock_of, scope_covers, value_text, AgentPolicy, FlowKind, Origin};
+use crate::text::{cells, fit, truncate};
 use crate::theme::Theme;
 use crate::tokens::{color, glyph};
 use crate::ui::centered;
-use crate::ui::text::{cells, fit, truncate};
+use crate::ui::scan::{key_text, HELP};
 use crate::viewers;
 
 /// A bordered, titled panel filling `area`; returns the drawable inside.
@@ -65,7 +66,7 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     }
     // The box sits above the prompt line and never leaves the screen: shrink
     // it to the rows available there, and draw nothing when fewer than three
-    // fit (border, one item, border) — a short terminal keeps the prompt.
+    // fit (border, one item, border): a short terminal keeps the prompt.
     let above = prompt_line.y.saturating_sub(screen.y);
     let h = cells(items.len().min(10) + 2).min(above);
     let w = screen.width.min(100);
@@ -105,100 +106,200 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     }
 }
 
+/// The flow list's help lines, as `(key, what)` pairs: the table
+/// [`help_rows`] lists under its `Flow list` heading.
+const FLOW_KEYS: &[(&str, &str)] = &[
+    ("↑↓ j k", "move · PgUp/PgDn · g/G first/last"),
+    (
+        "⏎ / Esc",
+        "inspect the selection · back (full screen below 120 columns)",
+    ),
+    ("Space", "quick-look the body"),
+    ("i", "arm / disarm intercept"),
+    ("a / A", "resume the targeted paused flow / resume all"),
+    ("d", "kill the targeted paused flow"),
+    ("e", "edit the paused request (raw), then ^S Apply & Resume"),
+    (
+        "r / n",
+        "replay unchanged / compose (prefilled from the selection)",
+    ),
+    ("p / m / c", "pin host / mark / comment"),
+    ("P", "build a PoC from the selected flow"),
+    (
+        "F / S / @",
+        "findings · scope · agent panels · :scan the Scan view (keys below)",
+    ),
+    (
+        "L / :l4",
+        "L4 panel: capture / intercept availability and running captures",
+    ),
+    ("", ":l4 capture <iface> [inbound|outbound] · :l4 stop [<id>]"),
+    (
+        "b / s / m / u",
+        "L4 craft pane: build · inject (guarded) · apply to parked packet · revert",
+    ),
+    ("1-9 0 Tab", "content-type chips"),
+    ("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
+    (
+        "b / l / t",
+        "toggle sidebar · layout below/right · auto-select",
+    ),
+    (
+        "s",
+        "set / restore the system proxy (:sysproxy on|off|status)",
+    ),
+    ("y / o", "copy URL (OSC 52) · open externally"),
+    (
+        "/",
+        "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed ~l4 ~tcp ~udp ~icmp · & | ! ( )",
+    ),
+    (":", "command palette, every bus tool plus:"),
+];
+
+/// How many palette commands the help lists.
+const HELP_COMMANDS: usize = 14;
+
+/// The `:scope add l4` row (L4 parity spec §3 / AC39), listed after the
+/// palette commands only where the core can confirm an operator L4 scope
+/// add; against any other core help does not offer it.
+const SCOPE_ADD_L4_ROW: HelpRow = HelpRow::Command(
+    "scope add l4 …",
+    "Add an L4 scope entry: <cidr> <ports> <iface> <inbound|outbound> <capture|inject|intercept>",
+);
+
+/// The help overlay's closing line.
+const HELP_CLOSE: &str = " ↑↓ PgUp PgDn Home End scroll · any other key closes this help.";
+
+/// The help overlay's box width.
+const HELP_WIDTH: u16 = 110;
+
+/// One row of the help overlay, theme-free (fix round H, H23): the one
+/// table [`help_lines`] styles and the scroll clamps count, so the count
+/// can never drift from what is drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HelpRow {
+    /// A section heading (`Flow list`, `Scan`).
+    Heading(&'static str),
+    /// A key (or key group) and what it does.
+    Key(&'static str, String),
+    /// A palette command and its detail.
+    Command(&'static str, &'static str),
+    Blank,
+    /// The closing line ([`HELP_CLOSE`]).
+    Close,
+}
+
+/// Every row of the help overlay, in order: the flow list's keys and
+/// palette commands (plus [`SCOPE_ADD_L4_ROW`] when `scope_add_l4`, the
+/// one row that depends on the bus), the Scan section (its key groups
+/// joined by [`key_text`] from the tabs' own tables, [`HELP`]), a blank and
+/// the closing line. The reducer's scroll clamps and the view build the
+/// same table, so the count can never drift from what is drawn.
+fn help_rows(scope_add_l4: bool) -> Vec<HelpRow> {
+    let mut rows = vec![HelpRow::Heading("Flow list")];
+    rows.extend(
+        FLOW_KEYS
+            .iter()
+            .map(|(key, what)| HelpRow::Key(key, (*what).to_string())),
+    );
+    rows.extend(
+        BUILTIN_COMMANDS
+            .iter()
+            .take(HELP_COMMANDS)
+            .map(|(cmd, detail)| HelpRow::Command(cmd, detail)),
+    );
+    if scope_add_l4 {
+        rows.push(SCOPE_ADD_L4_ROW);
+    }
+    rows.push(HelpRow::Heading("Scan"));
+    rows.extend(
+        HELP.iter()
+            .map(|(key, groups)| HelpRow::Key(key, key_text(groups))),
+    );
+    rows.push(HelpRow::Blank);
+    rows.push(HelpRow::Close);
+    rows
+}
+
+/// [`help_rows`] styled for `theme`, one line per row.
+fn help_lines(theme: &Theme, scope_add_l4: bool) -> Vec<Line<'static>> {
+    help_rows(scope_add_l4)
+        .iter()
+        .map(|row| match row {
+            HelpRow::Heading(title) => heading(theme, title),
+            HelpRow::Key(key, what) => key_line(theme, key, what),
+            HelpRow::Command(cmd, detail) => Line::from(vec![
+                Span::styled(format!("   :{cmd:<26}"), theme.accent()),
+                Span::styled((*detail).to_string(), theme.text_tertiary()),
+            ]),
+            HelpRow::Blank => Line::raw(""),
+            HelpRow::Close => Line::styled(HELP_CLOSE, theme.text_tertiary()),
+        })
+        .collect()
+}
+
+/// The help box on `screen`: [`HELP_WIDTH`] wide, as tall as `lines` rows
+/// need up to the screen (fix round G, G89).
+fn help_box(screen: Rect, lines: usize) -> Rect {
+    centered(
+        screen,
+        HELP_WIDTH,
+        u16::try_from(lines + 2).unwrap_or(u16::MAX),
+    )
+}
+
+/// The furthest the help overlay scrolls on a `cols`x`rows` screen: the
+/// lines that do not fit inside its box (fix round G, G85). Zero when the
+/// screen is tall enough for all of them. `scope_add_l4` is
+/// [`crate::l4::supports_operator_scope_add`] over the app's tools, the one
+/// fact the help table depends on (the reducer's clamp passes the same).
+pub fn help_scroll_max(cols: u16, rows: u16, scope_add_l4: bool) -> usize {
+    let lines = help_rows(scope_add_l4).len();
+    let inner = help_box(Rect::new(0, 0, cols, rows), lines)
+        .height
+        .saturating_sub(2);
+    lines.saturating_sub(usize::from(inner))
+}
+
+/// The rows the help overlay shows at once on a `cols`x`rows` screen: its
+/// page for PgUp/PgDn.
+pub fn help_page(cols: u16, rows: u16, scope_add_l4: bool) -> usize {
+    usize::from(
+        help_box(Rect::new(0, 0, cols, rows), help_rows(scope_add_l4).len())
+            .height
+            .saturating_sub(2),
+    )
+    .max(1)
+}
+
+/// The help overlay: every key and palette command, scrolled by
+/// `app.help_scroll` when the screen is too short for all of its lines,
+/// with a `more` marker on the cut edge (fix round G, G85).
 pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let k = |a: &str, b: &str| key_line(theme, a, b);
-    let mut lines =
-        vec![
-        heading(theme, "Flow list"),
-        k("↑↓ j k", "move · PgUp/PgDn · g/G first/last"),
-        k(
-            "⏎ / Esc",
-            "inspect the selection · back (full screen below 120 columns)",
-        ),
-        k("Space", "quick-look the body"),
-        k("i", "arm / disarm intercept"),
-        k("a / A", "resume the targeted paused flow / resume all"),
-        k("d", "kill the targeted paused flow"),
-        k("e", "edit the paused request (raw), then ^S Apply & Resume"),
-        k(
-            "r / n",
-            "replay unchanged / compose (prefilled from the selection)",
-        ),
-        k("p / m / c", "pin host / mark / comment"),
-        k("P", "build a PoC from the selected flow"),
-        k(
-            "F / S / @",
-            "findings · scope · agent panels · :scan scan panel (r crawls, ⏎ opens a point's flow)",
-        ),
-        k(
-            "L / :l4",
-            "L4 panel: capture / intercept availability and running captures",
-        ),
-        k("", ":l4 capture <iface> [inbound|outbound] · :l4 stop [<id>]"),
-        k(
-            "b / s / m / u",
-            "L4 craft pane: build · inject (guarded) · apply to parked packet · revert",
-        ),
-        k("1-9 0 Tab", "content-type chips"),
-        k("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
-        k(
-            "b / l / t",
-            "toggle sidebar · layout below/right · auto-select",
-        ),
-        k(
-            "s",
-            "set / restore the system proxy (:sysproxy on|off|status)",
-        ),
-        k("y / o", "copy URL (OSC 52) · open externally"),
-        k(
-            "/",
-            "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed ~l4 ~tcp ~udp ~icmp · & | ! ( )",
-        ),
-        k(":", "command palette — every bus tool plus:"),
-    ];
-    for (cmd, detail) in BUILTIN_COMMANDS.iter().take(14) {
-        lines.push(Line::from(vec![
-            Span::styled(format!("   :{cmd:<26}"), theme.accent()),
-            Span::styled((*detail).to_string(), theme.text_tertiary()),
-        ]));
-    }
-    // The L4 scope add form exists only where the core can confirm it (spec
-    // §3 / AC39); against any other core help does not offer it.
-    if crate::l4::supports_operator_scope_add(&app.tools) {
-        lines.push(Line::from(vec![
-            Span::styled("   :scope add l4 …             ", theme.accent()),
-            Span::styled(
-                "Add an L4 scope entry: <cidr> <ports> <iface> <inbound|outbound> <capture|inject|intercept>",
-                theme.text_tertiary(),
-            ),
-        ]));
-    }
-    // `lines` is the body: the key and palette lines. The box wants the body,
-    // a blank spacer, the closing hint and the frame, and is never taller than
-    // the screen. On a short terminal the spacer goes first; then the tail of
-    // the body is replaced by a footer that counts exactly the body lines it
-    // hides, so the closing hint is never clipped and a footer never appears
-    // when nothing is hidden.
-    let closing = " Any key closes this help.";
-    let wanted = u16::try_from(lines.len().saturating_add(4)).unwrap_or(u16::MAX);
-    let area = centered(screen, 96, wanted.min(screen.height));
+    let lines = help_lines(theme, crate::l4::supports_operator_scope_add(&app.tools));
+    let area = help_box(screen, lines.len());
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
-    let visible = usize::from(inner.height);
-    if lines.len() + 2 <= visible {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(closing, theme.text_tertiary()));
-    } else if lines.len() < visible {
-        lines.push(Line::styled(closing, theme.text_tertiary()));
-    } else if visible > 0 {
-        let shown = visible - 1;
-        let hidden = lines.len() - shown;
-        lines.truncate(shown);
-        lines.push(Line::styled(
-            format!(" … {hidden} more lines need a taller window ·{closing}"),
-            theme.text_tertiary(),
-        ));
+    if inner.height == 0 {
+        return;
     }
-    lines_into(buf, inner, &lines, 0);
+    let max = lines.len().saturating_sub(usize::from(inner.height));
+    let scroll = usize::from(app.help_scroll).min(max);
+    lines_into(buf, inner, &lines, scroll);
+    let mut marker = |text: &str, y: u16| {
+        let row = fit(&format!(" {text}"), usize::from(inner.width));
+        buf.set_line(
+            inner.x,
+            y,
+            &Line::styled(row, theme.text_tertiary()),
+            inner.width,
+        );
+    };
+    if scroll < max {
+        marker("more ↓", inner.bottom() - 1);
+    }
+    if scroll > 0 {
+        marker("↑ more", inner.y);
+    }
 }
 
 pub fn quick_look(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
@@ -316,7 +417,7 @@ pub fn compose(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             theme.fg(&color::status::SUCCESS),
         ),
         Some(a) => Span::styled(
-            format!("{a} is out of scope — add it with :scope add"),
+            format!("{a} is out of scope: add it with :scope add"),
             theme.fg(&color::intercept::BASE),
         ),
         None => Span::styled("enter a URL", theme.text_tertiary()),
@@ -344,7 +445,7 @@ pub fn compose(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 }
 
 pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Scope — the authorised hosts", area, buf);
+    let inner = boxed(theme, "Scope: the authorised hosts", area, buf);
     let mut lines = vec![
         Line::styled(
             " Only in-scope hosts can be acted on (replay, edit, compose, PoC). Adding is a human action.",
@@ -354,7 +455,7 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     ];
     if app.scope.is_empty() {
         lines.push(Line::styled(
-            " Scope is empty — every flow is dimmed and read-only. Press a to add a host.",
+            " Scope is empty: every flow is dimmed and read-only. Press a to add a host.",
             theme.intercept_armed_quiet(),
         ));
     }
@@ -399,7 +500,7 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     lines.push(heading(theme, "L4 scope"));
     if app.l4.scope.is_empty() {
         lines.push(Line::styled(
-            " no L4 scope — nothing is captured, injected or intercepted at L4.",
+            " no L4 scope: nothing is captured, injected or intercepted at L4.",
             theme.text_tertiary(),
         ));
     }
@@ -466,12 +567,12 @@ fn rate_limit_readout(app: &App) -> String {
 }
 
 pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Findings — PoCs and runs", area, buf);
+    let inner = boxed(theme, "Findings · PoCs and runs", area, buf);
     if app.findings.is_empty() {
         buf.set_string(
             inner.x + 1,
             inner.y + 1,
-            "No findings — build a PoC from any flow with P.",
+            "No findings: build a PoC from any flow with P.",
             theme.text_tertiary(),
         );
         return;
@@ -588,7 +689,7 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         }
     } else {
         d.push(Line::styled(
-            " not run yet — r runs it (poc.run: target, then vars)",
+            " not run yet: r runs it (poc.run: target, then vars)",
             theme.text_tertiary(),
         ));
     }
@@ -652,7 +753,7 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 /// line per leaf. Nested keys join with `.`, arrays with `, `; `null` is a
 /// dash. Read-only.
 pub fn config(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Config — the redacted config.get view", area, buf);
+    let inner = boxed(theme, "Config: the redacted config.get view", area, buf);
     let mut lines = Vec::new();
     match &app.config {
         Some(v) => {
@@ -710,10 +811,10 @@ fn flatten_config(prefix: &str, v: &serde_json::Value, out: &mut Vec<(String, St
 }
 
 /// The CA panel (§3.6): the facts `ca.status` reports, and the three
-/// actions — `e` export, `i` install, `u` uninstall (the last two confirmed
+/// actions: `e` export, `i` install, `u` uninstall (the last two confirmed
 /// locally, see `CONFIRM_TOOLS`).
 pub fn ca(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "CA — the MITM certificate", area, buf);
+    let inner = boxed(theme, "CA: the MITM certificate", area, buf);
     let mut lines = Vec::new();
     match &app.ca_status {
         Some(serde_json::Value::Object(map)) if !map.is_empty() => {
@@ -777,7 +878,7 @@ fn l4_capabilities(app: &App, theme: &Theme, lines: &mut Vec<Line<'static>>) {
     let settable = app.has_tool("l4.agent.set");
     let keys = ["c", "i", "n", "w"];
     lines.push(Line::styled(
-        " L4 agent capabilities — each toggle is the gate that governs the agent L4 path",
+        " L4 agent capabilities: each toggle is the gate that governs the agent L4 path",
         theme.accent().add_modifier(Modifier::BOLD),
     ));
     for (gate, key) in crate::l4::L4Gate::ALL.into_iter().zip(keys) {
@@ -795,18 +896,18 @@ fn l4_capabilities(app: &App, theme: &Theme, lines: &mut Vec<Line<'static>>) {
         ]));
     }
     let note = if !app.l4.gates.present {
-        " (l4.agent.status is not on this bus — gate states unknown)"
+        " (l4.agent.status is not on this bus: gate states unknown)"
     } else if settable {
         " Toggle with the key; the agent can never flip its own gates."
     } else {
-        " Read-only here — set l4.allow_agent_* in config and restart (l4.agent.set is not on this bus)."
+        " Read-only here: set l4.allow_agent_* in config and restart (l4.agent.set is not on this bus)."
     };
     lines.push(Line::styled(note, theme.text_tertiary()));
     lines.push(Line::raw(""));
 }
 
 pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Agent (MCP) — policy and activity", area, buf);
+    let inner = boxed(theme, "Agent (MCP): policy and activity", area, buf);
     let policy_line = |p: AgentPolicy, key: &str, what: &str| -> Line<'static> {
         let on = app.agent.policy == Some(p);
         let dot = if on { "●" } else { "○" };
@@ -852,12 +953,12 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     ];
     l4_capabilities(app, theme, &mut lines);
     lines.push(Line::styled(
-        " Activity log — every command from every frontend (agent rows in teal)",
+        " Activity log: every command from every frontend (agent rows in teal)",
         theme.accent().add_modifier(Modifier::BOLD),
     ));
     if app.agent.log.is_empty() {
         lines.push(Line::styled(
-            "   (empty — needs core follow-up F2 for the audit ring)",
+            "   (empty: needs core follow-up F2 for the audit ring)",
             theme.text_tertiary(),
         ));
     }
@@ -882,4 +983,45 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         ]));
     }
     lines_into(buf, inner, &lines, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix round G, G85/G89 (fix round H, H23): the rows the reducer
+    /// clamps with are the lines the overlay draws, one each, and the box
+    /// is as tall as the lines need.
+    #[test]
+    fn help_rows_are_the_lines_drawn() {
+        let theme = Theme::new(true);
+        let lines = help_lines(&theme, false);
+        assert_eq!(help_rows(false).len(), lines.len());
+        assert_eq!(
+            help_rows(false).first(),
+            Some(&HelpRow::Heading("Flow list"))
+        );
+        assert_eq!(help_rows(false).last(), Some(&HelpRow::Close));
+        assert!(
+            help_rows(false)
+                .iter()
+                .any(|r| matches!(r, HelpRow::Key("Jobs", w) if w == &key_text(&[crate::ui::scan::JOBS_KEYS]))),
+            "the Scan section joins the Jobs table"
+        );
+        // The operator L4 scope add row is the one bus-dependent row (L4
+        // parity spec §3 / AC39): one more line, right after the commands.
+        let with = help_rows(true);
+        assert_eq!(with.len(), lines.len() + 1);
+        assert!(!help_rows(false).contains(&SCOPE_ADD_L4_ROW));
+        assert_eq!(
+            with.iter().position(|r| *r == SCOPE_ADD_L4_ROW),
+            Some(1 + FLOW_KEYS.len() + HELP_COMMANDS)
+        );
+        let tall = help_box(Rect::new(0, 0, 200, 50), lines.len());
+        assert_eq!(usize::from(tall.height), lines.len() + 2);
+        assert_eq!(help_scroll_max(200, 50, false), 0);
+        assert_eq!(help_scroll_max(100, 30, false), lines.len() - 28);
+        assert_eq!(help_scroll_max(100, 30, true), lines.len() + 1 - 28);
+        assert_eq!(help_page(100, 30, false), 28);
+    }
 }

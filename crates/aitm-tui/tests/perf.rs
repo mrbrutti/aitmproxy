@@ -113,7 +113,7 @@ fn five_thousand_flows_ingest_and_render_within_bounds() {
     assert!(items > 0);
 
     eprintln!(
-        "tester: 5000 flows — ingest {ingest:?}, refresh {refresh:?}, render 200×50 {render_time:?}, filter {filter_time:?} ({n} rows), palette {palette_time:?} ({items} items)"
+        "tester: 5000 flows: ingest {ingest:?}, refresh {refresh:?}, render 200×50 {render_time:?}, filter {filter_time:?} ({n} rows), palette {palette_time:?} ({items} items)"
     );
     for (what, d) in [
         ("ingest", ingest),
@@ -149,6 +149,6 @@ fn inspector_frames_with_a_five_megabyte_body_do_not_freeze() {
             slow.push(format!("{tab} tab frame {d:?}"));
         }
     }
-    eprintln!("tester: one inspector frame at 200×50 with a 5 MB body — {report}");
+    eprintln!("tester: one inspector frame at 200×50 with a 5 MB body: {report}");
     assert!(slow.is_empty(), "{}", slow.join(", "));
 }

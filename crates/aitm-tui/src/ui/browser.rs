@@ -14,10 +14,10 @@ use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::model::human_bytes;
+use crate::text::truncate;
 use crate::theme::Theme;
 use crate::tokens::color;
 use crate::ui::overlays::{boxed, lines_into};
-use crate::ui::text::truncate;
 
 /// At most this many outline lines are kept (plan task 10: "first 200 lines").
 pub const OUTLINE_MAX: usize = 200;
@@ -234,7 +234,7 @@ fn id_class(attrs: &str) -> (Option<String>, Vec<String>) {
 
 /// Draw the view into `area`.
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Browser — embedded obscura", area, buf);
+    let inner = boxed(theme, "Browser: embedded obscura", area, buf);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -349,11 +349,11 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 
     if n == 0 {
         let empty = if !has_tools {
-            "   this bus offers no browser.* tools — the proxy was built without the embedded browser"
+            "   this bus offers no browser.* tools: the proxy was built without the embedded browser"
         } else if b.busy.is_some() {
             ""
         } else {
-            "   no DOM yet — d reads the page"
+            "   no DOM yet: d reads the page"
         };
         lines_into(buf, list, &[Line::styled(empty, theme.text_tertiary())], 0);
         return;

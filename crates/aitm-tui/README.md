@@ -390,8 +390,11 @@ Three kinds of check, and nothing else counts as evidence:
   `BusEvent` literals (`summary` builds a `flow.get` row, `sample_app` two
   in-scope flows with details). For a degradation case — what a *missing*
   tool does — use `App::new` + `connect` with `PRE_MERGE_TOOLS` (the bus
-  before the newer tools) or any list. `draw` / `text_of` read the screen
-  through `ui::render` into an off-screen buffer. The wall-clock-bounded
+  before the newer tools) or any list. The `scan_v2_*` suites also read
+  the `aitm-scan-model` contract pack (`fixture("scan.issue.json")` and
+  its siblings): wire-shape examples pinned against the engine by that
+  crate's own tests, not a recorded session. `draw` / `text_of` read the
+  screen through `ui::render` into an off-screen buffer. The wall-clock-bounded
   tests are their own binary, `tests/perf.rs`; the bus task's are
   `tests/bus_task.rs`, against a transport whose replies are literals.
 - **The real-server contract.** `cargo test -p aitm --test tui_live_bus`
