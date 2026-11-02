@@ -741,6 +741,8 @@ impl RawH2Client {
                 Some(gate) => Some(gate.check_live("raw h2 probe", &authority, &host, &ips)?),
                 None => None,
             };
+            // A pre-validated address is the one address `ips` held and the
+            // gate just passed; otherwise the first address the name resolved.
             let addr = match plan.target.addr {
                 Some(addr) => addr,
                 None => ips

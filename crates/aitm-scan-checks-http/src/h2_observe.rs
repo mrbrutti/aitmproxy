@@ -46,7 +46,7 @@
 //! [`ProbeHost::charge`] of one unit per stream the plan will open — and one
 //! for the stream-less settings probe, `max(1)` — **before** the origin is
 //! claimed and before the dial. The engine's host spends the job's budget
-//! and paces through the guard, so the streams are budgeted and counted in
+//! (pacing is the dial permit's, below), so the streams are budgeted and counted in
 //! `scan.status.probes`; when it refuses, nothing is opened and the verdict
 //! is `Inconclusive` (plan amendment A5, T3-6). The connection is also paced
 //! and scope-checked at the dial by the driver's own `check_active` permit.
@@ -538,7 +538,7 @@ impl Check for H2Check {
         &self.meta
     }
 
-    /// Ten gates stand between a point and the raw connection, in this
+    /// Eleven gates stand between a point and the raw connection, in this
     /// order, and each one that fails returns `Inconclusive` with nothing
     /// sent:
     ///

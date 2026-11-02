@@ -61,12 +61,15 @@ fn load(reg) {
             let url = origin + path;
             let reply = probe.raw(#{ method: "GET", url: url });
             if reply.status == 200 {
-                // `matched` is what the path answered; the model bounds it at
-                // 256 bytes, so the script hands it over whole.
+                // `matched` says only that and how much the path answered. The
+                // body of a `/.env` or a `web.config` is credential material by
+                // definition, and a manual `check.paths` hands the verdict to
+                // its caller unscrubbed, so the body itself stays out of the
+                // evidence; the operator has the URL to look for themselves.
                 verdicts.push(#{
                     outcome: "vulnerable",
                     confidence: "firm",
-                    evidence: #{ payload: "GET " + url, matched: reply.body },
+                    evidence: #{ payload: "GET " + url, matched: "HTTP " + reply.status + ", " + reply.body.len() + " bytes" },
                     detail: `${path} answered ${reply.status} on ${origin}; this well-known path should not be served.`,
                     location: #{ path: path },
                 });

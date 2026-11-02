@@ -35,11 +35,12 @@ const META = #{
 
 fn load(reg) {
     reg.add_check(META, |point| {
-        // The element name is the job's own marker — the collision-resistant
-        // token the job already stamps its traffic with. Random letters would
-        // do as well for uniqueness, but the marker is stable for the run, so
-        // the document quoted in the finding is byte-for-byte the document
-        // that was sent, and an operator can replay it.
+        // The element name is the job's own marker, the token the job stamps
+        // its traffic with. The host mints it fresh on every call, so it is
+        // taken once here and the same value builds the document, the
+        // evidence and the hint: the document quoted in the finding is
+        // byte-for-byte the document that was sent, and an operator can
+        // replay it.
         let tag = probe.marker();
         let reference = "&" + tag + ";";
         let document = `<?xml version="1.0"?>` +

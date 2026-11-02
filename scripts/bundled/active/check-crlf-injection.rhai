@@ -35,8 +35,9 @@ const META = #{
 fn load(reg) {
     reg.add_check(META, |point| {
         let base = if type_of(point.example) == "string" { point.example } else { "x" };
-        // The job's own marker, not random letters: it is collision-resistant
-        // and the same for every probe of this job, so the canary in a reply
+        // The job's own marker, not random letters: the host mints it fresh on
+        // every call, so it is taken once here and reused for the payload, the
+        // evidence and the hint, and the canary in a reply
         // can be tied back to the run that put it there — and the PoC below,
         // replayed later, looks for a value that is written down rather than
         // one that was thrown away when the check returned.

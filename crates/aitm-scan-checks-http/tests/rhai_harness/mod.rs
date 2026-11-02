@@ -16,10 +16,9 @@
 //! green run here says the script is well-formed and decides correctly on the
 //! shapes it was shown; it says nothing about the scanner in the field.
 
-#![allow(dead_code)] // Tasks 12-16 use the rest of this surface.
+#![allow(dead_code)] // Each test binary compiles its own copy of this module and uses a different subset.
 
 use std::fs;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -191,11 +190,6 @@ impl Loaded {
     pub fn source(&self) -> &str {
         &self.source
     }
-
-    /// The file the script was loaded from.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl std::fmt::Debug for Loaded {
@@ -252,14 +246,6 @@ impl Replies {
     pub fn baseline_headers(self, headers: &[(&str, &str)]) -> Self {
         Self {
             host: self.host.with_baseline_headers(owned(headers)),
-        }
-    }
-
-    /// The address the baseline is pretended to have come from.
-    #[must_use]
-    pub fn peer(self, addr: SocketAddr) -> Self {
-        Self {
-            host: self.host.with_peer(addr),
         }
     }
 

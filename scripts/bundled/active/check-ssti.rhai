@@ -2,7 +2,7 @@
 //
 // A template engine that renders request data evaluates expressions written in
 // its own syntax. The probe asks it to multiply two primes: if `73*79` comes
-// back as 5767 next to a per-run tag, the value was evaluated, not echoed. The
+// back as 5767 next to a marker tag, the value was evaluated, not echoed. The
 // product is a detection marker, not a code-execution payload — nothing is
 // read, written or executed beyond the arithmetic.
 //
