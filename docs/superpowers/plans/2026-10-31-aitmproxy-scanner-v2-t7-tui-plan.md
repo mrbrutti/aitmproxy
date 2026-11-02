@@ -774,6 +774,9 @@ Kept by the main session during stage 6. One row per finding.
 | H86 | fix round | done | `955e84c8`: `bound_summary` cuts every free string and the `jobs` list of each `scan.issues` page row at fold (before `rows` is built); two tests (200 ids of 2000 chars; 18 strings of 5000 chars) | panel over `3efafab6..955e84c8` |
 | 15 | live smoke | run 9 | 56 ok, 0 noted, 0 failed on the merged tree `955e84c8` (engine = main `2044ac52`, target 300 ms, T10 harness from `b9452781`; `/tmp/claude/t7-live-smoke13`): the definitive run | panel verdicts, workspace gate, un-draft |
 | 17 | security | PASS | two Minor: `forget_job` keeps an issue whose `jobs` repeats the sole finder or disagrees with `job` (predicate `jobs.len()==1`); Issues `next_cursor` stored unbounded (pre-existing, G16 parity) | fix round I (both) |
+| 17 | quality | FAIL | Important: `bound_summary` copies `bound_issue`'s shared-field list (next `IssueLocation` string lands in one bounder only); Minor: ` +n` built three ways, `forget_job` clones per issue, four stale doc comments and the README Testing bullet, legacy suite duplicates a robustness test and asserts loosely, H84 `+n` expectation restates the formula, three `screen` helpers | fix round I (I1, I2, I4-I8, I10, I11) |
+| 17 | spec | PASS | Minor: H40 `Findings · PoCs and runs` pin not re-homed; D11 literals and D3 shapes lag the `l4`/`job` lines and the Site map `job` head; spec still names `l4_surface.rs`/`scan_surface.rs`/`bus-fixture.json`; umbrella `scan.sitemap` verb row lacks `job` (coordinator) | I9; spec amended `60cbad9f`; umbrella row relayed |
+| I | fix round | dispatched | `docs/superpowers/plans/2026-11-01-aitmproxy-scanner-v2-t7-fix-round-i.md` I1-I11 | re-gate (crate + workspace) and re-run the cell on the final head |
 
 ## Shipped
 
