@@ -344,6 +344,14 @@ pub struct L4Options {
     pub max_bytes_per_s: u32,
     /// The messages mutation starts from. Empty means the grammar supplies them.
     pub seeds: Vec<L4Seed>,
+    /// The packet or message fields the lane may mutate, as field paths
+    /// (`tcp.flags`, `udp.length`, `raw`, a grammar field path).
+    ///
+    /// Empty — the default — means the lane's own full default table. A path the
+    /// lane refuses to fuzz (spec D8.4 names `dst`, `dst_port`, `interface`,
+    /// `ether.src`/`dst` and `ipv4.src`/`ipv6.src`) is rejected by the lane's
+    /// `Lane::validate`, so the job never starts.
+    pub fields: Vec<String>,
     /// Build every case and report what would be sent, sending nothing.
     pub dry_run: bool,
 }
@@ -357,6 +365,7 @@ impl Default for L4Options {
             consecutive_timeouts: 20,
             max_bytes_per_s: 65_536,
             seeds: Vec::new(),
+            fields: Vec::new(),
             dry_run: false,
         }
     }
@@ -646,6 +655,44 @@ mod tests {
             ..IgnoreRule::default()
         }
         .is_valid());
+    }
+
+    /// Coordinator decision 2 (spec D8.4): an operator may name the L4 fields
+    /// the lane fuzzes. The key is additive — a profile written before T1b, and
+    /// every built-in, reads as an empty list, which means "the lane's full
+    /// default table".
+    #[test]
+    fn l4_fields_default_empty_and_round_trip() {
+        let minimal: ScanProfile =
+            serde_yaml::from_str("name: mini\n").expect("a minimal profile parses");
+        assert!(minimal.l4.fields.is_empty());
+        assert!(L4Options::default().fields.is_empty());
+
+        let named: ScanProfile = serde_yaml::from_str("name: t\nl4:\n  fields: [tcp.flags, raw]\n")
+            .expect("a profile naming fields parses");
+        assert_eq!(
+            named.l4.fields,
+            vec!["tcp.flags".to_string(), "raw".to_string()]
+        );
+
+        let yaml = serde_yaml::to_string(&named).expect("serializes as YAML");
+        assert_eq!(
+            serde_yaml::from_str::<ScanProfile>(&yaml).expect("round trips"),
+            named
+        );
+
+        for profile in builtin_profiles() {
+            assert!(
+                profile.l4.fields.is_empty(),
+                "{}: a built-in names no L4 field",
+                profile.name
+            );
+        }
+
+        // The profile tree stays strict: a typo inside `l4` is still an error.
+        let err = serde_yaml::from_str::<ScanProfile>("name: t\nl4:\n  feilds: [raw]\n")
+            .expect_err("a mistyped key is an error");
+        assert!(err.to_string().contains("feilds"), "{err}");
     }
 
     #[test]

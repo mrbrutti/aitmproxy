@@ -250,21 +250,6 @@ family:
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `check.cmdi` | `[--args <json-object>]` | Confirm OS command injection in { url, param } |
-| `check.cors` | `[--args <json-object>]` | Probe { url } CORS with a canary Origin |
-| `check.crlf` | `[--args <json-object>]` | Confirm CRLF header injection in { url, param } |
-| `check.methods` | `[--args <json-object>]` | Send OPTIONS to { url } and report Allow |
-| `check.ldapi` | `[--args <json-object>]` | Confirm LDAP injection in { url, param } |
-| `check.nosqli` | `[--args <json-object>]` | Confirm NoSQL operator injection in { url, param, value? } |
-| `check.open_redirect` | `[--args <json-object>]` | Set { url, param } to a canary and check the redirect |
-| `check.path_traversal` | `[--args <json-object>]` | Confirm path traversal / LFI in { url, param } |
-| `check.headers` | `[--args <json-object>]` | Fetch { url } and report missing security headers |
-| `check.paths` | `[--args <json-object>]` | Probe { base } for well-known sensitive paths |
-| `check.sqli` | `[--args <json-object>]` | Confirm SQL injection in { url, param, value? } (error + boolean) |
-| `check.ssrf` | `[--args <json-object>]` | Confirm SSRF in { url, param } via metadata/internal targets |
-| `check.ssti` | `[--args <json-object>]` | Confirm template injection in { url, param } |
-| `check.xss` | `[--args <json-object>]` | Confirm reflected XSS in { url, param } (unencoded reflection) |
-| `check.xxe` | `[--args <json-object>]` | Confirm in-band XXE at { url } (XML endpoint) |
 
 ## `l4.*`
 
@@ -340,6 +325,41 @@ family:
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `scan.discover` | `--target <string> [--max_depth <int>] [--max_pages <int>]` | Discover reachable in-scope URLs under `target` (same-origin, scope-bound, budget-capped) and enumerate the injection points visible in captured requests. No injection or fuzzing is performed. `max_depth`/`max_pages` may lower the configured caps, never raise them. A navigation that lands off-origin or out of scope (a redirect) aborts the crawl with `stopped_reason = "left_scope"`. While the crawl runs the proxy's browser-egress posture is held confined, so the embedded browser cannot fetch an out-of-scope public host (sub-resource or redirect target); the hold is released when the command returns. Only one discovery runs at a time (crawls share one browser page); a second call while one is running is refused immediately — wait for it to finish. Needs the embedded browser for a real crawl; see `docs/scanner.md`. |
+| `scan.discover` | `--target <string> [--max_depth <int>] [--max_pages <int>]` | **Deprecated** — superseded by `scan.start` / `scan.map`, which run the same crawl as a job; kept for existing callers. (Write) Discover reachable in-scope URLs under `target` (same-origin, scope-bound, budget-capped) and enumerate the injection points visible in captured requests. No injection or fuzzing is performed. `max_depth`/`max_pages` may lower the configured caps, never raise them. A navigation that lands off-origin or out of scope (a redirect) aborts the crawl with `stopped_reason = "left_scope"`. While the crawl runs the proxy's browser-egress posture is held confined, so the embedded browser cannot fetch an out-of-scope public host (sub-resource or redirect target); the hold is released when the command returns. Only one discovery runs at a time (crawls share one browser page); a second call while one is running is refused immediately — wait for it to finish. Needs the embedded browser for a real crawl; see `docs/scanner.md`. |
+| `scan.start` | `[--profile <json>] [--profile_name <string>] [--target <string>] [--overrides <json>]` | (Sensitive) Accept a scan job against an authorized, in-scope target and return its job id at once; poll `scan.status`. One of `profile`, `profile_name` or `target` selects the profile, `overrides` is merged over it. Figures above a configured ceiling are clamped, not refused; a lane this build lacks is skipped. |
+| `scan.map` | `[--profile <json>] [--profile_name <string>] [--target <string>] [--overrides <json>]` | (Write) Map one target as a job: crawl it, run the passive checks and enumerate its insertion points. Forced to `lanes: [http]` and `intensity: passive`, so no probe is ever sent. Read the result with `scan.sitemap` and `scan.issues`. |
+| `scan.status` | `--job <string>` | (Read) One job's full status: state, phase, elapsed, probe and point counters, issues by severity, lanes, clamps and the stopped reason. |
+| `scan.list` | `[--active_only <bool>] [--limit <int>]` | (Read) Scan jobs newest first — the live ones plus the retained finished history. `active_only` keeps those that have not reached a terminal state. |
+| `scan.cancel` | `--job <string>` | (Write) Ask a running job to stop; returns its status. Idempotent, and the issues it already raised are kept. |
+| `scan.issues` | `[--job <string>] [--target <string>] [--severity_min <string>] [--confidence_min <string>] [--class <string>] [--lane <string>] [--status <string>] [--since <int>] [--limit <int>] [--cursor <string>]` | (Read) One filtered, paged slice of the issue store, ordered by severity then first seen then id. Every parameter narrows; page with `next_cursor` passed back as `cursor`. |
+| `scan.issue` | `--id <string>` | (Read) One issue in full: evidence, location, the probe flows behind it and any linked PoC or finding record. |
+| `scan.issue.update` | `--id <string> --status <string> [--note <string>]` | (Write) Triage one issue — set its status (for example `false_positive`) and an optional note. Persisted, so it survives a core restart. |
+| `scan.sitemap` | `[--job <string>] [--target <string>] [--cursor <string>] [--limit <int>]` | (Read) The crawled site tree for a job or target, paged: nodes with their URLs, methods and the insertion points found on them. |
+| `scan.checks` | `[--lane <string>] [--class <string>] [--origin <string>]` | (Read) The live check catalogue with each entry's full metadata, optionally filtered by lane, issue class or origin (native, bundled or custom). |
+| `scan.profile.list` | — | (Read) Every scan profile this build can resolve: the built-ins, the `scanner.profiles:` config section and the ones saved on disk. |
+| `scan.profile.get` | `--name <string>` | (Read) One resolved scan profile in full, as `scan.start` would run it. |
+| `scan.profile.save` | `--profile <json>` | (Write) Save a named scan profile under the findings directory; it shadows a configured or built-in profile of the same name. |
+| `scan.profile.delete` | `--name <string>` | (Write) Delete a saved scan profile. A built-in profile cannot be deleted; the saved one shadowing it is what goes. |
+| `scan.session.preview` | `--target <string>` | (Read) Preview the authenticated session a scan of `target` would reuse — which cookies and headers carry over — without starting a job. |
 | `scan.passive` | `[--target <string>]` | Run the passive checks (reflected request parameters, missing security headers, cookie flags) over the flows already captured for `target`, or over every captured flow when `target` is absent. Issues no traffic. Findings carry the parameter, header or cookie NAME, never its value. |
 | `scan.report` | `[--target <string>]` | Fold the recorded findings into `report_md` (one markdown section per finding) and `index` (one {poc_path, target_path, class, passed, control_passed, finding_capture, screenshot_path} entry per finding). `target` selects the findings recorded against that origin, or against a path under it. Empty when no findings directory is configured. Credentials are masked. |
+| `check.cmdi` | `[--args <json-object>]` | Confirm OS command injection in { url, param } |
+| `check.cors` | `[--args <json-object>]` | Probe { url } CORS with a canary Origin |
+| `check.crlf` | `[--args <json-object>]` | Confirm CRLF header injection in { url, param } |
+| `check.methods` | `[--args <json-object>]` | Send OPTIONS to { url } and report Allow |
+| `check.ldapi` | `[--args <json-object>]` | Confirm LDAP injection in { url, param } |
+| `check.nosqli` | `[--args <json-object>]` | Confirm NoSQL operator injection in { url, param, value? } |
+| `check.open_redirect` | `[--args <json-object>]` | Set { url, param } to a canary and check the redirect |
+| `check.path_traversal` | `[--args <json-object>]` | Confirm path traversal / LFI in { url, param } |
+| `check.headers` | `[--args <json-object>]` | Fetch { url } and report missing security headers |
+| `check.paths` | `[--args <json-object>]` | Probe { base } for well-known sensitive paths |
+| `check.sqli` | `[--args <json-object>]` | Confirm SQL injection in { url, param, value? } (error + boolean) |
+| `check.ssrf` | `[--args <json-object>]` | Confirm SSRF in { url, param } via metadata/internal targets |
+| `check.ssti` | `[--args <json-object>]` | Confirm template injection in { url, param } |
+| `check.xss` | `[--args <json-object>]` | Confirm reflected XSS in { url, param } (unencoded reflection) |
+| `check.xxe` | `[--args <json-object>]` | Confirm in-band XXE at { url } (XML endpoint) |
+| `check.xss-reflected` | `--url <string> --param <string> [--value <string>]` | (Sensitive) Run catalogue check `xss-reflected` by hand on one query parameter of an in-scope URL: a benign marker comes back unencoded in an HTML response. The request is synthesized in memory and never enters the flow store; probes are budgeted and bounded by `scanner.check_timeout_s`. |
+| `check.open-redirect` | `--url <string> --param <string> [--value <string>]` | (Sensitive) Run catalogue check `open-redirect` by hand on one query parameter of an in-scope URL: a parameter steers a redirect to an attacker-chosen origin. The request is synthesized in memory and never enters the flow store; probes are budgeted and bounded by `scanner.check_timeout_s`. |
+| `check.reflection` | `--url <string> --param <string> [--value <string>]` | (Sensitive) Run catalogue check `reflection` by hand on one query parameter of an in-scope URL: a request parameter value is echoed in the response body. The request is synthesized in memory and never enters the flow store; probes are budgeted and bounded by `scanner.check_timeout_s`. |
+| `check.security-header` | `--url <string> --param <string> [--value <string>]` | (Sensitive) Run catalogue check `security-header` by hand on one query parameter of an in-scope URL: a response is missing a security header the browser relies on. The request is synthesized in memory and never enters the flow store; probes are budgeted and bounded by `scanner.check_timeout_s`. |
+| `check.cookie-flag` | `--url <string> --param <string> [--value <string>]` | (Sensitive) Run catalogue check `cookie-flag` by hand on one query parameter of an in-scope URL: a `Set-Cookie` is missing `Secure` and/or `HttpOnly`. The request is synthesized in memory and never enters the flow store; probes are budgeted and bounded by `scanner.check_timeout_s`. |

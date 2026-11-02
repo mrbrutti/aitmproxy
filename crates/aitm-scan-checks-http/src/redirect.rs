@@ -93,6 +93,7 @@ impl OpenRedirect {
                 // `url` trait (spec D4, "skip checks unlikely to be effective").
                 wants_traits: Some(vec![PointTrait::Url]),
                 targets_session: false,
+                scope: aitm_scan_model::CheckScope::Point,
                 cwe: Some(601),
                 description: "Sets the point to a non-resolving canary host in three forms \
                               (absolute, scheme-relative and backslash) and reports when the \
@@ -191,6 +192,8 @@ fn redirected(
                 expect: vec![Assertion::Not(Box::new(canary_matcher))],
             }),
         }),
+        location: None,
+        more: Vec::new(),
     }
 }
 

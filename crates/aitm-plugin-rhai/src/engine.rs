@@ -57,6 +57,10 @@ pub enum RunKind {
     Load,
     /// A script-registered command invoked from a frontend.
     Command,
+    /// A scanner check's `run` (D4): its probes route through the job's client
+    /// under the per-check wall budget, not the 2 s hook budget, and each probe
+    /// is bounded by [`probe_budget`].
+    Check,
     /// A PoC `script` step.
     PocStep,
 }
@@ -78,6 +82,18 @@ impl Budget {
             max_operations: cfg.limits.max_operations,
             hook_timeout: cfg.hook_timeout,
             browser_timeout: cfg.browser_timeout,
+        }
+    }
+
+    /// The budget a scanner check's `run` gets (D4 "Timing without `sleep`"):
+    /// the per-check wall budget (`check_timeout` from the profile, default
+    /// 60 s) as the run's `hook_timeout`, with every other field from `base`.
+    /// A check is bounded by this rather than the 2 s hook budget so a timing
+    /// probe can wait out a server-side delay without aborting the run.
+    pub fn for_check(base: Budget, check_timeout: Duration) -> Budget {
+        Budget {
+            hook_timeout: check_timeout,
+            ..base
         }
     }
 }
@@ -153,6 +169,20 @@ pub struct RunGuard {
     previous: Option<Run>,
 }
 
+/// How far out a deadline is pushed when `now + timeout` does not fit in an
+/// `Instant`: one year, which is "never" for any run and still a real instant
+/// the progress callback can compare against.
+const FAR_FUTURE: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// `now + timeout`, or a far-future instant when the addition would overflow
+/// (a `check_timeout_s` at the top of `u64` must not panic the engine thread;
+/// it means "no wall limit", and a far-future deadline is exactly that).
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now.checked_add(FAR_FUTURE).unwrap_or(now))
+}
+
 /// Open a run of `kind` under `budget`: its deadline is `hook_timeout` from
 /// now, and its `browser_timeout` is what each `browser.*` host call gets.
 /// Every dispatcher (hook, `load`, command, PoC step) calls this before
@@ -160,7 +190,7 @@ pub struct RunGuard {
 pub fn begin_run(kind: RunKind, budget: Budget) -> RunGuard {
     let run = Run {
         kind,
-        deadline: Instant::now() + budget.hook_timeout,
+        deadline: deadline_after(budget.hook_timeout),
         hook_timeout: budget.hook_timeout,
         browser_timeout: budget.browser_timeout,
     };
@@ -189,6 +219,18 @@ pub fn remaining_budget() -> Option<Duration> {
     })
 }
 
+/// The hardest cap on a single scanner probe (D4): a probe never waits longer
+/// than this, whatever the check's wall budget leaves.
+pub const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The wall-clock a single scanner probe may take in the current run (D4):
+/// `min(remaining, 30 s)`, or `None` outside any run. A check's `http.send`
+/// awaits for this instead of the whole hook remainder, so one slow probe
+/// cannot consume the rest of the check's budget.
+pub fn probe_budget() -> Option<Duration> {
+    remaining_budget().map(|r| r.min(MAX_PROBE_TIMEOUT))
+}
+
 /// The wall-clock one `browser.*` host call may take in the current run
 /// (T9), or `None` outside any run. A per-call figure, not a remainder: each
 /// browser call gets the whole of it.
@@ -205,7 +247,7 @@ pub fn browser_budget() -> Option<Duration> {
 pub fn extend_deadline() {
     RUN.with(|cell| {
         if let Some(mut run) = cell.get() {
-            run.deadline = run.deadline.max(Instant::now() + run.hook_timeout);
+            run.deadline = run.deadline.max(deadline_after(run.hook_timeout));
             cell.set(Some(run));
         }
     });

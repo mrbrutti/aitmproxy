@@ -1,0 +1,27 @@
+app pid=49659
+first window 33902 origin 1105 -979 size 560 555
+setup sheet: Not Now clicked
+window 33898 origin 461 -1264 size 1848 1126
+17:51:27.651 shot 61-scope-page
+scope.json before: 
+scope.json after ok.test: {"hosts":["ok.test"]}
+core 49725 scope.list "structuredContent":["ok.test"],"isError":false}
+17:51:34.129 shot 62-refused-not-added
+scope.json after the refused add: {"hosts":["ok.test"]}
+core 49725 scope.list "structuredContent":["ok.test"],"isError":false}
+retry clicked
+17:51:36.809 shot 63-after-retry
+scope.json after Retry: {"hosts":["ok.test"]}
+core 49725 scope.list "structuredContent":["ok.test"],"isError":false}
+17:51:39.046 shot 64-dropped
+scope.json after x: {"hosts":["ok.test"]}
+core 49725 scope.list "structuredContent":["ok.test"],"isError":false}
+17:51:41.934 return pressed
+17:51:47.565 shot 65-landed
+scope.json after the restart add: {"hosts":["ok.test","during.restart"]}
+core 50074 scope.list "structuredContent":["ok.test","during.restart"],"isError":false}
+17:51:50.849 shot 66-remove-after-restart
+scope.json after x on ok.test: {"hosts":["during.restart"]}
+core 50074 scope.list "structuredContent":["during.restart"],"isError":false}
+leftovers: none
+final exit 0

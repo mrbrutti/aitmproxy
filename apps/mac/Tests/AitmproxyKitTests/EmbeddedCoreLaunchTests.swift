@@ -479,6 +479,120 @@ import Testing
         #expect(scoped.count > scopeless.count)
     }
 
+    // MARK: System-proxy block (SP-AC25)
+
+    private func config(systemProxyAuto: Bool = false, systemProxyBypass: [String] = []) -> EmbeddedCoreLaunch.Config {
+        EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            systemProxyAuto: systemProxyAuto, systemProxyBypass: systemProxyBypass
+        )
+    }
+
+    @Test func systemProxyBlockIsByteIdenticalToTheCoreParseInput() throws {
+        // The core's `crates/aitm/src/config_file.rs` `system_proxy_block_the_mac_app_emits_parses`
+        // test parses exactly this text: a top-level `system_proxy:` at column 0, `  auto: true`,
+        // `  bypass:` and one double-quoted `- "<host>"` line per host indented four,
+        // newline-terminated. What the app writes is what the core is proven to accept (SP-AC25).
+        let block = "system_proxy:\n  auto: true\n  bypass:\n    - \"corp.test\"\n"
+        #expect(try config(systemProxyAuto: true, systemProxyBypass: ["corp.test"]).yaml().hasSuffix(block))
+
+        // Pin the literal to its source: the Rust test must still spell this exact text. This
+        // file lives at apps/mac/Tests/AitmproxyKitTests/, so the repo root is five levels up.
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let source = root.appending(path: "crates/aitm/src/config_file.rs")
+        try #require(
+            FileManager.default.fileExists(atPath: source.path),
+            "cannot find the core's src/config_file.rs at \(source.path)")
+        let rust = try String(contentsOf: source, encoding: .utf8)
+        let rustLiteral = "\"" + block
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n") + "\""
+        #expect(rust.contains(rustLiteral), "src/config_file.rs no longer contains the literal \(rustLiteral)")
+        #expect(rust.contains("fn system_proxy_block_the_mac_app_emits_parses()"))
+    }
+
+    @Test func systemProxyBlockIsAbsentWhenOffAndEmpty() throws {
+        // A Config built without the two new parameters — every pre-existing call site — emits
+        // no `system_proxy` block, so the core keeps its `auto: false`, empty-bypass default.
+        let defaults = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
+        #expect(defaults.systemProxyAuto == false)
+        #expect(defaults.systemProxyBypass == [])
+        #expect(!(try defaults.yaml()).contains("system_proxy"))
+        // Explicitly off with an empty list is the same as the default.
+        #expect(!(try config(systemProxyAuto: false, systemProxyBypass: []).yaml()).contains("system_proxy"))
+    }
+
+    @Test func systemProxyBypassOnlyEmitsAutoFalse() throws {
+        // A bypass list with the launch toggle off still needs the block (the list is honoured on
+        // a live set), and `auto` is written out as `false` so the file says what the operator chose.
+        let yaml = try config(systemProxyBypass: ["a.test"]).yaml()
+        #expect(yaml.contains("system_proxy:\n  auto: false\n  bypass:\n    - \"a.test\"\n"))
+        #expect(yaml.hasSuffix("system_proxy:\n  auto: false\n  bypass:\n    - \"a.test\"\n"))
+    }
+
+    @Test func systemProxyAutoOnlyEmitsNoBypassKey() throws {
+        // The launch toggle alone emits `auto: true` and no `bypass:` key at all — the core's
+        // default (empty) list is what an absent key parses to.
+        let yaml = try config(systemProxyAuto: true).yaml()
+        #expect(yaml.hasSuffix("\nsystem_proxy:\n  auto: true\n"))
+        #expect(!yaml.contains("bypass"))
+    }
+
+    @Test func aBypassHostWithANewlineThrows() {
+        // A bypass host with a newline could break out of its double-quoted scalar and inject
+        // YAML into the token-bearing config; the same guard as scope hosts, the same error.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\nlisten: 0.0.0.0:1")) {
+            try config(systemProxyAuto: true, systemProxyBypass: ["ok.test", "evil.test\nlisten: 0.0.0.0:1"]).yaml()
+        }
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\r\nx")) {
+            try config(systemProxyBypass: ["evil.test\r\nx"]).yaml()
+        }
+    }
+
+    @Test func systemProxyBlockIsTheLastTailAfterScope() throws {
+        // All four tails at once: each top-level key appears exactly once, at column 0, in the
+        // order ssl_insecure, macos_capture, scope, system_proxy — so every byte-exact
+        // `hasSuffix` on a system-proxy-less config still holds.
+        let all = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true, scopeHosts: ["api.example.test"],
+            systemProxyAuto: true, systemProxyBypass: ["corp.test"]
+        )
+        let yaml = try all.yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "ssl_insecure: true" }.count == 1)
+        #expect(lines.filter { $0 == "macos_capture:" }.count == 1)
+        #expect(lines.filter { $0 == "scope:" }.count == 1)
+        #expect(lines.filter { $0 == "system_proxy:" }.count == 1)
+        let ssl = try #require(lines.firstIndex(of: "ssl_insecure: true"))
+        let capture = try #require(lines.firstIndex(of: "macos_capture:"))
+        let scope = try #require(lines.firstIndex(of: "scope:"))
+        let systemProxy = try #require(lines.firstIndex(of: "system_proxy:"))
+        #expect(ssl < capture)
+        #expect(capture < scope)
+        #expect(scope < systemProxy)
+        #expect(yaml.hasSuffix("scope:\n  entries:\n    - \"api.example.test\"\n\nsystem_proxy:\n  auto: true\n  bypass:\n    - \"corp.test\"\n"))
+        // The block only ever appends: everything before it is byte-identical without it.
+        let without = try EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true, scopeHosts: ["api.example.test"]
+        ).yaml()
+        #expect(yaml.hasPrefix(without))
+        // Scope-less, system-proxy-less configs are unchanged.
+        #expect(try config(scopeHosts: ["api.example.test"]).yaml().hasSuffix("scope:\n  entries:\n    - \"api.example.test\"\n"))
+    }
+
     // MARK: Config path escaping (S3)
 
     @Test func config_paths_are_escaped_for_a_double_quoted_scalar() throws {
@@ -612,6 +726,70 @@ import Testing
         #expect(picked != nil)
         #expect(picked != held)
         if let picked { #expect(EmbeddedCoreLaunch.isPortFree(picked)) }
+    }
+
+    // MARK: System-proxy block — edges (tester, stage 5, SP-AC25)
+
+    @Test func systemProxyBypassHostsAreEscapedForTheDoubleQuotedScalar() throws {
+        // A quote or a backslash in a host is backslash-escaped inside its scalar (the scope hosts' rule), so a
+        // crafted host cannot close the scalar; everything else is written as typed.
+        let yaml = try config(systemProxyAuto: true, systemProxyBypass: ["a\"b.test", "back\\slash.test", "*.local", "bücher.test"]).yaml()
+        #expect(yaml.hasSuffix("system_proxy:\n  auto: true\n  bypass:\n    - \"a\\\"b.test\"\n    - \"back\\\\slash.test\"\n"
+                               + "    - \"*.local\"\n    - \"bücher.test\"\n"))
+    }
+
+    @Test func systemProxyBypassKeepsOrderAndWritesEveryHost() throws {
+        let yaml = try config(systemProxyBypass: ["z.test", "a.test", "m.test"]).yaml()
+        #expect(yaml.hasSuffix("system_proxy:\n  auto: false\n  bypass:\n    - \"z.test\"\n    - \"a.test\"\n    - \"m.test\"\n"))
+        // An oversized list is written whole: 500 hosts, one line each, four-space indented, nothing collapsed.
+        let many = (1...500).map { "h\($0).test" }
+        let big = try config(systemProxyAuto: true, systemProxyBypass: many).yaml()
+        let lines = big.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0.hasPrefix("    - \"h") && $0.hasSuffix(".test\"") }.count == 500)
+        #expect(lines.filter { $0 == "system_proxy:" }.count == 1)
+        #expect(lines.filter { $0 == "  bypass:" }.count == 1)
+        #expect(big.contains("system_proxy:\n  auto: true\n  bypass:\n    - \"h1.test\"\n    - \"h2.test\"\n"))
+        #expect(big.hasSuffix("    - \"h499.test\"\n    - \"h500.test\"\n"))
+    }
+
+    @Test func aCarriageReturnAloneInABypassHostThrows() {
+        // `\r` alone is a line break to a YAML parser that honours it; rejected like `\n`.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\rx")) {
+            try config(systemProxyBypass: ["evil.test\rx"]).yaml()
+        }
+        // The error names the offending host, not the first one, and a later good host does not rescue it.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("\n")) {
+            try config(systemProxyAuto: true, systemProxyBypass: ["ok.test", "\n", "also-ok.test"]).yaml()
+        }
+        // A newline in a SCOPE host and in a BYPASS host throw the same case, so one catch covers both; the scope
+        // host is checked first because its block is written first.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("scope\nhost")) {
+            try EmbeddedCoreLaunch.Config(
+                obscuraBinary: URL(fileURLWithPath: "/ok/obscura"), proxyPort: 8080, browserProxyPort: 8083,
+                token: "00", operatorToken: "11", endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+                scopeHosts: ["scope\nhost"], systemProxyAuto: true, systemProxyBypass: ["bypass\nhost"]
+            ).yaml()
+        }
+    }
+
+    @Test func anEmptyBypassHostIsWrittenAsAnEmptyScalar() throws {
+        // `Config` trusts its caller like `scopeHosts` does: the one filter is `SystemProxyPreferences.bypassHosts`,
+        // which `EmbeddedCore.spawn()` and the live set always go through, so an empty host never reaches a real
+        // config. Pinned so a change here is a deliberate one.
+        let yaml = try config(systemProxyBypass: [""]).yaml()
+        #expect(yaml.hasSuffix("system_proxy:\n  auto: false\n  bypass:\n    - \"\"\n"))
+        #expect(SystemProxyPreferences.bypassHosts("") == [])
+    }
+
+    @Test func systemProxyBlockLinesAreAtTheRightColumns() throws {
+        // The core's `deny_unknown_fields` parser needs `system_proxy:` at column 0, `auto:`/`bypass:` at two, the
+        // items at four; one stray space would make it a child of the previous key or an unknown one.
+        let yaml = try config(systemProxyAuto: true, systemProxyBypass: ["corp.test"]).yaml()
+        let lines = yaml.split(separator: "\n").map(String.init)
+        let start = try #require(lines.firstIndex(of: "system_proxy:"))
+        #expect(Array(lines[start...]) == ["system_proxy:", "  auto: true", "  bypass:", "    - \"corp.test\""])
+        // With no other tail the block follows the `browser` section directly (byte-exact, as the core parses it).
+        #expect(yaml.hasSuffix("    stop_timeout: 2\nsystem_proxy:\n  auto: true\n  bypass:\n    - \"corp.test\"\n"))
     }
 }
 

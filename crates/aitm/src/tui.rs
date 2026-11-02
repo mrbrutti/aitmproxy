@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use aitm_bus_client::InProcessHandler;
 use aitm_core::{
-    AgentState, AuditRing, BrowserDriver, Config, EgressConfinement, FlowStore, Frontend,
+    AgentState, AuditRing, BrowserDriver, Config, EgressConfinement, FlowStore, Frontend, JobBus,
     McpTransport, PipelineClient, Proxy, ProxyClient, Registry, ScopeRateGuard,
 };
 use aitm_mcp::{ConnCtx, McpServer};
@@ -102,6 +102,13 @@ pub struct Services {
     pub egress: Arc<EgressConfinement>,
     /// Where tui-mode tracing went (see [`init_tracing`]), for the startup toast.
     pub log: TuiLog,
+    /// The one job bus from `wire::Assembled` (spec D9.2). Every server built
+    /// over these services carries it, so a job started on any surface
+    /// publishes where every surface's subscribers listen. The in-process TUI
+    /// connection has no push sink and polls instead (D3, "poll is truth"); it
+    /// still carries the bus, because the server it is built from is the same
+    /// one an operator-token client can subscribe on.
+    pub jobs: Arc<JobBus>,
 }
 
 /// The service handles exactly as `main` shares them between the frontends:
@@ -113,6 +120,7 @@ pub fn services(
     cfg: &Config,
     browser: Option<Arc<dyn BrowserDriver>>,
     log: TuiLog,
+    jobs: Arc<JobBus>,
 ) -> Services {
     let registry = proxy.registry_arc();
     let store = proxy.store();
@@ -137,6 +145,7 @@ pub fn services(
         browser,
         egress: proxy.egress(),
         log,
+        jobs,
     }
 }
 
@@ -164,6 +173,10 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
         // The proxy's live egress posture, so browser.confine over any server
         // built here (agent transport, TUI bus, web bridge) flips the real one.
         .with_egress(services.egress.clone())
+        // The one job bus (spec D9.2), so every server built here — the agent
+        // transport, the in-process TUI server and the `aitm web` bridge —
+        // dispatches `notifications/aitm/job` from the same stream of events.
+        .with_jobs(services.jobs.clone())
         .with_services(
             services.store.clone(),
             services.client.clone(),
@@ -432,6 +445,30 @@ mod tests {
     use aitm_core::{AgentPolicy, AuditResult};
     use aitm_proto_l4::guard::L4Guard;
 
+    /// Spec D9.2: every `McpServer` this binary builds carries the one job bus
+    /// assembly made, so a `scan.start` over any surface — the agent transport,
+    /// the in-process TUI server, the `aitm web` bridge — publishes its progress
+    /// where that surface's subscribers are listening. It is the bus the caller
+    /// passed, not a second one.
+    #[test]
+    fn server_carries_the_job_bus() {
+        let cfg = Config::default();
+        let proxy = Proxy::builder()
+            .with_config(cfg.clone())
+            .build()
+            .expect("a proxy builds without binding anything");
+        let jobs = Arc::new(JobBus::default());
+        let services = services(&proxy, &cfg, None, TuiLog::Off, Arc::clone(&jobs));
+
+        let carried = server(&cfg, McpTransport::Stdio, &services)
+            .jobs()
+            .expect("the server carries a job bus");
+        assert!(
+            Arc::ptr_eq(&carried, &jobs),
+            "it is the bus assembly made, not a second one"
+        );
+    }
+
     /// L4PAR-AC34 / spec §2.1 (security Critical, second half), live: an agent
     /// `McpServer` on loopback TCP port 0 with [`crate::wire::self_port_hook`]
     /// attached through `attach_bound_hook`, served, reports the ephemeral port it
@@ -643,7 +680,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ca.dir = std::env::temp_dir().join(format!("aitm-tui-egress-{}", std::process::id()));
         let proxy = crate::wire::build_proxy(&cfg).expect("build proxy");
-        let services = services(&proxy, &cfg, None, TuiLog::Off);
+        let services = services(&proxy, &cfg, None, TuiLog::Off, Arc::new(JobBus::default()));
         assert!(
             Arc::ptr_eq(&services.egress, &proxy.egress()),
             "the frontends share the proxy's own posture handle"
@@ -698,7 +735,13 @@ mod tests {
             cfg.ca.dir =
                 std::env::temp_dir().join(format!("aitm-tui-gov-{tag}-{}", std::process::id()));
             let assembled = crate::wire::assemble(&cfg).expect("assemble");
-            let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+            let services = services(
+                &assembled.proxy,
+                &cfg,
+                None,
+                TuiLog::Off,
+                Arc::clone(&assembled.job_bus),
+            );
             Self {
                 cfg,
                 assembled,
