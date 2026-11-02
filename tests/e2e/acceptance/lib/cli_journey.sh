@@ -47,7 +47,9 @@ finish() { # every id of the half that was never written
 }
 run() { # id secs -- cmd...   (capped; SIGINT at the cap so a serving mode exits orderly)
   local id="$1" secs="$2"; shift 2
-  ( trap - INT; exec "$@" ) >"$OUT/$id.out" 2>"$OUT/$id.err" & local pid=$!   # background jobs inherit SIGINT-ignore; reset it so the cap's INT reaches aitm
+  # Background jobs inherit SIGINT-ignore (bash 3.2 cannot undo it with `trap - INT`): exec through a
+  # python shim that restores SIG_DFL first, the same mechanism run.sh uses for the cells.
+  python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' "$@" >"$OUT/$id.out" 2>"$OUT/$id.err" & local pid=$!
   ( sleep "$secs"; kill -INT "$pid" 2>/dev/null; sleep 2; kill "$pid" 2>/dev/null ) & local w=$!
   wait "$pid" 2>/dev/null; local rc=$?; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
   echo "$rc" >"$OUT/$id.exit"; return "$rc"
@@ -68,7 +70,7 @@ print(json.dumps(connect(core).call(sys.argv[2], {}), separators=(",", ":")))
 PY
 }
 # installed.<fn>(...) through the shared module; prints the function's return (never a token).
-py_installed() { python3 -c "import sys; sys.path.insert(0, sys.argv[1]); from aitm_e2e import installed; sys.argv = sys.argv[1:]; $1" "$e2e" "${@:2}" 2>/dev/null; }
+py_installed() { python3 -c "import sys; sys.path.insert(0, sys.argv[1]); from aitm_e2e import installed; sys.argv = sys.argv[1:]; $1" "$e2e" "${@:2}"; }  # stderr stays visible: an import error must not read as "no"
 h8080=$(holder 8080)
 held=""   # "port N held by X" for the first busy default port (the no-core half needs all three free)
 for p in 8080 8081 8082; do hp=$(holder "$p"); if [ -n "$hp" ]; then held="port $p held by $hp"; break; fi; done

@@ -338,20 +338,20 @@ def test_exit_on_term() -> None:
 SAMPLE_CONFIG = """\
 listen: 127.0.0.1:8080
 scope:
-  - example.com
-  - "httpbin.org:443"
-  - '*.corp.example'
+  entries:
+    - example.com
+    - "httpbin.org:443"
+    - '*.corp.example'
+  allow_agent_widen: true
 system_proxy:
-  auto: false
   bypass:
     - "*.anthropic.com"
-    - claude.ai
+    - do-not-read-me.local
 mcp:
-  operator_token: do-not-read-me
+  operator_token: "not-a-scope-entry"
 """
-
-SAMPLE_CONFIG_INLINE = "scope: [a.example, \"b.example:80\"]\nsystem_proxy:\n  bypass: []\n"
-SAMPLE_CONFIG_EMPTY = "scope: []\nsystem_proxy:\n  bypass: []\n"
+SAMPLE_CONFIG_INLINE = "scope:\n  entries: [a.example, \"b.example:80\"]\n  allow_agent_widen: false\nsystem_proxy:\n  bypass: []\n"
+SAMPLE_CONFIG_EMPTY = "scope:\n  entries: []\nsystem_proxy:\n  bypass: []\n"
 
 
 def test_config_scope_entries() -> None:
@@ -363,6 +363,9 @@ def test_config_scope_entries() -> None:
         got = config_scope_entries(p)
         check(got == ["example.com", "httpbin.org:443", "*.corp.example"], f"the scope: block's entries, exact strings, quotes stripped (got {got})")
         check("do-not-read-me" not in " ".join(got) and "*.anthropic.com" not in got, "nothing outside the scope: block is read (no bypass entry, no token)")
+        check("true" not in got and not any("allow_agent_widen" in g for g in got), "allow_agent_widen is a sibling key, not an entry")
+        from aitm_e2e.installed import config_bypass as _cb
+        check(_cb(p) == ["*.anthropic.com", "do-not-read-me.local"], f"config_bypass reads system_proxy.bypass through the same walker (got {_cb(p)})")
         with open(p, "w", encoding="utf-8") as f:
             f.write(SAMPLE_CONFIG_INLINE)
         got = config_scope_entries(p)

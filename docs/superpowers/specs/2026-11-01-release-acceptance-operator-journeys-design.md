@@ -489,4 +489,10 @@ Stage-6 panel 2 on the fix round `e1583c75..6765dee0` (security, quality, spec; 
 
 Stage-6 panel 3 on the fix round `6765dee0..84e22c4f` (2026-11-02): spec PASS with three Minors (Review-log
 wording about AX verification; stale "300 ms" strings in the mac cell; `pass` needs one performed PASS) — all
-fixed in the same commit; security and quality verdicts recorded on the PR.
+fixed in the same commit. Quality FAIL on one Important — `config_scope_entries` parsed `scope:` as a bare
+list while the core's shape is `scope: { entries: [...], allow_agent_widen }` (the pre-existing-host guard
+would have been inert on a real config) — fixed: one `_block_list(top, sub)` walker for `scope.entries` and
+`system_proxy.bypass`, tests rewritten to the core's shape incl. the inline form and the sibling key; Minors
+fixed in the same commit (CLI cell's `run()` uses the SIGINT-reset shim run.sh uses, since bash 3.2 cannot undo
+the async SIGINT-ignore with `trap - INT`; N1 SKIP text names the probe digit; `py_installed` no longer swallows
+stderr). Security verdict recorded on the PR.

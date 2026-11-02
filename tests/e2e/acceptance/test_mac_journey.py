@@ -440,7 +440,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             elif not n1:
                 step("N1-MAC", "SKIP", "the Edit Scope sheet did not open / take focus before the restart; no add attempted")
             elif not n1_focus:
-                step("N1-MAC", "SKIP", f"the focus probe after Restart Core was not seen in the sheet's field; {N1_HOST} was pasted WITHOUT Return (nothing submitted) — clear the field by hand if it is still there; frames in N1-frames/", f"scope.list after restart {sc_after}")
+                step("N1-MAC", "SKIP", f"the focus probe after Restart Core was not seen in the sheet's field; {N1_HOST} and a probe digit `1` were pasted WITHOUT Return (nothing submitted) — clear the field by hand if it is still there; frames in N1-frames/", f"scope.list after restart {sc_after}")
             else:
                 landed = bool(sc_after) and N1_HOST in sc_after
                 if landed:

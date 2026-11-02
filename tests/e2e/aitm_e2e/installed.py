@@ -236,59 +236,51 @@ def _inline_list(rest: str) -> list[str]:
     return [x.strip().strip("\"'") for x in rest.strip("[]").split(",") if x.strip()]
 
 
-def config_bypass(path: str | None = None) -> list[str]:
-    """The operator's `system_proxy.bypass` entries from config.yaml (the TUI/web precondition).
-    Reads only that block; never copies the file."""
+def _block_list(path: str | None, top: str, sub: str) -> list[str]:
+    """The list under `top:` → `sub:` in a YAML file, read line by line without a YAML parser:
+    a block list (`- item`) or an inline list (`[a, b]`); sibling keys of `sub` are ignored and
+    nothing outside the `top:` block is read (never copies the file)."""
     p = path or os.path.join(DATA_DIR, "config.yaml")
     if not os.path.exists(p):
         return []
     out: list[str] = []
-    inside = sub = False
+    inside = in_sub = False
     with open(p, encoding="utf-8") as f:
         for line in f:
-            if line.startswith("system_proxy:"):
+            if line.startswith(top + ":"):
                 inside = True
+                in_sub = False
                 continue
             if inside and line.strip() and not line.startswith(" "):
                 break
             if not inside:
                 continue
             s = line.strip()
-            if s.startswith("bypass:"):
-                sub = True
+            if s.startswith(sub + ":"):
+                in_sub = True
                 rest = s.split(":", 1)[1].strip()
                 if rest.startswith("["):
                     out += _inline_list(rest)
+                    in_sub = False
                 continue
-            if sub and s.startswith("- "):
+            if in_sub and s.startswith("- "):
                 out.append(s[2:].strip().strip("\"'"))
-            elif sub and s and not s.startswith("- "):
-                sub = False
+            elif in_sub and s and not s.startswith("#"):
+                in_sub = False  # another key under `top:` (e.g. allow_agent_widen)
     return out
+
+
+def config_bypass(path: str | None = None) -> list[str]:
+    """The operator's `system_proxy.bypass` entries from config.yaml (the TUI/web precondition)."""
+    return _block_list(path, "system_proxy", "bypass")
 
 
 def config_scope_entries(path: str | None = None) -> list[str]:
-    """The `scope:` block of the operator's config.yaml as exact strings (quotes stripped), for
-    the pre-existing-host decision (security S2: a host persisted in his config is HIS even when
-    the surface has not rendered it yet, so it is never removed). Reads only that block."""
-    p = path or os.path.join(DATA_DIR, "config.yaml")
-    if not os.path.exists(p):
-        return []
-    out: list[str] = []
-    inside = False
-    with open(p, encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("scope:"):
-                inside = True
-                rest = line.split(":", 1)[1].strip()
-                if rest.startswith("["):
-                    out += _inline_list(rest)
-                continue
-            if inside and line.strip() and not line.startswith(" "):
-                break
-            if inside and line.strip().startswith("- "):
-                out.append(line.strip()[2:].strip().strip("\"'"))
-    return out
+    """The operator's `scope.entries` from config.yaml as exact strings (the core's shape:
+    `scope: { entries: [...], allow_agent_widen }`, crates/aitm/src/config_file.rs), for the
+    pre-existing-host decision (security S2: a host persisted in his config is HIS even when the
+    surface has not rendered it yet, so it is never removed)."""
+    return _block_list(path, "scope", "entries")
 
 
 def tooling_mentioned(reading: str | Iterable[str]) -> bool:
