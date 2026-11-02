@@ -1,0 +1,15 @@
+08:00:45 shot 71-run-t1; scan.status scan-1f5803db
+{"state": "running", "phase": "auditing", "stopped_reason": null, "sent": 227, "budget": 2000, "audited": 474, "found": 485, "issues": {"critical": 0, "high": 0, "info": 0, "low": 4, "medium": 1}}
+08:00:49 shot 71-run-t2; scan.status scan-1f5803db
+{"state": "done", "phase": "done", "stopped_reason": null, "sent": 285, "budget": 2000, "audited": 482, "found": 485, "issues": {"critical": 0, "high": 0, "info": 0, "low": 4, "medium": 2}}
+08:00:54 shot 71-run-t3; scan.status scan-1f5803db
+{"state": "done", "phase": "done", "stopped_reason": null, "sent": 285, "budget": 2000, "audited": 482, "found": 485, "issues": {"critical": 0, "high": 0, "info": 0, "low": 4, "medium": 2}}
+08:01:10 shot 72-before-cancel; scan.status scan-bd1d269e
+{"state": "running", "phase": "auditing", "stopped_reason": null, "sent": 207, "budget": 2000, "audited": 983, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 0, "medium": 0}}
+08:01:10 click Cancel Scan
+08:01:13 shot 73-cancel-t1; scan.status scan-bd1d269e
+{"state": "cancelled", "phase": "done", "stopped_reason": "cancelled", "sent": 248, "budget": 2000, "audited": 983, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 0, "medium": 0}}
+08:01:16 shot 73-cancel-t2; scan.status scan-bd1d269e
+{"state": "cancelled", "phase": "done", "stopped_reason": "cancelled", "sent": 248, "budget": 2000, "audited": 983, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 0, "medium": 0}}
+08:01:29 scan.issues by_severity {'critical': 0, 'high': 0, 'info': 0, 'low': 4, 'medium': 2} [('reflected-xss', 'medium', '/search', '/tmp/claude/t9-ext/findings/scan/pocs/aitm-poc-reflected-cross-site-scripting-43248-1-1793548843269530000/reflected-cross-site-scripting.poc.yaml', 'reflected-xss-c388095c'), ('reflected-xss', 'medium', '/greet', '/tmp/claude/t9-ext/findings/scan/pocs/aitm-poc-reflected-cross-site-scripting-43248-2-1793548846194363000/reflected-cross-site-scripting.poc.yaml', 'reflected-xss-9493a682'), ('security-header', 'low', '/', None, None), ('reflection', 'low', '/search', None, None), ('cookie-flag', 'low', '/lang', None, None), ('open-redirect', 'low', '/redirect', '/tmp/claude/t9-ext/findings/scan/pocs/aitm-poc-open-redirect-43248-0-1793548842386570000/open-redirect.poc.yaml', 'open-redirect-87baa47b')]
+08:01:39 scan.sitemap job1: 30 nodes; ['/', '/account', '/account/{id}', '/admin', '/api/login', '/api/profile', '/comments', '/docs/intro', '/fetch', '/flaky', '/go', '/greet'] ...
