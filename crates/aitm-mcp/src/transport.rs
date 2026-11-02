@@ -36,11 +36,11 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// listener with [`LoopbackTcp::with_token_line_timeout`].
 pub const TOKEN_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long [`LoopbackTcp::serve`] pauses after an `accept()` error of the
-/// descriptor-exhaustion class before accepting again (see
-/// [`accept_backoff`]), so a core out of file descriptors logs at a walking
-/// pace instead of spinning.
-const ACCEPT_EXHAUSTION_BACKOFF: Duration = Duration::from_millis(100);
+/// How long [`LoopbackTcp::serve`] pauses after every `accept()` error
+/// before accepting again (see [`accept_failed`]), so a core out of file
+/// descriptors, buffers or memory logs at a walking pace instead of
+/// spinning.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Serve newline-delimited JSON-RPC on one connection: each line in is one
 /// message, each reply out is one line. Returns at EOF, at a read error, or when
@@ -397,20 +397,14 @@ impl LoopbackTcp {
     /// error is logged at `warn!` and the loop goes on (security S1): the
     /// default-on operator bus must not end quietly on the first `EMFILE`,
     /// which a neighbour that opens connections and holds them can provoke;
-    /// the descriptor-exhaustion class pauses [`ACCEPT_EXHAUSTION_BACKOFF`]
-    /// first so it cannot spin.
+    /// every error pauses [`ACCEPT_ERROR_BACKOFF`] first so none can spin
+    /// it (security S7).
     pub async fn serve(self, server: Arc<McpServer>) -> anyhow::Result<()> {
         loop {
             let (stream, peer) = match self.listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "the bus listener could not accept a connection; still listening"
-                    );
-                    if let Some(pause) = accept_backoff(&err) {
-                        tokio::time::sleep(pause).await;
-                    }
+                    accept_failed(&err).await;
                     continue;
                 }
             };
@@ -486,22 +480,20 @@ fn write_endpoint_file(path: &Path, addr: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The pause [`LoopbackTcp::serve`] takes after `err` from `accept()`: `Some`
-/// for the descriptor-exhaustion class (`EMFILE`, `ENFILE`, `WouldBlock`),
-/// which recurs the instant it is retried and would otherwise spin a core at
-/// full CPU, logging as fast as it loops; `None` for the per-connection
-/// errors (`ECONNABORTED`, `EINTR`, a reset), which the next `accept()`
-/// simply moves past.
-fn accept_backoff(err: &io::Error) -> Option<Duration> {
-    // `io::ErrorKind` has no variant for EMFILE/ENFILE (both decode as
-    // `Uncategorized`), so the raw errno is matched. The two numbers are the
-    // same on Linux, macOS and the BSDs, the platforms this Unix-only crate
-    // builds for (`pointer.rs` is `std::os::unix` throughout).
-    const ENFILE: i32 = 23;
-    const EMFILE: i32 = 24;
-    let exhausted = err.kind() == io::ErrorKind::WouldBlock
-        || matches!(err.raw_os_error(), Some(ENFILE | EMFILE));
-    exhausted.then_some(ACCEPT_EXHAUSTION_BACKOFF)
+/// What [`LoopbackTcp::serve`] does with an `accept()` error (security S1,
+/// S7): logs it at `warn!` and pauses [`ACCEPT_ERROR_BACKOFF`] before the
+/// next `accept()`. Every error pauses and none is inspected: a persistent
+/// one (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) recurs the instant it is
+/// retried and would otherwise spin a core at full CPU, logging as fast as
+/// it loops, while a per-connection one (`ECONNABORTED`, `EINTR`, a reset)
+/// loses nothing to 100 ms; so no class of error can be missed. (tokio's
+/// `accept()` never surfaces `WouldBlock`.)
+async fn accept_failed(err: &io::Error) {
+    tracing::warn!(
+        error = %err,
+        "the bus listener could not accept a connection; still listening"
+    );
+    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
 }
 
 /// Remove the rendezvous file; a missing one is fine (idempotent).
@@ -782,32 +774,44 @@ mod tests {
     // ---- S1 (security pass 1): the default-on bus against a silent or
     // ---- flooding same-user neighbour.
 
-    /// S1(b): only the descriptor-exhaustion class of `accept()` errors
-    /// (`EMFILE`, `ENFILE`, `WouldBlock`) earns the 100 ms pause; the
-    /// per-connection ones (`ECONNABORTED`, `EINTR`, a reset) are moved past
-    /// at once.
-    #[test]
-    fn accept_backoff_pauses_only_for_descriptor_exhaustion() {
-        let pause = Some(Duration::from_millis(100));
-        assert_eq!(accept_backoff(&io::Error::from_raw_os_error(24)), pause); // EMFILE
-        assert_eq!(accept_backoff(&io::Error::from_raw_os_error(23)), pause); // ENFILE
-        assert_eq!(
-            accept_backoff(&io::Error::from(io::ErrorKind::WouldBlock)),
-            pause
-        );
-        assert_eq!(
-            accept_backoff(&io::Error::from(io::ErrorKind::ConnectionAborted)),
-            None
-        );
-        assert_eq!(
-            accept_backoff(&io::Error::from(io::ErrorKind::Interrupted)),
-            None
-        );
-        assert_eq!(
-            accept_backoff(&io::Error::from(io::ErrorKind::ConnectionReset)),
-            None
-        );
-        assert_eq!(accept_backoff(&io::Error::other("anything else")), None);
+    /// S1(b), security S7 / quality Q15: every `accept()` error pauses the
+    /// listener 100 ms, the per-connection ones (`ECONNABORTED`, `EINTR`, a
+    /// reset) as much as the persistent ones (`EMFILE`, `ENFILE`, `ENOBUFS`,
+    /// `ENOMEM`), so no class of error can spin it. `WouldBlock` is no
+    /// case: tokio's `accept()` never surfaces it. Real time, lower bound
+    /// only: a sleep never ends early, and an upper bound would flake under
+    /// load.
+    #[tokio::test]
+    async fn every_accept_error_pauses_the_listener() {
+        // `ENOBUFS` differs per platform; `ENFILE`/`EMFILE` do not.
+        #[cfg(target_os = "linux")]
+        const ENOBUFS: i32 = 105;
+        #[cfg(not(target_os = "linux"))]
+        const ENOBUFS: i32 = 55;
+        for (label, err) in [
+            ("ENFILE", io::Error::from_raw_os_error(23)),
+            ("EMFILE", io::Error::from_raw_os_error(24)),
+            ("ENOBUFS", io::Error::from_raw_os_error(ENOBUFS)),
+            ("ENOMEM", io::Error::from(io::ErrorKind::OutOfMemory)),
+            (
+                "ECONNABORTED",
+                io::Error::from(io::ErrorKind::ConnectionAborted),
+            ),
+            ("EINTR", io::Error::from(io::ErrorKind::Interrupted)),
+            (
+                "ECONNRESET",
+                io::Error::from(io::ErrorKind::ConnectionReset),
+            ),
+            ("anything else", io::Error::other("anything else")),
+        ] {
+            let before = Instant::now();
+            accept_failed(&err).await;
+            let paused = before.elapsed();
+            assert!(
+                paused >= Duration::from_millis(100),
+                "{label}: the listener paused only {paused:?}"
+            );
+        }
     }
 
     /// S1(a): a connection that sends no token line within the limit is

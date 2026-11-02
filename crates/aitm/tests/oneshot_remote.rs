@@ -1209,13 +1209,13 @@ const READ_ONLY_LIVE_VERBS: &[&str] = &[
 ];
 
 /// Tester — spec D8 step 10 across the verb table: every read-only live verb
-/// a bare assembly registers renders through its *declared* result schema
-/// byte for byte as the local `Cli` prints the same registry's answer
-/// (decision (f), AC-R14-24). `render` cannot fail (quality Q3), so the only
-/// observable regression is a wrong rendering, and parity per verb is what
-/// catches it (quality Q9a): a `null` dropped from an optional field, a
-/// declared `Bytes` left as base64, a key the structural fallback orders or
-/// types differently.
+/// a bare assembly registers renders, through its *declared* result schema,
+/// byte-identically to what the local `Cli` prints for the same registry's
+/// answer (decision (f), AC-R14-24). `render` cannot fail (quality Q3), so
+/// the only observable regression is a wrong rendering, and parity per verb
+/// is what catches it (quality Q9a): a `null` dropped from an optional
+/// field, a declared `Bytes` left as base64, a key the structural fallback
+/// orders or types differently.
 ///
 /// Recorded 2026-11-01 (tester, pass 1) against a bare assembly: `proxy.status`
 /// (`control.rs:105`, `result: Object(Vec::new())`) → `unknown param
@@ -1232,7 +1232,7 @@ const READ_ONLY_LIVE_VERBS: &[&str] = &[
 /// `Object` as "some object", keeps a `null` answered for an optional field,
 /// and shows an answer its schema cannot explain structurally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tester_every_read_only_live_verb_renders_through_its_declared_schema() {
+async fn tester_every_read_only_live_verb_renders_byte_identically_to_the_local_cli() {
     let rig = rig("remote-schemas", Some(OP_TOKEN), Frontend::Operator);
     remote::handshake(&rig.client, HANDSHAKE)
         .await
@@ -1295,53 +1295,24 @@ async fn tester_every_read_only_live_verb_renders_through_its_declared_schema() 
          {skipped:?}):\n  {}",
         mismatched.join("\n  ")
     );
-    assert!(
-        compared.len() >= 6,
-        "too few verbs compared ({compared:?}); skipped: {skipped:?}"
+    // The exact set a bare assembly compares (quality Q13): the table minus
+    // the two `script.*` verbs the script tier registers. A verb that stops
+    // being compared, for whatever reason, fails here.
+    assert_eq!(
+        compared,
+        [
+            "flow.list",
+            "flow.table",
+            "proxy.status",
+            "capture.status",
+            "scope.list",
+            "tls.passthrough.list",
+            "map.list",
+            "agent.status",
+            "agent.activity",
+            "config.get",
+        ],
+        "skipped: {skipped:?}"
     );
     assert!(yes.prompts().is_empty(), "read-only verbs ask nothing");
-}
-
-/// Tester — AC-R14-24 parity beyond the Scope list, on the read-only live
-/// verbs whose declared schema does match their answer: the remote bytes
-/// equal `render_cli_value` of the local `Cli` over the same registry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tester_parity_holds_for_more_shapes() {
-    let rig = rig("remote-parity", Some(OP_TOKEN), Frontend::Operator);
-    remote::handshake(&rig.client, HANDSHAKE)
-        .await
-        .expect("handshake");
-    let yes = Always::new(true);
-    let cli = Cli::new(rig.services.registry.clone()).with_services(
-        rig.services.store.clone(),
-        rig.services.client.clone(),
-        rig.services.guard.clone(),
-        None,
-    );
-    for verb in [
-        &["flow", "list"][..],
-        &["flow", "table"][..],
-        &["scope", "list"][..],
-        &["tls", "passthrough", "list"][..],
-        &["map", "list"][..],
-        &["agent", "activity"][..],
-    ] {
-        let dotted = verb.join(".");
-        let cmd = rig
-            .services
-            .registry
-            .command(&dotted)
-            .expect("registered")
-            .clone();
-        let remote_json = remote::call(&rig.client, &dotted, json!({}), CALL, &yes, false)
-            .await
-            .unwrap_or_else(|e| panic!("{dotted}: {e:?}"));
-        let remote_bytes = remote::render(&remote_json, &cmd.schema().result);
-        let local = cli.dispatch(&args(verb)).expect("local dispatch");
-        assert_eq!(
-            String::from_utf8_lossy(&remote_bytes),
-            String::from_utf8_lossy(&render_cli_value(&local)),
-            "{dotted}"
-        );
-    }
 }

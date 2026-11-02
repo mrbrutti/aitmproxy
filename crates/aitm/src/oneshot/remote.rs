@@ -404,15 +404,16 @@ fn confirmation_request(result: &JsonValue) -> Option<(&str, &str)> {
 /// and an incomplete declaration must not print an error against a healthy
 /// core. Three steps ([`rebuild_value`]), and never a failure:
 ///
-/// 1. A declared `Object` with no fields means "some object" (fifteen
-///    commands declare `result: TypeDesc::Object(Vec::new())`); the answer
-///    is converted structurally, as `TypeDesc::Any`.
-/// 2. Otherwise the strict `from_json`, which is where the schema adds
-///    information (`Bytes` from base64). When it refuses, [`lenient`] runs
-///    once: the same conversion, except that a `null` answered for a field
-///    the schema marks optional is kept as `Value::Null`, so the printed
-///    object keeps every key the core answered and the bytes stay identical
-///    to the local path's (G6).
+/// 1. The strict `from_json`, which is where the schema adds information
+///    (`Bytes` from base64).
+/// 2. When it refuses, [`lenient`] runs once: the same conversion, except
+///    that a `null` answered for a field the schema marks optional is kept
+///    as `Value::Null`, so the printed object keeps every key the core
+///    answered and the bytes stay identical to the local path's (G6); and a
+///    declared `Object` with no fields, at any depth, means "some object"
+///    (fifteen commands declare `result: TypeDesc::Object(Vec::new())`,
+///    `findings.list` and `poc.list` an array of it) and is converted
+///    structurally, as `TypeDesc::Any`.
 /// 3. When that refuses too the answer is converted structurally so the
 ///    operator sees it, with one `debug!` naming the declared schema and the
 ///    answer's JSON kind, never its content (security S5).
@@ -422,9 +423,6 @@ pub fn render(result: &JsonValue, ty: &TypeDesc) -> Vec<u8> {
 
 /// The three steps [`render`] documents, as the `Value` to print.
 fn rebuild_value(result: &JsonValue, ty: &TypeDesc) -> Value {
-    if matches!(ty, TypeDesc::Object(defs) if defs.is_empty()) {
-        return structural(result);
-    }
     if let Ok(value) = from_json(result, ty) {
         return value;
     }
@@ -445,14 +443,18 @@ fn structural(j: &JsonValue) -> Value {
 }
 
 /// Step 2 of [`render`]: the strict conversion, except that a `null`
-/// answered for a field `ty` marks optional is [`Value::Null`], through
-/// nested declared objects and the arrays and maps of them; every leaf is
-/// `from_json`'s. What the strict conversion refuses for any other reason
-/// (a key the schema does not declare, a missing required field, a leaf of
-/// the wrong type) is refused here too, so step 3 decides it. The error
-/// carries nothing the core answered and is never logged.
+/// answered for a field `ty` marks optional is [`Value::Null`], and a
+/// declared `Object` with no fields is "some object" and takes whatever the
+/// core answered structurally, through nested declared objects and the
+/// arrays and maps of them; every other leaf is `from_json`'s. What the
+/// strict conversion refuses for any other reason (a key the schema does
+/// not declare, a missing required field, a leaf of the wrong type) is
+/// refused here too, so step 3 decides it. Leaf errors are `from_json`'s
+/// and quote the answer; [`rebuild_value`] discards the error and never
+/// logs it.
 fn lenient(j: &JsonValue, ty: &TypeDesc) -> anyhow::Result<Value> {
     match (ty, j) {
+        (TypeDesc::Object(defs), _) if defs.is_empty() => Ok(structural(j)),
         (TypeDesc::Object(defs), JsonValue::Object(fields)) => {
             let mut out = BTreeMap::new();
             for def in defs {
@@ -823,6 +825,93 @@ mod tests {
         }
     }
 
+    /// Run `f` under a `DEBUG`-level subscriber writing to a buffer: what it
+    /// returned, and every line it logged.
+    fn capture_debug_log<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buf").extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let log = String::from_utf8(buf.0.lock().expect("buf").clone()).expect("utf8 log");
+        (out, log)
+    }
+
+    /// Quality Q14: a declared `Object` with no fields means "some object"
+    /// at any depth, not only at the top. `findings.list` and `poc.list`
+    /// declare `Array(Object([]))` and answer free-form objects: the walker
+    /// shows them structurally, so a healthy call never reaches the
+    /// fallback and never logs its `debug!`.
+    #[test]
+    fn lenient_treats_an_empty_declared_object_as_some_object_at_any_depth() {
+        let schema = TypeDesc::Array(Box::new(TypeDesc::Object(Vec::new())));
+        let answer = serde_json::json!([
+            {"id": "f1", "severity": "high", "evidence": {"url": "https://a/"}},
+            {"id": "f2", "tags": ["x", "y"]}
+        ]);
+        assert!(
+            from_json(&answer, &schema).is_err(),
+            "strict refuses the undeclared keys"
+        );
+        let expected = structural(&answer);
+        assert_eq!(
+            lenient(&answer, &schema).expect("some object, at any depth"),
+            expected
+        );
+        let (bytes, log) = capture_debug_log(|| render(&answer, &schema));
+        assert_eq!(bytes, render_cli_value(&expected));
+        assert_eq!(
+            String::from_utf8(bytes).expect("utf8"),
+            "[\n  {\n    \"evidence\": {\n      \"url\": \"https://a/\"\n    },\n    \"id\": \"f1\",\n    \
+             \"severity\": \"high\"\n  },\n  {\n    \"id\": \"f2\",\n    \"tags\": [\n      \"x\",\n      \
+             \"y\"\n    ]\n  }\n]\n"
+        );
+        assert!(
+            !log.contains("does not fit the verb's declared result schema"),
+            "a healthy call must not log the fallback: {log}"
+        );
+
+        // Under a declared field as well, beside an optional `null` the
+        // walker keeps; and whatever kind the core answered for "some object"
+        // (the old top-level rule showed it as is, this one still does).
+        let nested = TypeDesc::Object(vec![
+            def("items", schema.clone(), true),
+            def("note", TypeDesc::Str, false),
+        ]);
+        let answer = serde_json::json!({"items": [{"a": 1}, {"b": [2]}], "note": null});
+        assert_eq!(
+            lenient(&answer, &nested).expect("nested"),
+            Value::Object(BTreeMap::from([
+                (
+                    "items".to_string(),
+                    structural(&serde_json::json!([{"a": 1}, {"b": [2]}]))
+                ),
+                ("note".to_string(), Value::Null),
+            ]))
+        );
+        assert_eq!(
+            lenient(&serde_json::json!([1]), &TypeDesc::Object(Vec::new())).expect("as is"),
+            Value::Array(vec![Value::Int(1)])
+        );
+    }
+
     /// Spec D8 step 10 against a healthy core (tester defect, 2026-11-01):
     /// `proxy.status` and `config.get` declare `result: Object(Vec::new())`,
     /// "some object", and answer keys the schema never names. Step 1 renders
@@ -964,35 +1053,13 @@ mod tests {
     /// it never reach the log.
     #[test]
     fn fallback_debug_names_the_schema_and_kind_never_the_answer() {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("buf").extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
-        let sink = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(move || sink.clone())
-            .finish();
         let schema = TypeDesc::Object(vec![def("state", TypeDesc::Str, true)]);
         let answer = serde_json::json!({"state": "on", "evil\u{1b}[2J": "secret-value"});
-        let bytes = tracing::subscriber::with_default(subscriber, || render(&answer, &schema));
+        let (bytes, log) = capture_debug_log(|| render(&answer, &schema));
         // Step 3 showed the answer as is: both keys are printed (S6: stdout is data).
         let shown = String::from_utf8(bytes).expect("utf8");
         assert!(shown.contains("\"state\": \"on\""), "{shown}");
         assert!(shown.contains("secret-value"), "{shown}");
-        let log = String::from_utf8(buf.0.lock().expect("buf").clone()).expect("utf8 log");
         assert!(
             log.contains("does not fit the verb's declared result schema"),
             "{log}"

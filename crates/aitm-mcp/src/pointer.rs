@@ -263,25 +263,29 @@ impl Drop for Published {
 /// chose, or a data dir they set up) and is left exactly as they have it,
 /// with one `debug!` when it is wider than `0700` (security S3).
 pub fn write(dir: &Path, ptr: &CorePointer) -> io::Result<Published> {
-    match fs::symlink_metadata(dir) {
-        Ok(_) => {
-            let mode = fs::metadata(dir)?.mode() & 0o777;
+    // One stat decides (quality Q16): a dir that exists (a link to one
+    // included) is the operator's and keeps its mode; a missing one is made.
+    let owner_uid = match fs::metadata(dir) {
+        Ok(meta) => {
+            let mode = meta.mode() & 0o777;
             if mode & 0o077 != 0 {
                 tracing::debug!(path = %dir.display(), mode = %format_args!("{mode:o}"), "the core pointer run dir already exists wider than 0700; leaving it as the operator has it");
             }
+            meta.uid()
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let mut builder = DirBuilder::new();
             builder.recursive(true).mode(0o700);
             builder.create(dir)?;
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            fs::metadata(dir)?.uid()
         }
         Err(err) => return Err(err),
-    }
+    };
 
     let path = dir.join(format!("{}.json", ptr.pid));
     let tmp = dir.join(format!("{}.json.tmp", ptr.pid));
-    remove_stale_tmp(&tmp, fs::metadata(dir)?.uid());
+    remove_stale_tmp(&tmp, owner_uid);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
