@@ -120,8 +120,12 @@ const expect = (cond, okMsg, detail) => (cond ? pass(okMsg, detail) : fail(okMsg
 /**
  * Every `#t=<token>` fragment in `text` (a stack or a log line can carry both UI URLs), and the
  * per-run bus tokens themselves wherever they appear (a `connectBus` error quotes what it sent),
- * redacted; never print a UI URL or an error any other way. `env` is read at call time (it is
- * assigned by `startAitm` below, before the first line that could carry a token is printed).
+ * redacted; never print a UI URL or an error any other way. `env` is read at call time and is
+ * assigned when `startAitm` returns, so the literal-token pass covers every line printed after
+ * that assignment. The one earlier caller is the `log` callback passed INTO `startAitm` (aitm
+ * stderr lines matching /error|panic/ during start-up): while it runs `env` is still undefined and
+ * only the `#t=` regex applies. The core prints its tokens only in URL form, which that regex
+ * covers; a start-up line carrying a bare token would not be literally redacted.
  */
 const redact = (text) => {
   let out = String(text ?? '').replace(/#t=[^&\s]*/g, '#t=<redacted>');
