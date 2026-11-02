@@ -2,9 +2,9 @@
 //! `.app`, `.xpc` or `.appex` directory on the path, so `/usr/bin/python3`'s real
 //! executable inside `Xcode.app/…/Python.app` names `com.apple.python3`, not Xcode.
 
-// Consumed by the macOS identity step (plan Task 5); until it lands only the tests
-// name this.
-#[allow(dead_code)]
+// Consumed by the macOS identity step; the module is not cfg-gated (so the rule
+// is tested on every host) but only macOS has a caller outside the tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The prefix of `path` through its last non-final component ending in `.app`,
 /// `.xpc` or `.appex`, or `None` when no such component exists. The final
 /// component (the executable itself) never counts, so `/tmp/x.app` is `None`.

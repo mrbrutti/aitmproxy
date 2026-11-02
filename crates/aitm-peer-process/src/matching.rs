@@ -6,9 +6,9 @@ use std::net::IpAddr;
 
 use crate::types::Tuple;
 
-// Consumed by the per-OS scanners (plan Tasks 3-4); nothing in this crate calls
-// these until they land.
-#[allow(dead_code)]
+// Consumed by the macOS and Linux scanners; on any other OS `ProcessResolver`
+// is the `NoScanner` stub and nothing calls these outside the tests.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 /// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4; leave
 /// everything else alone, so `127.0.0.1` and `::ffff:127.0.0.1` compare equal.
 pub(crate) fn canonical(ip: IpAddr) -> IpAddr {
@@ -21,7 +21,7 @@ pub(crate) fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 /// `true` when the scanned socket's local end is `wanted.client` and its foreign
 /// end is `wanted.proxy`, comparing ports exactly and addresses canonically.
 pub(crate) fn tuple_matches(
@@ -37,7 +37,8 @@ pub(crate) fn tuple_matches(
         && canonical(faddr) == canonical(wanted.proxy.ip())
 }
 
-#[allow(dead_code)]
+// libproc only: on Linux the ports come from `/proc/net/tcp` in host order.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Decode a libproc `insi_lport` / `insi_fport`: the kernel stores the 16-bit
 /// network-order port in the low half of an `int`.
 pub(crate) fn port_from_libproc(raw: i32) -> u16 {

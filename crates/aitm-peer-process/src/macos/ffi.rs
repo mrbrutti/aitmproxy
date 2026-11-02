@@ -160,8 +160,8 @@ const _: () = assert!(size_of::<libc::proc_bsdinfo>() == 136);
 const _: () = assert!(size_of::<tcp_sockinfo>() <= 528);
 
 // ---------------------------------------------------------------------------
-// Safe wrappers. Consumed by the macOS scanner (plan Task 5); until it lands only
-// `find_owners_raw` and the tests call them.
+// Safe wrappers. `find_owners_raw`, `pid_path` and `pid_name` are what
+// `macos::scan::MacScanner` calls; the rest are its building blocks.
 // ---------------------------------------------------------------------------
 
 /// `pid` as the `int` libproc wants; `None` for a value no process can have.
@@ -181,7 +181,6 @@ fn positive_len(rc: libc::c_int) -> Option<usize> {
 /// Every pid on the system, ascending and de-duplicated, via
 /// `proc_listpids(PROC_ALL_PIDS)` with the usual two-call sizing (a size query,
 /// then a buffer with slack for pids forked in between). Empty on any error.
-#[allow(dead_code)]
 pub(crate) fn list_pids() -> Vec<u32> {
     // SAFETY: a null buffer with size 0 is the documented size query: libproc
     // writes nothing and returns the byte count it would need.
@@ -223,7 +222,6 @@ pub(crate) fn list_pids() -> Vec<u32> {
 /// The socket descriptors of `pid` (`PROC_PIDLISTFDS`, filtered to
 /// `PROX_FDTYPE_SOCKET`). `None` when the table cannot be read (`EPERM` for
 /// another user's process, `ESRCH` for a gone one) or is empty; both are skips.
-#[allow(dead_code)]
 pub(crate) fn socket_fds(pid: u32) -> Option<Vec<i32>> {
     let pid = c_pid(pid)?;
     // SAFETY: a null buffer with size 0 is the documented size query; libproc
@@ -290,7 +288,6 @@ fn decode_addr(vflag: u8, raw: &[u8; 16]) -> Option<IpAddr> {
 /// The TCP four-tuple behind `fd` of `pid` (`PROC_PIDFDSOCKETINFO`). `None`
 /// unless the kernel wrote the full 792-byte `socket_fdinfo`, `soi_kind` is
 /// `SOCKINFO_TCP`, and both addresses decode.
-#[allow(dead_code)]
 pub(crate) fn tcp_socket(pid: u32, fd: i32) -> Option<TcpSocket> {
     let pid = c_pid(pid)?;
     let mut info = socket_fdinfo::ZERO;
@@ -345,7 +342,6 @@ fn utf8_prefix(buf: &[u8], len: usize) -> Option<String> {
 
 /// The executable path of `pid` (`proc_pidpath`). `None` on any error or if the
 /// kernel's bytes are not UTF-8.
-#[allow(dead_code)]
 pub(crate) fn pid_path(pid: u32) -> Option<String> {
     let pid = c_pid(pid)?;
     let mut buf = [0u8; PID_PATH_BUF];
@@ -360,7 +356,6 @@ pub(crate) fn pid_path(pid: u32) -> Option<String> {
 
 /// The short name of `pid` (`proc_name`, at most `2 * MAXCOMLEN` bytes). `None`
 /// on any error or if the bytes are not UTF-8.
-#[allow(dead_code)]
 pub(crate) fn pid_name(pid: u32) -> Option<String> {
     let pid = c_pid(pid)?;
     let mut buf = [0u8; PID_NAME_BUF];
@@ -375,7 +370,6 @@ pub(crate) fn pid_name(pid: u32) -> Option<String> {
 /// The start time of `pid` in microseconds since the epoch
 /// (`PROC_PIDTBSDINFO` → `pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`).
 /// `None` unless the full 136-byte `proc_bsdinfo` was written.
-#[allow(dead_code)]
 pub(crate) fn pid_start_micros(pid: u32) -> Option<u64> {
     let pid = c_pid(pid)?;
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
@@ -411,7 +405,6 @@ pub(crate) fn pid_start_micros(pid: u32) -> Option<u64> {
 /// [`pid_start_micros`] for matched pids only, `0` if the kernel would not say.
 /// Any per-pid or per-fd failure is a skip. Tuples not found by `deadline` are
 /// absent from the result.
-#[allow(dead_code)]
 pub(crate) fn find_owners_raw(
     wanted: &[Tuple],
     deadline: Instant,

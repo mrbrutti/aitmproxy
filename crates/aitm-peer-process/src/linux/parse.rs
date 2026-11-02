@@ -3,9 +3,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-// Consumed by the Linux scanner glue (plan Task 4), which is cfg-gated to Linux;
-// on other hosts only the tests name these.
-#[allow(dead_code)]
+// Linux-only in production: the consumer, `linux::scan`, is built on other hosts
+// only under `cfg(test)`, so there these are reachable from the tests alone.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// One row of `/proc/net/tcp` or `/proc/net/tcp6`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TcpRow {
@@ -16,7 +16,7 @@ pub(crate) struct TcpRow {
     pub inode: u64,
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// Parse one data row of `/proc/net/tcp` (`v6 == false`, 8 hex chars per address)
 /// or `/proc/net/tcp6` (`v6 == true`, 32 hex chars as four native-endian `u32`
 /// words). Ports are host-order hex. The header line and anything short or
@@ -70,7 +70,7 @@ fn parse_hex_endpoint(word: &str, v6: bool) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// Field 22 (`starttime`) of `/proc/<pid>/stat`. The second field, `comm`, is in
 /// parentheses and may contain spaces or parentheses itself, so fields are counted
 /// from the **last** `)`.
@@ -85,7 +85,7 @@ pub(crate) fn parse_stat_starttime(stat: &str) -> Option<u64> {
         .ok()
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// The executable basename from a `/proc/<pid>/exe` link target, with the
 /// ` (deleted)` suffix the kernel appends to an unlinked binary stripped.
 pub(crate) fn exe_basename(link: &str) -> Option<String> {
@@ -97,7 +97,7 @@ pub(crate) fn exe_basename(link: &str) -> Option<String> {
     Some(base.to_string())
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// The inode `N` of a `/proc/<pid>/fd/<n>` link target of the form `socket:[N]`;
 /// `None` for anything else (a file path, a pipe, an anon inode).
 pub(crate) fn fd_socket_inode(link: &str) -> Option<u64> {

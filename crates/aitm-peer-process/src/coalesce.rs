@@ -21,8 +21,6 @@ use crate::sanitize::sanitize;
 use crate::types::{Limits, ProcessKey, SocketScanner, Tuple};
 
 /// Serialises scans over one scanner and resolves tuples to sanitised identities.
-// Assembled into `ProcessResolver` by plan Task 5; until then only tests drive it.
-#[allow(dead_code)]
 pub(crate) struct Coalescer<S: SocketScanner> {
     scanner: S,
     limits: Limits,
@@ -79,7 +77,6 @@ impl State {
     }
 }
 
-#[allow(dead_code)]
 impl<S: SocketScanner> Coalescer<S> {
     pub(crate) fn new(scanner: S, limits: Limits) -> Self {
         let state = State {

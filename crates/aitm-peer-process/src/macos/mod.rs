@@ -8,3 +8,7 @@ pub(crate) mod bundle_path;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod ffi;
+#[cfg(target_os = "macos")]
+pub(crate) mod identity;
+#[cfg(target_os = "macos")]
+pub(crate) mod scan;

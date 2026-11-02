@@ -22,8 +22,10 @@ mod coalesce;
 pub mod linux;
 pub mod macos;
 pub(crate) mod matching;
+mod resolver;
 pub mod sanitize;
 pub mod types;
 
+pub use resolver::ProcessResolver;
 pub use sanitize::sanitize;
 pub use types::{Limits, ProcessKey, Tuple};
