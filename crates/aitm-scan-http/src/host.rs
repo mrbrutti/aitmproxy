@@ -11,7 +11,11 @@
 //!
 //! - **The source is the capture, not a reconstruction.** The request comes
 //!   from the store by the point's `flow` id; a point whose flow is gone is an
-//!   error rather than a probe against a guessed URL.
+//!   error rather than a probe against a guessed URL. The one point with no
+//!   capture behind it is the scheduler's **origin-scoped** item (amendment
+//!   38), whose source is a bodiless request to its own `url`; it is built
+//!   here, and [`ProbeHost::captured`] answers `None` for it. A point with
+//!   neither a flow nor an absolute URL is still an error.
 //! - **The session is settled once.** Under `session.mode: observed`
 //!   [`session::apply_session`] runs in [`HttpProbeHost::new`], so every probe,
 //!   the baseline and every raw probe carry the job's session (spec **D7**,
@@ -86,7 +90,11 @@ pub(crate) struct HttpProbeHost {
     /// The stored flow the point came from, as the proxy captured it, for the
     /// engine's passive checks ([`ProbeHost::captured`]): they read the
     /// operator's own request and response and send nothing.
-    captured: HttpFlow,
+    ///
+    /// `None` for an origin-scoped point (amendment 38): nothing was captured
+    /// for it, and a passive check must see that rather than a reconstruction
+    /// of a request nobody made.
+    captured: Option<HttpFlow>,
     /// The one point this host mutates.
     point: InsertionPoint,
     /// The source's origin; a raw probe may not leave it.
@@ -109,25 +117,48 @@ pub(crate) struct HttpProbeHost {
 impl HttpProbeHost {
     /// A host for `point`, reading its source request out of the job's store.
     ///
+    /// An **origin-scoped** point (amendment 38) carries no `flow` — T1b's
+    /// follow-up scheduler synthesises one point per origin, `id:
+    /// "origin:<origin>"`, so the origin-wide checks (the h2 natives among
+    /// them) get a host at all. Its source is built from the point's own `url`
+    /// and `method` instead: a bodiless request to that URL, and
+    /// [`ProbeHost::captured`] answers `None`, because nothing was captured
+    /// for it. The session is applied (or stripped) exactly as for a captured
+    /// source.
+    ///
     /// # Errors
     ///
-    /// When the point names no source flow, when that flow is absent from the
-    /// store or is not an HTTP flow, or when its request does not address an
-    /// absolute `http(s)` origin.
+    /// When the point names neither a source flow nor a usable absolute
+    /// `http(s)` URL, when the flow it names is absent from the store or is
+    /// not an HTTP flow, or when its request does not address an absolute
+    /// `http(s)` origin.
     pub(crate) fn new(
         point: &InsertionPoint,
         job: Arc<dyn JobCtx>,
         monitor: Arc<SessionMonitor>,
     ) -> Result<Self> {
-        let Some(flow_ref) = point.flow else {
-            return Err(anyhow!("scan: point {} has no source flow", point.id));
+        let (captured, mut source) = match point.flow {
+            Some(flow_ref) => {
+                let Some(Flow::Http(flow)) = job.store().get(flow_ref.0) else {
+                    return Err(anyhow!("scan: source flow {flow_ref} is gone"));
+                };
+                (Some(flow.clone()), flow.request)
+            }
+            None => {
+                let synthetic = point
+                    .url
+                    .as_deref()
+                    .and_then(url_norm::parse_absolute)
+                    .and_then(|url| origin_request(&url, point.method.as_deref()));
+                let Some(request) = synthetic else {
+                    return Err(anyhow!(
+                        "scan: point {} has no source flow and no absolute address to stand in for one",
+                        point.id
+                    ));
+                };
+                (None, request)
+            }
         };
-        let Some(Flow::Http(flow)) = job.store().get(flow_ref.0) else {
-            return Err(anyhow!("scan: source flow {flow_ref} is gone"));
-        };
-
-        let captured = flow.clone();
-        let mut source = flow.request;
         match job.profile().session.mode {
             // The capture may itself be authenticated; an unauthenticated job
             // sheds that here, before the baseline exists, so no later path
@@ -141,7 +172,8 @@ impl HttpProbeHost {
         }
         let Some(origin) = url_norm::request_url(&source) else {
             return Err(anyhow!(
-                "scan: source flow {flow_ref} does not address an absolute origin"
+                "scan: the source of point {} does not address an absolute origin",
+                point.id
             ));
         };
 
@@ -368,6 +400,30 @@ impl HttpProbeHost {
     }
 }
 
+/// The source request of an origin-scoped point (amendment 38): `method`
+/// (`GET` when the point names none) to `url`, no body.
+///
+/// The one header it carries is `host`, the authority the request addresses;
+/// everything else a probe needs is put on by [`mutate::build_request`], the
+/// session by [`session::apply_session`], and the HTTP version by the send
+/// options, which read the profile's `http.version` as every other send of
+/// this lane does. `None` when the URL names no host.
+fn origin_request(url: &Url, method: Option<&str>) -> Option<HttpRequest> {
+    let (authority, path) = url_norm::parts(url)?;
+    let mut headers = HeaderMap::new();
+    headers.set("host", &authority);
+    Some(HttpRequest {
+        method: method.unwrap_or("GET").to_string(),
+        scheme: url.scheme().to_string(),
+        authority,
+        path,
+        version: aitm_core::HttpVersion::Http11,
+        headers,
+        body: Body::Empty,
+        timestamp: SystemTime::now(),
+    })
+}
+
 /// Whether `name` is a header a session rides in: `Cookie`, `Authorization`,
 /// or any name the shared secret vocabulary recognises (`X-Api-Key`,
 /// `X-CSRF-Token`, …).
@@ -445,7 +501,7 @@ impl ProbeHost for HttpProbeHost {
     }
 
     fn captured(&self) -> Option<HttpFlow> {
-        Some(self.captured.clone())
+        self.captured.clone()
     }
 
     fn baseline_peer_addr(&self) -> Option<SocketAddr> {
@@ -664,7 +720,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use aitm_core::{
-        Flow, FlowStore, HttpRequest, MemFlowStore, ProxyClient, RecordPolicy, ScopeRateGuard,
+        Body, Flow, FlowStore, HttpRequest, MemFlowStore, ProxyClient, RecordPolicy, ScopeRateGuard,
     };
     use aitm_scan_model::{
         Canary, CanaryMethod, FlowRef, InsertionKind, InsertionPoint, JobCtx, LaneKind, OnLost,
@@ -673,7 +729,7 @@ mod tests {
     };
 
     use crate::host::{HttpProbeHost, SessionMonitors};
-    use crate::limits::{MAX_HELD_FLOWS, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS};
+    use crate::limits::{job_mark, MAX_HELD_FLOWS, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS};
     use crate::session::{CanaryRequest, SessionMonitor, SESSION_LOST_PREFIX};
     use crate::testutil::{captured_flow, request, response, FakeJob, ScriptedClient, JOB_ID};
 
@@ -714,6 +770,25 @@ mod tests {
             frequency: 1,
             method: None,
             url: None,
+        }
+    }
+
+    /// The synthetic origin-scoped point T1b's follow-up scheduler hands the
+    /// lane: one per origin, with no captured flow (amendment 38).
+    fn origin_point() -> InsertionPoint {
+        InsertionPoint {
+            id: "origin:http://t:8080".to_string(),
+            lane: LaneKind::Http,
+            kind: InsertionKind::PathSegment,
+            name: "/".to_string(),
+            path: Some("/".to_string()),
+            example: None,
+            flow: None,
+            site_node: None,
+            traits: Vec::new(),
+            frequency: 1,
+            method: Some("GET".to_string()),
+            url: Some("http://t:8080/".to_string()),
         }
     }
 
@@ -1173,6 +1248,76 @@ mod tests {
             Ok(_) => panic!("{what}"),
             Err(err) => format!("{err:#}"),
         }
+    }
+
+    /// Amendment 38: T1b's follow-up scheduler hands the lane one synthetic
+    /// origin-scoped point per origin (`id: "origin:<origin>"`, no `flow`, a
+    /// `url`). The host builds a `GET <origin>/` source for it, so the h2
+    /// natives run on this lane instead of erroring "point has no source
+    /// flow".
+    #[tokio::test]
+    async fn an_origin_scoped_point_builds_a_synthetic_get() {
+        let fx = fixture(ok_200().with_peer(upstream()));
+        let host = HttpProbeHost::new(&origin_point(), fx.ctx(), unarmed()).unwrap();
+
+        // Nothing was captured for this point: a passive check must see `None`
+        // rather than a reconstruction of a request nobody made.
+        assert!(host.captured().is_none());
+
+        host.baseline().await.unwrap();
+
+        let sent = fx.sent();
+        assert_eq!(sent.len(), 1);
+        let (req, opts) = &sent[0];
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.scheme, "http");
+        assert_eq!(req.authority, "t:8080");
+        assert_eq!(req.path, "/");
+        assert_eq!(req.headers.get("host"), Some("t:8080"));
+        assert_eq!(req.version, aitm_core::HttpVersion::Http11);
+        assert!(matches!(req.body, Body::Empty));
+        assert_eq!(opts.marks, vec![job_mark(JOB_ID)]);
+        // The job's session is applied to the synthetic source exactly as it
+        // is to a captured one.
+        assert_eq!(req.headers.get("cookie"), Some("sid=S3"));
+
+        assert_eq!(host.baseline_peer_addr(), Some(upstream()));
+    }
+
+    /// Amendment 38: the synthetic source keeps the point's own method and the
+    /// URL's query, and an `https` origin-scoped point stays `https`.
+    #[tokio::test]
+    async fn an_origin_scoped_point_keeps_its_method_and_query() {
+        let fx = fixture(ok_200());
+        let mut point = origin_point();
+        point.method = Some("HEAD".to_string());
+        point.url = Some("https://t:8443/health?deep=1".to_string());
+        let host = HttpProbeHost::new(&point, fx.ctx(), unarmed()).unwrap();
+
+        host.baseline().await.unwrap();
+
+        let sent = fx.sent();
+        let (req, _) = &sent[0];
+        assert_eq!(req.method, "HEAD");
+        assert_eq!(req.scheme, "https");
+        assert_eq!(req.authority, "t:8443");
+        assert_eq!(req.path, "/health?deep=1");
+        assert_eq!(req.headers.get("host"), Some("t:8443"));
+    }
+
+    /// Amendment 38: a point with neither a flow nor a usable absolute URL is
+    /// still an error — the host never guesses an origin.
+    #[tokio::test]
+    async fn an_unusable_origin_url_is_still_an_error() {
+        let fx = fixture(ok_200());
+
+        let mut relative = origin_point();
+        relative.url = Some("/only-a-path".to_string());
+        let bad = refusal(
+            HttpProbeHost::new(&relative, fx.ctx(), unarmed()),
+            "a point whose url is not absolute is an error",
+        );
+        assert!(bad.contains("no source flow"), "unexpected message: {bad}");
     }
 
     #[tokio::test]
