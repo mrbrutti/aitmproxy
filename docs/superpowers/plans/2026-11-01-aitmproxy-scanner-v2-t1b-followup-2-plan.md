@@ -281,6 +281,8 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
 
 ### Task 5: deterministic terminal waits
 
+**Rescoped 2026-11-01 (coordinator priority request):** the production piece — a `watch` terminal signal on `JobEntry`, flipped in `JobRegistry::finish`, `JobRegistry::terminal_signal`, and the signal-based `test_support::wait_terminal`/`wait_terminal_blocking` under a 60 s `TERMINAL_NET` — ships ahead of this PR in **PR #285** (branch `claude/scanner-v2-flaky-tests`, off main 449d6d17) together with the `cancel_moves_to_cancelled_and_keeps_issues` fix and the `aitm-scan-ws` dialer test deadlines. This PR merges main after #285 lands and Task 5 then covers only what #285 did not: (a) the remaining wall-clock *measured* assertions in the four scanner test modules (`verbs.rs` `start_returns_a_start_result_immediately` `< 2 s`; `commands.rs` `discover_time_budget_cancels_and_reports` `< 6 s` with `CANCEL_GRACE` 5 s, the 5 s confinement-release poll, the 10 s `recv_timeout`) — convert to the mechanism or accept in writing; (b) the production `commands.rs::poll_until` (100 ms sleep loop behind `scan.discover`) → the terminal signal; (c) the inventory table below re-checked after the merge (every `wait_terminal(.., Duration)` is already gone in #285). The cancel test is out of this PR's scope.
+
 - **Satisfies:** CI determinism (the `cancel_moves_to_cancelled_and_keeps_issues` 2 s failure);
   the "tests must be deterministic" convention.
 - **Depends on:** Task 1b (last writer of `worker.rs`).
@@ -439,6 +441,7 @@ Kept by the main session during stage 6. One row per finding.
 | 3 | Coder (Task 3) | Important (casualty) | `worker::tests::an_all_erroring_host_stops_the_job_with_stopped_reason_errors` used `answering(500)` as the host failure, which amendment 40 removes from the ladder; `StubClient` has no transport-failure mode; `jobs.rs` docs still say a 5xx is what the ladder counts | fixed in bf3526e5: `StubClient::failing` + `Harness::failing`, the test's stimulus is a transport error, `answering(5xx)` helpers removed (no caller), `jobs.rs` docs corrected; `docs/scanner.md` `per_host_errors` wording is Task 6's per C8 |
 | 4 | Coder (Task 4) | Note | New ceiling placed after `l4_bytes_per_s`; "the other five" → "six" in `config_file.rs` and docs; only other `Ceilings` literal uses `..default()` | accepted; committed in c9fe6b3e |
 | 2 | Coder (Task 2) | Note | Plan named full-run tests needing a `FakeLane` crawl-error hook in `jobs.rs` (Task 5's file); the coder covered the behaviour at the `JobRuntime` level and asked for the hook | orchestrator added `FakeLane::with_crawl_errors` and the two full-run tests in bf3526e5; the runtime-level tests stay |
+| 5 | Orchestrator | Note | Task 5's production piece (terminal signal + signal-based waits + the cancel test) moved to PR #285 on the coordinator's priority request; this PR rebases on it | recorded above; Task 5 rescoped to the remaining measured bounds and `poll_until` |
 | all | Orchestrator | Note | Wave A coders ran into each other's mid-TDD states (expected in one tree); whole-package reds during Wave A were the Task 3 casualty above, not regressions | noted |
 
 ## Shipped
