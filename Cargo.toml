@@ -25,6 +25,7 @@ members = [
     "crates/aitm-bus-client",
     "crates/aitm-tui",
     "crates/aitm-peer-token",
+    "crates/aitm-peer-process",
     "crates/aitm-scan-model",
     "crates/aitm-scan-http",
     "crates/aitm-scan-checks-http",
@@ -33,6 +34,7 @@ members = [
     "crates/aitm-scan-l4-stream",
     "crates/aitm-sysproxy",
     "crates/aitm-term",
+    "crates/aitm-l4-helper",
     "crates/aitm",
 ]
 
@@ -99,6 +101,7 @@ aitm-bus-client = { path = "crates/aitm-bus-client" }
 aitm-tui = { path = "crates/aitm-tui" }
 aitm-plugin-scanner = { path = "crates/aitm-plugin-scanner" }
 aitm-peer-token = { path = "crates/aitm-peer-token" }
+aitm-peer-process = { path = "crates/aitm-peer-process" }
 aitm-scan-model = { path = "crates/aitm-scan-model" }
 aitm-scan-http = { path = "crates/aitm-scan-http" }
 aitm-scan-checks-http = { path = "crates/aitm-scan-checks-http" }
@@ -107,3 +110,4 @@ aitm-scan-l4-packet = { path = "crates/aitm-scan-l4-packet" }
 aitm-scan-l4-stream = { path = "crates/aitm-scan-l4-stream" }
 aitm-sysproxy = { path = "crates/aitm-sysproxy" }
 aitm-term = { path = "crates/aitm-term" }
+aitm-l4-helper = { path = "crates/aitm-l4-helper" }

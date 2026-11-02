@@ -1,0 +1,174 @@
+
+== when / host
+2026-11-02T03:00:16Z
+ProductName:		macOS ProductVersion:		27.0 BuildVersion:		26A428 
+
+== installed versions
+app  CFBundleShortVersionString: 0.5.11
+app  bundled core: 36379232 Nov 1 18:02
+cli  which aitm: /opt/homebrew/bin/aitm
+aitm 0.5.10
+(brew list failed)
+
+== processes (app, embedded core, terminal cores, obscura, extension)
+79149 /Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy
+16734 /Applications/Aitmproxy.app/Contents/Resources/core/aitm --config /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/137E0FB1-FA40-4745-AD78-40DE359ADC94/config.yaml
+dev-bundle apps: none
+terminal aitm: none
+16740 /Applications/Aitmproxy.app/Contents/Resources/core/obscura serve --host 127.0.0.1 --port 57572 --proxy http://127.0.0.1:8083 --ca-cert /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt --ready-file /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-obscura-16734-1c6e9084f0eb67c9896df34b376b64d8/ready-1c6e9084f0eb67c9896df34b376b64d8.ready
+30227 /tmp/claude/obscura/extracted/obscura serve --host 127.0.0.1 --port 50463 --proxy http://127.0.0.1:50461 --ca-cert /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt --allow-private-network --ready-file /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-obscura-30205-bb33bcfc9972fdc535ca0a569e7307b6/ready-bb33bcfc9972fdc535ca0a569e7307b6.ready
+31160 /tmp/claude/obscura/extracted/obscura serve --host 127.0.0.1 --port 50513 --proxy http://127.0.0.1:50511 --ca-cert /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt --allow-private-network --ready-file /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-obscura-31157-aeebf96d9b1b0e38812e1bce73ba9a5a/ready-aeebf96d9b1b0e38812e1bce73ba9a5a.ready
+32470 /Users/matt/Security/aitmproxy/.claude/worktrees/cli-ux-terminal-reporting-64b09b/target/debug/obscura serve --host 127.0.0.1 --port 62088 --proxy http://127.0.0.1:62086 --ca-cert /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/tmp.sJHgUn2063/disc_dev/ca/ca.crt --ready-file /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-obscura-32463-6c3935860c57e69444fb4b2c05a78495/ready-6c3935860c57e69444fb4b2c05a78495.ready
+32581 /Users/matt/Security/aitmproxy/.claude/worktrees/cli-ux-terminal-reporting-64b09b/target/debug/obscura serve --host 127.0.0.1 --port 62116 --proxy http://127.0.0.1:62112 --ca-cert /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/tmp.sJHgUn2063/web/ca/ca.crt --ready-file /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-obscura-32575-d31ccbc36f48ad1c25becd5ff1c47ca8/ready-d31ccbc36f48ad1c25becd5ff1c47ca8.ready
+32866 /tmp/claude/obscura/extracted/obscura serve --host 127.0.0.1 --port 50978 --proxy http://127.0.0.1:50976 --ca-cert /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt --allow-private-network --ready-file /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-obscura-32863-d5dd6727c901a097b1c6a7683b3590e9/ready-d5dd6727c901a097b1c6a7683b3590e9.ready
+79187 /Library/SystemExtensions/6897DC10-F8D8-465A-ADC9-16C22F71B52F/com.mrbrutti.aitmproxy.ne.systemextension/Contents/MacOS/AitmproxyNE
+
+== listeners on the default ports
+COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+aitm    16734 matt   12u  IPv4 0xa8a1558715819344      0t0  TCP 127.0.0.1:8080 (LISTEN)
+(none)
+
+== system proxy: scutil --proxy (effective)
+<dictionary> {
+  ExceptionsList : <array> {
+    0 : *.local
+    1 : 169.254/16
+  }
+  FTPPassive : 1
+  HTTPEnable : 0
+  HTTPSEnable : 0
+}
+
+== system proxy: per service
+-- Wi-Fi
+   http  Enabled: No
+   http  Server: 127.0.0.1
+   http  Port: 9090
+   http  Authenticated Proxy Enabled: 0
+   https Enabled: No
+   https Server: 127.0.0.1
+   https Port: 9090
+   https Authenticated Proxy Enabled: 0
+-- Display Ethernet
+   http  Enabled: No
+   http  Server: 127.0.0.1
+   http  Port: 9090
+   http  Authenticated Proxy Enabled: 0
+   https Enabled: No
+   https Server: 127.0.0.1
+   https Port: 9090
+   https Authenticated Proxy Enabled: 0
+
+== CA trust (login + System keychains)
+-- /Users/matt/Library/Keychains/login.keychain-db
+SHA-1 hash: B2D8E780FF3AB71F71F8544A1D7A8B64DDC5A485
+    "labl"<blob>="aitmproxy root CA"
+-- /Library/Keychains/System.keychain
+   (no aitmproxy certificate)
+
+== network extension
+--- com.apple.system_extension.network_extension (Go to 'System Settings > General > Login Items & Extensions > Network Extensions' to modify these system extension(s))
+enabled	active	teamID	bundleID (version)	name	[state]
+*	*	MLZF7K7B5R	at.obdev.littlesnitch.networkextension (6.5/7303)	Little Snitch Network Extension	[activated enabled]
+*	*	4P645293E8	com.ui.uid.standard-desktop.network-extension (0.0.18/1)	IdentityWireGuardProvider	[activated enabled]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.1/1)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.11/202611011802)	AitmproxyNE	[activated enabled]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.5/202610311711)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.10/202611011427)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.4/202610311454)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610310840)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610311334)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.6/202610311834)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.7/202610311934)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.10/202611011041)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+--- com.apple.system_extension.endpoint_security (Go to 'System Settings > General > Login Items & Extensions > Endpoint Security Extensions' to modify these system extension(s))
+enabled	active	teamID	bundleID (version)	name	[state]
+*	*	MLZF7K7B5R	at.obdev.littlesnitch.endpointsecurity (6.5/7303)	Little Snitch Endpoint Security	[activated enabled]
+
+== data dir: /Users/matt/Library/Application Support/aitmproxy
+total 14536
+drwx------@  13 matt  staff      416 Nov  1 18:28 .
+drwx------+ 176 matt  staff     5632 Nov  1 09:01 ..
+-rw-------@   1 matt  staff     6706 Nov  1 18:52 audit.agent.jsonl
+-rw-------@   1 matt  staff    42764 Nov  1 18:52 audit.jsonl
+-rw-------@   1 matt  staff  7014174 Nov  1 19:00 audit.reads.jsonl
+drwx------@   4 matt  staff      128 Oct 27 18:09 ca
+-rw-------@   1 matt  staff    20889 Nov  1 08:48 ca-audit.jsonl
+-rw-r--r--@   1 matt  staff      534 Nov  1 18:35 columns.json
+-rw-r--r--@   1 matt  staff     1012 Nov  1 08:47 findings.json
+drwx------@   3 matt  staff       96 Nov  1 15:54 logs
+-rw-r--r--@   1 matt  staff       41 Nov  1 18:29 pins.json
+-rw-r--r--@   1 matt  staff       22 Oct 31 18:56 rules.json
+-rw-r--r--@   1 matt  staff       47 Nov  1 15:38 system-proxy-watchdog.log
+-- config.yaml: listen / scope / mcp keys (values of tokens are NOT shown)
+(no config.yaml)
+-- run/cores pointer files (cli-oneshot-live-core, after #271)
+(none)
+-- system-proxy-state.json
+(absent)
+-- audit.jsonl tail (last 5 control entries)
+{"at":1793586723559,"marker":"start","pid":15639,"schema":1,"stream":"control","version":"0.5.11"}
+{"at":1793586812616,"marker":"start","pid":16734,"schema":1,"stream":"control","version":"0.5.11"}
+{"at":1793586905464,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_d4ab833f2733e0a0-2","command":"scope.add","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+{"at":1793586911134,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_d4ab833f2733e0a0-3","command":"scope.remove","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+{"at":1793587928813,"marker":"start","pid":31540,"schema":1,"stream":"control","version":"0.5.10"}
+
+== app defaults (com.mrbrutti.aitmproxy) - connection and capture keys, tokens redacted
+    "bus.activeKind" = embedded;
+    "bus.expectedRole" = agent;
+    "bus.fromConfig" = 1;
+    "capture.enabled" = 1;
+    "proxy.preferredPort" = 8080;
+    "settings.tab" = capture;
+
+== embedded core per-launch dirs (aitm-embedded-core)
+total 0
+drwx------@    24 matt  staff      768 Nov  1 18:33 .
+drwx------@ 65535 matt  staff  4033056 Nov  1 19:00 ..
+drwx------@     4 matt  staff      128 Nov  1 17:49 0BAC06C5-7D16-4EAF-B8A5-D23A15D03025
+drwx------@     4 matt  staff      128 Nov  1 18:33 137E0FB1-FA40-4745-AD78-40DE359ADC94
+drwx------@     3 matt  staff       96 Nov  1 17:51 19FE8755-2855-44A3-969D-9AD6F65F16CC
+drwx------@     3 matt  staff       96 Nov  1 17:38 204E503D-97C5-4B17-846D-5D009FE6D166
+drwx------@     4 matt  staff      128 Nov  1 17:44 2B34DE3A-90FF-40B3-9773-7DC5D7A233E8
+drwx------@     3 matt  staff       96 Nov  1 17:46 2E39B69F-6BD2-425C-B355-DF11ECC68DE2
+drwx------@     3 matt  staff       96 Nov  1 18:05 2FD6FCCB-78AD-4F9C-AFCC-F9F582767272
+drwx------@     3 matt  staff       96 Nov  1 18:12 3EBEB991-DA80-4F75-A4ED-9F69F5F3DE0F
+drwx------@     3 matt  staff       96 Nov  1 18:09 4A07F12A-0F3B-49BE-8F49-0CAB8C52E4FF
+drwx------@     4 matt  staff      128 Nov  1 18:03 581F1732-8543-4B63-8596-2320D011839C
+drwx------@     4 matt  staff      128 Nov  1 18:12 74398BC5-5A92-4FF3-B43D-9BC2A018EECF
+drwx------@     3 matt  staff       96 Nov  1 17:44 7A4B906E-AE20-4B9E-8808-81E87B84BC37
+drwx------@     3 matt  staff       96 Nov  1 17:34 8773A9ED-A085-4D51-A96D-C703E6FEA772
+drwx------@     3 matt  staff       96 Nov  1 17:49 88C84845-F1A9-4A4F-8616-0346C07A4391
+drwx------@     3 matt  staff       96 Nov  1 18:08 9143A008-B794-4FE2-A562-A397BCEDAD8A
+drwx------@     3 matt  staff       96 Nov  1 17:23 92E85248-E6BB-4201-9F09-E237DD4DD92F
+drwx------@     3 matt  staff       96 Nov  1 17:54 9382617C-470F-4F7D-AEAA-B2FEEE6FB850
+drwx------@     3 matt  staff       96 Nov  1 17:53 A5130070-E301-40AF-A1DD-3D187ED2646F
+drwx------@     4 matt  staff      128 Nov  1 18:07 A6917427-7868-4878-A7FA-F9B436971DAD
+drwx------@     3 matt  staff       96 Nov  1 18:04 AB9D399B-F8CF-477A-83DD-297F9A4B7425
+drwx------@     4 matt  staff      128 Nov  1 15:15 C8AEBDB0-62CC-46ED-BCAC-A987CCD796D8
+drwx------@     3 matt  staff       96 Nov  1 17:50 FEDE690A-D08D-4E3F-8DE7-817822B8D11B
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/0BAC06C5-7D16-4EAF-B8A5-D23A15D03025/  bus.endpoint=127.0.0.1:49444  listen="127.0.0.1:49440"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/137E0FB1-FA40-4745-AD78-40DE359ADC94/  bus.endpoint=127.0.0.1:57574  listen="127.0.0.1:8080"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/19FE8755-2855-44A3-969D-9AD6F65F16CC/  bus.endpoint=none  listen="127.0.0.1:49867"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/204E503D-97C5-4B17-846D-5D009FE6D166/  bus.endpoint=none  listen="127.0.0.1:63943"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/2B34DE3A-90FF-40B3-9773-7DC5D7A233E8/  bus.endpoint=127.0.0.1:64968  listen="127.0.0.1:64964"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/2E39B69F-6BD2-425C-B355-DF11ECC68DE2/  bus.endpoint=none  listen="127.0.0.1:65279"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/2FD6FCCB-78AD-4F9C-AFCC-F9F582767272/  bus.endpoint=none  listen="127.0.0.1:52111"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/3EBEB991-DA80-4F75-A4ED-9F69F5F3DE0F/  bus.endpoint=none  listen="127.0.0.1:53469"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/4A07F12A-0F3B-49BE-8F49-0CAB8C52E4FF/  bus.endpoint=none  listen="127.0.0.1:52769"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/581F1732-8543-4B63-8596-2320D011839C/  bus.endpoint=127.0.0.1:51989  listen="127.0.0.1:51985"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/74398BC5-5A92-4FF3-B43D-9BC2A018EECF/  bus.endpoint=127.0.0.1:53457  listen="127.0.0.1:53453"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/7A4B906E-AE20-4B9E-8808-81E87B84BC37/  bus.endpoint=none  listen="127.0.0.1:64983"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/8773A9ED-A085-4D51-A96D-C703E6FEA772/  bus.endpoint=none  listen="127.0.0.1:63145"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/88C84845-F1A9-4A4F-8616-0346C07A4391/  bus.endpoint=none  listen="127.0.0.1:49454"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/9143A008-B794-4FE2-A562-A397BCEDAD8A/  bus.endpoint=none  listen="127.0.0.1:52708"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/92E85248-E6BB-4201-9F09-E237DD4DD92F/  bus.endpoint=none  listen="127.0.0.1:61199"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/9382617C-470F-4F7D-AEAA-B2FEEE6FB850/  bus.endpoint=none  listen="127.0.0.1:50363"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/A5130070-E301-40AF-A1DD-3D187ED2646F/  bus.endpoint=none  listen="127.0.0.1:50106"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/A6917427-7868-4878-A7FA-F9B436971DAD/  bus.endpoint=127.0.0.1:52700  listen="127.0.0.1:52696"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/AB9D399B-F8CF-477A-83DD-297F9A4B7425/  bus.endpoint=none  listen="127.0.0.1:52006"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/C8AEBDB0-62CC-46ED-BCAC-A987CCD796D8/  bus.endpoint=127.0.0.1:54839  listen="127.0.0.1:54835"
+/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/FEDE690A-D08D-4E3F-8DE7-817822B8D11B/  bus.endpoint=none  listen="127.0.0.1:49594"
+
+== done
+written to /tmp/claude/acceptance/0.5.11/run-20261102T030016Z/state-before.txt

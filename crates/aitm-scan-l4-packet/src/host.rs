@@ -33,8 +33,8 @@ use aitm_proto_l4::guard::{L4Guard, L4GuardError};
 use aitm_proto_l4::icmp::transport_payload;
 use aitm_proto_l4::sendrecv::{send_recv, SendRecvOutcome};
 use aitm_scan_model::{
-    InsertionPoint, JobCtx, L4Evidence, L4Oracle, L4Reply, Payload, ProbeHost, ProbeResponse,
-    RawProbe, ScanProfile, MAX_MATCH_BODY,
+    InsertionPoint, JobCtx, L4Evidence, L4Options, L4Oracle, L4Reply, Payload, ProbeHost,
+    ProbeResponse, RawProbe, ScanProfile, MAX_MATCH_BODY,
 };
 use futures::future::BoxFuture;
 
@@ -45,8 +45,8 @@ use crate::oracle::{classify, liveness_passes, CaseClass, LatencyWindow};
 use crate::plan::{is_decodable, send_recv_spec, PlanError, SeedSpec, TargetPlan};
 use crate::rng::{derive_seed, Rng};
 use crate::state::{
-    report_counters, Candidate, CaseOutcome, CaseRecord, CrashRecord, LaneState, PointRun,
-    StopReason,
+    report_counters, Candidate, CaseNote, CaseOutcome, CaseRecord, CrashRecord, LaneState,
+    PointRun, StopReason,
 };
 use crate::sync::lock;
 
@@ -56,6 +56,21 @@ pub const CASE_REPLY_WINDOW: Duration = Duration::from_millis(500);
 /// How long a silent target is given to come back before the outage is called
 /// persistent (plan call C27).
 pub const RECOVERY_WAIT: Duration = Duration::from_secs(10);
+
+/// The floor, in milliseconds, under which the lane refuses to pace an
+/// ICMP-baseline point, whatever the profile asks for (spec amendment 46; D11's
+/// `scanner.ceilings.l4_icmp_pace_ms_min`).
+///
+/// A remote target's kernel rate-limits the ICMP errors it generates — Linux
+/// defaults to `net.ipv4.icmp_ratelimit = 1000` ms per destination; loopback is
+/// exempt (write-up `2026-11-01-t5-live-proof.md`, section iii) — so a point
+/// stimulated faster than this reads silence where the port is simply closed.
+/// The engine clamps the profile value up to D11's ceiling and reports it in
+/// `scan.start`'s `clamped`; until it passes its ceilings to the lane, the lane
+/// applies this floor itself. The only way under it is [`Timing::icmp_pace`],
+/// and that field is crate-private, so no lane caller can under-pace a closed
+/// port.
+pub const ICMP_PACE_FLOOR_MS: u32 = 1000;
 
 /// Every wait and ceiling the fuzz loop obeys. Set by the lane (plan call C3),
 /// never by a profile; tests shrink it so a run costs milliseconds.
@@ -80,6 +95,14 @@ pub struct Timing {
     pub max_raw_bytes: usize,
     /// How many cases a dry run renders.
     pub dry_run_cases: u32,
+    /// This crate's own ICMP pace, replacing both the profile's `icmp_pace_ms`
+    /// and [`ICMP_PACE_FLOOR_MS`]. `None` — the production value — means the
+    /// profile's, never below the floor (see [`Timing::icmp_pace_for`]).
+    ///
+    /// Crate-private: only the in-crate test harness (`fast_timing`) sets it,
+    /// so a caller of [`crate::PacketLane::with_timing`] cannot under-pace a
+    /// closed port (spec D11); the floor holds by construction.
+    pub(crate) icmp_pace: Option<Duration>,
 }
 
 impl Default for Timing {
@@ -92,6 +115,7 @@ impl Default for Timing {
             recovery_polls: 10,
             max_raw_bytes: DEFAULT_MAX_RAW_BYTES,
             dry_run_cases: 50,
+            icmp_pace: None,
         }
     }
 }
@@ -101,6 +125,17 @@ impl Timing {
     #[must_use]
     pub fn recovery_wait(&self) -> Duration {
         self.recovery_poll.saturating_mul(self.recovery_polls)
+    }
+
+    /// How far apart consecutive stimuli to an ICMP-baseline point are spaced
+    /// (spec amendment 46): the profile's `l4.icmp_pace_ms`, raised to
+    /// [`ICMP_PACE_FLOOR_MS`] when it is below it, unless the crate-private
+    /// [`Timing::icmp_pace`] override is set.
+    #[must_use]
+    pub fn icmp_pace_for(&self, options: &L4Options) -> Duration {
+        let floored =
+            Duration::from_millis(u64::from(options.icmp_pace_ms.max(ICMP_PACE_FLOOR_MS)));
+        self.icmp_pace.unwrap_or(floored)
     }
 }
 
@@ -231,6 +266,9 @@ pub struct PointRunner {
     /// (review finding M8).
     seed0: SeedSpec,
     baseline: Mutex<Option<CaseClass>>,
+    /// When this point last had a stimulus put on the wire, so an ICMP-paced
+    /// point spaces the next one (spec amendment 46).
+    last_stimulus_at: Mutex<Option<Instant>>,
     run: tokio::sync::OnceCell<Arc<PointRun>>,
 }
 
@@ -242,6 +280,7 @@ impl fmt::Debug for PointRunner {
             .field("field", &self.field)
             .field("rng_seed", &self.rng_seed)
             .field("baseline", &*lock(&self.baseline))
+            .field("icmp_paced", &self.is_icmp_paced())
             .finish()
     }
 }
@@ -272,6 +311,7 @@ impl PointRunner {
             rng_seed,
             seed0,
             baseline: Mutex::new(None),
+            last_stimulus_at: Mutex::new(None),
             run: tokio::sync::OnceCell::new(),
         })
     }
@@ -530,6 +570,47 @@ impl PointRunner {
         }
     }
 
+    /// Whether this point is **ICMP-paced**: its baseline reply class is an
+    /// ICMP error, so the target host's kernel — not a service — is what
+    /// answers it (spec D8.4, amendment 46).
+    ///
+    /// On such a point the lane spaces every stimulus by
+    /// [`Timing::icmp_pace_for`], records a silent case as
+    /// `no_reply (icmp_ratelimit)`, spends no liveness probe on that silence
+    /// and never raises a crash candidate: a closed port can never yield
+    /// `l4-crash`.
+    fn is_icmp_paced(&self) -> bool {
+        matches!(*lock(&self.baseline), Some(CaseClass::Icmp { .. }))
+    }
+
+    /// Wait until this point's pace has elapsed since its previous stimulus,
+    /// for an ICMP-paced point (spec amendment 46).
+    ///
+    /// Bounded by the job's deadline: the wait never runs past it, and the
+    /// caller's own deadline check raises the [`StopReason::Deadline`] stop, so
+    /// the pace adds no new failure path. A point that has sent nothing yet,
+    /// one whose baseline is not an ICMP error, and a zero pace all return at
+    /// once.
+    async fn pace_icmp_point(&self) {
+        if !self.is_icmp_paced() {
+            return;
+        }
+        let pace = self.shared.timing.icmp_pace_for(&self.job.profile().l4);
+        if pace.is_zero() {
+            return;
+        }
+        let Some(last) = *lock(&self.last_stimulus_at) else {
+            return;
+        };
+        let now = Instant::now();
+        let due = last + pace;
+        if due <= now {
+            return;
+        }
+        let left = self.job.deadline().saturating_duration_since(now);
+        tokio::time::sleep((due - now).min(left)).await;
+    }
+
     /// One stimulus end to end: the stop checks, the craft, the charge, the
     /// guarded send with its rate wait, and the oracle's reading of the reply.
     async fn deliver(
@@ -597,7 +678,9 @@ impl PointRunner {
             return Err(HostError::Stopped(StopReason::Budget));
         }
 
-        // (e) The guarded send, waiting out the guard's injection rate.
+        // (e) The pace of an ICMP-paced point (spec amendment 46), then the
+        // guarded send, waiting out the guard's injection rate.
+        self.pace_icmp_point().await;
         let (outcome, elapsed) = loop {
             let now = Instant::now();
             let deadline = self.job.deadline();
@@ -611,6 +694,7 @@ impl PointRunner {
                 .reply_window
                 .min(deadline.saturating_duration_since(now));
             let started = Instant::now();
+            *lock(&self.last_stimulus_at) = Some(started);
             match self
                 .send_blocking(spec.clone(), timeout, request_field)
                 .await
@@ -656,6 +740,12 @@ impl PointRunner {
             elapsed_ms: classified.elapsed_ms,
             latency_outlier: false,
         };
+        // Silence on an ICMP-paced point is the target host's ICMP rate
+        // limiter, not a service that stopped answering: it is recorded as
+        // `no_reply (icmp_ratelimit)` and judged no further (amendment 46).
+        if classified.class == CaseClass::Silence && self.is_icmp_paced() {
+            record.note = Some(CaseNote::IcmpRatelimit);
+        }
         let stop = if counted == Counted::Case {
             self.shared
                 .state
@@ -827,7 +917,10 @@ impl PointRunner {
                 };
             }
 
-            if class.is_candidate() && stop.is_none() {
+            // An ICMP-baseline point never spends a liveness probe on a
+            // candidate class and never becomes a crash: the kernel's reaction
+            // proves classification, never a crash (spec D8.4, amendment 46).
+            if class.is_candidate() && stop.is_none() && !self.is_icmp_paced() {
                 // A pair a stop cut short is read as the stop it is, before
                 // any verdict is taken off it (review finding P1).
                 let (first, second) = match self.probe_pair(false).await {
@@ -1392,7 +1485,7 @@ mod tests {
     use aitm_proto_l4::flow::L4Packet;
     use aitm_proto_l4::icmp::transport_payload;
     use aitm_proto_l4::types::L4Direction;
-    use aitm_scan_model::{JobCtx, L4Counters, Payload, PayloadMode, ProbeHost};
+    use aitm_scan_model::{JobCtx, L4Counters, L4Options, Payload, PayloadMode, ProbeHost};
 
     use super::{
         craft_stop, join_error_message, HostError, PacketHost, PointRunner, RunnerRegistry, Shared,
@@ -1403,7 +1496,7 @@ mod tests {
     use crate::fields::FieldPath;
     use crate::oracle::CaseClass;
     use crate::plan::{SeedOrigin, SeedPayload};
-    use crate::state::{Candidate, StopReason};
+    use crate::state::{Candidate, CaseNote, StopReason};
     use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
         fields, l4_profile, tcp_target, udp_target, with_hex_seed, MockBackend, MockReply,
@@ -3065,5 +3158,306 @@ mod tests {
         assert_eq!(refused.chain, Vec::<String>::new());
         assert_eq!(mock.inject_count(), 0, "a dry run sends nothing");
         assert_eq!(job.charged(), 0);
+    }
+
+    /// Amendment 46: the pace a point obeys is the profile's, never below the
+    /// lane's defensive floor, and the crate-private override replaces both
+    /// (so a unit test costs milliseconds instead of twenty seconds; see
+    /// `pace_override_is_crate_private_and_floor_holds_otherwise`).
+    #[test]
+    fn profile_pace_below_the_floor_is_raised() {
+        assert_eq!(super::ICMP_PACE_FLOOR_MS, 1000);
+        let mut options = L4Options::default();
+
+        assert_eq!(
+            Timing::default().icmp_pace_for(&options),
+            Duration::from_millis(1100),
+            "the profile default is above the floor, so it is used as written"
+        );
+
+        options.icmp_pace_ms = 500;
+        assert_eq!(
+            Timing::default().icmp_pace_for(&options),
+            Duration::from_millis(1000),
+            "a profile value below the floor is raised to it"
+        );
+
+        options.icmp_pace_ms = 0;
+        assert_eq!(
+            Timing::default().icmp_pace_for(&options),
+            Duration::from_millis(1000),
+            "zero is below the floor too"
+        );
+
+        options.icmp_pace_ms = 2000;
+        assert_eq!(
+            Timing::default().icmp_pace_for(&options),
+            Duration::from_millis(2000)
+        );
+
+        let timing = Timing {
+            icmp_pace: Some(Duration::from_millis(30)),
+            ..Timing::default()
+        };
+        assert_eq!(
+            timing.icmp_pace_for(&options),
+            Duration::from_millis(30),
+            "the test override replaces the profile value and the floor"
+        );
+    }
+
+    /// Tester F2 (spec D11: "the packet lane applies the same floor itself so
+    /// no lane caller can under-pace a closed port") and the quality panel:
+    /// `Timing::icmp_pace` is `pub(crate)`, so no caller of
+    /// `PacketLane::with_timing` outside this crate can set it and the floor
+    /// holds by construction for every lane caller. In-crate, the override
+    /// replaces the floored profile value — how `fast_timing` keeps a unit
+    /// test at milliseconds — and without one the floored value stands.
+    #[test]
+    fn pace_override_is_crate_private_and_floor_holds_otherwise() {
+        let options = L4Options {
+            icmp_pace_ms: 0,
+            ..L4Options::default()
+        };
+
+        let overridden = Timing {
+            icmp_pace: Some(Duration::ZERO),
+            ..Timing::default()
+        };
+        assert_eq!(
+            overridden.icmp_pace_for(&options),
+            Duration::ZERO,
+            "an in-crate override is honoured as written"
+        );
+
+        let production = Timing {
+            icmp_pace: None,
+            ..Timing::default()
+        };
+        assert_eq!(
+            production.icmp_pace_for(&options),
+            Duration::from_millis(1000),
+            "without an override the profile value is raised to the floor"
+        );
+    }
+
+    /// The case classes of a run, as the oracle labels them, for an assertion
+    /// message that says what actually happened.
+    fn labels(run: &crate::state::PointRun) -> Vec<String> {
+        run.cases
+            .iter()
+            .map(|case| {
+                case.class()
+                    .map_or_else(|| "unsent".to_string(), |class| class.label())
+            })
+            .collect()
+    }
+
+    /// Amendment 46, the differential half. A target host whose kernel
+    /// rate-limits ICMP errors (Linux: `net.ipv4.icmp_ratelimit = 1000` ms per
+    /// destination) answers at most one stimulus per window, so an **unpaced**
+    /// run against a closed port reads mostly silence — the shape a
+    /// rate-limiting remote host shows (the rig's loopback is exempt; write-up
+    /// `2026-11-01-t5-live-proof.md`, section iii). Every such silence is recorded as
+    /// `no_reply (icmp_ratelimit)`, spends no liveness probe and is no crash
+    /// candidate: a closed port can never yield `l4-crash` (spec D8.4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpaced_closed_port_on_a_ratelimiting_host_reads_silence() {
+        let mock = MockBackend::new(MockReply::Icmp {
+            icmp_type: 3,
+            code: 3,
+        });
+        mock.icmp_ratelimit(Duration::from_millis(300));
+        let mut profile = l4_profile(vec![udp_target(9)], 20);
+        profile.l4.icmp_pace_ms = 0;
+        // The timeout ladder is not what this test is about: twenty silent
+        // cases in a row would stop the job on its own threshold.
+        profile.l4.consecutive_timeouts = 50;
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // `fast_timing` overrides the pace with zero, which is how the lane ran
+        // before amendment 46.
+        assert_eq!(shared.timing.icmp_pace, Some(Duration::ZERO));
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let run = runner.run_point().await;
+
+        let icmp = CaseClass::Icmp {
+            icmp_type: 3,
+            code: 3,
+        };
+        let silent: Vec<_> = run
+            .cases
+            .iter()
+            .filter(|case| case.class() == Some(CaseClass::Silence))
+            .collect();
+        assert_eq!(run.cases.len(), 20);
+        assert_eq!(run.baseline, Some(icmp));
+        assert!(
+            silent.len() >= 10,
+            "an unpaced run against a rate-limiting host reads mostly silence; classes {:?}",
+            labels(&run)
+        );
+        for case in &silent {
+            assert_eq!(
+                case.note,
+                Some(CaseNote::IcmpRatelimit),
+                "case {} is silence on an ICMP-paced point",
+                case.index
+            );
+            assert_eq!(case.candidate, Candidate::No);
+        }
+        assert_eq!(
+            run.no_reply_count(),
+            u32::try_from(silent.len()).expect("a case count fits a u32")
+        );
+        assert!(run.crash.is_none());
+        assert!(run.stopped.is_none(), "{:?}", run.stopped);
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 20,
+                crashes: 0,
+                liveness_failures: 0,
+                retired_elements: 0,
+            })
+        );
+        // 1 baseline + 20 cases: not one liveness probe was spent on the
+        // silence of a closed port.
+        assert_eq!(mock.inject_count(), 21);
+    }
+
+    /// Amendment 46, the paced half: with the stimuli spaced at least the pace
+    /// apart, the same rate-limiting host answers every one of them, so every
+    /// case classifies `icmp(3,3)` and the run takes at least `19 x pace`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paced_closed_port_classifies_every_case() {
+        let mock = MockBackend::new(MockReply::Icmp {
+            icmp_type: 3,
+            code: 3,
+        });
+        mock.icmp_ratelimit(Duration::from_millis(20));
+        let profile = l4_profile(vec![udp_target(9)], 20);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let pace = Duration::from_millis(30);
+        let shared = Arc::new(Shared {
+            timing: Timing {
+                icmp_pace: Some(pace),
+                ..shared.timing
+            },
+            ..(*shared).clone()
+        });
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let started = Instant::now();
+        let run = runner.run_point().await;
+        let elapsed = started.elapsed();
+
+        let icmp = CaseClass::Icmp {
+            icmp_type: 3,
+            code: 3,
+        };
+        assert_eq!(run.cases.len(), 20);
+        assert!(
+            run.cases.iter().all(|case| case.class() == Some(icmp)),
+            "every paced case draws the port-unreachable; classes {:?}",
+            labels(&run)
+        );
+        assert!(run.cases.iter().all(|case| case.note.is_none()));
+        assert!(run.cases.iter().all(|case| case.candidate == Candidate::No));
+        assert_eq!(run.no_reply_count(), 0);
+        assert_eq!(run.reactions(), vec![(icmp, 20)]);
+        assert!(run.crash.is_none());
+        assert!(run.stopped.is_none(), "{:?}", run.stopped);
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 20,
+                crashes: 0,
+                liveness_failures: 0,
+                retired_elements: 0,
+            })
+        );
+        assert!(
+            elapsed >= 19 * pace,
+            "twenty cases spaced by {pace:?} cost at least {:?}; the run took {elapsed:?}",
+            19 * pace
+        );
+        assert_eq!(mock.inject_count(), 21);
+    }
+
+    /// Tester (T5 stage 5, amendment 46's blast radius): the pace applies to an
+    /// **ICMP baseline only**. A point whose baseline is `Reset` (a closed TCP
+    /// port) or `Clean` (a live service) runs at full speed even with a minute
+    /// of configured pace, and the lane keeps its crash rule on such a point.
+    ///
+    /// The profile pace is a minute and the job's deadline ten seconds, so a
+    /// pace wrongly applied here would sleep into the deadline and the run
+    /// would come back `StopReason::Deadline` with cases missing — the
+    /// assertions below are what fails, not a hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_point_whose_baseline_is_not_icmp_is_never_paced() {
+        for (reply, target, field, expected, probes_per_case) in [
+            (
+                MockReply::Rst,
+                tcp_target(80),
+                "tcp.flags",
+                CaseClass::Reset,
+                1,
+            ),
+            (MockReply::Echo, udp_target(9), "raw", CaseClass::Clean, 0),
+        ] {
+            let mock = MockBackend::new(reply);
+            let mut profile = l4_profile(vec![target], 6);
+            // A minute of pace: only an ICMP baseline may act on it.
+            profile.l4.icmp_pace_ms = 60_000;
+            let (shared, job, plans, disc) =
+                setup(Arc::clone(&mock), profile, &fields(&[field]), 1000);
+            // `icmp_pace: None` is production behaviour: the profile's value,
+            // raised to the floor. `fast_timing` would have zeroed it.
+            let shared = Arc::new(Shared {
+                timing: Timing {
+                    icmp_pace: None,
+                    ..shared.timing
+                },
+                ..(*shared).clone()
+            });
+            assert_eq!(
+                shared.timing.icmp_pace_for(&job.profile().l4),
+                Duration::from_secs(60),
+                "{expected:?}: the pace that must not be applied"
+            );
+            let job = Arc::clone(&job).with_deadline(Instant::now() + Duration::from_secs(10));
+            let runner = runner_for(&shared, &job, &plans, &disc.points, field);
+
+            let started = Instant::now();
+            let run = runner.run_point().await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(run.baseline, Some(expected));
+            assert!(
+                run.stopped.is_none(),
+                "{expected:?}: an unpaced point never runs into the deadline: {:?}",
+                run.stopped
+            );
+            assert_eq!(run.cases.len(), 6, "{expected:?}: every case was sent");
+            assert!(
+                run.cases.iter().all(|case| case.class() == Some(expected)),
+                "{expected:?}: classes {:?}",
+                labels(&run)
+            );
+            assert!(
+                run.cases.iter().all(|case| case.note.is_none()),
+                "{expected:?}: no `no_reply (icmp_ratelimit)` note off an ICMP baseline"
+            );
+            assert_eq!(
+                mock.inject_count(),
+                1 + 6 + 6 * probes_per_case,
+                "{expected:?}: baseline + cases + the liveness probes the class earns"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "{expected:?}: six cases cost milliseconds unpaced; the run took {elapsed:?}"
+            );
+        }
     }
 }

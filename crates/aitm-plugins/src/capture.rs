@@ -70,8 +70,9 @@ impl Command for FlowList {
 }
 
 /// `flow.get {id}` → a summary object for one flow: kind, request line, status,
-/// body sizes, timing (`started_at`, `duration_ms`), capture attribution
-/// (`source_app`, `capture_interface`; null for a proxied flow), the per-host
+/// body sizes, timing (`started_at`, `duration_ms`), client attribution
+/// (`source_app`, null unless the core could name the client; `capture_interface`,
+/// null unless a capture backend delivered the connection), the per-host
 /// decryption keys (`tunnel`, `tunnel_reason`, `bytes_up`, `bytes_down`, `passive`;
 /// spec D7) and interception state.
 struct FlowGet;
@@ -187,8 +188,9 @@ fn summary_fields() -> Vec<ParamDef> {
             "source_app",
             TypeDesc::Str,
             false,
-            "Signing identifier of the app that opened the connection, as the capture \
-             backend observed it; null for a proxied flow.",
+            "Identifier of the app that opened the connection: a capture backend's \
+             observation, or the core's own resolution of a proxied loopback client; \
+             null when neither could name it.",
         ),
         field(
             "capture_interface",
@@ -299,14 +301,16 @@ fn opt_int(n: Option<i64>) -> Value {
 }
 
 /// An optional attribution string as a `Value`: the text a capture backend
-/// recorded (`FlowMeta::source_app`, `FlowMeta::capture_interface`), or `Null`
-/// for a proxied flow. Never a placeholder: a UI must not show a fake app group.
+/// recorded or the core resolved (`FlowMeta::source_app`,
+/// `FlowMeta::capture_interface`), or `Null` unless the core could name the
+/// client. Never a placeholder: a UI must not show a fake app group.
 fn opt_str(v: Option<&str>) -> Value {
     v.map_or(Value::Null, |s| Value::Str(s.to_owned()))
 }
 
-/// A transport-neutral summary of a flow: identity, timing, capture attribution
-/// (`source_app` / `capture_interface`, null on a proxied flow), and the per-kind
+/// A transport-neutral summary of a flow: identity, timing, client attribution
+/// (`source_app` / `capture_interface`, null unless the core could name the
+/// client), and the per-kind
 /// fields (request line, status and body sizes for HTTP; handshake and message
 /// count for WebSocket). `started_at` is `metadata.created` for both kinds, so
 /// `started_at + duration_ms` is the flow's end.
@@ -447,8 +451,9 @@ fn row_fields() -> Vec<ParamDef> {
             "source_app",
             TypeDesc::Str,
             false,
-            "Signing identifier of the app that opened the connection, as the capture \
-             backend observed it; null for a proxied flow.",
+            "Identifier of the app that opened the connection: a capture backend's \
+             observation, or the core's own resolution of a proxied loopback client; \
+             null when neither could name it.",
         ),
         field(
             "capture_interface",
@@ -463,8 +468,9 @@ fn row_fields() -> Vec<ParamDef> {
     .collect()
 }
 
-/// A single flows-table row: identity, state, marks, capture attribution
-/// (`source_app` / `capture_interface`, null on a proxied flow), and (HTTP only)
+/// A single flows-table row: identity, state, marks, client attribution
+/// (`source_app` / `capture_interface`, null unless the core could name the
+/// client), and (HTTP only)
 /// the request line and response status. No headers, no bodies.
 fn flow_row(flow: &Flow) -> Value {
     let mut obj = BTreeMap::new();
@@ -514,4 +520,41 @@ fn flow_row(flow: &Flow) -> Value {
         }
     }
     Value::Object(obj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec D7 / AC16: the `source_app` description names both sources (a
+    /// capture backend's observation, or the core's own resolution of a proxied
+    /// loopback client) and says when it is null; `capture_interface` still
+    /// names the backend and the word "proxied", which stays exactly true.
+    #[test]
+    fn source_app_description_names_the_core_resolution() {
+        for (schema, fields) in [("flow.get", summary_fields()), ("flow.table", row_fields())] {
+            let desc = |name: &str| {
+                fields
+                    .iter()
+                    .find(|f| f.name == name)
+                    .unwrap_or_else(|| panic!("{schema} declares {name}"))
+                    .description
+                    .clone()
+            };
+            let source_app = desc("source_app");
+            assert!(
+                source_app.contains("the core's own resolution of a proxied loopback client"),
+                "{schema}.source_app names the core resolution: {source_app}"
+            );
+            assert!(
+                source_app.contains("null when neither could name it"),
+                "{schema}.source_app says when it is null: {source_app}"
+            );
+            let capture_interface = desc("capture_interface");
+            assert!(
+                capture_interface.contains("`macos-ne`") && capture_interface.contains("proxied"),
+                "{schema}.capture_interface names the backend and the proxied case: {capture_interface}"
+            );
+        }
+    }
 }

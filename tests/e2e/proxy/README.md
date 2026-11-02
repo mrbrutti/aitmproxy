@@ -81,6 +81,26 @@ Python stdlib has no h2 server).
   `aitm` logs "Nothing is decrypted until a host is in Scope." exactly once (the
   core's own stdout + stderr, polled briefly after boot in case the line lags the
   bus endpoint file).
+- **test_client_attribution.py** — the core names the loopback client of a proxied
+  connection (spec 2026-11-01-proxied-client-attribution, AC10-AC13), on a real core
+  booted with an EMPTY scope: after `curl -sS -m 15 -x http://127.0.0.1:<proxy>
+  <up>/attr-<uuid>` the `flow.table` row for that path has `source_app` a string
+  whose lower-case contains `curl`, `capture_interface` null (no capture backend:
+  this is the explicit proxy), and `flow.detail` `client_conn.process` equal to that
+  same string; a `via_proxy` GET from the test's own python process yields a row
+  whose `source_app` contains `python` (the vocabulary is spec D5: a bundled
+  executable is its bundle identifier, `com.apple.python3` for `/usr/bin/python3`,
+  a bare one its basename, `curl` for Apple's curl, `python3.14` for a Homebrew or
+  nix python, so the checks are lower-cased CONTAINS, never one spelling); with
+  `scope.add 127.0.0.1` and the TLS echo origin, `curl --cacert <aitm ca>` produces a
+  `decrypted` `CONNECT` row and the inner `GET` row, both `curl`, both
+  `capture_interface` null, all three curl rows carrying the identical string; and
+  20 sequential `via_proxy` GETs through the same core print `median_ms=<value>`
+  and must stay under 100 ms (the 25 ms attribution budget is the most a connection
+  can pay). SKIPs (77) without `curl` or `openssl`, or on an OS where the resolver
+  is `None` by design. The UPSTREAM's own record confirms every request crossed the
+  proxy. The "null or a real name" half for a proxied flow is
+  `tests/e2e/flow/test_source_app_null_on_proxied.py`.
 
 ## The kill-503 regression
 

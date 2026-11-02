@@ -1,0 +1,4 @@
+132c132
+< written to /tmp/claude/acceptance/0.5.10-dry/state-before.txt
+---
+> written to /tmp/claude/acceptance/0.5.10-dry/state-after.txt

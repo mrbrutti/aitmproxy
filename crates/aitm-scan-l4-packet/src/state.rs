@@ -102,6 +102,39 @@ pub struct CaseRecord {
     /// recorded here rather than inferred later from the run's stop (review
     /// finding Q2).
     pub candidate: Candidate,
+    /// Why this case carries no reply, when the lane knows the reason: the
+    /// `no_reply (icmp_ratelimit)` note of spec amendment 46. `None` for every
+    /// other case.
+    pub note: Option<CaseNote>,
+}
+
+/// Why a case reads the way it does, when the lane knows a reason the class
+/// alone does not carry.
+///
+/// Today there is one: a silent case on a point whose baseline is an ICMP
+/// error. A remote target's kernel rate-limits the errors it generates, so the
+/// silence is the rate limiter, not the service; the case is recorded with the
+/// note, is no crash candidate, and spends no liveness probe (spec D8.4,
+/// amendment 46). Every reason is a unit variant, so the only labels that can
+/// exist are the ones [`CaseNote::label`] spells. The note carries no wire
+/// bytes, so `Debug` prints it whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseNote {
+    /// Nothing came back on an ICMP-paced point: the target host's kernel
+    /// rate-limits the ICMP errors it answers with. The operator reads it as
+    /// `no_reply (icmp_ratelimit)`.
+    IcmpRatelimit,
+}
+
+impl CaseNote {
+    /// The note as the operator reads it in a verdict detail:
+    /// `no_reply (icmp_ratelimit)`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match *self {
+            CaseNote::IcmpRatelimit => "no_reply (icmp_ratelimit)".to_string(),
+        }
+    }
 }
 
 /// Whether a case reached the wire, and what came back when it did.
@@ -137,6 +170,7 @@ impl CaseRecord {
             sent_hex,
             outcome: CaseOutcome::Unsent,
             candidate: Candidate::No,
+            note: None,
         }
     }
 
@@ -230,6 +264,7 @@ impl fmt::Debug for CaseRecord {
             )
             .field("outcome", &self.outcome)
             .field("candidate", &self.candidate)
+            .field("note", &self.note)
             .finish()
     }
 }
@@ -335,6 +370,21 @@ impl PointRun {
     #[must_use]
     pub fn sent_count(&self) -> u32 {
         u32::try_from(self.cases.iter().filter(|case| case.sent()).count()).unwrap_or(u32::MAX)
+    }
+
+    /// How many of the run's cases carry the `no_reply (icmp_ratelimit)` note
+    /// of amendment 46: silent cases on a point whose baseline is an ICMP
+    /// error, which the target host's kernel rate-limited. Counts that note
+    /// alone, so a note of another kind is never mistaken for it.
+    #[must_use]
+    pub fn no_reply_count(&self) -> u32 {
+        u32::try_from(
+            self.cases
+                .iter()
+                .filter(|case| matches!(case.note, Some(CaseNote::IcmpRatelimit)))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
     }
 
     /// How many of the run's cases came back outside the latency window.
@@ -756,6 +806,7 @@ mod tests {
                 latency_outlier: false,
             },
             candidate: Candidate::No,
+            note: None,
         }
     }
 
@@ -1059,6 +1110,64 @@ mod tests {
         let printed = format!("{:?}", case(0, CaseClass::Clean));
         assert!(!printed.contains("deadbeef"), "{printed}");
         assert!(printed.contains("4 bytes"), "{printed}");
+    }
+
+    /// Tester (T5 stage 5, amendment 46) and the quality panel: the note is a
+    /// unit variant whose operator wording is `no_reply (icmp_ratelimit)` —
+    /// the string the crash and reaction details are asserted on —
+    /// `no_reply_count` counts the `IcmpRatelimit` cases and nothing else, and
+    /// `Debug` prints the note while still hiding the wire bytes.
+    #[test]
+    fn case_note_label_counts_and_debug() {
+        assert_eq!(CaseNote::IcmpRatelimit.label(), "no_reply (icmp_ratelimit)");
+
+        let mut noted = case(1, CaseClass::Silence);
+        noted.note = Some(CaseNote::IcmpRatelimit);
+        let run = PointRun {
+            point_id: "p0".to_string(),
+            target: "127.0.0.1:9/udp".to_string(),
+            field: FieldPath::Raw,
+            rng_seed: 1,
+            dry_run: false,
+            recovery_wait: Duration::from_secs(10),
+            baseline: Some(CaseClass::Icmp {
+                icmp_type: 3,
+                code: 3,
+            }),
+            cases: vec![
+                case(
+                    0,
+                    CaseClass::Icmp {
+                        icmp_type: 3,
+                        code: 3,
+                    },
+                ),
+                noted.clone(),
+                case(2, CaseClass::Silence),
+            ],
+            crash: None,
+            stopped: None,
+        };
+        assert_eq!(
+            run.no_reply_count(),
+            1,
+            "only the noted case counts, not every silence"
+        );
+        assert_eq!(
+            PointRun {
+                cases: Vec::new(),
+                ..run
+            }
+            .no_reply_count(),
+            0
+        );
+
+        let printed = format!("{noted:?}");
+        assert!(
+            printed.contains("note: Some(IcmpRatelimit)"),
+            "the note is printed: {printed}"
+        );
+        assert!(!printed.contains("deadbeef"), "the hex is not: {printed}");
     }
 
     #[test]
