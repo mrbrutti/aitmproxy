@@ -9,9 +9,9 @@ use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::model::{clock_of, human_bytes, human_ms, FlowKind, FlowRow, Origin};
+use crate::text::{cells, elide_middle, fit, right, width};
 use crate::theme::Theme;
 use crate::tokens::{color, glyph, ColorToken};
-use crate::ui::text::{cells, elide_middle, fit, right, width};
 use crate::ui::{selection_bg, FrameView};
 
 /// The glyph of the mark swatch in the Tick column (§2.7 "marked: colour
@@ -228,13 +228,13 @@ pub fn render(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
     if visible.is_empty() {
         let msg = if app.flows.is_empty() {
             match &app.listening {
-                Some(l) => format!("No flows yet — point a client at {l} or open the browser."),
+                Some(l) => format!("No flows yet: point a client at {l} or open the browser."),
                 None => {
-                    "No flows yet — point a client at the proxy or open the browser.".to_string()
+                    "No flows yet: point a client at the proxy or open the browser.".to_string()
                 }
             }
         } else {
-            "No flows match this filter — Esc clears it.".to_string()
+            "No flows match this filter: Esc clears it.".to_string()
         };
         if rows_area.height > 0 {
             buf.set_string(
@@ -470,7 +470,7 @@ fn l4_row_line<'a>(app: &App, theme: &Theme, r: &'a FlowRow, cols: &[Col]) -> Li
     let dim = theme.text_tertiary();
     let s = |style: Style| if in_scope { style } else { dim };
     let Some(l4) = &r.l4 else {
-        return Line::styled(format!("  L4 flow {} — details pending", r.id), dim);
+        return Line::styled(format!("  L4 flow {}: details pending", r.id), dim);
     };
     let mut spans: Vec<Span<'a>> = Vec::with_capacity(cols.len() * 2);
     for c in cols {

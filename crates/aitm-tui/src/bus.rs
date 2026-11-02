@@ -1,8 +1,9 @@
 //! The bus task: the one place the TUI talks to the proxy. It connects
-//! (initialize → tools/list), polls `flow.list` + `flow.get` on a timer (F4
-//! push is not on the bus yet, foundation §4.4), runs the app's [`BusRequest`]s
-//! and reports everything as [`BusEvent`]s. Features the bus does not offer
-//! are simply not polled: the app reads `tools/list` and degrades (§2.10).
+//! (initialize → tools/list → proxy.status → flow.subscribe), polls
+//! `flow.list` + `flow.get` on a timer (push lines are a trigger, the poll is
+//! the truth; scanner v2 D5/D6), runs the app's [`BusRequest`]s and reports
+//! everything as [`BusEvent`]s. Features the bus does not offer are simply
+//! not polled: the app reads `tools/list` and degrades (§2.10).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use aitm_bus_client::{BusClient, BusError};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::action::{BusEvent, BusRequest, Level, ToolInfo};
+use crate::action::{BusEvent, BusRequest, Level, ToolInfo, CONFIRM_KEY};
 use crate::l4::{
     flow_get_args, fold_status, slow_l4_reads, supports_window, L4Availability, L4Read,
 };
@@ -183,7 +184,30 @@ impl Session {
         .await?;
         // `proxy.status` is read-only: a tool error here leaves the state
         // unknown and the session alive; only a dead transport ends it.
-        self.proxy_status().await
+        self.proxy_status().await?;
+        self.subscribe().await
+    }
+
+    /// Subscribe to server pushes once per connection (scanner v2 D5): when
+    /// the bus offers `flow.subscribe`, call it with no filter so job and
+    /// flow lines reach this connection. A tool error is a warning, not a
+    /// session loss: the poll cadence still carries scan progress. The
+    /// result value is ignored.
+    async fn subscribe(&self) -> Result<(), Outcome> {
+        if !self.has("flow.subscribe") {
+            return Ok(());
+        }
+        match self.client.call("flow.subscribe", json!({})).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = refusal(e)?;
+                self.emit(BusEvent::Toast(
+                    Level::Warn,
+                    format!("flow.subscribe failed: {msg}; scan progress will poll only"),
+                ))
+                .await
+            }
+        }
     }
 
     /// Read `proxy.status` (F7) when the bus has it and report it.
@@ -399,7 +423,7 @@ impl Session {
 
     /// Read a slow-changing panel. A transport failure ends the session like
     /// anywhere else; a tool or protocol error leaves the panel as it was
-    /// (`Null`) — it is re-read on the next slow pass, no toast every 3 s.
+    /// (`Null`): it is re-read on the next slow pass, no toast every 3 s.
     async fn panel(&self, name: &str) -> Result<Value, Outcome> {
         match self.client.call(name, json!({})).await {
             Ok(v) => Ok(v),
@@ -485,6 +509,10 @@ impl Session {
                 let args = self.prune(&name, args);
                 return self.call_and_report(&name, args).await;
             }
+            BusRequest::CallTagged { tag, name, args } => {
+                let args = self.prune(&name, args);
+                return self.call_and_report_tagged(&tag, &name, args).await;
+            }
         };
         let args = self.prune(name, args);
         self.call_and_report(name, args).await
@@ -497,13 +525,61 @@ impl Session {
     }
 
     async fn call_and_report(&mut self, name: &str, args: Value) -> Result<(), Outcome> {
-        if !self.has(name) {
-            return self
-                .emit(BusEvent::CallFailed {
+        match self.perform(name, args).await? {
+            Ok(value) => {
+                self.emit(BusEvent::CallOk {
                     name: name.to_string(),
-                    message: format!("{name} is not on this bus"),
+                    value,
                 })
-                .await;
+                .await
+            }
+            Err(message) => {
+                self.emit(BusEvent::CallFailed {
+                    name: name.to_string(),
+                    message,
+                })
+                .await
+            }
+        }
+    }
+
+    /// [`Self::call_and_report`] for a [`BusRequest::CallTagged`]: the same
+    /// call, the same failure texts, the reply echoing `tag` verbatim as
+    /// [`BusEvent::CallTaggedOk`] or [`BusEvent::CallTaggedFailed`]. The
+    /// task never reads the tag; which verbs use it is the reducer's business.
+    async fn call_and_report_tagged(
+        &mut self,
+        tag: &str,
+        name: &str,
+        args: Value,
+    ) -> Result<(), Outcome> {
+        match self.perform(name, args).await? {
+            Ok(value) => {
+                self.emit(BusEvent::CallTaggedOk {
+                    tag: tag.to_string(),
+                    name: name.to_string(),
+                    value,
+                })
+                .await
+            }
+            Err(message) => {
+                self.emit(BusEvent::CallTaggedFailed {
+                    tag: tag.to_string(),
+                    name: name.to_string(),
+                    message,
+                })
+                .await
+            }
+        }
+    }
+
+    /// Run one `tools/call` the app asked for. The outer `Err` is a dead
+    /// transport (the session ends like anywhere else); the inner `Err` is
+    /// the operator-facing text of a refusal: the bus does not offer `name`
+    /// (never sent), or the tool, RPC or protocol error it answered with.
+    async fn perform(&mut self, name: &str, args: Value) -> Result<Result<Value, String>, Outcome> {
+        if !self.has(name) {
+            return Ok(Err(format!("{name} is not on this bus")));
         }
         // A mutation changes rows: forget the summary of the flow it names so
         // the next poll re-reads that one. Only the whole-store commands
@@ -519,13 +595,9 @@ impl Session {
                         }
                     }
                 }
-                self.emit(BusEvent::CallOk {
-                    name: name.to_string(),
-                    value,
-                })
-                .await
+                Ok(Ok(value))
             }
-            Err(e) => self.call_failed(name, e).await,
+            Err(e) => refusal(e).map(Err),
         }
     }
 
@@ -533,21 +605,27 @@ impl Session {
     /// the session like anywhere else; a tool, RPC or protocol error is the
     /// app's [`BusEvent::CallFailed`] with the operator-facing text.
     async fn call_failed(&self, name: &str, e: BusError) -> Result<(), Outcome> {
-        match e {
-            BusError::Transport(e) => Err(Outcome::Lost(format!("{e:#}"))),
-            other => {
-                self.emit(BusEvent::CallFailed {
-                    name: name.to_string(),
-                    message: error_text(other),
-                })
-                .await
-            }
-        }
+        let message = refusal(e)?;
+        self.emit(BusEvent::CallFailed {
+            name: name.to_string(),
+            message,
+        })
+        .await
     }
 }
 
 fn lost(e: BusError) -> Outcome {
     Outcome::Lost(e.to_string())
+}
+
+/// The one split between a dead transport and a refusal the bus answered
+/// with: a transport failure ends the session (`Err(Outcome::Lost)`), any
+/// other error is the operator-facing text of the refusal.
+fn refusal(e: BusError) -> Result<String, Outcome> {
+    match e {
+        BusError::Transport(e) => Err(Outcome::Lost(format!("{e:#}"))),
+        other => Ok(error_text(other)),
+    }
 }
 
 /// The operator-facing text of a non-transport error.
@@ -558,11 +636,6 @@ fn error_text(e: BusError) -> String {
         BusError::Rpc { code, message } => format!("{message} ({code})"),
     }
 }
-
-/// The reserved confirm-over-the-wire acknowledgment (spec D4): the server
-/// strips it before schema enforcement, so no `inputSchema` declares it and
-/// [`prune_args`] must never drop it.
-const CONFIRM_KEY: &str = "_confirm";
 
 /// Drop the arguments `tool`'s `inputSchema` does not declare, so a form built
 /// for a richer schema still works against an older core. No tool, no
@@ -749,7 +822,7 @@ mod tests {
     /// slow pass (never cached), `l4.intercept.list` is never requested while
     /// the last `l4.intercept.status` said unavailable, it is requested once
     /// the core says available (and the parked list reaches the app), and it
-    /// stops again the pass after the core withdraws availability — even
+    /// stops again the pass after the core withdraws availability, even
     /// though that pass's read list was planned while it was still available.
     #[tokio::test]
     async fn l4_slow_pass_reads_statuses_every_pass_and_gates_the_parked_list_on_availability() {
@@ -941,7 +1014,7 @@ mod tests {
 
     /// Spec §2 at the bus task: the list poll's `l4.flow.get` carries
     /// `limit: 0` exactly when the core's `inputSchema` declares `limit`, and
-    /// just `{id}` against an older core — the same reply either way.
+    /// just `{id}` against an older core: the same reply either way.
     #[tokio::test]
     async fn l4_poll_sends_limit_zero_only_when_the_core_declares_the_window() {
         let answer: Answer = StdArc::new(|name: &str, args: &Value| match name {
@@ -995,8 +1068,8 @@ mod tests {
     }
 
     /// The `_confirm` re-issue reaches the wire intact for **every**
-    /// confirmable L4 verb — `l4.inject`, `l4.scope.add`,
-    /// `l4.intercept.forward`, `l4.intercept.drop` — through the real
+    /// confirmable L4 verb (`l4.inject`, `l4.scope.add`,
+    /// `l4.intercept.forward`, `l4.intercept.drop`) through the real
     /// `handle` → `prune` → `call` path, against each verb's declared schema
     /// (the rig's key sets): the declared keys and `_confirm` survive, an
     /// undeclared key is dropped, and the reply comes back as `CallOk`. The
@@ -1037,7 +1110,7 @@ mod tests {
         for (call, original) in cases {
             // What the app sends on `y`: the originals plus the token (and a
             // stray undeclared key, to prove pruning still happens).
-            let confirm = crate::l4::L4Confirm {
+            let confirm = crate::scan::launch::WireConfirm {
                 call: call.to_string(),
                 args: original.clone(),
                 prompt: "P".into(),

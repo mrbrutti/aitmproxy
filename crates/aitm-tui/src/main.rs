@@ -1,9 +1,9 @@
-//! `aitm-tui` — run the terminal operator UI against a proxy's bus.
+//! `aitm-tui`: run the terminal operator UI against a proxy's bus.
 //!
 //! ```text
 //! aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token [--poc-dir dir]
 //! ```
-//! `--poc-dir` is where a built PoC (`P`) is written — `poc.build` answers
+//! `--poc-dir` is where a built PoC (`P`) is written: `poc.build` answers
 //! with the YAML text; it should be the proxy's `poc.dir` so `poc.run` can
 //! read it back. `--ansi` forces the 16-colour palette, `--truecolor` the hex palette.
 //! `--token t` is accepted but visible to every process on the machine
