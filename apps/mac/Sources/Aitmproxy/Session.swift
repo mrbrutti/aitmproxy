@@ -368,12 +368,10 @@ final class Session {
     /// Bumped whenever `rows` or `details` change, so the cache knows.
     @ObservationIgnored private var rowsVersion = 0
 
-    /// Clients and hosts for the sidebar's Apps / Domains groups, most flows first.
-    var clients: [(ClientInfo, Int)] {
-        var counts: [ClientInfo: Int] = [:]
-        for row in rows { if let c = row.client { counts[c, default: 0] += 1 } }
-        return counts.sorted { $0.value == $1.value ? $0.key.name < $1.key.name : $0.value > $1.value }
-    }
+    /// Clients and hosts for the sidebar's Apps / Domains groups, most flows first. Clients are the
+    /// Kit's one grouping rule (by `groupKey`, icons plan Task 2) so the Apps header equals the
+    /// Overview tile.
+    var clients: [(ClientInfo, Int)] { ClientTree.clients(in: rows) }
 
     var hosts: [(String, Int)] {
         var counts: [String: Int] = [:]
@@ -419,27 +417,16 @@ final class Session {
         self.group = group
     }
 
-    func pin(_ group: FlowGroup) {
-        switch group {
-        case .host(let h): pins.pinHost(h)
-        case .client(let c): pins.pinApp(c)
-        }
-    }
+    // Group → pin mapping lives in the Kit (`Pins.pin/unpin/contains(_ group:)`, icons plan Task 2):
+    // `.host`/`.clientHost` pin the host, `.client` pins the app by its group key.
+    func pin(_ group: FlowGroup) { pins.pin(group) }
 
     func unpin(_ group: FlowGroup) {
-        switch group {
-        case .host(let h): pins.unpinHost(h)
-        case .client(let c): pins.unpinApp(c)
-        }
+        pins.unpin(group)
         if self.group == group { self.group = nil }
     }
 
-    func isPinned(_ group: FlowGroup) -> Bool {
-        switch group {
-        case .host(let h): pins.hosts.contains(h)
-        case .client(let c): pins.apps.contains(c)
-        }
-    }
+    func isPinned(_ group: FlowGroup) -> Bool { pins.contains(group) }
 
     // MARK: Intents — state (the actions live in Session+Verbs.swift)
 
