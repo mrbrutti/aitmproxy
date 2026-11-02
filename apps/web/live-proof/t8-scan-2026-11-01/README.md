@@ -22,3 +22,13 @@ Main's #247 rewrote `apps/web/src/panels/l4/inject.ts`, which the launch handsha
 was re-run on the merged head against the same `ca852f71` engine: **26 PASS · 0 FAIL · 1 GAP** (the same
 8b GAP). Step log: `scan-live-after-main-merge.log`. Web gate on the merged head: typecheck 0, vitest
 870/870, build 0.
+
+## Final run: engine on main, core built from this branch (4b169d5b)
+
+After #232 merged, main `82e495f3` (incl. `c99ea718`, #276 web L4 parity) was merged into the branch
+(`4b169d5b`, clean) and the core was built from the branch itself (`cargo build -p aitm -p
+aitm-testtarget` with this `apps/web/dist` embedded): the first proof on a release-shaped core.
+`node apps/web/scripts/scan-live.mjs`: **26 PASS · 0 FAIL · 1 GAP** (same 8b GAP: no L4 lane on this
+build). The screenshots and `bus-transcript.jsonl` in this directory are from this run; the step log is
+`scan-live-engine-on-main.log`. Web gate on `4b169d5b`: typecheck 0, vitest 1122 passed / 1 skipped,
+build 0.
