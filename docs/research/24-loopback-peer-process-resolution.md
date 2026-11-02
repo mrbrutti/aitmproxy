@@ -49,7 +49,9 @@ BUNDLE.md live-confirmed twelve named apps with the extension off.
 | `PROC_PIDTBSDINFO` | `3` (136-byte `proc_bsdinfo`, V); `PROC_PIDT_SHORTBSDINFO` = `13` (`pbsi_ppid`, `pbsi_comm`) |
 
 Layout measured with a C `offsetof` probe (V): `sizeof(struct socket_fdinfo)` = **792**, `pfi` 24 bytes, `psi` at
-24, `soi_kind` at 232, `soi_proto` at 240; inside `in_sockinfo` (80 bytes): `insi_fport` 0, `insi_lport` 4,
+24, `soi_kind` at 256, `soi_proto` at 264 (232/240 inside `socket_info`, which starts at 24; the `soi_proto`
+union is 528 bytes; corrected 2026-11-01 by a C `offsetof` probe: the first probe reported the `socket_info`-relative
+numbers as if they were `socket_fdinfo`-relative); inside `in_sockinfo` (80 bytes): `insi_fport` 0, `insi_lport` 4,
 `insi_vflag` 24, `insi_faddr` 32, `insi_laddr` 48; `tcpsi_state` at 80 in the 120-byte `tcp_sockinfo`. Address
 unions are `in4in6_addr` (`i46a_pad32[3]` then `i46a_addr4`) or `in6_addr`; `insi_vflag` is `INI_IPV4`
 (0x1) or `INI_IPV6` (0x2) (H, lines 366-392). `tcpsi_state` uses the BSD enum `TSI_S_*` (LISTEN=1,

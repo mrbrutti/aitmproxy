@@ -7,7 +7,9 @@
 //!
 //! The `#[repr(C)]` mirrors below copy the layouts of `sys/proc_info.h` from the
 //! macOS SDK on this Mac (`$(xcrun --show-sdk-path)/usr/include/sys/proc_info.h`,
-//! measured in research 24 §3.1); `tests::socket_fdinfo_layout_matches_the_sdk`
+//! measured in research 24 §3.1, corrected 2026-11-01: `soi_kind` / `soi_proto`
+//! sit at 232 / 240 *inside `socket_info`*, i.e. 256 / 264 inside
+//! `socket_fdinfo`); `tests::socket_fdinfo_layout_matches_the_sdk`
 //! pins every size and offset the code relies on (spec AC8), so a header change
 //! fails the build's tests rather than silently misreading a port.
 //!
@@ -97,39 +99,65 @@ pub(crate) struct tcp_sockinfo {
     _rest: [u8; 36],
 }
 
-/// `struct socket_fdinfo` (792 bytes): `proc_fileinfo pfi` (24), then
-/// `socket_info psi` whose head (208 bytes: stat, handles, type, options,
-/// buffers) we skip to reach `soi_kind` at 232 and the `soi_proto` union at 240.
-/// `align(8)` matches the C type (it holds `uint64_t`s) so the union arm can be
-/// read in place.
+/// `struct socket_info` (768 bytes), the `psi` member of `socket_fdinfo`. Its
+/// offsets (C `offsetof` probe against the SDK header, 2026-11-01): `soi_stat`
+/// 0 (136 bytes), `soi_so` 136, `soi_pcb` 144, `soi_type` 152, `soi_protocol`
+/// 156, `soi_family` 160, then options / linger / state / queue lengths /
+/// `soi_rcv` / `soi_snd` up to `soi_kind` at 232 and the 528-byte `soi_proto`
+/// union at 240. Fields we never read are blobs. `align(8)` matches the C type
+/// (it holds `uint64_t`s) so the union arm can be read in place.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types, dead_code)]
+pub(crate) struct socket_info {
+    /// `soi_stat` (136) + `soi_so` (8) + `soi_pcb` (8).
+    _soi_head: [u8; 152],
+    _soi_type: i32,
+    pub soi_protocol: i32,
+    pub soi_family: i32,
+    /// `soi_options` .. `soi_snd` (164..232).
+    _soi_mid: [u8; 68],
+    pub soi_kind: i32,
+    /// Padding the 8-aligned union forces after the `int`.
+    _pad: i32,
+    pub soi_proto: [u8; 528],
+}
+
+/// `struct socket_fdinfo` (792 bytes): `proc_fileinfo pfi` (24 bytes, skipped),
+/// then [`socket_info`] `psi` at 24, so `soi_kind` sits at 256 and `soi_proto`
+/// at 264 of the buffer `proc_pidfdinfo` fills.
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 #[allow(non_camel_case_types)]
 pub(crate) struct socket_fdinfo {
     _pfi: [u8; 24],
-    _psi_head: [u8; 208],
-    pub soi_kind: i32,
-    _pad: i32,
-    pub soi_proto: [u8; 552],
+    pub psi: socket_info,
 }
 
 impl socket_fdinfo {
     /// An all-zero buffer for the kernel to fill; no `unsafe` needed.
     const ZERO: Self = Self {
         _pfi: [0; 24],
-        _psi_head: [0; 208],
-        soi_kind: 0,
-        _pad: 0,
-        soi_proto: [0; 552],
+        psi: socket_info {
+            _soi_head: [0; 152],
+            _soi_type: 0,
+            soi_protocol: 0,
+            soi_family: 0,
+            _soi_mid: [0; 68],
+            soi_kind: 0,
+            _pad: 0,
+            soi_proto: [0; 528],
+        },
     };
 }
 
 const _: () = assert!(size_of::<socket_fdinfo>() == 792);
+const _: () = assert!(size_of::<socket_info>() == 768);
 const _: () = assert!(size_of::<tcp_sockinfo>() == 120);
 const _: () = assert!(size_of::<in_sockinfo>() == 80);
 const _: () = assert!(size_of::<proc_fdinfo>() == 8);
 const _: () = assert!(size_of::<libc::proc_bsdinfo>() == 136);
-const _: () = assert!(size_of::<tcp_sockinfo>() <= 552);
+const _: () = assert!(size_of::<tcp_sockinfo>() <= 528);
 
 // ---------------------------------------------------------------------------
 // Safe wrappers. Consumed by the macOS scanner (plan Task 5); until it lands only
@@ -269,9 +297,10 @@ pub(crate) fn tcp_socket(pid: u32, fd: i32) -> Option<TcpSocket> {
     let size = libc::c_int::try_from(size_of::<socket_fdinfo>()).ok()?;
     // SAFETY: `info` is a live, writable, 8-byte-aligned `socket_fdinfo` of
     // exactly `size` (792) bytes, the `#[repr(C)]` mirror of the C struct whose
-    // size and offsets the pin test checks against the SDK; libproc writes at
-    // most `size` bytes into it and returns how many it wrote. Every bit pattern
-    // is a valid `socket_fdinfo` (byte arrays and `i32`s). `pid` and `fd` are
+    // size and offsets (`psi` at 24, `soi_kind` at 256, `soi_proto` at 264) the
+    // pin test checks against the SDK; libproc writes at most `size` bytes into
+    // it and returns how many it wrote. Every bit pattern is a valid
+    // `socket_fdinfo` (byte arrays and `i32`s). `pid` and `fd` are
     // only integers handed to the kernel: a stale or non-socket descriptor makes
     // the call fail with an errno (`rc <= 0`, checked below), never UB.
     let rc = unsafe {
@@ -286,16 +315,18 @@ pub(crate) fn tcp_socket(pid: u32, fd: i32) -> Option<TcpSocket> {
     if positive_len(rc)? != size_of::<socket_fdinfo>() {
         return None; // short read: the kernel did not fill the union arm
     }
-    if info.soi_kind != SOCKINFO_TCP {
+    if info.psi.soi_kind != SOCKINFO_TCP {
         return None;
     }
-    // SAFETY: `info.soi_proto` is a live 552-byte array; `tcp_sockinfo` is 120
-    // bytes (`const` asserted `<= 552`), so the read stays in bounds. Every bit
-    // pattern is a valid `tcp_sockinfo` (integers and byte arrays, no padding
-    // bytes are interpreted). `read_unaligned` carries no alignment requirement,
-    // so the `align(8)` of `socket_fdinfo` is a convenience, not a precondition.
+    // SAFETY: `info.psi.soi_proto` is a live 528-byte array (offset 264 of the
+    // 792-byte buffer, as the pin test checks against the SDK); `tcp_sockinfo`
+    // is 120 bytes (`const` asserted `<= 528`), so the read stays in bounds.
+    // Every bit pattern is a valid `tcp_sockinfo` (integers and byte arrays, no
+    // padding bytes are interpreted). `read_unaligned` carries no alignment
+    // requirement, so the `align(8)` of the mirrors is a convenience, not a
+    // precondition.
     let tcp: tcp_sockinfo =
-        unsafe { std::ptr::read_unaligned(info.soi_proto.as_ptr().cast::<tcp_sockinfo>()) };
+        unsafe { std::ptr::read_unaligned(info.psi.soi_proto.as_ptr().cast::<tcp_sockinfo>()) };
     let ini = tcp.tcpsi_ini;
     Some(TcpSocket {
         laddr: decode_addr(ini.insi_vflag, &ini.insi_laddr)?,
@@ -429,7 +460,7 @@ mod tests {
 
     use super::{
         find_owners_raw, in_sockinfo, list_pids, pid_name, pid_path, pid_start_micros, proc_fdinfo,
-        socket_fdinfo, socket_fds, tcp_sockinfo,
+        socket_fdinfo, socket_fds, socket_info, tcp_sockinfo,
     };
     use crate::types::Tuple;
 
@@ -437,8 +468,23 @@ mod tests {
     #[test]
     fn socket_fdinfo_layout_matches_the_sdk() {
         assert_eq!(size_of::<socket_fdinfo>(), 792);
-        assert_eq!(offset_of!(socket_fdinfo, soi_kind), 232);
-        assert_eq!(offset_of!(socket_fdinfo, soi_proto), 240);
+        assert_eq!(offset_of!(socket_fdinfo, psi), 24);
+        assert_eq!(size_of::<socket_info>(), 768);
+        // Inside `socket_info` (research 24 §3.1, corrected 2026-11-01 by a C
+        // `offsetof` probe): 156 / 160 / 232 / 240 ...
+        assert_eq!(offset_of!(socket_info, soi_protocol), 156);
+        assert_eq!(offset_of!(socket_info, soi_family), 160);
+        assert_eq!(offset_of!(socket_info, soi_kind), 232);
+        assert_eq!(offset_of!(socket_info, soi_proto), 240);
+        // ... so inside `socket_fdinfo` (what `proc_pidfdinfo` fills): 180 / 184 / 256 / 264.
+        assert_eq!(offset_of!(socket_fdinfo, psi.soi_protocol), 180);
+        assert_eq!(offset_of!(socket_fdinfo, psi.soi_family), 184);
+        assert_eq!(offset_of!(socket_fdinfo, psi.soi_kind), 256);
+        assert_eq!(offset_of!(socket_fdinfo, psi.soi_proto), 264);
+        assert_eq!(
+            size_of::<socket_info>() - offset_of!(socket_info, soi_proto),
+            528
+        );
         assert_eq!(size_of::<in_sockinfo>(), 80);
         assert_eq!(offset_of!(in_sockinfo, insi_lport), 4);
         assert_eq!(offset_of!(in_sockinfo, insi_vflag), 24);
