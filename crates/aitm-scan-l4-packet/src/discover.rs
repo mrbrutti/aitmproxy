@@ -1875,6 +1875,71 @@ mod tests {
         assert_eq!(example("udp.length").as_deref(), Some("24"));
     }
 
+    /// Tester (stage 5), task 4b: the site node of an **IPv6** target. The node
+    /// id is the point-id prefix for v6 too, which means bracketed
+    /// (`l4:[::1]:53/udp`): the engine looks a point's node up by string
+    /// equality (`aitm_plugin_scanner::scheduler::plan` builds a map keyed by
+    /// `SiteNode::id`), so an unbracketed node id would leave every v6 point
+    /// nodeless — `location.l4` null again, and exposure 0 — while every id
+    /// still *looked* plausible. `host` carries the bare address, because
+    /// `l4_location` reads the IP from it.
+    ///
+    /// Mutation: build the node id from `format!("l4:{}:{}/{}", ip, port,
+    /// proto)` instead of `target_key` (so v4 is unchanged and v6 loses its
+    /// brackets) and the prefix assertion fails.
+    #[test]
+    fn the_site_node_of_an_ipv6_target_is_the_point_id_prefix() {
+        let guard = guard_over(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128, "*", &BOTH);
+        let backend = MockBackend::new(MockReply::Echo);
+        let v6 = L4TargetSpec {
+            ip: "::1".to_string(),
+            port: 53,
+            proto: L4Transport::Udp,
+            grammar: None,
+        };
+        let profile = l4_profile(vec![v6], 100);
+
+        let (_plans, discovery) = discover_all(
+            &guard,
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &[],
+            "aitm7f3a",
+        )
+        .expect("::1 resolves against a v6 entry");
+
+        assert_eq!(discovery.nodes.len(), 1);
+        let node = &discovery.nodes[0];
+        assert_eq!(node.id, "l4:[::1]:53/udp", "the v6 node id is bracketed");
+        assert_eq!(
+            node.host, "::1",
+            "the issue's location.l4.ip is the bare address"
+        );
+        assert_eq!(node.port, 53);
+        assert_eq!(node.scheme, "udp");
+        assert_eq!(node.l4_transport(), Some(L4Transport::Udp));
+        assert_eq!(node.points, 9, "the v6 default table mints nine points");
+
+        assert_eq!(discovery.points.len(), 9);
+        for point in &discovery.points {
+            assert_eq!(
+                point.site_node.as_deref(),
+                Some(node.id.as_str()),
+                "point {} names the v6 node",
+                point.id
+            );
+            assert!(
+                point.id.starts_with(&format!("{}/", node.id)),
+                "point {} is not under node {}",
+                point.id,
+                node.id
+            );
+        }
+        assert_eq!(guard.in_flight(), 0);
+    }
+
     /// Tester (stage 5): `cidr_contains` at the prefix extremes, in both
     /// families, and never across families.
     #[test]

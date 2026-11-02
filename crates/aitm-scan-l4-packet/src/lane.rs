@@ -1092,6 +1092,47 @@ mod tests {
         );
     }
 
+    /// Tester (stage 5), AC T5-3: `validate` checks both dimensions of a
+    /// field's applicability — the transport *and* the IP version — against
+    /// **every** declared target, in profile order. A mixed-family profile is
+    /// the case the engine cannot catch for us: `ipv4.ttl` is a real, fuzzable
+    /// field of the v4 target and nonsense for the `[::1]` one, and
+    /// `ipv6.hop_limit` is the mirror image. Either way `scan.start` must
+    /// refuse, naming the family and transport that rejected the path, rather
+    /// than letting discovery raise `invalid_profile` later with a job
+    /// already begun.
+    ///
+    /// Mutation: `break` out of `validate`'s loop after the first target (or
+    /// check `spec.proto` without `ip_version(ip)`) and both halves pass
+    /// `Ok(())`.
+    #[test]
+    fn validate_checks_the_ip_version_of_every_target() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+
+        // Valid for the first (v4) target, nonsense for the second (v6) one.
+        let mut profile = l4_profile(vec![udp_target(9), v6_target(53)], 10);
+        profile.l4.fields = fields(&["ipv4.ttl"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "ipv4.ttl" does not apply to a ipv6/udp target"#.to_string())
+        );
+
+        // The mirror image, with the families the other way round.
+        let mut profile = l4_profile(vec![v6_target(53), udp_target(9)], 10);
+        profile.l4.fields = fields(&["ipv6.hop_limit"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "ipv6.hop_limit" does not apply to a ipv4/udp target"#.to_string())
+        );
+
+        // `raw` and `udp.*` apply to both families, so a mixed profile that
+        // names only portable paths is accepted: validate refuses nothing a
+        // run would accept.
+        let mut profile = l4_profile(vec![udp_target(9), v6_target(53)], 10);
+        profile.l4.fields = fields(&["raw", "udp.length"]);
+        assert_eq!(lane.validate(&profile.target, &profile), Ok(()));
+    }
+
     /// Tester (stage 5): `with_timing` on a handle-less lane keeps refusing,
     /// and its counters/stats/state are all `None`.
     #[test]

@@ -2470,6 +2470,65 @@ mod tests {
         assert!(registry.is_empty());
     }
 
+    /// Tester (stage 5), T5 live proof 4b: the registry key is a **pair**, so
+    /// two jobs auditing the same target hold their own runner for the same
+    /// point id, and forgetting one job leaves the other's untouched. The
+    /// point id is derived from the target alone (`l4:<ip>:<port>/<proto>/
+    /// <field>`), so two concurrent jobs against one host collide on it by
+    /// construction — this is the case a job-id-only or point-id-only key
+    /// would get wrong, in opposite ways.
+    ///
+    /// Mutation: key the map by the point id alone and the second
+    /// `register` hands back the first job's runner (`Arc::ptr_eq` fails);
+    /// make `forget_job` clear the whole map and the surviving-job assertions
+    /// fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_jobs_sharing_a_point_id_keep_their_own_runners() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 5);
+        let (shared, job_a, plans, disc) =
+            setup(Arc::clone(&mock), profile.clone(), &fields(&["raw"]), 1000);
+        let job_b = crate::testing::TestJob::new(profile).with_job_id("scan-b0b0b0b0");
+        assert_ne!(job_a.job_id(), job_b.job_id(), "two distinct jobs");
+
+        let runner_a = runner_for(&shared, &job_a, &plans, &disc.points, "raw");
+        let runner_b = runner_for(&shared, &job_b, &plans, &disc.points, "raw");
+        let point_id = runner_a.point().id.clone();
+        assert_eq!(point_id, runner_b.point().id, "the same point id");
+        assert!(
+            !Arc::ptr_eq(&runner_a, &runner_b),
+            "two runners, one per job"
+        );
+
+        let registry = RunnerRegistry::new();
+        let got_a = registry.register(job_a.job_id(), &point_id, Arc::clone(&runner_a));
+        let got_b = registry.register(job_b.job_id(), &point_id, Arc::clone(&runner_b));
+        assert!(Arc::ptr_eq(&got_a, &runner_a), "job A keeps its own runner");
+        assert!(
+            Arc::ptr_eq(&got_b, &runner_b),
+            "job B is not handed job A's runner"
+        );
+        assert_eq!(registry.len(), 2, "one entry per (job, point) pair");
+
+        // Forgetting a job the registry never saw changes nothing.
+        registry.forget_job("scan-never-ran");
+        assert_eq!(registry.len(), 2);
+
+        registry.forget_job(job_a.job_id());
+        assert!(
+            registry.get(job_a.job_id(), &point_id).is_none(),
+            "job A's runner is gone"
+        );
+        let survivor = registry
+            .get(job_b.job_id(), &point_id)
+            .expect("job B's runner survives its neighbour's end");
+        assert!(Arc::ptr_eq(&survivor, &runner_b));
+        assert_eq!(registry.len(), 1);
+
+        registry.forget_job(job_b.job_id());
+        assert!(registry.is_empty());
+    }
+
     /// Tester (stage 5): the budget runs out during the recovery wait. The
     /// candidate case had two failed probes but **no replay ran** and the
     /// target was never given the recovery bound, so spec D8.4 / call 14 ("two

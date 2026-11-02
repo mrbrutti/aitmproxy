@@ -654,6 +654,150 @@ mod tests {
         );
     }
 
+    /// A packet-lane point as `aitm-scan-l4-packet`'s discovery mints one:
+    /// `l4` lane, `l4_field` kind, no method, an `udp://` url and its target's
+    /// site node (`l4:<ip>:<port>/<proto>`).
+    fn l4_point(id: &str, name: &str, node: Option<&str>) -> InsertionPoint {
+        InsertionPoint {
+            id: id.to_string(),
+            lane: LaneKind::L4Packet,
+            kind: InsertionKind::L4Field,
+            name: name.to_string(),
+            site_node: node.map(ToString::to_string),
+            method: None,
+            url: Some("udp://127.0.0.1:9".to_string()),
+            ..point(id, name)
+        }
+    }
+
+    /// A packet-lane site node as that discovery emits one.
+    fn l4_node(id: &str, port: u16, points: u32) -> SiteNode {
+        SiteNode {
+            scheme: "udp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port,
+            path_template: "/".to_string(),
+            method: String::new(),
+            ..node(id, "127.0.0.1", points)
+        }
+    }
+
+    /// A packet-lane check: `l4` lane, `l4_field` kind, intrusive, heavy,
+    /// point-scoped — the meta `aitm_scan_l4_packet::checks` declares.
+    fn l4_check(id: &str) -> Arc<dyn Check> {
+        check(id, |meta| {
+            meta.lanes = vec![LaneKind::L4Packet];
+            meta.kinds = vec![InsertionKind::L4Field];
+            meta.intensity = aitm_scan_model::Intensity::Intrusive;
+            meta.cost = CheckCost::Heavy;
+            meta.scope = CheckScope::Point;
+        })
+    }
+
+    /// Tester (stage 5), task 4b: the packet lane's site nodes are what give
+    /// its points any exposure at all. `plan` looks a point's node up by
+    /// `site_node` and scores `exposure(node.points, busiest)`, so before
+    /// discovery emitted nodes every L4 point scored exposure 0 and the whole
+    /// lane sorted below every HTTP point — on top of the issue placement
+    /// (`location.l4` null) the missing node cost. With the nodes in place a
+    /// 14-field target outranks a 2-field one, and a point whose node is
+    /// missing from the node list still schedules, at exposure 0.
+    ///
+    /// Mutation: return `Discovery { nodes: Vec::new(), .. }` from the lane's
+    /// `discover_all` (the state before commit ef950434) and all three
+    /// priorities collapse to 0.06.
+    #[test]
+    fn l4_points_take_their_exposure_from_their_targets_site_node() {
+        let checks = vec![l4_check("l4-crash")];
+        let busy = l4_node("l4:127.0.0.1:9/udp", 9, 14);
+        let quiet = l4_node("l4:127.0.0.1:80/tcp", 80, 2);
+        let points = vec![
+            l4_point("l4:127.0.0.1:9/udp/raw", "raw", Some("l4:127.0.0.1:9/udp")),
+            l4_point(
+                "l4:127.0.0.1:80/tcp/raw",
+                "raw",
+                Some("l4:127.0.0.1:80/tcp"),
+            ),
+            l4_point("l4:127.0.0.1:7/udp/raw", "raw", None),
+        ];
+        let profile = ScanProfile {
+            intensity: aitm_scan_model::Intensity::Intrusive,
+            ..ScanProfile::default()
+        };
+
+        let out = plan(&points, &[busy, quiet], &checks, &profile);
+
+        assert_eq!(out.active.len(), 3, "every L4 point is scheduled");
+        // interest is 0.2 * 0.3 = 0.06 for all three (no method, no auth), so
+        // the spread is exposure alone.
+        assert!(
+            (out.active[0].priority - (0.8 + 0.06)).abs() < 1e-6,
+            "the 14-field target is at full exposure: {}",
+            out.active[0].priority
+        );
+        assert!(
+            (out.active[1].priority - (0.8 * (2.0 / 14.0) + 0.06)).abs() < 1e-6,
+            "the 2-field target is at 2/14: {}",
+            out.active[1].priority
+        );
+        assert!(
+            (out.active[2].priority - 0.06).abs() < 1e-6,
+            "a point with no node in the list scores exposure 0: {}",
+            out.active[2].priority
+        );
+        assert_eq!(
+            pairs(&out.active),
+            vec![
+                ("l4-crash".to_string(), 0),
+                ("l4-crash".to_string(), 1),
+                ("l4-crash".to_string(), 2),
+            ],
+            "equal cost, so exposure orders them"
+        );
+        assert!(
+            out.passive.is_empty(),
+            "the packet lane has no passive check"
+        );
+    }
+
+    /// Tester (stage 5), task 4b (rig run with zero cases): both packet-lane
+    /// checks are `Intrusive`, and `plan` drops every check whose intensity is
+    /// **above the profile's**. The default profile is `Medium`, so a job that
+    /// does not ask for `intrusive` schedules nothing on an L4 point, finishes
+    /// `done` and sends not one frame — which is exactly what the first
+    /// real-bus T5 cells did until they set the intensity (commit 9d086234).
+    /// Pinned here so the engine-side half of that trap has a test.
+    ///
+    /// Mutation: change `meta.intensity > profile.intensity` to `>=` and the
+    /// intrusive half schedules nothing; drop the comparison and the medium
+    /// half schedules the check.
+    #[test]
+    fn an_intrusive_l4_check_needs_an_intrusive_profile() {
+        let checks = vec![l4_check("l4-crash")];
+        let node = l4_node("l4:127.0.0.1:9/udp", 9, 14);
+        let points = vec![l4_point(
+            "l4:127.0.0.1:9/udp/raw",
+            "raw",
+            Some("l4:127.0.0.1:9/udp"),
+        )];
+
+        let medium = ScanProfile::default();
+        assert_eq!(medium.intensity, aitm_scan_model::Intensity::Medium);
+        let out = plan(&points, std::slice::from_ref(&node), &checks, &medium);
+        assert!(
+            out.active.is_empty() && out.passive.is_empty(),
+            "a medium job runs no intrusive packet-lane check: {:?}",
+            pairs(&out.active)
+        );
+
+        let intrusive = ScanProfile {
+            intensity: aitm_scan_model::Intensity::Intrusive,
+            ..ScanProfile::default()
+        };
+        let out = plan(&points, std::slice::from_ref(&node), &checks, &intrusive);
+        assert_eq!(ids(&out.active), vec!["l4-crash".to_string()]);
+    }
+
     /// Spec D2: `Speed` maps to payload caps and `Accuracy` to blind repeats.
     #[test]
     fn caps_and_repeats() {
