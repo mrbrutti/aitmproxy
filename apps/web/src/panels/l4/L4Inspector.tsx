@@ -7,7 +7,7 @@
 // inspector reads the connection role (`useApp().bus.role()`), hands the intercept bar its reason,
 // and gates Inject itself — the craft editor's button is told `canInject={false}` and `onInject`
 // returns here before the confirm path, so a forced click sends nothing.
-import { createSignal, Show, type Component } from 'solid-js';
+import { createEffect, createSignal, on, Show, type Component } from 'solid-js';
 import { useApp } from '~/state/context';
 import { CraftEditor } from './CraftEditor';
 import { LayerTree } from './LayerTree';
@@ -42,7 +42,20 @@ export const L4Inspector: Component<L4InspectorProps> = (props) => {
   const bus = useApp().bus;
   /** The D12 gate: `null` on an operator connection, else the reason inject and the verdicts show. */
   const operatorOnly = () => operatorOnlyReason(bus.role());
-  const [sel, setSel] = createSignal<number | null>(props.flow.packets.length ? 0 : null);
+  // The selected packet is derived, not snapshotted: under windowed reads (spec §2) the first flow
+  // the inspector sees is the `limit: 0` list row with no packets and the window lands later, so a
+  // mount-time choice would leave nothing selected until a click. `picked` is only the operator's
+  // explicit pick; with none, the first packet (once there is one) is shown, and a pick past the end
+  // of the current packets is clamped so the highlight never lands on nothing.
+  const [picked, setPicked] = createSignal<number | null>(null);
+  const sel = (): number | null => {
+    const n = props.flow.packets.length;
+    if (n === 0) return null;
+    const p = picked();
+    return p === null ? 0 : Math.min(p, n - 1);
+  };
+  // Another flow: the pick belongs to the old packet list, so start from its first packet again.
+  createEffect(on(() => props.flow.id, () => setPicked(null), { defer: true }));
   /** The spec the craft editor last built successfully; what Mutate sends. */
   const [lastBuilt, setLastBuilt] = createSignal<PacketSpec | null>(null);
   const packet = () => {
@@ -84,7 +97,7 @@ export const L4Inspector: Component<L4InspectorProps> = (props) => {
           selected={sel()}
           inScope={props.row.inScope}
           truncated={props.flow.truncated === true}
-          onSelect={setSel}
+          onSelect={setPicked}
           onLoadMore={props.onLoadMore}
         />
       </div>
