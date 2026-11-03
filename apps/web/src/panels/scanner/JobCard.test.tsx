@@ -488,6 +488,46 @@ describe('JobCard: the comp', () => {
     expect(cancel.textContent).toBe('Cancel Scan');
   });
 
+  it('cancel_finally_guard_is_per_job (spec round 2): a late reply to the last job’s Cancel does not clear the Cancelling… the next job has in flight', async () => {
+    // One deferred per `scan.cancel` call, keyed by the job it names; the test resolves each by hand.
+    const pending = new Map<string, (status: Record<string, unknown>) => void>();
+    const h = mount(
+      factsOf(compStatus()),
+      {},
+      {
+        replies: {
+          'scan.cancel': (args: Record<string, unknown>) =>
+            new Promise<Record<string, unknown>>((resolveReply) => {
+              pending.set(String(args.job), resolveReply);
+            }),
+        },
+      },
+    );
+    fireEvent.click(h.button(`Cancel scan ${JOB}`));
+    await tick();
+    expect(h.count('scan.cancel')).toBe(1);
+    expect(h.button(`Cancel scan ${JOB}`).textContent).toBe('Cancelling…');
+    expect(h.button(`Cancel scan ${JOB}`).disabled).toBe(true);
+    // The selection moves: OTHER on the same card, and its own Cancel is sent.
+    h.setFacts(factsOf(compStatus({ job: OTHER })));
+    await tick();
+    fireEvent.click(h.button(`Cancel scan ${OTHER}`));
+    await tick();
+    expect(h.count('scan.cancel')).toBe(2);
+    expect([...pending.keys()]).toEqual([JOB, OTHER]);
+    expect(h.button(`Cancel scan ${OTHER}`).textContent).toBe('Cancelling…');
+    // JOB's reply lands late. It is not OTHER's: OTHER's Cancel stays in flight.
+    pending.get(JOB)!(compStatus({ state: 'cancelling' }));
+    await tick();
+    expect(h.button(`Cancel scan ${OTHER}`).textContent).toBe('Cancelling…');
+    expect(h.button(`Cancel scan ${OTHER}`).disabled).toBe(true);
+    // OTHER's own reply clears it.
+    pending.get(OTHER)!(compStatus({ job: OTHER, state: 'cancelling' }));
+    await tick();
+    expect(h.button(`Cancel scan ${OTHER}`).textContent).toBe('Cancel Scan');
+    expect(h.button(`Cancel scan ${OTHER}`).disabled).toBe(false);
+  });
+
   it('entrance_indices: the title row, the lane block and the KPI strip enter at indices 0, 1, 2; the card says whether it plays', () => {
     const h = mount(factsOf(compStatus()), { generation: 3, play: true });
     const card = h.card();

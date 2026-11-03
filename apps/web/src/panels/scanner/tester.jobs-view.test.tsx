@@ -18,7 +18,6 @@ import {
   clock,
   findingLine,
   hostsText,
-  jobAccessibilityLabel,
   jobFacts,
   jobHeading,
   jobProgress,
