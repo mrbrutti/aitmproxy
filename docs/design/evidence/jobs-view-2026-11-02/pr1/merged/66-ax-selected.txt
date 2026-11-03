@@ -1,0 +1,4 @@
+scan-job-scan-42a348d2	AXButton	selected=nil	focused=nil
+scan-job-scan-c5b3114e	AXButton	selected=true	focused=nil
+scan-job-scan-30c7bc44	AXButton	selected=nil	focused=nil
+rows: 3

@@ -437,3 +437,22 @@ public enum EmbeddedCoreLaunch {
         }
     }
 }
+
+// MARK: - Core pointer isolation
+
+extension EmbeddedCoreLaunch {
+    /// The core's environment key for its run dir (`aitm-mcp` `pointer::RUN_DIR_ENV`): the
+    /// directory where it publishes its pointer for the CLI's one-shots to find.
+    public static let runDirEnvironmentKey = "AITM_RUN_DIR"
+
+    /// Where an app launched on an overridden store (a dev bundle, the harness, the live
+    /// self-test: `APP_STORE` set, the same signal `SettingsDomain` reads) must make its core
+    /// publish: `<store>/run/cores`, so it never shadows the installed app's core in the default run
+    /// dir. Nil for a normal launch — the installed app leaves the default in place, which is where
+    /// the CLI looks. Pure on the environment, so the core spawner can call it off the main actor.
+    public static func isolatedRunDir(environment: [String: String]) -> URL? {
+        guard let store = SettingsDomain.overriddenStoreURL(environment: environment) else { return nil }
+        return store.appending(path: "run", directoryHint: .isDirectory)
+            .appending(path: "cores", directoryHint: .isDirectory)
+    }
+}

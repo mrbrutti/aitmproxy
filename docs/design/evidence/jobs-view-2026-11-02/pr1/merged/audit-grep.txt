@@ -1,0 +1,1 @@
+{"at":1793662225329,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_50f68398574296c1-1","command":"scan.cancel","args":"{\"job\":\"scan-c5b3114e\"}","result":"ok"}

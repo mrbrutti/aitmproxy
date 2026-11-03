@@ -1,0 +1,28 @@
+== /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-OPyeZz
+14:  audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-OPyeZz/ca-audit.jsonl"
+17:  audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-OPyeZz/audit.jsonl"
+total 288
+drwx------@     8 matt  staff      256 Nov  2 20:33 .
+drwx------@ 65535 matt  staff  4614752 Nov  2 20:34 ..
+-rw-------@     1 matt  staff       97 Nov  2 20:33 audit.agent.jsonl
+-rw-------@     1 matt  staff     2055 Nov  2 20:34 audit.jsonl
+-rw-------@     1 matt  staff   119827 Nov  2 20:34 audit.reads.jsonl
+-rw-r--r--@     1 matt  staff      753 Nov  2 20:33 config.yaml
+drwxr-xr-x@     2 matt  staff       64 Nov  2 20:33 poc
+drwxr-xr-x@     2 matt  staff       64 Nov  2 20:33 poc-out
+audit.jsonl bytes: 2055
+scan.cancel lines: 1
+== /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-E1UMKQ
+14:  audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-E1UMKQ/ca-audit.jsonl"
+17:  audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-E1UMKQ/audit.jsonl"
+total 32
+drwx------@     8 matt  staff      256 Nov  2 20:34 .
+drwx------@ 65535 matt  staff  4614752 Nov  2 20:34 ..
+-rw-------@     1 matt  staff       97 Nov  2 20:34 audit.agent.jsonl
+-rw-------@     1 matt  staff      859 Nov  2 20:34 audit.jsonl
+-rw-------@     1 matt  staff     3931 Nov  2 20:34 audit.reads.jsonl
+-rw-r--r--@     1 matt  staff      992 Nov  2 20:34 config.yaml
+drwxr-xr-x@     2 matt  staff       64 Nov  2 20:34 poc
+drwxr-xr-x@     2 matt  staff       64 Nov  2 20:34 poc-out
+audit.jsonl bytes: 859
+scan.cancel lines: 0

@@ -1,0 +1,108 @@
+window: aitmproxy 120 39 1862 1130
+AXStaticText		aitmproxy		136	105	86	16
+AXStaticText		TRAFFIC		136	156	51	14
+AXButton			Flows, 126	128	178	224	28
+AXButton			Apps, 1	128	206	224	28
+AXButton			Domains, 2	128	234	224	28
+AXButton			Pinned, 0	128	262	224	28
+AXButton			Connection Log	128	290	224	28
+AXButton			Overview	128	318	224	28
+AXStaticText		TESTING		136	366	53	14
+AXButton			Scope, 5	128	388	224	28
+AXButton			Scan	128	416	224	28
+AXButton			Findings	128	444	224	28
+AXButton			Browser, 0 tabs	128	472	224	28
+AXStaticText		AUTOMATION		136	520	82	14
+AXButton			Scripts, 0 active	128	542	224	28
+AXButton			Agent, 0/min	128	570	224	28
+AXStaticText		⌘⇧F		315	1112	28	14
+AXButton			Profiles	383	127	58	36
+AXButton			Jobs 3	443	127	54	36
+AXButton			Site map	499	127	66	36
+AXButton			Issues	567	127	51	36
+AXStaticText		Cancelling · Auditing · 1:55		734	171	238	24
+AXButton			Cancel Scan	1664	170	92	26
+AXButton			Show Issues	1768	169	88	28
+AXButton			Show Site Map	1868	169	102	28
+AXStaticText		287 / 2,000		734	238	136	24
+AXStaticText		Errors		734	282	32	14
+AXStaticText		Timeouts		786	282	49	14
+AXStaticText		Rate waits		855	282	54	14
+AXStaticText		0		734	300	9	16
+AXStaticText		0		786	300	9	16
+AXStaticText		0		855	300	9	16
+AXStaticText		By lane		734	324	39	14
+AXStaticText		http 287		734	342	65	16
+AXStaticText		Pages		734	400	32	14
+AXStaticText		Queued		786	400	42	14
+AXStaticText		Depth		848	400	32	14
+AXStaticText		Forms		900	400	33	14
+AXStaticText		46		734	418	17	16
+AXStaticText		0		786	418	9	16
+AXStaticText		0		848	418	9	16
+AXStaticText		5		900	418	9	16
+AXStaticText		Found		734	476	33	14
+AXStaticText		Queued		787	476	42	14
+AXStaticText		Audited		849	476	41	14
+AXStaticText		1020		734	494	33	16
+AXStaticText		6468		787	494	33	16
+AXStaticText		97		849	494	17	16
+AXStaticText		Skipped ignored		734	518	86	14
+AXStaticText		Skipped frequent		840	518	91	14
+AXStaticText		Skipped limit		951	518	68	14
+AXStaticText		0		734	536	9	16
+AXStaticText		722		840	536	25	16
+AXStaticText		0		951	536	9	16
+AXStaticText		Scheduled		734	594	56	14
+AXStaticText		Done		810	594	28	14
+AXStaticText		6468		734	612	33	16
+AXStaticText		3236		810	612	33	16
+AXStaticText		Running		734	636	43	14
+AXStaticText		header-reflection		734	654	127	15
+AXStaticText		Critical		734	734	38	14
+AXStaticText		High		792	734	25	14
+AXStaticText		Medium		836	734	42	14
+AXStaticText		Low		898	734	21	14
+AXStaticText		Info		939	734	20	14
+AXStaticText		0		734	752	9	16
+AXStaticText		0		792	752	9	16
+AXStaticText		0		836	752	9	16
+AXStaticText		4		898	752	9	16
+AXStaticText		0		939	752	9	16
+AXStaticText		Certain		734	776	39	14
+AXStaticText		Firm		793	776	24	14
+AXStaticText		Tentative		836	776	48	14
+AXStaticText		1		734	794	9	16
+AXStaticText		2		793	794	9	16
+AXStaticText		1		836	794	9	16
+AXStaticText		Requested		734	852	56	14
+AXStaticText		Run		875	852	21	14
+AXStaticText		HTTP, WebSocket		734	870	121	16
+AXStaticText		HTTP, WebSocket		875	870	121	16
+AXStaticText		Reused		734	928	39	14
+AXStaticText		Lost		793	928	23	14
+AXStaticText		Browser partial		836	928	79	14
+AXStaticText		no		734	946	17	16
+AXStaticText		no		793	946	17	16
+AXStaticText		no		836	946	17	16
+AXStaticText		Auth-lost detection off: no GET/HEAD flow seen		734	970	270	15
+AXButton			Clear	132	1145	44	20
+AXButton			Filter	184	1145	43	20
+AXButton			Auto-select	235	1145	78	20
+AXStaticText		0 / 126 rows		976	1148	69	15
+AXStaticText		5 hosts in scope		1058	1148	93	15
+AXStaticText		↑ 166 B/s		1815	1148	67	15
+AXStaticText		↓ 3.3 KB/s		1896	1148	75	15
+AXButton		This build has no extension	aitmproxy: core: running, bus: connected, all apps: no extension	793	51	322	28
+AXButton			Toggle Sidebar	212	39	47	52
+AXButton			Compose	259	39	44	52
+AXButton			Clear Session	303	39	44	52
+AXMenuButton	Agent			1715	51	84	28
+AXButton			Command Palette	1802	39	44	52
+AXButton			Rectangle Split One By Two	1850	51	28	28
+AXButton			Rectangle Split Two By One	1882	51	28	28
+AXButton			Mac Window On A Rectangle	1914	51	28	28
+AXButton			Square Split Two By One	1946	51	28	28
+AXButton				138	57	16	16
+AXButton				184	57	16	16
+AXButton				161	57	16	16

@@ -1923,6 +1923,53 @@ mod tests {
         assert!(example.contains("[redacted]"), "{example}");
     }
 
+    /// Call C13 (plan Task 11b), end to end through the lane: a real JSON body
+    /// longer than [`MAX_EXAMPLE_CHARS`] reaches its `entire_body` point
+    /// **whole**, because a document-level check (`nosqli-json`, `xxe`)
+    /// rebuilds the document from exactly this string and refuses to probe a
+    /// prefix of it. The body's own `json_value` points are unaffected and keep
+    /// the 64-character cut.
+    #[test]
+    fn a_json_document_longer_than_the_value_cap_reaches_its_body_point_whole() {
+        let long_value = "v".repeat(200);
+        let body = format!(r#"{{"note":"{long_value}","user":"amy"}}"#);
+        assert!(
+            body.chars().count() > crate::limits::MAX_EXAMPLE_CHARS,
+            "the fixture has to be longer than the value cap"
+        );
+        let flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/api/search",
+                &[],
+                Some(("application/json", body.as_bytes())),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let profile = ScanProfile::default();
+        let no_ignore = CompiledIgnore::compile(&[]).unwrap();
+        let out = enumerate_v2(
+            &flow,
+            &EnumerateOptions::from_profile(&profile, &no_ignore, None),
+        );
+
+        assert_eq!(
+            point(&out, EntireBody, "body").example.as_deref(),
+            Some(body.as_str()),
+            "the document point shows the document, not a prefix of it"
+        );
+        assert_eq!(
+            point(&out, JsonValue, "note")
+                .example
+                .as_deref()
+                .map(|e| e.chars().count()),
+            Some(crate::limits::MAX_EXAMPLE_CHARS),
+            "a value point keeps the 64-character cut"
+        );
+    }
+
     #[test]
     fn streamed_and_huge_bodies_skip() {
         let profile = ScanProfile::default();

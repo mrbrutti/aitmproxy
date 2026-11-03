@@ -75,6 +75,15 @@ pub(crate) const MAX_MULTIPART_PARTS: usize = 256;
 /// Characters kept in an `InsertionPoint.example`.
 pub(crate) const MAX_EXAMPLE_CHARS: usize = 64;
 
+/// Characters kept in the `example` of an `entire_body` point (call C13 of
+/// the T1b PR 3 plan): a document-level check such as `nosqli-json` needs the
+/// document, and a real JSON body is almost always longer than
+/// [`MAX_EXAMPLE_CHARS`]. The value is scrubbed (`scrub_text_wide`) BEFORE the
+/// cut, so a credential near the end of a long body is masked, not kept by
+/// the truncation. A constant ceiling, not a knob; every other kind stays at
+/// [`MAX_EXAMPLE_CHARS`].
+pub(crate) const MAX_ENTIRE_BODY_EXAMPLE_CHARS: usize = 1024;
+
 /// Characters kept in a URL that reaches a log line or an error message.
 pub(crate) const MAX_SAFE_URL_CHARS: usize = 256;
 

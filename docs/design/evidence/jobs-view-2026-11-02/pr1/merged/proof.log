@@ -1,0 +1,109 @@
+[15:29:32] == pass 7: PR 1 head ad822f45, bundle tree b7f603f7 (merged head + #310)
+[15:29:32] real audit log before: mtime=1793660731 size=92013
+share
+app pid 52327
+core pid 52333 proxy port 49371 bus 127.0.0.1:49375
+[15:29:58] core config /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/A1E40B7F-2577-4F4F-A6A0-5F4E06959628/config.yaml
+1:listen: "127.0.0.1:49371"
+9:  audit_log: "/tmp/Aitmproxy-dev-state-jobsux/audit.jsonl"
+[15:29:58] #310: audit log path from the config: /tmp/Aitmproxy-dev-state-jobsux/audit.jsonl
+[15:29:58] #310 PASS: audit log under the isolated store
+pressed AXButton 'Not Now' -> 0
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[15:30:05] frame 60-empty
+[15:30:05] == AC8: bus-started light-http selected with no click
+[15:30:05] light-http job scan-30c7bc44
+[15:30:10] frame 61-ac8-autoselected
+AXButton			Running, crawling, light-http, 127.0.0.1:8120, 9 of 2000 probes, 0 of 0 points audited, no issues
+AXStaticText		Running · Crawling · 0:04	
+AXButton			Cancel Scan
+[15:30:10] == AC5/AC7: standard job, select, frame loop across the press, two ⌥⌘., +5 s, +60 s
+[15:30:10] standard job scan-c5b3114e
+[15:30:24] frame 62-ac5-running
+pressed AXButton 'Cancel Scan' -> 0
+posted key 47 flags 1572864 to 52327
+posted key 47 flags 1572864 to 52327
+AC5 status cancelled cancelled 14653
+[15:30:32] frame 63-ac5-cancelled-5s
+AXButton			Cancelled, done, standard, 127.0.0.1:8117, 29 of 2000 probes, 0 of 0 points audited, no issues
+AXButton			Running, auditing, light-http, 127.0.0.1:8120, 60 of 2000 probes, 35 of 325 points audited, 3 issues: 3 low
+AXStaticText		Cancelled · Done · 0:14	
+[15:30:33] AC7 audit scan.cancel for scan-c5b3114e: before=0
+0 after=1 (expect after-before == 1)
+{"at":1793662225329,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_50f68398574296c1-1","command":"scan.cancel","args":"{\"job\":\"scan-c5b3114e\"}","result":"ok"}
+[15:30:33] == AC10: dead target 8121 (sentence, crawl line, raw token once)
+[15:30:33] dead-target job scan-42a348d2
+[15:31:17] frame 64-ac10-dead-target
+88:AXStaticText		Stopped early: too many errors from the target.
+89:AXStaticText		The crawl fetched 1 page and hit 1 error
+90:AXStaticText		stopped_reason: errors
+[15:31:18] == AC5 +60 s: re-select the cancelled standard job
+[15:31:22] frame 65-ac5-cancelled-65s
+AXButton			Cancelled, done, standard, 127.0.0.1:8117, 29 of 2000 probes, 0 of 0 points audited, no issues
+AXButton			Running, auditing, light-http, 127.0.0.1:8120, 187 of 2000 probes, 67 of 325 points audited, 3 issues: 3 low
+AXStaticText		Cancelled · Done · 0:14	
+[15:31:22] == AC11: three rows, selected attribute
+scan-job-scan-42a348d2	AXButton	selected=nil	focused=nil
+scan-job-scan-c5b3114e	AXButton	selected=true	focused=nil
+scan-job-scan-30c7bc44	AXButton	selected=nil	focused=nil
+rows: 3
+[15:31:23] == AC6: wait for scan-30c7bc44, then select it
+AC6 status running 480324 1523 1538 5
+1 scan-42a348d2 done
+2 scan-c5b3114e cancelled
+3 scan-30c7bc44 running
+[15:38:05] AC6 row 3 -> click y=334
+[15:38:10] frame 67-ac6-light-http-done
+AXButton			Done, done, standard, 127.0.0.1:8121, 1 of 2000 probes, 0 of 12 points audited, no issues
+AXButton			Running, auditing, light-http, 127.0.0.1:8120, 1200 of 2000 probes, 321 of 325 points audited, 5 issues: 2 high, 3 low
+AXButton			Cancel Scan
+AXStaticText		Scheduled	
+AXStaticText		Done	
+[15:38:10] == AC12: freeze with a running job selected; age clause advances; recovery
+[15:38:10] thorough job scan-732b2599
+[15:38:17] core 52333 stopped
+[15:38:54] frame 68-ac12-36s
+AXButton			Cancel Scan	false
+[15:39:05] core continued
+[15:39:11] frame 69-ac12-recovered
+AXButton			Cancel Scan	true
+[15:39:12] thorough cancelled over the bus (cleanup)
+[15:39:12] real audit log after: mtime=1793660731 size=92013 (expect unchanged: 1793660731 / 92013)
+[15:39:12] #310 PASS: Matt's real audit log untouched
+[15:39:12] == evidence copy
+[15:39:13] == done pass 7; quitting the bundle (quit-when-idle rule)
+down
+[15:39:15] targets stopped
+[15:40:57] == pass 7b: bundle tree b7f603f7, PR 1 head ad822f45
+share
+app pid 55679
+core pid 55691 proxy port 52197 bus 127.0.0.1:52203
+pressed AXButton 'Not Now' -> 0
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[15:41:18] == AC6: light-http on 8120, then a thorough job on 8119 so the finished job is NOT selected while it ends
+[15:41:18] light-http job scan-95c651db
+[15:41:21] thorough job scan-950d25a6 (selected by the click below)
+[15:41:27] frame 70-ac6-thorough-selected
+[15:41:27] == AC12 (while waiting): freeze, dump without role filter at +36 s and +47 s, recover
+[15:41:27] core 55691 stopped
+[15:42:04] frame 71-ac12-36s
+33:AXUnknown			Error: Unable to list jobs: the bus did not reply in time. Showing values from 0:39 ago; retrying every 2 s.	true
+35:AXButton			Cancel Scan	false
+33:AXUnknown		
+[15:42:16] core continued
+[15:42:23] frame 72-ac12-recovered
+38:AXButton			Cancel Scan	true
+[15:42:24] == AC6: wait for scan-95c651db to finish while scan-950d25a6 stays selected
+AC6 status done 351252 940 940 5
+[15:47:16] frame 73-ac6-before-select
+[15:47:16] AC6 row 2 -> click y=246
+[15:47:20] frame 74-ac6-light-http-done
+AXButton			Running, auditing, thorough, 127.0.0.1:8119, 762 of 2000 probes, 141 of 1269 points audited, 4 issues: 4 low
+AXButton			Done, done, light-http, 127.0.0.1:8120, 748 of 2000 probes, 199 of 199 points audited, 5 issues: 2 high, 3 low
+AXStaticText		Done · Done · 5:51	
+AXStaticText		Scheduled	
+AXStaticText		Done	
+[15:47:21] thorough cancelled over the bus (cleanup)
+[15:47:21] == evidence copy
