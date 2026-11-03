@@ -1,0 +1,80 @@
+AXStaticText		aitmproxy			true	69	-1341	86	16	
+AXStaticText		TRAFFIC			true	69	-1290	51	14	
+AXButton			Flows, 86		true	61	-1268	224	28	
+AXButton			Apps, 1		true	61	-1240	224	28	
+AXButton			Domains, 2		true	61	-1212	224	28	
+AXButton			Pinned, 0		true	61	-1184	224	28	
+AXButton			Connection Log		true	61	-1156	224	28	
+AXButton			Overview		true	61	-1128	224	28	
+AXStaticText		TESTING			true	69	-1080	53	14	
+AXButton			Scope, 2		true	61	-1058	224	28	
+AXButton			Scan		true	61	-1030	224	28	
+AXButton			Findings		true	61	-1002	224	28	
+AXButton			Browser, 0 tabs		true	61	-974	224	28	
+AXStaticText		AUTOMATION			true	69	-926	82	14	
+AXButton			Scripts, 0 active		true	61	-904	224	28	
+AXButton			Agent, 0/min		true	61	-876	224	28	
+AXStaticText		⌘⇧F			true	248	-564	28	14	
+AXButton			Profiles		true	316	-1319	58	36	
+AXButton			Jobs 2		true	376	-1319	54	36	
+AXButton			Site map		true	432	-1319	66	36	
+AXButton			Issues		true	499	-1319	51	36	
+AXStaticText		Done			true	342	-1240	61	22	
+AXButton			Show Site Map		true	1138	-1241	102	28	
+AXButton			Show Issues		true	1248	-1241	88	28	
+AXButton			Scan Again		true	1344	-1240	85	26	
+AXStaticText		Stopped early: too many errors from the target.			true	342	-1211	305	17	
+AXStaticText		standard · started 06:40 by anim-verify · finished 06:41			true	342	-1190	357	17	
+AXStaticText		Progress, —			true	358	-941	54	53	
+AXStaticText		Checks, 49, of 135			true	575	-941	84	53	
+AXStaticText		Probes, 1, of 2,000			true	793	-941	78	53	
+AXStaticText		Points audited, 0, of 14			true	1010	-941	87	53	
+AXStaticText		Issues, 0, no issues			true	1228	-941	83	53	
+AXStaticText		The crawl fetched 1 page and hit 1 error			true	342	-822	240	16	
+AXStaticText		stopped_reason: errors			true	342	-798	150	14	
+AXButton			Done, standard, 127.0.0.1:8121, no issues, 30 seconds.		true	318	-711	1134	44	scan-job-scan-5765d365
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 33 seconds.		true	318	-666	1134	44	scan-job-scan-d3156689
+AXStaticText		Pages fetched, 1			true	338	-548	519	16	
+AXStaticText		Pages waiting, 0			true	338	-519	519	16	
+AXStaticText		Depth, 0			true	338	-490	519	16	
+AXStaticText		Forms submitted, 0			true	338	-461	519	16	
+AXStaticText		Forms not submitted, 0			true	338	-432	519	16	
+AXStaticText		Crawl errors, 1			true	338	-403	519	16	
+AXStaticText		Points found, 14			true	338	-374	519	16	
+AXStaticText		Waiting for audit, 135			true	338	-345	519	16	
+AXStaticText		Audited, 0			true	338	-316	519	16	
+AXStaticText		skipped as repetitive, 0			true	338	-287	519	16	
+AXStaticText		skipped by rule, 0			true	338	-258	519	16	
+AXStaticText		skipped at the per-request cap, 0			true	338	-229	519	16	
+AXStaticText		Lanes, HTTP, WebSocket			true	338	-200	519	16	
+AXStaticText		Probes by lane, HTTP 1			true	338	-171	519	16	
+AXStaticText		Session, no · no · off · no			true	338	-142	519	16	
+AXStaticText		Critical · High · Medium, 0 · 0 · 0			true	913	-548	519	16	
+AXStaticText		Low, 0			true	913	-519	519	16	
+AXStaticText		Info, 0			true	913	-490	519	16	
+AXStaticText		Certain · Firm · Tentative, 0 · 0 · 0			true	913	-461	519	16	
+AXStaticText		Probe errors · timeouts · rate waits, 10 · 0 · 0			true	913	-432	519	16	
+AXStaticText		Checks scheduled · done · errors · skipped, 135 · 49 · 7 · 0			true	913	-403	519	16	
+AXButton						1476	-1283	0	0	
+AXButton						1476	-1283	0	0	
+AXButton						1479	-822	11	284	
+AXButton						1479	-1280	11	0	
+AXButton			Clear		true	65	-531	44	20	
+AXButton			Filter		true	117	-531	43	20	
+AXButton			Auto-select		true	168	-531	78	20	
+AXStaticText		0 / 86 rows			true	719	-529	64	15	
+AXStaticText		2 hosts in scope			true	797	-529	93	15	
+AXStaticText		↑ 0 B/s			true	1363	-529	52	15	
+AXStaticText		↓ 0 B/s			true	1429	-529	52	15	
+AXButton		This build has no extension	aitmproxy: core: running, bus: connected, all apps: no extension		true	515	-1395	322	28	
+AXButton			Toggle Sidebar		true	145	-1407	47	52	
+AXButton			Compose		true	192	-1407	44	52	
+AXButton			Clear Session		true	236	-1407	44	52	
+AXButton			Command Palette		true	1313	-1407	44	52	
+AXButton			Rectangle Split One By Two		true	1361	-1395	28	28	rectangle.split.1x2
+AXButton			Rectangle Split Two By One		true	1393	-1395	28	28	rectangle.split.2x1
+AXButton			Mac Window On A Rectangle		true	1425	-1395	28	28	macwindow.on.rectangle
+AXButton			Square Split Two By One		true	1457	-1395	28	28	square.split.2x1
+AXButton					true	71	-1389	16	16	
+AXButton					true	117	-1389	16	16	
+AXButton					true	94	-1389	16	16	

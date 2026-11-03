@@ -1,0 +1,75 @@
+AXStaticText		aitmproxy			true	69	-1341	86	16	
+AXStaticText		TRAFFIC			true	69	-1290	51	14	
+AXButton			Flows, 85		true	61	-1268	224	28	
+AXButton			Apps, 1		true	61	-1240	224	28	
+AXButton			Domains, 1		true	61	-1212	224	28	
+AXButton			Pinned, 0		true	61	-1184	224	28	
+AXButton			Connection Log		true	61	-1156	224	28	
+AXButton			Overview		true	61	-1128	224	28	
+AXStaticText		TESTING			true	69	-1080	53	14	
+AXButton			Scope, 2		true	61	-1058	224	28	
+AXButton			Scan		true	61	-1030	224	28	
+AXButton			Findings		true	61	-1002	224	28	
+AXButton			Browser, 0 tabs		true	61	-974	224	28	
+AXStaticText		AUTOMATION			true	69	-926	82	14	
+AXButton			Scripts, 0 active		true	61	-904	224	28	
+AXButton			Agent, 0/min		true	61	-876	224	28	
+AXStaticText		⌘⇧F			true	248	-564	28	14	
+AXButton			Profiles		true	316	-1319	58	36	
+AXButton			Jobs 1		true	376	-1319	52	36	
+AXButton			Site map		true	430	-1319	66	36	
+AXButton			Issues		true	498	-1319	51	36	
+AXStaticText		Auditing			true	342	-1240	79	22	
+AXButton			Show Site Map		true	1130	-1241	102	28	
+AXButton			Show Issues		true	1240	-1241	88	28	
+AXButton			Cancel Scan		true	1336	-1240	92	26	
+AXStaticText		4 low issues so far · header-reflection running now · standard · started 06:40 by anim-verify			true	342	-1211	627	17	
+AXStaticText		Progress, 47 %			true	358	-962	70	53	
+AXStaticText		Checks, 3,062, of 6,457			true	575	-962	148	53	
+AXStaticText		Probes, 79, of 2,000			true	793	-962	96	53	
+AXStaticText		Points audited, 43, of 1,014			true	1010	-962	95	53	
+AXStaticText		Issues, 4, 4 low			true	1228	-962	58	53	
+AXButton			Auditing, standard, 127.0.0.1:8117, 47 percent, 3,062 of 6,457 checks, 4 issues: 4 low, 31 seconds.		true	318	-778	1134	44	scan-job-scan-d3156689
+AXStaticText		Pages fetched, 46			true	338	-660	519	16	
+AXStaticText		Pages waiting, 0			true	338	-631	519	16	
+AXStaticText		Depth, 0			true	338	-602	519	16	
+AXStaticText		Forms submitted, 5			true	338	-573	519	16	
+AXStaticText		Forms not submitted, 0			true	338	-544	519	16	
+AXStaticText		Points found, 1,014			true	338	-515	519	16	
+AXStaticText		Waiting for audit, 6,457			true	338	-486	519	16	
+AXStaticText		Audited, 43			true	338	-457	519	16	
+AXStaticText		skipped as repetitive, 722			true	338	-428	519	16	
+AXStaticText		skipped by rule, 0			true	338	-399	519	16	
+AXStaticText		skipped at the per-request cap, 0			true	338	-370	519	16	
+AXStaticText		Lanes, HTTP, WebSocket			true	338	-341	519	16	
+AXStaticText		Probes by lane, HTTP 79			true	338	-312	519	16	
+AXStaticText		Session, no · no · off · no			true	338	-283	519	16	
+AXStaticText		Critical · High · Medium, 0 · 0 · 0			true	913	-660	519	16	
+AXStaticText		Low, 4			true	913	-631	519	16	
+AXStaticText		Info, 0			true	913	-602	519	16	
+AXStaticText		Certain · Firm · Tentative, 1 · 2 · 1			true	913	-573	519	16	
+AXStaticText		Probe errors · timeouts · rate waits, 0 · 0 · 0			true	913	-544	519	16	
+AXStaticText		Checks scheduled · done · errors · skipped, 6,457 · 3,062 · 5 · 0			true	913	-515	519	16	
+AXButton						1476	-1283	0	0	
+AXButton						1476	-1283	0	0	
+AXButton						1479	-761	11	223	
+AXButton						1479	-1280	11	0	
+AXButton			Clear		true	65	-531	44	20	
+AXButton			Filter		true	117	-531	43	20	
+AXButton			Auto-select		true	168	-531	78	20	
+AXStaticText		0 / 85 rows			true	719	-529	64	15	
+AXStaticText		2 hosts in scope			true	797	-529	93	15	
+AXStaticText		↑ 0 B/s			true	1363	-529	52	15	
+AXStaticText		↓ 0 B/s			true	1429	-529	52	15	
+AXButton		This build has no extension	aitmproxy: core: running, bus: connected, all apps: no extension		true	515	-1395	322	28	
+AXButton			Toggle Sidebar		true	145	-1407	47	52	
+AXButton			Compose		true	192	-1407	44	52	
+AXButton			Clear Session		true	236	-1407	44	52	
+AXButton			Command Palette		true	1313	-1407	44	52	
+AXButton			Rectangle Split One By Two		true	1361	-1395	28	28	rectangle.split.1x2
+AXButton			Rectangle Split Two By One		true	1393	-1395	28	28	rectangle.split.2x1
+AXButton			Mac Window On A Rectangle		true	1425	-1395	28	28	macwindow.on.rectangle
+AXButton			Square Split Two By One		true	1457	-1395	28	28	square.split.2x1
+AXButton					true	71	-1389	16	16	
+AXButton					true	117	-1389	16	16	
+AXButton					true	94	-1389	16	16	
