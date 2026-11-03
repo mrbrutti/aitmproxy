@@ -829,7 +829,7 @@ extension ScanFormat {
     public static func checksToGo(done: Int, scheduled: Int) -> String?
 }
 extension ScanJobProgress {
-    public var checksToGoText: String?   // while auditing or reporting with scheduled > 0; nil otherwise and when terminal
+    public var checksToGoText: String?   // while running in auditing or reporting with scheduled > 0; nil otherwise (incl. cancelling and terminal)
     public var nowTag: String?           // "now · xss-reflected" / "now · xss-reflected and 3 more"; nil when nowLine is nil
     public var estimateText: String?     // "at this pace, about 1:04 to go"
     public var estimateHelp: String?     // "Derived from the counters: 3,236 checks done in 1:04, about 51 checks per second, 3,232 to go."
@@ -896,13 +896,15 @@ The Jobs tab is one scrolling column: banner (D15) → job card (D11) → jobs
 table → wells (D11). The table is `ScanJobsTable` in `ScanPanel+Jobs.swift`:
 a header row and one `ScanJobRow` per job, newest first, both laid out by one
 `ScanJobsColumns` definition so cells align (builder's call: a SwiftUI `Grid`
-or an `HStack` of fixed frames). Columns: **State** (flexible, min 148 pt),
-**Profile** (120), **Target** (flexible, min 220, data face), **Progress**
-(flexible, min 220, data face), **Probes** · **Points** · **Issues** ·
+or an `HStack` of fixed frames). Columns: **State** (flexible, share 148),
+**Profile** (120), **Target** (flexible, share 220, data face), **Progress**
+(flexible, share 220, data face), **Probes** · **Points** · **Issues** ·
 **Elapsed** (120 · 120 · 124 · 80, right-aligned, tabular), and a trailing
-84 pt action column. Header: 32 pt, labels UI sm `Tok.Ink.tertiary` sentence
+84 pt action column (the three flexible columns split the leftover width in
+148:220:220 shares, as the comp's auto table does; the literal minimums would
+overflow the 1,152 pt usable width, gap 36). Header: 32 pt, labels UI sm `Tok.Ink.tertiary` sentence
 case (`ScanFormat.tableHeaders`: `State`, `Profile`, `Target`, `Progress`,
-`Probes`, `Points`, `Issues`, `Elapsed`), no fill, no rule under it. Rows:
+`Probes`, `Points`, `Issues`, `Elapsed`), no fill; rows are split by `Tok.Line.rule` (the comp's `td { border-top }`). Rows:
 44 pt pitch (the comp's 46 on the 4 pt grid; a row with a sub-line grows to
 60), `Rule(color: Tok.Line.rule)` between rows, padding `Space.sm` horizontal
 per cell.
@@ -961,7 +963,7 @@ per cell.
 
 #### D11. The job card and the wells (locked comp)
 
-The job card replaces the inspector. `ScanJobCard(facts:progress:link:…)` in
+The job card replaces the inspector. `ScanJobCard(state:facts:progress:reduceMotion:generation:…)` (no clock-driven `link`: the verb slot reads the state's clock-free `verbsEnabled`, gap 34d) in
 `ScanJobCard.swift` is composed of small views: `ScanJobTitleRow`, `ScanJobLane`,
 `ScanIssueLedger`, `ScanProbeGauge`, `ScanKPIStrip`, `ScanAttentionBlock`;
 the wells are `ScanJobWells` in `ScanJobWells.swift`. The card's **tone** is
@@ -983,7 +985,8 @@ horizontal, a 3 pt left edge in the tone's colour clipped to the radius,
 
 1. **Title row** (`ScanJobTitleRow`): the **chip** (`ScanStateChip`: 22 pt
    pill, `Tok.Radius.pill`, padding 9 pt, UI sm 500, the tone pair, a 6 pt
-   dot in the foreground colour before the word, static), the **heading**
+   dot in the foreground colour before the word; static while running, breathing
+   while cancelling as the row's does, D12), the **heading**
    `ScanFormat.jobHeading(facts)` = the hosts (`127.0.0.1:8117`; `a.test,
    b.test`; `a.test and 2 more` with `.help(jobHeadingHelp)`; the chip, not
    the heading, carries the state now), data face `Tok.Typography.Size.xxl`
@@ -1018,7 +1021,7 @@ horizontal, a 3 pt left edge in the tone's colour clipped to the radius,
    primary: `PrimaryButton("Cancel Scan")` while live (disabled and titled
    `Cancelling…` while cancelling or a cancel is in flight, D2) or
    `PrimaryButton("Scan Again")` when terminal (D13). The slot is disabled
-   while `!link.verbsEnabled` (D6, D15); the first enabled button takes
+   while `!state.verbsEnabled` (D6, D15; clock-free); the first enabled button takes
    `.focused(inspectorFocused)`; `.onExitCommand` returns focus to the table
    and clears `scanAgainError`. `Unable to scan again: <display>` renders
    under the title row (D13).
@@ -1131,7 +1134,7 @@ and `Skipped frequent` is `skipped as repetitive` (C9). The Session and Lanes
 sections of the old inspector are gone as sections (C9); their facts survive
 as the rows above **(Architect's call)**.
 
-**Tokens, exhaustively**: grounds `Tok.Ground.surface / card / raised /
+**Tokens** (every colour, radius and duration the card reads; the comp's geometric constants live once in `enum CardMetrics`, 36 values after Tasks 2.6–2.10): grounds `Tok.Ground.surface / card / raised /
 active / hover`; lines `Tok.Line.border / rule / control`; inks
 `Tok.Ink.primary / secondary / tertiary / onAccent`; accent `Tok.Accent.base
 / deep / tint`; `Tok.Agent.base / tint`; `Tok.Intercept.base / tint`;
@@ -1244,7 +1247,7 @@ public static func scanAgainHelp(_ status: ScanJobStatus) -> String
   for the first target host not in `scopeHosts`; `scanL4Hint` when
   `status.lanes.requested` has an L4 lane and `l4InjectScopeKnown != true`;
   `"Select a finished job."` when the status is missing or non-terminal.
-  The button is additionally disabled while `!link.verbsEnabled`,
+  The button is additionally disabled while `!state.verbsEnabled`,
   `launchInFlight`, or `confirm != nil`; its `.help` is the refusal when
   there is one, else `scanAgainHelp`.
 - **Send path**: `ScanPanelState.scanAgain(job:)` reuses `send(tool:args:)`,
@@ -1339,7 +1342,7 @@ not memoise them.
 #### D17. Words added by this spec (D12 of the mac spec extended)
 
 Every string lives in `ScanSurface.swift` (`ScanFormat` or `ScanEndText`).
-New buttons: `Scan Again`, `Cancelling…`. New sentences: D4's table, D8's
+New button titles: `Scan Again` (a view literal, as the plan writes the verb titles; gap 37), `Cancelling…` (`ScanFormat.cancellingTitle`). New sentences: D4's table, D8's
 phase lines and derived texts (`3,232 checks to go`, `now · …`, `at this
 pace, about 1:04 to go` and its help), D9's attention lines, D15's banners,
 the help strings of the UX section verbatim, `Unable to scan again:
@@ -2002,7 +2005,7 @@ Locked-comp additions (numbered after the existing 43 so no reference moves):
   `.transition` + delayed animation, or a per-block `onChange`), as long as
   AC50 holds and keyboard selection shows none.
 - The attention disclosures' default open/closed state.
-- Whether the chip draws its 6 pt dot (the comp does; it is static).
+- Whether the chip draws its 6 pt dot (the comp does; it is static while running and breathes while cancelling — ruled at the Part 2 panel, 2026-11-02).
 
 ## Open questions
 
