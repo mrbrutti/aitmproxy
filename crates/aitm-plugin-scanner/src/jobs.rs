@@ -135,7 +135,8 @@ pub struct JobEntry {
     pub started_by: StartedBy,
     /// What discovery found, for `scan.sitemap`.
     pub discovery: Arc<RwLock<Discovery>>,
-    /// The normalized origins the job is single-flight on.
+    /// The normalized HTTP origins and the L4 `ip:port` targets the job is
+    /// single-flight on (amendment 73a).
     pub origins: Vec<String>,
     /// Whether an agent started it, so the worker knows to re-check policy.
     pub is_agent: bool,
@@ -213,10 +214,15 @@ impl JobRegistry {
 
     /// `scan.start`'s concurrency gate and admission as **one** critical
     /// section (spec D5 "Registry"/`busy`; security review, whole branch,
-    /// 2026-11-01): the `max_jobs` ceiling and the per-origin single flight
+    /// 2026-11-01): the `max_jobs` ceiling and the per-target single flight
     /// are checked, a free id is minted and the entry `build(id)` returns is
     /// inserted, all under the same lock, so two callers racing each other
     /// cannot both see a free slot and both take it.
+    ///
+    /// Each entry of `targets` is one target — an HTTP origin or an L4
+    /// `ip:port` (amendment 73a) — and the job is refused
+    /// [`AdmitRefused::Origin`] if a non-terminal job already holds any of
+    /// them.
     ///
     /// `build` runs under the lock: it must only assemble the entry (it is
     /// handed the minted id to stamp on the status) and never touch the
@@ -224,7 +230,7 @@ impl JobRegistry {
     pub fn admit(
         &self,
         max_jobs: usize,
-        origins: &[String],
+        targets: &[String],
         build: impl FnOnce(&JobId) -> JobEntry,
     ) -> Result<JobId, AdmitRefused> {
         let mut inner = self.lock();
@@ -232,8 +238,8 @@ impl JobRegistry {
             return Err(AdmitRefused::MaxJobs);
         }
         let active = active_origins_in(&inner);
-        if let Some(origin) = origins.iter().find(|o| active.contains(*o)) {
-            return Err(AdmitRefused::Origin(origin.clone()));
+        if let Some(target) = targets.iter().find(|t| active.contains(*t)) {
+            return Err(AdmitRefused::Origin(target.clone()));
         }
         let mut id = None;
         for _ in 0..MAX_ID_ATTEMPTS {
@@ -263,9 +269,10 @@ impl JobRegistry {
         self.newest_where(|_| true)
     }
 
-    /// The newest job that ran against `origin`, for `scan.sitemap { target }`.
-    pub fn newest_for_target(&self, origin: &str) -> Option<JobId> {
-        self.newest_where(|e| e.origins.iter().any(|o| o == origin))
+    /// The newest job that ran against `target` — an HTTP origin or an L4
+    /// `ip:port` (amendment 73a) — for `scan.sitemap { target }`.
+    pub fn newest_for_target(&self, target: &str) -> Option<JobId> {
+        self.newest_where(|e| e.origins.iter().any(|t| t == target))
     }
 
     /// The job with the greatest `started_at` among those `keep` admits; the
@@ -325,7 +332,8 @@ impl JobRegistry {
         active_count_in(&self.lock())
     }
 
-    /// The origins a non-terminal job is already running against.
+    /// The targets a non-terminal job is already running against: each is
+    /// an HTTP origin or an L4 `ip:port` (amendment 73a).
     pub fn active_origins(&self) -> HashSet<String> {
         active_origins_in(&self.lock())
     }
@@ -479,7 +487,9 @@ pub struct JobHandles {
 pub enum AdmitRefused {
     /// `max_jobs` jobs are already running.
     MaxJobs,
-    /// A job is already running against this origin.
+    /// A job is already running against this target — an HTTP origin or an
+    /// L4 `ip:port` (amendment 73a). The variant keeps its name for the
+    /// crate's call sites; the value is a target, not always an origin.
     Origin(String),
     /// Every id minted in [`MAX_ID_ATTEMPTS`] tries was taken. Not a verb
     /// refusal: no D3 code describes "the random source keeps repeating
@@ -502,7 +512,8 @@ fn active_count_in(inner: &HashMap<JobId, JobEntry>) -> usize {
     inner.values().filter(|e| is_active(e)).count()
 }
 
-/// [`JobRegistry::active_origins`] over an already-locked map.
+/// [`JobRegistry::active_origins`] over an already-locked map: the targets
+/// (HTTP origins and L4 `ip:port`, amendment 73a) that are in flight.
 fn active_origins_in(inner: &HashMap<JobId, JobEntry>) -> HashSet<String> {
     inner
         .values()
@@ -937,9 +948,27 @@ pub fn start(
         }
         origins.push(normalized);
     }
+    // Every `target.l4` entry is parsed here, before admission and whatever
+    // the L4 lane's availability (security review, PR 3b): on a build where
+    // `services.l4` is `None` the lane is skipped, and an unparsed caller
+    // string used to join the single-flight set raw — a string such as
+    // `http://victim.test` with port 8080 spells an HTTP origin, which is
+    // then `busy` for real scans of that origin without ever facing the HTTP
+    // scope check. The parsed address is also what the key is built from
+    // below, so two spellings of one IPv6 target are one key.
+    let mut l4_targets = Vec::with_capacity(profile.target.l4.len());
+    for target in &profile.target.l4 {
+        let Ok(ip) = target.ip.parse::<std::net::IpAddr>() else {
+            return Err(scan_error(
+                ScanErrorCode::InvalidProfile,
+                format!("`target.l4`: `{}` is not an IP address", target.ip),
+            ));
+        };
+        l4_targets.push(std::net::SocketAddr::new(ip, target.port));
+    }
     if let Some(guard) = &services.l4 {
-        for target in &profile.target.l4 {
-            check_l4_target(guard.as_ref(), target)?;
+        for (target, addr) in profile.target.l4.iter().zip(&l4_targets) {
+            check_l4_target(guard.as_ref(), target, addr.ip())?;
         }
     }
 
@@ -947,28 +976,25 @@ pub fn start(
     // verb layer (Task 15) refuses with exactly the same words.
     agent_gate(engine, &caller, &profile, force_map)?;
 
-    // (7) and (8): the concurrency gate — the job ceiling and the per-origin
-    // single flight — and the admission, in one critical section of the
+    // (7) and (8): the concurrency gate — the job ceiling and the per-target
+    // single flight, over the HTTP origins *and* the L4 `ip:port` targets
+    // (amendment 73a) — and the admission, in one critical section of the
     // registry (`JobRegistry::admit`). The confinement token lives on the
     // entry and drops with it, so a job can never leave the egress posture
     // held.
     let confine = services.egress.as_ref().map(|e| e.confine());
     let started_by = caller.started_by();
     let mut targets = origins.clone();
-    targets.extend(
-        profile
-            .target
-            .l4
-            .iter()
-            .map(|t| format!("{}:{}", t.ip, t.port)),
-    );
+    // The key is the parsed `SocketAddr`'s spelling (`[::1]:9`), never the
+    // caller's string: it canonicalises IPv6 and can never contain `://`.
+    targets.extend(l4_targets.iter().map(std::net::SocketAddr::to_string));
 
     let status = JobStatus {
         job: String::new(),
         state: JobState::Queued,
         phase: Phase::Queued,
         profile_name: profile.name.clone(),
-        targets,
+        targets: targets.clone(),
         started_by: started_by.clone(),
         started_at: util::now_ms(),
         probes: ProbeCounters {
@@ -987,7 +1013,7 @@ pub fn start(
     let status = Arc::new(RwLock::new(status));
     let job = engine
         .registry
-        .admit(engine.cfg.max_jobs as usize, &origins, |id| {
+        .admit(engine.cfg.max_jobs as usize, &targets, |id| {
             status.write().unwrap_or_else(|e| e.into_inner()).job = id.clone();
             JobEntry {
                 status: Arc::clone(&status),
@@ -995,7 +1021,7 @@ pub fn start(
                 confine,
                 started_by: started_by.clone(),
                 discovery: Arc::clone(&discovery),
-                origins: origins.clone(),
+                origins: targets.clone(),
                 is_agent: caller.is_agent(),
                 terminal: tokio::sync::watch::channel(false).0,
             }
@@ -1070,16 +1096,15 @@ pub struct JobStart {
 }
 
 /// Refuse an L4 target the guard does not grant `Inject` on (spec D3).
+///
+/// `ip` is `target.ip` already parsed by [`start`], which parses every entry
+/// before admission whether or not an L4 guard is bound; there is no second
+/// parse here.
 fn check_l4_target(
     guard: &aitm_proto_l4::guard::L4Guard,
     target: &L4TargetSpec,
+    ip: std::net::IpAddr,
 ) -> anyhow::Result<()> {
-    let Ok(ip) = target.ip.parse::<std::net::IpAddr>() else {
-        return Err(scan_error(
-            ScanErrorCode::InvalidProfile,
-            format!("`target.l4`: `{}` is not an IP address", target.ip),
-        ));
-    };
     let l4_target = aitm_proto_l4::types::L4Target {
         interface: "*".to_string(),
         direction: aitm_proto_l4::types::L4Direction::Outbound,
@@ -2418,7 +2443,9 @@ mod tests {
     use std::sync::Arc;
 
     use aitm_core::{AgentPolicy, Frontend, ScopeRateGuard};
-    use aitm_scan_model::{Intensity, LaneKind, ScanErrorCode, SessionMode, SkippedLane};
+    use aitm_scan_model::{
+        Intensity, L4TargetSpec, L4Transport, LaneKind, ScanErrorCode, SessionMode, SkippedLane,
+    };
 
     /// Spec D5, call B3: the services are bound by the binary after the proxy
     /// is built. A verb that runs before that fails with a **plain** error —
@@ -2746,6 +2773,250 @@ mod tests {
         .expect_err("the same origin is single-flight");
         assert_eq!(code(&err), ScanErrorCode::Busy);
         h.cancel_all();
+    }
+
+    /// Amendment 73a: `scan.start`'s single flight covers the L4 targets as
+    /// well as the HTTP origins. Two jobs over *different* origins that name
+    /// the same `ip:port` are `busy` on that target; a different port is free.
+    ///
+    /// The l4 lane is not on this build, so it is skipped and no L4 guard is
+    /// consulted (`services.l4` is `None` in the harness). The profile still
+    /// has to *name* an l4 lane, because `profiles::validate` refuses a
+    /// `target.l4` that names none — the lane being absent is what makes this
+    /// a pure admission test, with the http `FakeLane`'s blocking check
+    /// keeping the first job active.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn busy_on_the_same_l4_target() {
+        let h = Harness::new().with_blocking_check().with_max_jobs(3);
+        h.bind();
+        let profile = |origin: &str, port: u16| {
+            let mut profile = h.profile(&[origin]);
+            profile.lanes = vec![LaneKind::Http, LaneKind::L4Packet];
+            profile.target.l4 = vec![L4TargetSpec {
+                ip: "127.0.0.1".to_string(),
+                port,
+                proto: L4Transport::Tcp,
+                grammar: None,
+            }];
+            profile
+        };
+
+        crate::jobs::start(&h.engine, profile("http://scan.test", 9), operator(), false)
+            .expect("the first job starts");
+
+        let err = crate::jobs::start(
+            &h.engine,
+            profile("http://other.test", 9),
+            operator(),
+            false,
+        )
+        .expect_err("the same l4 target is single-flight");
+        assert_eq!(code(&err), ScanErrorCode::Busy);
+        assert_eq!(
+            err.to_string(),
+            "scan: busy: a scan is already running against 127.0.0.1:9"
+        );
+
+        crate::jobs::start(
+            &h.engine,
+            profile("http://other.test", 10),
+            operator(),
+            false,
+        )
+        .expect("a different l4 port is free");
+
+        h.cancel_all();
+    }
+
+    /// Security review, PR 3b (Minor 2): a `target.l4[].ip` that is not an
+    /// IP address never reaches the single-flight key. `check_l4_target` runs
+    /// only when the L4 lane is bound, so on a build without it (the harness:
+    /// `services.l4` is `None`) an unparsed string such as `http://a.test`
+    /// used to be admitted raw and could spell an HTTP origin, answering
+    /// `busy` to real scans of that origin. `start` parses first and refuses
+    /// `invalid_profile`, and nothing is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_l4_target_that_is_not_an_ip_is_refused_before_admission() {
+        let h = Harness::new().with_blocking_check().with_max_jobs(3);
+        h.bind();
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.lanes = vec![LaneKind::Http, LaneKind::L4Packet];
+        profile.target.l4 = vec![L4TargetSpec {
+            ip: "http://a.test".to_string(),
+            port: 8080,
+            proto: L4Transport::Tcp,
+            grammar: None,
+        }];
+
+        let err = crate::jobs::start(&h.engine, profile, operator(), false)
+            .expect_err("a target.l4 ip that is not an IP address is refused");
+        assert_eq!(code(&err), ScanErrorCode::InvalidProfile);
+        assert_eq!(
+            err.to_string(),
+            "scan: invalid_profile: `target.l4`: `http://a.test` is not an IP address"
+        );
+
+        let active = h.engine.registry.active_origins();
+        assert!(
+            !active.contains("http://a.test:8080"),
+            "nothing is admitted under the unparsed target: {active:?}"
+        );
+        assert!(active.is_empty(), "no job was admitted at all: {active:?}");
+    }
+
+    /// Security review, PR 3b (Minor 2): two spellings of one IPv6 target are
+    /// one single-flight key, because the key is built from the parsed
+    /// `SocketAddr` (`[::1]:9`) and not from the caller's string.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_spellings_of_one_ipv6_target_are_one_key() {
+        let h = Harness::new().with_blocking_check().with_max_jobs(3);
+        h.bind();
+        let profile = |origin: &str, ip: &str| {
+            let mut profile = h.profile(&[origin]);
+            profile.lanes = vec![LaneKind::Http, LaneKind::L4Packet];
+            profile.target.l4 = vec![L4TargetSpec {
+                ip: ip.to_string(),
+                port: 9,
+                proto: L4Transport::Tcp,
+                grammar: None,
+            }];
+            profile
+        };
+
+        crate::jobs::start(
+            &h.engine,
+            profile("http://scan.test", "::1"),
+            operator(),
+            false,
+        )
+        .expect("the first job starts");
+
+        let err = crate::jobs::start(
+            &h.engine,
+            profile("http://other.test", "0:0:0:0:0:0:0:1"),
+            operator(),
+            false,
+        )
+        .expect_err("the long spelling of the same IPv6 target is single-flight");
+        assert_eq!(code(&err), ScanErrorCode::Busy);
+        assert_eq!(
+            err.to_string(),
+            "scan: busy: a scan is already running against [::1]:9"
+        );
+
+        h.cancel_all();
+    }
+
+    /// Amendment 73a at the registry: [`crate::jobs::JobRegistry::admit`]'s
+    /// single flight is per *target*, so an L4 `ip:port` a live entry holds
+    /// refuses the next job exactly as an HTTP origin does, whatever the
+    /// origins around it are.
+    #[test]
+    fn admit_refuses_a_target_already_active() {
+        let registry = crate::jobs::JobRegistry::new(10);
+        let build = |targets: Vec<String>| {
+            move |id: &String| crate::jobs::JobEntry {
+                status: Arc::new(std::sync::RwLock::new(aitm_scan_model::JobStatus {
+                    job: id.clone(),
+                    state: aitm_scan_model::JobState::Running,
+                    targets: targets.clone(),
+                    ..aitm_scan_model::JobStatus::default()
+                })),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                confine: None,
+                started_by: Default::default(),
+                discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+                origins: targets.clone(),
+                is_agent: false,
+                terminal: tokio::sync::watch::channel(false).0,
+            }
+        };
+        let targets = |origin: &str, l4: &str| vec![origin.to_string(), l4.to_string()];
+
+        let first = targets("http://a.test:80", "127.0.0.1:9");
+        registry
+            .admit(4, &first, build(first.clone()))
+            .expect("the first job is admitted");
+
+        let second = targets("http://b.test:80", "127.0.0.1:9");
+        assert_eq!(
+            registry
+                .admit(4, &second, build(second.clone()))
+                .expect_err("the l4 target is already active"),
+            crate::jobs::AdmitRefused::Origin("127.0.0.1:9".to_string())
+        );
+
+        let third = targets("http://b.test:80", "127.0.0.1:10");
+        registry
+            .admit(4, &third, build(third.clone()))
+            .expect("a different l4 port, and a free origin, is admitted");
+    }
+
+    /// The accepted side effect of amendment 73a (call C10): because an
+    /// entry's `origins` now also holds the job's L4 `ip:port` targets,
+    /// [`crate::jobs::JobRegistry::newest_for_target`] — `scan.sitemap`'s
+    /// target resolver — matches those strings too.
+    ///
+    /// Harmless, and pinned here with the reason: the verb normalizes its
+    /// `target` through [`crate::profiles::normalize_origin`] first, and a
+    /// bare `ip:port` is not an origin, so the resolver is never reached with
+    /// one from the bus. A caller that *does* reach it (an in-process caller,
+    /// or an origin spelled `http://127.0.0.1:9`) gets the L4 job and its
+    /// empty site map rather than a `not_found`, which is what C10 accepted.
+    #[test]
+    fn newest_for_target_also_answers_to_an_l4_ip_port() {
+        use aitm_scan_model::{JobState, JobStatus};
+
+        let registry = crate::jobs::JobRegistry::new(10);
+        let targets = vec!["http://a.test:80".to_string(), "127.0.0.1:9".to_string()];
+        assert!(registry.try_insert(crate::jobs::JobEntry {
+            status: Arc::new(std::sync::RwLock::new(JobStatus {
+                job: "scan-0000000a".to_string(),
+                state: JobState::Running,
+                started_at: 10,
+                targets: targets.clone(),
+                ..JobStatus::default()
+            })),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            confine: None,
+            started_by: Default::default(),
+            discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+            origins: targets.clone(),
+            is_agent: false,
+            terminal: tokio::sync::watch::channel(false).0,
+        }));
+
+        assert_eq!(
+            registry.newest_for_target("127.0.0.1:9"),
+            Some("scan-0000000a".to_string()),
+            "the L4 target the job is single-flight on resolves to it"
+        );
+        assert_eq!(
+            registry.newest_for_target("http://a.test:80"),
+            Some("scan-0000000a".to_string()),
+            "the HTTP origin resolves exactly as before"
+        );
+        assert_eq!(
+            registry.newest_for_target("127.0.0.1:10"),
+            None,
+            "another port is another target"
+        );
+        // The job it resolves to has an empty site map, not a wrong one.
+        let handles = registry
+            .entry_handles("scan-0000000a")
+            .expect("the entry is there");
+        let discovery = handles.discovery.read().expect("discovery");
+        assert!(discovery.points.is_empty() && discovery.nodes.is_empty());
+        drop(discovery);
+
+        // And `scan.sitemap`'s own front door refuses the spelling before the
+        // resolver sees it, so nothing on the bus changed shape.
+        let refused = crate::profiles::normalize_origin("127.0.0.1:9")
+            .expect_err("a bare ip:port is not an origin");
+        assert!(
+            refused.contains("is not an origin"),
+            "the sitemap verb's refusal names the shape: {refused}"
+        );
     }
 
     /// AC T5-3 (spec D8.4): a lane refuses a profile it cannot run **before**

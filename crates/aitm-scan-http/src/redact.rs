@@ -25,7 +25,7 @@
 use aitm_core::flow::HttpRequest;
 use aitm_scan_model::InsertionKind;
 
-use crate::limits::{MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
+use crate::limits::{MAX_ENTIRE_BODY_EXAMPLE_CHARS, MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
 
 /// What the lane shows instead of a value it must never reveal.
 ///
@@ -67,14 +67,22 @@ pub(crate) fn is_secret_name(name: &str) -> bool {
 ///
 /// [`REDACTED`] when the point is a cookie (every cookie value is session
 /// material, whatever it is called) or when the name reads as a secret;
-/// otherwise the scrubbed value cut to [`MAX_EXAMPLE_CHARS`] characters on a
-/// char boundary, with no ellipsis (an ellipsis would be indistinguishable from
-/// one in the value itself).
+/// otherwise the scrubbed value cut on a char boundary to
+/// [`MAX_ENTIRE_BODY_EXAMPLE_CHARS`] for an `entire_body` point (a
+/// document-level check needs the document, call C13) and to
+/// [`MAX_EXAMPLE_CHARS`] for every other kind, with no ellipsis (an ellipsis
+/// would be indistinguishable from one in the value itself). The scrub runs
+/// before the cut, so a credential past the cap is masked, never kept.
 pub(crate) fn example(kind: InsertionKind, name: &str, value: &str) -> String {
     if kind == InsertionKind::Cookie || is_secret_name(name) {
         return REDACTED.to_string();
     }
-    cut_chars(&scrub(value), MAX_EXAMPLE_CHARS)
+    let cap = if kind == InsertionKind::EntireBody {
+        MAX_ENTIRE_BODY_EXAMPLE_CHARS
+    } else {
+        MAX_EXAMPLE_CHARS
+    };
+    cut_chars(&scrub(value), cap)
 }
 
 /// `url` with every credential removed, safe for a log line or an error message.
@@ -310,7 +318,7 @@ pub(crate) mod capture {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{example, safe_url, scrub_error};
-    use crate::limits::{MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
+    use crate::limits::{MAX_ENTIRE_BODY_EXAMPLE_CHARS, MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
     use aitm_scan_model::InsertionKind;
     use regex::Regex;
 
@@ -340,6 +348,106 @@ mod tests {
                 .chars()
                 .count(),
             MAX_EXAMPLE_CHARS
+        );
+
+        // Task 11b / call C13: an `entire_body` point keeps the whole document
+        // up to 1024 chars, so a document-level check sees a real body ...
+        assert_eq!(MAX_ENTIRE_BODY_EXAMPLE_CHARS, 1024);
+        assert_eq!(
+            example(
+                InsertionKind::EntireBody,
+                "body",
+                &r#"{"k":"v"}"#.repeat(60)
+            )
+            .chars()
+            .count(),
+            540
+        );
+        assert_eq!(
+            example(InsertionKind::EntireBody, "body", &"x".repeat(2000))
+                .chars()
+                .count(),
+            1024
+        );
+        // ... every other kind keeps the 64-char cut ...
+        assert_eq!(
+            example(InsertionKind::Query, "q", &"x".repeat(100))
+                .chars()
+                .count(),
+            64
+        );
+        // ... and the body is scrubbed before the cut, as before.
+        assert_eq!(
+            example(
+                InsertionKind::EntireBody,
+                "body",
+                r#"{"user":"a","password":"hunter2"}"#
+            ),
+            r#"{"user":"a","password":"[redacted]"}"#
+        );
+    }
+
+    /// Task 11b / call C13, the edges of the wider `entire_body` cap: the last
+    /// character that is kept, a multibyte document (the cut counts characters
+    /// and never splits one), and the scrub-before-cut order where it matters —
+    /// a credential sitting just inside the cap is masked, not shown.
+    #[test]
+    fn entire_body_examples_cut_at_exactly_the_wider_cap() {
+        // Exactly 1024 characters: the whole document survives, unchanged.
+        let exact = "y".repeat(MAX_ENTIRE_BODY_EXAMPLE_CHARS);
+        assert_eq!(example(InsertionKind::EntireBody, "body", &exact), exact);
+        // One more: the cut takes the last character and nothing else; no
+        // ellipsis is added.
+        let over = "y".repeat(MAX_ENTIRE_BODY_EXAMPLE_CHARS + 1);
+        let cut = example(InsertionKind::EntireBody, "body", &over);
+        assert_eq!(cut.chars().count(), MAX_ENTIRE_BODY_EXAMPLE_CHARS);
+        assert_eq!(cut, exact);
+
+        // A multibyte document: 2000 three-byte characters cut to 1024
+        // *characters* (3072 bytes), on a char boundary — a byte-wise cut
+        // would panic or emit a replacement character here.
+        let multibyte = "— ".repeat(1000); // em dash + space, 2000 chars
+        let cut = example(InsertionKind::EntireBody, "body", &multibyte);
+        assert_eq!(cut.chars().count(), MAX_ENTIRE_BODY_EXAMPLE_CHARS);
+        assert_eq!(cut.len(), 1024 + 512 * 2, "every em dash survives whole");
+        assert!(multibyte.starts_with(&cut));
+
+        // The scrub runs before the cut: a credential that sits inside the cap
+        // is masked in what the operator sees ...
+        let filler = "a".repeat(900);
+        let body = format!(r#"{{"note":"{filler}","password":"hunter2"}}"#);
+        let shown = example(InsertionKind::EntireBody, "body", &body);
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.ends_with(r#""password":"[redacted]"}"#), "{shown}");
+        // ... and one past the cap is cut away entirely, never half-shown.
+        let filler = "a".repeat(1100);
+        let body = format!(r#"{{"note":"{filler}","password":"hunter2"}}"#);
+        let shown = example(InsertionKind::EntireBody, "body", &body);
+        assert_eq!(shown.chars().count(), MAX_ENTIRE_BODY_EXAMPLE_CHARS);
+        assert!(!shown.contains("hunter"), "{shown}");
+    }
+
+    /// What the widened cap hands a document-level check when the body holds a
+    /// secret-named field whose value is **not** quoted: the scrub replaces the
+    /// whole value run, so the example is no longer parsable JSON. Pinned here
+    /// because `check-nosqli-json.rhai` rebuilds its probe from this string.
+    #[test]
+    fn an_entire_body_example_with_an_unquoted_secret_value_is_no_longer_json() {
+        assert_eq!(
+            example(
+                InsertionKind::EntireBody,
+                "body",
+                r#"{"user":"a","api_key":12345}"#
+            ),
+            r#"{"user":"a","api_key":[redacted]}"#
+        );
+        assert_eq!(
+            example(
+                InsertionKind::EntireBody,
+                "body",
+                r#"{"user":"a","auth":{"token":"t"}}"#
+            ),
+            r#"{"user":"a","auth":[redacted]"token":"[redacted]"}}"#
         );
     }
 
