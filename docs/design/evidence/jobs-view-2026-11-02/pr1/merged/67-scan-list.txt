@@ -1,0 +1,3 @@
+1 scan-42a348d2 done
+2 scan-c5b3114e cancelled
+3 scan-30c7bc44 running

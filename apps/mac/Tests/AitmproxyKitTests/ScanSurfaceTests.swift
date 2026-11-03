@@ -472,11 +472,16 @@ import Testing
         model.moveSelection(in: .issues, by: -1)
         #expect(model.selectedIssue == "issue-9f8e7d6c")
 
+        // Jobs view spec D3: the list selects its newest job when nothing is selected,
+        // so the walk starts from `scan-1a2b3c4d`, not from no selection.
         model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
-        model.moveSelection(in: .jobs, by: 1)
         #expect(model.selectedJob == "scan-1a2b3c4d")
         model.moveSelection(in: .jobs, by: 1)
         #expect(model.selectedJob == "scan-55667788")
+        model.moveSelection(in: .jobs, by: 1)
+        #expect(model.selectedJob == "scan-55667788")
+        model.moveSelection(in: .jobs, by: -1)
+        #expect(model.selectedJob == "scan-1a2b3c4d")
 
         model.applyProfiles(try ScanProfileListResult(json: Self.load("scan.profile.list.json")))
         model.moveSelection(in: .profiles, by: 1)
@@ -1343,7 +1348,7 @@ extension ScanSurfaceTests {
         start = ScanPack.edited(start, path: ["job"], to: "scan-local")
         start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
         model.applyStart(try ScanStartResult(json: start))
-        model.jobsError = "old"
+        model.noteReadFailure(text: "old", now: 0)
         model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
         #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
         #expect(model.jobsError == nil)

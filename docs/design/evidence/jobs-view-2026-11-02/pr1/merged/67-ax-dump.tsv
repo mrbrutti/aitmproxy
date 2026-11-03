@@ -1,0 +1,109 @@
+AXStaticText		aitmproxy			true	136	105	86	16	
+AXStaticText		TRAFFIC			true	136	156	51	14	
+AXButton			Flows, 100		true	128	178	224	28	
+AXButton			Apps, 1		true	128	206	224	28	
+AXButton			Domains, 3		true	128	234	224	28	
+AXButton			Pinned, 0		true	128	262	224	28	
+AXButton			Connection Log		true	128	290	224	28	
+AXButton			Overview		true	128	318	224	28	
+AXStaticText		TESTING			true	136	366	53	14	
+AXButton			Scope, 5		true	128	388	224	28	
+AXButton			Scan		true	128	416	224	28	
+AXButton			Findings		true	128	444	224	28	
+AXButton			Browser, 0 tabs		true	128	472	224	28	
+AXStaticText		AUTOMATION			true	136	520	82	14	
+AXButton			Scripts, 0 active		true	128	542	224	28	
+AXButton			Agent, 0/min		true	128	570	224	28	
+AXStaticText		⌘⇧F			true	315	1112	28	14	
+AXButton			Profiles		true	383	127	58	36	
+AXButton			Jobs 3		true	443	127	54	36	
+AXButton			Site map		true	499	127	66	36	
+AXButton			Issues		true	567	127	51	36	
+AXButton			Done, done, standard, 127.0.0.1:8121, 1 of 2000 probes, 0 of 12 points audited, no issues		true	361	163	360	82	scan-job-scan-42a348d2
+AXButton			Cancelled, done, standard, 127.0.0.1:8117, 29 of 2000 probes, 0 of 0 points audited, no issues		true	361	245	360	82	scan-job-scan-c5b3114e
+AXButton			Running, auditing, light-http, 127.0.0.1:8120, 1200 of 2000 probes, 321 of 325 points audited, 5 issues: 2 high, 3 low		true	361	327	360	82	scan-job-scan-30c7bc44
+AXStaticText		Running · Auditing · 8:05			true	734	171	222	24	
+AXButton			Cancel Scan		true	1563	170	92	26	
+AXButton			Show Issues		true	1667	169	88	28	
+AXButton			Show Site Map		true	1767	169	102	28	
+AXStaticText		1,200 / 2,000			true	734	238	161	24	
+AXStaticText		Errors			true	734	282	32	14	
+AXStaticText		Timeouts			true	786	282	49	14	
+AXStaticText		Rate waits			true	855	282	54	14	
+AXStaticText		0			true	734	300	9	16	
+AXStaticText		0			true	786	300	9	16	
+AXStaticText		0			true	855	300	9	16	
+AXStaticText		By lane			true	734	324	39	14	
+AXStaticText		http 1200			true	734	342	73	16	
+AXStaticText		Pages			true	734	400	32	14	
+AXStaticText		Queued			true	786	400	42	14	
+AXStaticText		Depth			true	848	400	32	14	
+AXStaticText		Forms			true	900	400	33	14	
+AXStaticText		12			true	734	418	17	16	
+AXStaticText		0			true	786	418	9	16	
+AXStaticText		0			true	848	418	9	16	
+AXStaticText		4			true	900	418	9	16	
+AXStaticText		Found			true	734	476	33	14	
+AXStaticText		Queued			true	787	476	42	14	
+AXStaticText		Audited			true	849	476	41	14	
+AXStaticText		325			true	734	494	25	16	
+AXStaticText		1538			true	787	494	33	16	
+AXStaticText		321			true	849	494	25	16	
+AXStaticText		Skipped ignored			true	734	518	86	14	
+AXStaticText		Skipped frequent			true	840	518	91	14	
+AXStaticText		Skipped limit			true	951	518	68	14	
+AXStaticText		0			true	734	536	9	16	
+AXStaticText		0			true	840	536	9	16	
+AXStaticText		0			true	951	536	9	16	
+AXStaticText		Scheduled			true	734	594	56	14	
+AXStaticText		Done			true	810	594	28	14	
+AXStaticText		1538			true	734	612	33	16	
+AXStaticText		1529			true	810	612	33	16	
+AXStaticText		Running			true	734	636	43	14	
+AXStaticText		header-reflection			true	734	654	127	15	
+AXStaticText		Critical			true	734	734	38	14	
+AXStaticText		High			true	792	734	25	14	
+AXStaticText		Medium			true	836	734	42	14	
+AXStaticText		Low			true	898	734	21	14	
+AXStaticText		Info			true	939	734	20	14	
+AXStaticText		0			true	734	752	9	16	
+AXStaticText		2			true	792	752	9	16	
+AXStaticText		0			true	836	752	9	16	
+AXStaticText		3			true	898	752	9	16	
+AXStaticText		0			true	939	752	9	16	
+AXStaticText		Certain			true	734	776	39	14	
+AXStaticText		Firm			true	793	776	24	14	
+AXStaticText		Tentative			true	836	776	48	14	
+AXStaticText		3			true	734	794	9	16	
+AXStaticText		1			true	793	794	9	16	
+AXStaticText		1			true	836	794	9	16	
+AXStaticText		Requested			true	734	852	56	14	
+AXStaticText		Run			true	810	852	21	14	
+AXStaticText		HTTP			true	734	870	33	16	
+AXStaticText		HTTP			true	810	870	33	16	
+AXStaticText		Reused			true	734	928	39	14	
+AXStaticText		Lost			true	793	928	23	14	
+AXStaticText		Browser partial			true	836	928	79	14	
+AXStaticText		no			true	734	946	17	16	
+AXStaticText		no			true	793	946	17	16	
+AXStaticText		no			true	836	946	17	16	
+AXStaticText		Auth-lost detection off: no GET/HEAD flow seen			true	734	970	270	15	
+AXButton			Clear		true	132	1145	44	20	
+AXButton			Filter		true	184	1145	43	20	
+AXButton			Auto-select		true	235	1145	78	20	
+AXStaticText		0 / 100 rows			true	944	1148	69	15	
+AXStaticText		5 hosts in scope			true	1027	1148	93	15	
+AXStaticText		↑ 0 B/s			true	1751	1148	52	15	
+AXStaticText		↓ 0 B/s			true	1817	1148	52	15	
+AXButton		This build has no extension	aitmproxy: core: running, bus: connected, all apps: no extension		true	742	51	322	28	
+AXButton			Toggle Sidebar		true	212	39	47	52	
+AXButton			Compose		true	259	39	44	52	
+AXButton			Clear Session		true	303	39	44	52	
+AXButton			Command Palette		true	1701	39	44	52	
+AXButton			Rectangle Split One By Two		true	1749	51	28	28	rectangle.split.1x2
+AXButton			Rectangle Split Two By One		true	1781	51	28	28	rectangle.split.2x1
+AXButton			Mac Window On A Rectangle		true	1813	51	28	28	macwindow.on.rectangle
+AXButton			Square Split Two By One		true	1845	51	28	28	square.split.2x1
+AXButton					true	138	57	16	16	
+AXButton					true	184	57	16	16	
+AXButton					true	161	57	16	16	

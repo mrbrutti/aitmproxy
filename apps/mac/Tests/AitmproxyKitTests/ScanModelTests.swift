@@ -636,9 +636,14 @@ extension ScanModelTests {
         let issue = ScanPack.edited(try ScanPack.load("scan.issue.json"), path: ["evidence", "payload"], to: .string(big))
         #expect(try ScanIssue(json: issue).evidence.payload?.count == 1 << 20)
 
+        // A status's running list is the exception: the Jobs detail prints it, so the
+        // decoder holds the engine's own cap of 8 against a hostile core (fix 1.5e;
+        // `coreStringsAreBoundedAndCleaned`). The page-sized lists above stay whole.
         let manyLanes = ScanPack.edited(try ScanPack.load("scan.status.json"), path: ["checks", "running"],
                                         to: .array((0..<1000).map { JSONValue.string("check-\($0)") }))
-        #expect(try ScanJobStatus(json: manyLanes).checks.running.count == 1000)
+        let running = try ScanJobStatus(json: manyLanes).checks.running
+        #expect(running.count == 8)
+        #expect(running == ["check-0", "check-1", "check-2", "check-3", "check-4", "check-5", "check-6", "check-7"])
     }
 
     @Test func taggedObjectsRefuseAMalformedShape() throws {
@@ -939,5 +944,277 @@ extension ScanModelTests {
         #expect(topIssue.summary.firstSeen == top)
         #expect(ScanFormat.relative(ms: topIssue.firstSeen, now: 1_761_900_000_000) == "0 s ago")
         #expect(ScanFormat.relative(ms: 0, now: topIssue.firstSeen) == "2501999792 h ago")
+    }
+
+    /// AC1 and AC2 (Jobs view spec D1): the check-error, skipped-check and crawl-error
+    /// fields decode with their literals, and an older core's status without them
+    /// reads 0 / `[]` / nil.
+    @Test func checkAndCrawlErrorFieldsDecodeWithDefaults() throws {
+        let checks = try ScanCheckCounters(json: JSONValue.parse(Data("""
+            {"scheduled":4,"done":3,"running":[],"errors":7,\
+            "error_samples":[{"check":"http.xss","point":"p1","detail":"Connection refused (os error 61)"}],\
+            "skipped":3,"skipped_samples":[{"check":"fake.point","point":"p2","detail":"the lane hosts nothing"}]}
+            """.utf8)))
+        #expect(checks.scheduled == 4)
+        #expect(checks.done == 3)
+        #expect(checks.errors == 7)
+        #expect(checks.errorSamples.count == 1)
+        #expect(checks.errorSamples[0] == ScanCheckErrorSample(check: "http.xss", point: "p1", detail: "Connection refused (os error 61)"))
+        #expect(checks.skipped == 3)
+        #expect(checks.skippedSamples.count == 1)
+        #expect(checks.skippedSamples[0].check == "fake.point")
+        #expect(checks.skippedSamples[0].point == "p2")
+        #expect(checks.skippedSamples[0].detail == "the lane hosts nothing")
+
+        // A sample with a key missing reads "" (the engine's `#[serde(default)]`).
+        #expect(try ScanCheckErrorSample(json: ["check": "http.xss"]) == ScanCheckErrorSample(check: "http.xss", point: "", detail: ""))
+        #expect(throws: BusError.self) { try ScanCheckErrorSample(json: ["check": 7]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["error_samples": "nope"]) }
+
+        let crawl = try ScanCrawlCounters(json: JSONValue.parse(Data("""
+            {"pages":1,"queued":0,"depth":0,"forms_submitted":0,"errors":1,"forms_skipped":2,"last_error":"connect_refused"}
+            """.utf8)))
+        #expect(crawl.pages == 1)
+        #expect(crawl.errors == 1)
+        #expect(crawl.formsSkipped == 2)
+        #expect(crawl.lastError == .connectRefused)
+
+        let weird = try ScanCrawlCounters(json: ["pages": 0, "last_error": "weird"])
+        #expect(weird.lastError == .unknown("weird"))
+        #expect(weird.lastError?.rawValue == "weird")
+        #expect(try ScanCrawlCounters(json: ["pages": 0, "last_error": .null]).lastError == nil)
+
+        // The vocabulary spells the wire both ways; the engine's own `other` is a known case.
+        let kinds: [ScanCrawlErrorKind] = [.h2NotNegotiated, .connectRefused, .tls, .timeout, .transport, .other]
+        #expect(kinds.map(\.rawValue) == ["h2_not_negotiated", "connect_refused", "tls", "timeout", "transport", "other"])
+        for kind in kinds {
+            #expect(ScanCrawlErrorKind(rawValue: kind.rawValue) == kind)
+        }
+        #expect(ScanCrawlErrorKind(rawValue: "other") == .other)
+        #expect(ScanCrawlErrorKind.other("x") == .unknown("x"))
+
+        // The fixture pack's status carries none of the keys: zero, empty, nil.
+        let status = try ScanJobStatus(json: ScanPack.load("scan.status.json"))
+        #expect(status.checks.errors == 0)
+        #expect(status.checks.errorSamples == [])
+        #expect(status.checks.skipped == 0)
+        #expect(status.checks.skippedSamples == [])
+        #expect(status.crawl.errors == 0)
+        #expect(status.crawl.formsSkipped == 0)
+        #expect(status.crawl.lastError == nil)
+    }
+
+    /// Tester (Jobs view plan 1.6): the D1 decoders at the edges AC1 and AC2 do not
+    /// name: a wrong type, a negative count or a non-object sample is refused; an
+    /// empty object reads every default; a sample list longer than the engine's cap
+    /// of 8 is cut to the first 8 (the Kit holds the engine's own cap against a
+    /// hostile core, fix 1.5e); an empty `last_error` token is an unknown kind
+    /// whose raw value is the empty string.
+    @Test func checkAndCrawlErrorFieldsAtTheEdges() throws {
+        // Wrong types and negative counts are malformed wire, not defaults.
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["errors": "seven"]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["errors": -1]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["skipped": 1.5]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["skipped_samples": ["check": "x"]]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["error_samples": [7]]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["error_samples": [["detail": 3]]]) }
+        #expect(throws: BusError.self) { try ScanCrawlCounters(json: ["errors": "one"]) }
+        #expect(throws: BusError.self) { try ScanCrawlCounters(json: ["forms_skipped": -2]) }
+        #expect(throws: BusError.self) { try ScanCrawlCounters(json: ["last_error": 7]) }
+        #expect(throws: BusError.self) { try ScanCheckErrorSample(json: "not an object") }
+        #expect(throws: BusError.self) { try ScanCheckErrorSample(json: .null) }
+
+        // Empty objects read every default.
+        let emptyChecks = try ScanCheckCounters(json: [:])
+        #expect(emptyChecks.scheduled == 0)
+        #expect(emptyChecks.done == 0)
+        #expect(emptyChecks.running == [])
+        #expect(emptyChecks.errors == 0)
+        #expect(emptyChecks.errorSamples == [])
+        #expect(emptyChecks.skipped == 0)
+        #expect(emptyChecks.skippedSamples == [])
+        let emptyCrawl = try ScanCrawlCounters(json: [:])
+        #expect(emptyCrawl.pages == 0)
+        #expect(emptyCrawl.errors == 0)
+        #expect(emptyCrawl.formsSkipped == 0)
+        #expect(emptyCrawl.lastError == nil)
+        #expect(try ScanCheckErrorSample(json: [:]) == ScanCheckErrorSample(check: "", point: "", detail: ""))
+        #expect(try ScanCheckCounters(json: ["error_samples": [], "skipped_samples": []]).errorSamples == [])
+
+        // An explicit null reads as absent (the engine's `Option` fields), so the default.
+        #expect(try ScanCheckCounters(json: ["errors": .null]).errors == 0)
+        #expect(try ScanCheckCounters(json: ["error_samples": .null]).errorSamples == [])
+
+        // A sample list past the engine's cap of 8 is cut to the first 8, in order.
+        let many = JSONValue.array((0..<64).map { i in
+            .object(["check": .string("c\(i)"), "point": .string("p\(i)"), "detail": .string("d\(i)")])
+        })
+        let capped = try ScanCheckCounters(json: ["errors": 64, "error_samples": many, "skipped_samples": many])
+        #expect(capped.errorSamples.count == 8)
+        #expect(capped.skippedSamples.count == 8)
+        #expect(capped.errorSamples[7] == ScanCheckErrorSample(check: "c7", point: "p7", detail: "d7"))
+
+        // A detail with the engine's scrubbed text and non-ASCII survives verbatim.
+        let detail = "Connection refused (os error 61) — «scrubbed» \u{1F512}"
+        #expect(try ScanCheckErrorSample(json: ["detail": .string(detail)]).detail == detail)
+
+        // The empty token is an unknown kind, round-trips, and reads as a failed connection.
+        let blank = try ScanCrawlCounters(json: ["last_error": ""])
+        #expect(blank.lastError == .unknown(""))
+        #expect(blank.lastError?.rawValue == "")
+        #expect(ScanCrawlErrorKind(rawValue: "") == .unknown(""))
+        #expect(ScanCrawlErrorKind(rawValue: "CONNECT_REFUSED") == .unknown("CONNECT_REFUSED"), "tokens are case-sensitive")
+        // The wire token `other` always lands in the engine's own case, never the escape
+        // hatch (equality on a `ScanVocabulary` is by raw value, so only the case match tells).
+        var landsInOther = false
+        if case .other = try #require(ScanCrawlErrorKind(rawValue: "other")) { landsInOther = true }
+        #expect(landsInOther)
+        var landsInUnknown = false
+        if case .unknown("weird") = try #require(ScanCrawlErrorKind(rawValue: "weird")) { landsInUnknown = true }
+        #expect(landsInUnknown)
+
+        // The status's row summary carries none of the new fields: a status with errors
+        // and a crawl error still summarises to the same seven counters as the list row.
+        var json = try ScanPack.load("scan.status.json")
+        json = ScanPack.edited(json, path: ["checks", "errors"], to: 7)
+        json = ScanPack.edited(json, path: ["crawl", "errors"], to: 1)
+        json = ScanPack.edited(json, path: ["crawl", "last_error"], to: "connect_refused")
+        let status = try ScanJobStatus(json: json)
+        #expect(status.checks.errors == 7)
+        #expect(status.crawl.lastError == .connectRefused)
+        let row = try ScanListResult(json: ScanPack.load("scan.list.json")).jobs[0]
+        #expect(status.summary == row)
+    }
+
+    /// Security review, fix 1.5e: every core-controlled string the Jobs detail can
+    /// print is bounded at decode, one choke point (`ScanWire.cleaned`): control,
+    /// format and line/paragraph separator scalars are dropped, then the text is cut
+    /// to its field's cap (profile name 64; error, sample fields, clamped field,
+    /// skipped reason and running ids 400; targets 200; an unknown vocabulary token
+    /// 64); the sample, running and target lists are cut to the engine's own 8.
+    /// `ScanWire.boundedArray`'s contract (D1 amendment; plan fix 1.5g): items past
+    /// `listMax` are neither type-checked nor kept, so a malformed ninth item is not
+    /// refused, while a malformed item inside the cap is. The two string helpers are
+    /// named by what they return: `optionalBoundedString` (nil when absent) and
+    /// `boundedString` (required; absent is malformed).
+    @Test func boundedArrayContractAndTheTwoBoundedStringHelpers() throws {
+        let status = try ScanPack.load("scan.status.json")
+        let eight: [JSONValue] = ["a", "b", "c", "d", "e", "f", "g", "h"]
+        let decoded = try ScanJobStatus(json: ScanPack.edited(status, path: ["checks", "running"], to: .array(eight + [42])))
+        #expect(decoded.checks.running == ["a", "b", "c", "d", "e", "f", "g", "h"])
+        #expect(throws: BusError.self) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["checks", "running"], to: .array([42])))
+        }
+
+        let wire = try ScanWire(["present": .string("ab\u{0007}cdef")], as: "T")
+        #expect(try wire.optionalBoundedString("present", max: 4) == "abcd")
+        #expect(try wire.optionalBoundedString("absent", max: 4) == nil)
+        let required: String = try wire.boundedString("present", max: 4)
+        #expect(required == "abcd")
+        #expect(throws: BusError.malformed("T needs `absent`")) {
+            let _: String = try wire.boundedString("absent", max: 4)
+        }
+    }
+
+    @Test func coreStringsAreBoundedAndCleaned() throws {
+        // A 1,000-character detail with a bidi override and a newline in it: 400 clean characters.
+        let hostile = String(repeating: "a", count: 300) + "\u{202E}" + String(repeating: "b", count: 300)
+            + "\n" + String(repeating: "c", count: 400)
+        #expect(hostile.count == 1_002)
+        let sample = try ScanCheckErrorSample(json: ["check": .string(hostile), "point": .string(hostile), "detail": .string(hostile)])
+        #expect(sample.detail.count == 400)
+        #expect(sample.detail == String(repeating: "a", count: 300) + String(repeating: "b", count: 100))
+        #expect(!sample.detail.contains("\u{202E}"))
+        #expect(!sample.detail.contains("\n"))
+        #expect(sample.check == sample.detail)
+        #expect(sample.point == sample.detail)
+
+        // Nine samples decode to the engine's 8; so do nine running ids and nine targets.
+        let nine = JSONValue.array((0..<9).map { i in .object(["check": .string("c\(i)"), "detail": .string("d\(i)")]) })
+        let checks = try ScanCheckCounters(json: [
+            "error_samples": nine, "skipped_samples": nine,
+            "running": .array((0..<9).map { .string("run-\($0)" + String(repeating: "x", count: 500)) }),
+        ])
+        #expect(checks.errorSamples.count == 8)
+        #expect(checks.errorSamples.last == ScanCheckErrorSample(check: "c7", point: "", detail: "d7"))
+        #expect(checks.skippedSamples.count == 8)
+        #expect(checks.running.count == 8)
+        #expect(checks.running[0].count == 400)
+        #expect(checks.running[0].hasPrefix("run-0xxx"))
+
+        // A 200-character `last_error` with a control character: `.unknown` of 64 clean characters.
+        let token = String(repeating: "k", count: 100) + "\u{0007}" + String(repeating: "m", count: 99)
+        #expect(token.count == 200)
+        let crawl = try ScanCrawlCounters(json: ["last_error": .string(token)])
+        #expect(crawl.lastError == .unknown(String(repeating: "k", count: 64)))
+        #expect(crawl.lastError?.rawValue.count == 64)
+        #expect(ScanCrawlErrorKind(rawValue: token)?.rawValue == String(repeating: "k", count: 64))
+        // The other vocabularies clean their unknown token the same way (the row and header print them).
+        #expect(ScanJobState(rawValue: "ex\u{0000}ploded\u{2028}" + String(repeating: "!", count: 80))?.rawValue
+                == "exploded" + String(repeating: "!", count: 56))
+        #expect(ScanPhase(rawValue: "\u{2029}" + String(repeating: "p", count: 65))?.rawValue == String(repeating: "p", count: 64))
+        #expect(ScanStoppedReason(rawValue: String(repeating: "r", count: 65) + "\r")?.rawValue == String(repeating: "r", count: 64))
+        // Known tokens are untouched.
+        #expect(ScanJobState(rawValue: "running") == .running)
+        #expect(ScanCrawlErrorKind(rawValue: "connect_refused") == .connectRefused)
+
+        // The status's own strings: profile name 64, error 400, each target 200 and at most 8,
+        // a clamped field 400, a skipped lane's reason 400.
+        var json = try ScanPack.load("scan.status.json")
+        json = ScanPack.edited(json, path: ["profile_name"], to: .string(String(repeating: "n", count: 70) + "\u{200B}"))
+        json = ScanPack.edited(json, path: ["error"], to: .string(hostile))
+        json = ScanPack.edited(json, path: ["targets"], to: .array((0..<9).map { _ in .string(String(repeating: "t", count: 250)) }))
+        json = ScanPack.edited(json, path: ["clamped"], to: .array([
+            .object(["field": .string(hostile), "requested": 2, "applied": 1]),
+        ]))
+        json = ScanPack.edited(json, path: ["lanes", "skipped"], to: .array([
+            .object(["lane": .string("ws"), "reason": .string(hostile)]),
+        ]))
+        let status = try ScanJobStatus(json: json)
+        #expect(status.profileName == String(repeating: "n", count: 64))
+        #expect(status.error?.count == 400)
+        #expect(status.error == sample.detail)
+        #expect(status.targets.count == 8)
+        #expect(status.targets.allSatisfy { $0 == String(repeating: "t", count: 200) })
+        #expect(status.clamped == [ScanClamped(field: sample.detail, requested: 2, applied: 1)])
+        #expect(status.lanes.skipped == [ScanSkippedLane(lane: .ws, reason: sample.detail)])
+
+        // Short, clean strings pass through untouched; an empty string stays empty.
+        #expect(try ScanCheckErrorSample(json: ["detail": "Connection refused (os error 61) — «scrubbed» \u{1F512}"]).detail
+                == "Connection refused (os error 61) — «scrubbed» \u{1F512}")
+        #expect(try ScanJobStatus(json: ScanPack.load("scan.status.json")).profileName == "standard")
+        #expect(ScanWire.cleaned("", max: 64) == "")
+        #expect(ScanWire.cleaned("tab\there", max: 64) == "tabhere")
+    }
+
+    /// Fix 1.5f (security minors): `cleaned` cuts on Unicode scalars, not Characters, so
+    /// a thousand combining marks on one base letter cannot ride through a 400 cap as one
+    /// grapheme; and a job id is bounded at decode like every other core string the
+    /// views print (`ScanWire.tokenMax`), while a missing id is still refused.
+    @Test func cleanedCutsOnScalarsAndJobIdsAreBounded() throws {
+        let marks = "a" + String(repeating: "\u{0301}", count: 1_000)
+        #expect(marks.count == 1)
+        #expect(marks.unicodeScalars.count == 1_001)
+        let cut = ScanWire.cleaned(marks, max: 400)
+        #expect(cut.unicodeScalars.count == 400)
+        #expect(cut.unicodeScalars.first == "a")
+        #expect(cut.unicodeScalars.dropFirst().allSatisfy { $0 == "\u{0301}" })
+        // A plain string still cuts to `max` characters.
+        #expect(ScanWire.cleaned(String(repeating: "x", count: 500), max: 400).count == 400)
+
+        // A 300-character job id decodes to 64 scalars on a list row and on a status.
+        let longJob = String(repeating: "j", count: 300)
+        var row = try #require(ScanPack.load("scan.list.json")["jobs"]?.arrayValue?.first)
+        row = ScanPack.edited(row, path: ["job"], to: .string(longJob))
+        #expect(try ScanJobSummary(json: row).job == String(repeating: "j", count: 64))
+        let status = ScanPack.edited(try ScanPack.load("scan.status.json"), path: ["job"], to: .string("\n" + longJob))
+        let decoded = try ScanJobStatus(json: status)
+        #expect(decoded.job.unicodeScalars.count == 64)
+        #expect(decoded.job == String(repeating: "j", count: 64))
+        // A short id is untouched; a missing one is still malformed.
+        #expect(try ScanJobStatus(json: ScanPack.load("scan.status.json")).job == "scan-1a2b3c4d")
+        var members = try #require(try ScanPack.load("scan.status.json").objectValue)
+        members.removeValue(forKey: "job")
+        #expect(throws: BusError.self) { try ScanJobStatus(json: .object(members)) }
     }
 }
