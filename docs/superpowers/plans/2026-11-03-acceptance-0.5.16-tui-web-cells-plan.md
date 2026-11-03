@@ -32,7 +32,7 @@ Tasks 1, 2, 3 and 4 touch disjoint files and run in parallel. Task 5 is the live
 | TUI status bar | regex `bus \S.*? · operator` (reads `● bus in-process · operator`) |
 | TUI scope prompt hint | `host · host:port · *.wildcard (a human action)` |
 | TUI Scope panel, empty | `Scope is empty: every flow is dimmed and read-only. Press a to add a host.` |
-| TUI sidebar host count | regex `^\s*Scope\s+(\d+)`: exactly 1 for a fresh Scope, ≥ 1 when the host pre-existed (the status bar's ` · N in scope` counts flows) |
+| TUI sidebar host count | regex `^\s*Scope\s+(\d+)`: exactly 1 for a fresh Scope, ≥ 1 only when the host pre-existed (the status bar's ` · N in scope` counts flows) |
 | TUI armed bar | `Intercept armed: every request pauses here`; pill gains ` · intercept armed` (asserted while armed); toasts `Intercept armed: every request pauses` (transient, a survey fact in D12, not asserted) / `Intercept disarmed` (asserted) |
 | TUI CA confirm | prompt `confirm: ca.install` (the cell's regex `confirm: ca\.install`; the row continues `: <description> [y/N]`); hint `y runs it · n / Esc cancels` is **not asserted** (the description pushes it off 180 cols); `n` → toast `ca.install cancelled` |
 | TUI bus truth | `aitm scope list` (JSON array contains the host), `aitm proxy status` (`intercept_armed`) run as one-shot verbs on the operator's default config while `aitm tui` runs |
@@ -92,7 +92,7 @@ Tasks 1, 2, 3 and 4 touch disjoint files and run in parallel. Task 5 is the live
 
 ## Review log
 
-Stage-6 panel on `abeda7d6..77c5aef4` (security, quality, spec; 2026-11-03): three PASS verdicts, no Critical or Important, twelve Minors.
+Stage-6 panel on `abeda7d6..77c5aef4` (security, quality, spec; 2026-11-03): three PASS verdicts, no Critical or Important, twelve Minors. Re-review of the fix round `77c5aef4..61719d0a` (quality, spec): PASS, one wording Minor, fixed.
 
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
@@ -108,6 +108,7 @@ Stage-6 panel on `abeda7d6..77c5aef4` (security, quality, spec; 2026-11-03): thr
 | 4 | spec | Minor | D12 names no survey SHA (AC2 anchor) | Fixed: D12 heading names `abeda7d6` (survey tree) and `96101377` (Task 1 fix) |
 | 2/4 | spec | Minor | TUI-5 row lists the pill suffix and the arm toast, the cell asserted neither | Fixed: the cell asserts the pill ` · intercept armed`; the arm toast is a D12 survey fact, moved out of the "must show" words |
 | 2 | spec | Minor | sidebar count asserted `>= 1`, the row says `Scope 1` | Fixed: `== 1`, or `>= 1` when the host pre-existed |
+| 2/4 | spec (re-review of `77c5aef4..61719d0a`) | Minor | plan Literals row lacked the word "only" the spec row has | Fixed in the plan |
 | 1/2 | spec | Minor | tester's tests ride in the coder commits, not `test(...): tester —` commits | Accepted 2026-11-03: the orchestrator committed the shared tree in three logical commits; the tests are doc-commented "Tester" |
 
 ## Shipped
