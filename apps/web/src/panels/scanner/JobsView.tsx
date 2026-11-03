@@ -10,7 +10,8 @@
 // the generation and play; a keyboard selection changes the job and plays nothing. The view
 // decides by the cause it was given (`selectJob`) or, for a selection it did not make (the store's
 // after-start pick, the first list), by an effect on the store's selection. No timer lives here:
-// the banner's age is read when the bus goes away, the counters come from the poll (AC32).
+// the banner's age is the store's 1 s clock against `jobsLoadedAt` (D16), the counters come from
+// the poll (AC32).
 
 import { createEffect, createMemo, createSignal, Match, on, Show, Switch, type Component } from 'solid-js';
 import { Button } from '~/components';
@@ -41,14 +42,16 @@ export const JobsView: Component = () => {
   const offline = () => !s.busOpen();
 
   /**
-   * The age of the values the banner shows (D15): `jobsLoadedAt` against the clock when the bus
-   * went away; `null` before the first list. Read once per bus state change — the polls stop with
-   * the bus, so nothing else ticks it (no view timer).
+   * The age of the values the banner shows (D15): `jobsLoadedAt` against the store's clock
+   * (`nowMs`, the one 1 s interval, D6 amendment), so the clause counts up while the bus is away
+   * and the polls are stopped; `null` before the first list. Clamped at 0: two wall-clock stamps
+   * within one tick can otherwise read negative for a beat. The clock is not read while online,
+   * so the view does not re-render on it then.
    */
   const valuesAgeMs = createMemo<number | null>(() => {
     if (!offline()) return null;
     const at = s.jobsLoadedAt();
-    return at === null ? null : Math.max(0, Date.now() - at);
+    return at === null ? null : Math.max(0, s.nowMs() - at);
   });
 
   /** The launch's notices for the selected job, in the Kit's words (the mac's `launchNotices[job]`). */

@@ -699,3 +699,23 @@ describe('scanStore: crossing into the rest of the app (D-T8.8, D-T8.9)', () => 
     expect(h.setSidebar).not.toHaveBeenCalled();
   });
 });
+
+describe('scanStore: the clock (Jobs view D6 amendment, D16, AC38)', () => {
+  it('now_ms_ticks_once_a_second_and_stops_on_dispose: the store owns the one timer the banner age reads', async () => {
+    const T = Date.UTC(2026, 9, 31, 14, 3, 22);
+    vi.setSystemTime(T);
+    const h = harness();
+    expect(h.s.nowMs()).toBe(T);
+    await tick(1_000);
+    expect(h.s.nowMs()).toBe(T + 1_000);
+    await tick(1_000);
+    expect(h.s.nowMs()).toBe(T + 2_000);
+    // Nothing between the ticks moves it: the clock is the interval's, not every read's.
+    vi.setSystemTime(T + 2_500);
+    expect(h.s.nowMs()).toBe(T + 2_000);
+
+    h.s.dispose();
+    await tick(3_000);
+    expect(h.s.nowMs()).toBe(T + 2_000);
+  });
+});

@@ -533,9 +533,10 @@ describe('JobsView: states (W-16, D15)', () => {
     await tick();
     expect(h.r.container.querySelector('[data-reconnect]')).toBeNull();
 
-    vi.setSystemTime(T + 42_000);
+    // The bus goes away; the store's 1 s clock (not the view) reads the wall clock 42 s on.
     h.setBusState('reconnecting');
-    await tick();
+    vi.setSystemTime(T + 41_000);
+    await tick(1_000);
     const banner = h.r.container.querySelector(`.${jobsCss.banner} [data-reconnect]`);
     expect(banner).not.toBeNull();
     expect(banner!.textContent).toBe('Bus disconnected · showing values from 0:42 ago · reconnecting…');
@@ -551,6 +552,27 @@ describe('JobsView: states (W-16, D15)', () => {
     await tick();
     expect(h.r.container.querySelector('[data-reconnect]')).toBeNull();
     expect(h.cancelButton(h.region(), JOB).disabled).toBe(false);
+  });
+
+  it('bus_banner_counts_up (AC38, gap 76): the age clause advances every second on the store’s clock while the bus is away; the view owns no timer', async () => {
+    const T = Date.UTC(2026, 9, 31, 14, 3, 22);
+    vi.setSystemTime(T);
+    const h = mount();
+    await tick();
+    expect(h.s.jobsLoadedAt()).toBe(T);
+
+    // The bus goes away with the values 42 s old: the polls stop, the clock does not.
+    h.setBusState('reconnecting');
+    vi.setSystemTime(T + 41_000);
+    await tick(1_000);
+    const banner = () => h.r.container.querySelector(`.${jobsCss.banner} [data-reconnect]`);
+    expect(banner()!.textContent).toBe('Bus disconnected · showing values from 0:42 ago · reconnecting…');
+
+    await tick(5_000);
+    expect(h.s.nowMs()).toBe(T + 47_000);
+    expect(banner()!.textContent).toBe('Bus disconnected · showing values from 0:47 ago · reconnecting…');
+    // The data was not re-read behind the banner: the rows keep their values.
+    expect(h.field(h.row(JOB), 'probes')).toBe('418 of 2,000');
   });
 });
 

@@ -55,6 +55,9 @@ import {
   type StartResult,
 } from './model';
 
+/** How often the store's clock (`nowMs`) moves: the banner age counts in seconds (Jobs view D15). */
+const CLOCK_MS = 1_000;
+
 /** Which scan engine this core offers (D-T8.1): the v2 family, the v1 `scan.discover`, or neither. */
 export type Offered = 'v2' | 'legacy' | 'none';
 
@@ -101,6 +104,13 @@ export interface ScanStore extends LiveModel {
   l4Offered: Accessor<boolean>;
   agent: Accessor<boolean>;
   busOpen: Accessor<boolean>;
+  /**
+   * The store's clock: `Date.now()` as of the last 1 s tick of the one interval the store owns
+   * (Jobs view D6 amendment, D16). The banner's values age is `nowMs() - jobsLoadedAt()`, so it
+   * counts up while the bus is away and the polls are stopped; no view keeps a timer. Stops on
+   * `dispose`.
+   */
+  nowMs: Accessor<number>;
 
   tab: Accessor<Tab>;
   setTab(t: Tab): void;
@@ -300,6 +310,11 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
   const [lastError, setLastError] = createSignal<ScanError | null>(null);
   const [startNotice, setStartNotice] = createSignal<StartResult | null>(null);
   const [pendingConfirm, setPendingConfirm] = createSignal<PendingConfirm | null>(null);
+  // The clock runs independently of the polls (`live.ts` stops those with the bus) so the banner
+  // age keeps moving against a closed or hung bus; it reads the wall clock rather than counting,
+  // so a throttled background tab catches up on its next tick.
+  const [nowMs, setNowMs] = createSignal(Date.now());
+  const clock = setInterval(() => setNowMs(Date.now()), CLOCK_MS);
 
   // Keyed by wire strings (profile names, issue ids), so: no prototype, every read via `own` (A5).
   const [drafts, setDrafts] = createStore<Record<string, ProfileDraft>>(emptyRecord());
@@ -690,6 +705,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
   function dispose(): void {
     if (disposed) return;
     disposed = true;
+    clearInterval(clock);
     live.dispose();
     stores.delete(app);
     disposeRoot();
@@ -705,6 +721,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     l4Offered,
     agent,
     busOpen,
+    nowMs,
 
     tab,
     setTab: (t: Tab) => setTabSignal(t),
