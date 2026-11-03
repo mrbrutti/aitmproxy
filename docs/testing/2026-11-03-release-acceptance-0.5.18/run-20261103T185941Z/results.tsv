@@ -1,0 +1,5 @@
+cli-livecore	SKIP	CLI-0   SKIP    release run only; brew upgrade is Matt's
+n5	SKIP	N5-CLI   N/A     the one-shot refusal is CLI-6's row (no separate step on this surface)
+tui	FAIL	exit 1
+web	SKIP	WEB-4    SKIP    bypass list absent in config.yaml system_proxy.bypass (none); add it through Settings first
+cli-nocore	SKIP	CLI-8   SKIP    could not hold 8082 with a plain listener (holder: ); not starting aitm web against a live port

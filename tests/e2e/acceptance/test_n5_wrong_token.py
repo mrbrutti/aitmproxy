@@ -25,7 +25,7 @@ import time
 
 E2E = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, E2E)
-from aitm_e2e.installed import INSTALLED_CLI, StepWriter, exit_on_term, find_embedded_core, port_holder  # noqa: E402
+from aitm_e2e.installed import INSTALLED_CLI, StepWriter, exit_on_term, find_embedded_core, port_holder, port_holder_pid  # noqa: E402
 from aitm_e2e.tui_pty import Terminal  # noqa: E402
 
 OUT = os.environ.get("ACCEPT_OUT", "/tmp/claude/acceptance/n5")
@@ -101,7 +101,26 @@ def n5_tui(core) -> None:
         os.unlink(wrong)
 
 
+def installed_core_holds_8080() -> tuple[bool, str, object]:
+    """(True, holder text, core) only when the LISTEN holder of 8080 is the installed app's embedded
+    core, by pid identity (lsof truncates COMMAND, so names are never compared). Right after MAC-13's
+    Restart Core the port is free for a few seconds; an `aitm tui`/`aitm web` started then binds it
+    itself, publishes a pointer naming the operator's real config and leaves the restarted core on an
+    ephemeral port (0.5.18 run A: N4-TUI entered its alternate screen, N4-WEB held 8080-8082)."""
+    try:
+        core = find_embedded_core()
+    except RuntimeError:
+        core = None
+    holder_pid = port_holder_pid(8080)
+    holder = port_holder(8080) or "nobody"
+    return (core is not None and holder_pid == core.pid), holder, core
+
+
 def n4_tui() -> None:
+    ok, holder, core = installed_core_holds_8080()
+    if not ok:
+        step("N4-TUI", "SKIP", f"8080 is not held by the installed app's core (holder: {holder}; core pid {core.pid if core else None}); not starting aitm tui against a free port")
+        return
     env = dict(os.environ)
     env.setdefault("LANG", "en_US.UTF-8")
     term = Terminal([AITM, "tui"], env)
@@ -122,25 +141,43 @@ def n4_tui() -> None:
 
 
 def n4_web() -> None:
+    # Precondition (2026-11-03): 8080 must be held by the INSTALLED app's core. Right after MAC-13's
+    # Restart Core the port is free for a few seconds; an `aitm web` started then binds 8080-8082
+    # itself, publishes a pointer naming the operator's real config, and the restarted embedded core
+    # falls back to an ephemeral port (0.5.18 run A). Refuse to start one against a free port.
+    ok, holder, core = installed_core_holds_8080()
+    if not ok:
+        step("N4-WEB", "SKIP", f"8080 is not held by the installed app's core (holder: {holder}; core pid {core.pid if core else None}); not starting aitm web against a free port")
+        return
+    env = dict(os.environ, LANG=os.environ.get("LANG", "en_US.UTF-8"))
+    proc = subprocess.Popen([AITM, "web"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     try:
-        r = subprocess.run([AITM, "web"], capture_output=True, text=True, timeout=5, env=dict(os.environ, LANG=os.environ.get("LANG", "en_US.UTF-8")))
-        out, err, rc = r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired as e:  # subprocess.run killed our own child at the 5 s cap
-        out, err, rc = (e.stdout or ""), (e.stderr or ""), None
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", "replace")
-        if isinstance(err, bytes):
-            err = err.decode("utf-8", "replace")
-    text = strip_ansi(out + "\n" + err)
+        out, err = proc.communicate(timeout=5)
+        rc = proc.returncode
+        child_dead = True
+    except subprocess.TimeoutExpired:
+        # Still serving after the cap: it bound the ports. End it for certain — `aitm web` ignored
+        # SIGTERM for 10 s on 0.5.18 — and never leave it holding 8080 behind the operator's app.
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        rc = None
+        child_dead = proc.poll() is not None
+    text = strip_ansi((out or "") + "\n" + (err or ""))
     with open(os.path.join(OUT, "N4-WEB.txt"), "w", encoding="utf-8") as fh:
         fh.write(text)
     panel, miss = n4_words(text)
     # The card is on stderr since wave 1 (G1/D13), `Web UI: http…` on a pipe: look in both streams.
     card = re.search(r"Web UI:?\s+http", text) is not None
-    if panel and rc not in (None, 0) and not card:
-        step("N4-WEB", "PASS", f"panel, exit {rc}, no card first" + (f"; missing follow-up lines {miss}" if miss else ""), f"8080 held by {port_holder(8080)}")
+    after_pid = port_holder_pid(8080)
+    after = port_holder(8080) or "nobody"
+    left_ours = after_pid is not None and after_pid != core.pid   # the child (or a survivor of it) kept the port
+    if panel and rc not in (None, 0) and not card and not left_ours:
+        step("N4-WEB", "PASS", f"panel, exit {rc}, no card first" + (f"; missing follow-up lines {miss}" if miss else ""), f"8080 before {holder}; after {after}")
     else:
-        step("N4-WEB", "FAIL", f"panel {panel}; exit {rc} (None = still running after 5 s, killed by the cell); card printed {card}; missing {miss}")
+        step("N4-WEB", "FAIL", f"panel {panel}; exit {rc} (None = still running after 5 s, killed by the cell); card printed {card}; missing {miss}; 8080 before {holder}; after {after}" + ("; a process of ours still holds 8080" if left_ours else "") + ("" if child_dead else "; the aitm web child did not die after SIGKILL"))
 
 
 def main() -> int:

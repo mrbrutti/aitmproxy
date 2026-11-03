@@ -1,0 +1,14 @@
+121d120
+< <ls> 68521.json
+125,129c124,128
+< {"at":<ms>,"marker":"start","pid":68292,"schema":1,"stream":"control","version":"0.5.18"}
+< {"at":<ms>,"marker":"start","pid":68464,"schema":1,"stream":"control","version":"0.5.18"}
+< {"at":<ms>,"marker":"start","pid":68521,"schema":1,"stream":"control","version":"0.5.18"}
+< {"at":<ms>,"marker":"start","pid":69736,"schema":1,"stream":"control","version":"0.5.18"}
+< {"at":<ms>,"marker":"start","pid":69980,"schema":1,"stream":"control","version":"0.5.18"}
+---
+> {"at":<ms>,"origin":"operator","client_label":"web-bridge","connection_id":"conn_54181af9d7a27081-1","command":"scope.add","args":"{\"host\":\"example.com\"}","result":"ok"}
+> {"at":<ms>,"origin":"operator","client_label":"web-bridge","connection_id":"conn_54181af9d7a27081-1","command":"flow.intercept","args":"{\"enabled\":true}","result":"ok"}
+> {"at":<ms>,"origin":"operator","client_label":"web-bridge","connection_id":"conn_54181af9d7a27081-1","command":"flow.intercept","args":"{\"enabled\":false}","result":"ok"}
+> {"at":<ms>,"origin":"operator","client_label":"web-bridge","connection_id":"conn_54181af9d7a27081-1","command":"scope.remove","args":"{\"host\":\"example.com\"}","result":"ok"}
+> {"at":<ms>,"marker":"start","pid":71010,"schema":1,"stream":"control","version":"0.5.18"}

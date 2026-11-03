@@ -1,0 +1,12 @@
+127,131c127,131
+< {"at":<ms>,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_8abd40a1b597ebad-6","command":"scope.remove","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+< {"at":<ms>,"marker":"start","pid":23699,"schema":1,"stream":"control","version":"0.5.17"}
+< {"at":<ms>,"marker":"start","pid":23901,"schema":1,"stream":"control","version":"0.5.17"}
+< {"at":<ms>,"marker":"start","pid":23906,"schema":1,"stream":"control","version":"0.5.17"}
+< {"at":<ms>,"marker":"start","pid":53844,"schema":1,"stream":"control","version":"0.5.18"}
+---
+> {"at":<ms>,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_67b1a90f94181752-4","command":"scope.add","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+> {"at":<ms>,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_67b1a90f94181752-6","command":"scope.remove","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+> {"at":<ms>,"marker":"start","pid":54682,"schema":1,"stream":"control","version":"0.5.18"}
+> {"at":<ms>,"marker":"start","pid":54894,"schema":1,"stream":"control","version":"0.5.18"}
+> {"at":<ms>,"marker":"start","pid":54899,"schema":1,"stream":"control","version":"0.5.18"}

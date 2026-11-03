@@ -1,0 +1,4 @@
+N5-CLI	N/A	the one-shot refusal is CLI-6's row (no separate step on this surface)		
+N5-TUI	PASS	exact refusal sentence shown; TUI stays open with the message	core 127.0.0.1:51257 refused the token line (unauthorized)	
+N4-TUI	PASS	panel before any screen, exit 1	8080 held by aitm pid 53844	
+N4-WEB	PASS	panel, exit 1, no card first	8080 held by aitm pid 53844	

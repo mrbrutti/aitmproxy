@@ -392,6 +392,17 @@ class StepWriter:
         return 0
 
 
+def has_text_field(dump: str, identifier: str) -> bool:
+    """True when an `ax_texts.sh` dump has an AXTextField row whose accessibility identifier (5th tab
+    column, text-field rows only) equals `identifier`. The Edit Scope sheet's field is `scope-add-host`;
+    the Scope page's copy, same description, is `scope-page-add-host` and must not count (0.5.18 run A)."""
+    for row in dump.splitlines():
+        cols = row.split("\t")
+        if len(cols) > 4 and cols[0] == "AXTextField" and cols[4] == identifier:
+            return True
+    return False
+
+
 def field_center(dump: str, description: str, identifier: str | None = None) -> tuple[int, int] | None:
     """Screen centre of a text field in an `ax_texts.sh` dump: the row whose accessibility
     identifier equals `identifier` AND whose description matches wins (the mac fix adds the

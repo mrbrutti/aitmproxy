@@ -1,0 +1,14 @@
+TUI-1	FAIL	frame True; missing ['sys-proxy', 'CA trusted']; no-flows line exact True — observed `Browser                 —│  No flows yet: point a client at 127.0.0.1:8080 or open the browser.`; status bar `bus … · operator` True; startup toast True; screen head:  ›•‹ aitmproxy  ● rec  ✎ compose  ⌫ clear                          ● aitmproxy · listening 127.0.0.1		
+TUI-2	PASS	prompt + hint shown, toast `Scope + example.com`, panel lists it, sidebar `Scope 1`, status bar ` · 0 in scope` (flows; recorded); Scope-empty words before: True	aitm scope list contains example.com (1 hosts); bus truth: one-shot CLI	
+N2-TUI	PASS	pill `· sys-proxy off`; flows pane empty state while a host is in Scope (zero rows is correct here)	bus truth: one-shot CLI (TUI-2's aitm scope list)	
+TUI-3	SKIP	bypass list absent in config.yaml system_proxy.bypass (none); add it through the surface's Settings first		
+TUI-4	BLOCKED	TUI-3 did not set the route		
+TUI-5b	BLOCKED	TUI-3	no route / no hand: park and resume cannot be judged	
+TUI-5a	PASS	armed bar True; pill `· intercept armed` True; toast `Intercept disarmed` True; aitm proxy status intercept_armed after arm True, after disarm False	bus truth: one-shot CLI (aitm proxy status: exit 0; aitm proxy status: exit 0)	
+TUI-6	PASS	confirm prompt `confirm: ca.install` shown; hint `y runs it · n / Esc cancels` visible False (not required: clipped at 180 cols); n → `ca.install cancelled`	ca-audit.jsonl: no ca.install from this run	PR #263 (over-the-wire _confirm) not pinned here
+TUI-7	SKIP	nothing to restore (TUI-3 did not set it)		
+TUI-8	PASS	exit 0, no child left, scutil unchanged	audit: last entries from this pid	
+TUI-9	N/A	no All Apps control on this surface		UIs pending (per-host decryption decision)
+TUI-10	N/A	no Apps view on this surface on 0.5.10		
+N1-TUI	N/A	aitm tui owns its core on 0.5.10; the app's restart is seen only from aitm-tui --bus		
+N3-TUI	SKIP	CA stays trusted (un-trusting is Matt's yes; words read from source)		

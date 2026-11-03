@@ -1,0 +1,23 @@
+MAC-0	SKIP	release run only; brew upgrade is Matt's		
+N3-MAC	SKIP	CA stays trusted (un-trusting is Matt's yes; words read from source)		
+N4-MAC	SKIP	needs a plain 8080 listener before launch — yes (it blocks his app's core)		
+N5-MAC	SKIP	hand: Settings ▸ Bus field		
+MAC-1	PASS	app running (bundle 0.5.18); embedded core pid 53844 listening 127.0.0.1:8080 version 0.5.18	proxy.status.listening True, version 0.5.18; start marker in audit: True	
+MAC-2	SKIP	needs the display-lock window (ACCEPT_WINDOW=1) to open the page and read it; expected words for the current state: system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core. | All Apps is on	scope.list ['wikipedia.org']; capture enabled True provider attached; system proxy off	
+MAC-3	SKIP	needs the display-lock window (ACCEPT_WINDOW=1) to open the page and read it; expected words for the current state: system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core. | All Apps is on	scope.list ['wikipedia.org']; capture enabled True provider attached; system proxy off	
+MAC-4	SKIP	needs the display-lock window (ACCEPT_WINDOW=1) to open the page and read it; expected words for the current state: system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core. | All Apps is on	scope.list ['wikipedia.org']; capture enabled True provider attached; system proxy off	
+N2-MAC	SKIP	needs the window (judged from the MAC-3 read)		
+MAC-5	SKIP	needs the window (ACCEPT_WINDOW=1): types into the Edit Scope sheet; hosts ('example.com:80', 'httpbin.org:443')		
+MAC-6	SKIP	needs Matt's yes (ACCEPT_YES=MAC-6) and the window		
+MAC-7	SKIP	All Apps already on at start; needs the window to read 'All Apps is on' on the Status page	capture.status enabled True feeder listening provider attached handed off {'tcp': 0, 'udp': 0}	
+MAC-8	BLOCKED	needs MAC-5 and a route (MAC-6 or MAC-7)		
+MAC-9a	BLOCKED	no extension-captured rows (All Apps on but Scope empty → the extension claims nothing)	capture.status flows_handed_off {'tcp': 0, 'udp': 0}	
+MAC-9b	BLOCKED	no proxied rows to judge		
+MAC-10	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-11	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-12	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-13	SKIP	needs the window (ACCEPT_WINDOW=1): Proxy ▸ Restart Core; Scope must survive		
+N1-MAC	SKIP	needs the window and --manual (Restart Core, then an add within ~1 s after a focus re-probe)		
+MAC-14	SKIP	All Apps was already on at start (operator's state) — not turned off by the run		
+MAC-15	SKIP	nothing to restore (MAC-6 did not set it)		
+MAC-16	SKIP	the app was already running at start; not quit by the run (Matt's app)		

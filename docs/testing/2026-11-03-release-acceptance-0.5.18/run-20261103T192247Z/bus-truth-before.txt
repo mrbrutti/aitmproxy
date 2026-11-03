@@ -1,0 +1,301 @@
+embedded core config: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/73E387CB-0E44-44B1-B41B-BCC382328AB5/config.yaml
+bus: 127.0.0.1:64118
+role: ?
+
+== scope.list
+[
+ "wikipedia.org"
+]
+
+== proxy.status
+{
+ "address": "127.0.0.1:8080",
+ "capturing": true,
+ "decrypt": {
+  "advice": null,
+  "decrypting": true,
+  "scope_hosts": 1
+ },
+ "flows": 2,
+ "intercept_armed": false,
+ "listening": true,
+ "paused": 0,
+ "system_proxy": {
+  "detail": "HTTP and HTTPS off",
+  "host": null,
+  "managed_by_us": false,
+  "port": null,
+  "setting": false,
+  "state": "off",
+  "supported": true
+ },
+ "version": "0.5.18"
+}
+
+== capture.status
+{
+ "capability": "approved_attached",
+ "capability_reason": null,
+ "enabled": true,
+ "feeder": {
+  "reason": null,
+  "state": "listening"
+ },
+ "flows_handed_off": {
+  "tcp": 0,
+  "udp": 0
+ },
+ "last_handoff_at": null,
+ "provider": {
+  "attached_at": 1793732414920,
+  "state": "attached",
+  "team_id": "995PCLM9KH"
+ },
+ "scope_entries": 1,
+ "scope_tokens": [
+  "wikipedia.org"
+ ]
+}
+
+== proxy.system.status
+{
+ "bypass_default": [
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "*.local",
+  "169.254/16"
+ ],
+ "detail": "HTTP and HTTPS off",
+ "effective": {
+  "bypass": [
+   "*.local",
+   "169.254/16"
+  ],
+  "http": {
+   "enabled": false,
+   "host": "",
+   "port": 0
+  },
+  "https": {
+   "enabled": false,
+   "host": "",
+   "port": 0
+  }
+ },
+ "guidance": null,
+ "last_change_ms": null,
+ "managed_by_us": false,
+ "mechanism": "networksetup",
+ "ours": {
+  "host": "127.0.0.1",
+  "port": 8080
+ },
+ "remedy": null,
+ "services": [
+  {
+   "bypass": [
+    "*.local",
+    "169.254/16"
+   ],
+   "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "https": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "service": "Display Ethernet"
+  },
+  {
+   "bypass": [
+    "*.local",
+    "169.254/16"
+   ],
+   "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "https": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "service": "Wi-Fi"
+  }
+ ],
+ "setting": false,
+ "state": "off",
+ "state_file": "/Users/matt/Library/Application Support/aitmproxy/system-proxy-state.json",
+ "supported": true,
+ "watchdog_pid": null
+}
+
+== flow.table
+{
+ "count": 2,
+ "last": [
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": 6385,
+   "bytes_up": 2234,
+   "capture_interface": null,
+   "duration_ms": 170205,
+   "id": "0efb6431-2d13-4bc3-9207-c293f1a764c3",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": null,
+   "duration_ms": 38,
+   "id": "b069ae9a-33e5-4901-a0f0-e8e9b6bc135f",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": null,
+   "tunnel": "failed",
+   "tunnel_reason": "client_closed"
+  }
+ ]
+}
+
+== ca.status
+{
+ "exists": true,
+ "fingerprint_sha1": "B2:D8:E7:80:FF:3A:B7:1F:71:F8:54:4A:1D:7A:8B:64:DD:C5:A4:85",
+ "stores": {
+  "system": {
+   "installed": "absent",
+   "location": "/Library/Keychains/System.keychain",
+   "trusted": "no"
+  },
+  "user": {
+   "installed": "present",
+   "location": "/Users/matt/Library/Keychains/login.keychain-db",
+   "trusted": "yes"
+  }
+ }
+}
+
+== agent.activity
+[
+ {
+  "args": "{}",
+  "at": 1793733770211,
+  "client_label": "aitm-e2e",
+  "command": "scope.list",
+  "connection_id": "conn_3feaba486b1948cf-2",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793733770212,
+  "client_label": "aitm-e2e",
+  "command": "proxy.status",
+  "connection_id": "conn_3feaba486b1948cf-2",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793733770212,
+  "client_label": "aitm-e2e",
+  "command": "capture.status",
+  "connection_id": "conn_3feaba486b1948cf-2",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793733770328,
+  "client_label": "aitm-mac",
+  "command": "scope.list",
+  "connection_id": "conn_3feaba486b1948cf-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793733770329,
+  "client_label": "aitm-mac",
+  "command": "proxy.status",
+  "connection_id": "conn_3feaba486b1948cf-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793733770352,
+  "client_label": "aitm-mac",
+  "command": "flow.list",
+  "connection_id": "conn_3feaba486b1948cf-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{\"id\":\"b069ae9a-33e5-4901-a0f0-e8e9b6bc135f\"}",
+  "at": 1793733770357,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_3feaba486b1948cf-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793733770483,
+  "client_label": "aitm-e2e",
+  "command": "proxy.system.status",
+  "connection_id": "conn_3feaba486b1948cf-2",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793733770483,
+  "client_label": "aitm-e2e",
+  "command": "flow.table",
+  "connection_id": "conn_3feaba486b1948cf-2",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793733770535,
+  "client_label": "aitm-e2e",
+  "command": "ca.status",
+  "connection_id": "conn_3feaba486b1948cf-2",
+  "origin": "operator",
+  "result": "ok"
+ }
+]
+
+== durable audit tail (control stream)
+{"at":1793732385953,"marker":"start","pid":70762,"schema":1,"stream":"control","version":"0.5.18"}
+{"at":1793732397112,"marker":"start","pid":70832,"schema":1,"stream":"control","version":"0.5.18"}
+{"at":1793732400105,"origin":"operator","client_label":"web-bridge","connection_id":"conn_54181af9d7a27081-1","command":"scope.add","args":"{\"host\":\"example.com\"}","result":"ok"}
+{"at":1793732401805,"origin":"operator","client_label":"web-bridge","connection_id":"conn_54181af9d7a27081-1","command":"flow.intercept","args":"{\"enabled\":true}","result":"ok"}
+{"at":1793732402420,"origin":"operator","client_label":"web-bridge","connection_id":"conn_54181af9d7a27081-1","command":"flow.intercept","args":"{\"enabled\":false}","result":"ok"}
+{"at":1793732403531,"origin":"operator","client_label":"web-bridge","connection_id":"conn_54181af9d7a27081-1","command":"scope.remove","args":"{\"host\":\"example.com\"}","result":"ok"}
+{"at":1793732408281,"marker":"start","pid":71010,"schema":1,"stream":"control","version":"0.5.18"}
+{"at":1793732413336,"marker":"start","pid":71655,"schema":1,"stream":"control","version":"0.5.18"}

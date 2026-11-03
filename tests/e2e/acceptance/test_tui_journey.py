@@ -187,6 +187,11 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         screen = term.text()
         regression = SUBSCRIBE_REGRESSION in plain_raw(term)
         pill = next((ln for ln in screen.splitlines() if "aitmproxy" in ln and ("listening" in ln or "bus" in ln)), "")
+        # The toolbar pills (`sys-proxy …`, `CA trusted`) are drawn on the first bus tick, after the
+        # frame and the status bar; wait for them instead of reading the first screen (0.5.18 run B).
+        for pill_word in ("sys-proxy", "CA trusted"):
+            term.wait_for(re.escape(pill_word), 5)
+        screen = term.text()
         want = ["listening 127.0.0.1:8080", "sys-proxy", "CA trusted"]
         miss = [x for x in want if x not in screen]
         exact = NO_FLOWS in screen

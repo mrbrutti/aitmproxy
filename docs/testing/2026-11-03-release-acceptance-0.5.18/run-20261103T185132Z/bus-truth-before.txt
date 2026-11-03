@@ -1,0 +1,409 @@
+embedded core config: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/D2F6014D-C90F-46E5-85BB-24675E3C9EC8/config.yaml
+bus: 127.0.0.1:51257
+role: ?
+
+== scope.list
+[
+ "wikipedia.org"
+]
+
+== proxy.status
+{
+ "address": "127.0.0.1:8080",
+ "capturing": true,
+ "decrypt": {
+  "advice": null,
+  "decrypting": true,
+  "scope_hosts": 1
+ },
+ "flows": 8,
+ "intercept_armed": false,
+ "listening": true,
+ "paused": 0,
+ "system_proxy": {
+  "detail": "HTTP and HTTPS off",
+  "host": null,
+  "managed_by_us": false,
+  "port": null,
+  "setting": false,
+  "state": "off",
+  "supported": true
+ },
+ "version": "0.5.18"
+}
+
+== capture.status
+{
+ "capability": "approved_attached",
+ "capability_reason": null,
+ "enabled": true,
+ "feeder": {
+  "reason": null,
+  "state": "listening"
+ },
+ "flows_handed_off": {
+  "tcp": 0,
+  "udp": 0
+ },
+ "last_handoff_at": null,
+ "provider": {
+  "attached_at": 1793727051978,
+  "state": "attached",
+  "team_id": "995PCLM9KH"
+ },
+ "scope_entries": 1,
+ "scope_tokens": [
+  "wikipedia.org"
+ ]
+}
+
+== proxy.system.status
+{
+ "bypass_default": [
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "*.local",
+  "169.254/16"
+ ],
+ "detail": "HTTP and HTTPS off",
+ "effective": {
+  "bypass": [
+   "*.local",
+   "169.254/16"
+  ],
+  "http": {
+   "enabled": false,
+   "host": "",
+   "port": 0
+  },
+  "https": {
+   "enabled": false,
+   "host": "",
+   "port": 0
+  }
+ },
+ "guidance": null,
+ "last_change_ms": null,
+ "managed_by_us": false,
+ "mechanism": "networksetup",
+ "ours": {
+  "host": "127.0.0.1",
+  "port": 8080
+ },
+ "remedy": null,
+ "services": [
+  {
+   "bypass": [
+    "*.local",
+    "169.254/16"
+   ],
+   "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "https": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "service": "Display Ethernet"
+  },
+  {
+   "bypass": [
+    "*.local",
+    "169.254/16"
+   ],
+   "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "https": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "service": "Wi-Fi"
+  }
+ ],
+ "setting": false,
+ "state": "off",
+ "state_file": "/Users/matt/Library/Application Support/aitmproxy/system-proxy-state.json",
+ "supported": true,
+ "watchdog_pid": null
+}
+
+== flow.table
+{
+ "count": 8,
+ "last": [
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": 6385,
+   "bytes_up": 2234,
+   "capture_interface": null,
+   "duration_ms": 170089,
+   "id": "694c4f22-e36d-4fce-b1d9-db35130f86ab",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": null,
+   "duration_ms": 32,
+   "id": "f581f1ff-757f-41ef-96f5-72e0f1e63cd8",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": null,
+   "tunnel": "failed",
+   "tunnel_reason": "client_closed"
+  },
+  {
+   "authority": "merino.services.mozilla.com:443",
+   "bytes_down": 7260,
+   "bytes_up": 2514,
+   "capture_interface": null,
+   "duration_ms": 171158,
+   "id": "abd50d10-fe78-4b28-8a2a-61b56c7b4b73",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": 6385,
+   "bytes_up": 2234,
+   "capture_interface": null,
+   "duration_ms": 170168,
+   "id": "017d6d42-47dc-4c56-b852-88251fec9e75",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": null,
+   "duration_ms": 34,
+   "id": "899b1c79-04a9-4cd5-8032-8710eb450f52",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": null,
+   "tunnel": "failed",
+   "tunnel_reason": "client_closed"
+  },
+  {
+   "authority": "merino.services.mozilla.com:443",
+   "bytes_down": 7240,
+   "bytes_up": 2513,
+   "capture_interface": null,
+   "duration_ms": 171397,
+   "id": "302d45a2-4024-466e-a8aa-ab7f2afcc963",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": 6385,
+   "bytes_up": 2234,
+   "capture_interface": null,
+   "duration_ms": 170285,
+   "id": "4b3009aa-c337-479d-a48b-1ac5ca893312",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": null,
+   "duration_ms": 33,
+   "id": "6ef9fd96-b7a9-4505-ba7a-711ff55514f7",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "firefox",
+   "state": "observed",
+   "status": null,
+   "tunnel": "failed",
+   "tunnel_reason": "client_closed"
+  }
+ ]
+}
+
+== ca.status
+{
+ "exists": true,
+ "fingerprint_sha1": "B2:D8:E7:80:FF:3A:B7:1F:71:F8:54:4A:1D:7A:8B:64:DD:C5:A4:85",
+ "stores": {
+  "system": {
+   "installed": "absent",
+   "location": "/Library/Keychains/System.keychain",
+   "trusted": "no"
+  },
+  "user": {
+   "installed": "present",
+   "location": "/Users/matt/Library/Keychains/login.keychain-db",
+   "trusted": "yes"
+  }
+ }
+}
+
+== agent.activity
+[
+ {
+  "args": "{}",
+  "at": 1793731894435,
+  "client_label": "aitm-mac",
+  "command": "flow.list",
+  "connection_id": "conn_67b1a90f94181752-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{\"id\":\"f581f1ff-757f-41ef-96f5-72e0f1e63cd8\"}",
+  "at": 1793731894435,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_67b1a90f94181752-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{\"id\":\"899b1c79-04a9-4cd5-8032-8710eb450f52\"}",
+  "at": 1793731894436,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_67b1a90f94181752-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{\"id\":\"6ef9fd96-b7a9-4505-ba7a-711ff55514f7\"}",
+  "at": 1793731894437,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_67b1a90f94181752-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793731894716,
+  "client_label": "aitm-e2e",
+  "command": "scope.list",
+  "connection_id": "conn_67b1a90f94181752-13",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793731894717,
+  "client_label": "aitm-e2e",
+  "command": "proxy.status",
+  "connection_id": "conn_67b1a90f94181752-13",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793731894717,
+  "client_label": "aitm-e2e",
+  "command": "capture.status",
+  "connection_id": "conn_67b1a90f94181752-13",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793731894950,
+  "client_label": "aitm-e2e",
+  "command": "proxy.system.status",
+  "connection_id": "conn_67b1a90f94181752-13",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793731894951,
+  "client_label": "aitm-e2e",
+  "command": "flow.table",
+  "connection_id": "conn_67b1a90f94181752-13",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793731895002,
+  "client_label": "aitm-e2e",
+  "command": "ca.status",
+  "connection_id": "conn_67b1a90f94181752-13",
+  "origin": "operator",
+  "result": "ok"
+ }
+]
+
+== durable audit tail (control stream)
+{"at":1793725101313,"marker":"start","pid":23901,"schema":1,"stream":"control","version":"0.5.17"}
+{"at":1793725101609,"marker":"start","pid":23906,"schema":1,"stream":"control","version":"0.5.17"}
+{"at":1793727049946,"marker":"start","pid":53844,"schema":1,"stream":"control","version":"0.5.18"}
+{"at":1793727233113,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_67b1a90f94181752-4","command":"scope.add","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+{"at":1793727233242,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_67b1a90f94181752-6","command":"scope.remove","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+{"at":1793727233357,"marker":"start","pid":54682,"schema":1,"stream":"control","version":"0.5.18"}
+{"at":1793727239392,"marker":"start","pid":54894,"schema":1,"stream":"control","version":"0.5.18"}
+{"at":1793727239688,"marker":"start","pid":54899,"schema":1,"stream":"control","version":"0.5.18"}

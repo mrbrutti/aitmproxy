@@ -1,0 +1,23 @@
+MAC-0	SKIP	release run only; brew upgrade is Matt's		
+N3-MAC	SKIP	CA stays trusted (un-trusting is Matt's yes; words read from source)		
+N4-MAC	SKIP	needs a plain 8080 listener before launch — yes (it blocks his app's core)		
+N5-MAC	SKIP	hand: Settings ▸ Bus field		
+MAC-1	PASS	app running (bundle 0.5.18); embedded core pid 71655 listening 127.0.0.1:8080 version 0.5.18; lane words: 'running' True, 'connected' True, 'operator ·' True	proxy.status.listening True, version 0.5.18; start marker in audit: True	
+MAC-2	PASS	first-run sheet not shown (already dismissed or every row done); recorded as such		
+MAC-3	PASS	Status page words present: ['system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core.', 'All Apps is on']; missing: []	scope.list ['wikipedia.org']; capture True/attached; system proxy off	
+MAC-4	PASS	rows exist: banner case applies	flow.table rows 2	
+N2-MAC	SKIP	not the N2 state: scope 1 host(s), system proxy off, All Apps True		
+MAC-5	PASS	typed ['example.com:80', 'httpbin.org:443']; rows shown ['example.com:80', 'httpbin.org:443']; pending words []; status-bar error False	scope.list now ['wikipedia.org', 'example.com:80', 'httpbin.org:443']; audit scope.add ok since start: 2	
+MAC-6	SKIP	needs Matt's yes (ACCEPT_YES=MAC-6) and the window		
+MAC-7	PASS	All Apps already on at start; Status page shows the All Apps lane as attached: True	capture.status enabled True feeder listening provider attached handed off {'tcp': 0, 'udp': 0}	
+MAC-8	SKIP	needs a hand: Safari visits http://example.com/ and https://httpbin.org/get		
+MAC-9a	BLOCKED	no extension-captured rows (All Apps on but Scope empty → the extension claims nothing)	capture.status flows_handed_off {'tcp': 0, 'udp': 0}	
+MAC-9b	PASS	2 proxied rows, 2 carry a source_app → Apps sidebar shows them	flow.table source_app null ×0	
+MAC-10	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-11	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-12	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-13	PASS	new core pid 90646; Scope rows kept True; back on 8080 True (holder: aitm pid 90646); stale failed banner present False	scope.list before ['wikipedia.org', 'example.com:80', 'httpbin.org:443'] after ['wikipedia.org', 'example.com:80', 'httpbin.org:443']	
+N1-MAC	SKIP	needs --manual (a hand watches the restart) — the restart itself ran as MAC-13		
+MAC-14	SKIP	All Apps was already on at start (operator's state) — not turned off by the run		
+MAC-15	SKIP	nothing to restore (MAC-6 did not set it)		
+MAC-16	SKIP	the app was already running at start; not quit by the run (Matt's app)		

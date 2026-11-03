@@ -33,7 +33,8 @@ import time
 E2E = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, E2E)
 from aitm_e2e import is_manual, pause  # noqa: E402
-from aitm_e2e.installed import (  # noqa: E402
+from aitm_e2e.installed import (
+    has_text_field,  # noqa: E402
     StepWriter,
     app_version,
     append_leftover,
@@ -137,18 +138,22 @@ def core_holds_8080(core) -> str | None:
     return f"8080 holder is {port_holder(8080) or 'nobody'}, not this app's core pid {core.pid}; a yes press would act on the wrong core"
 
 
+SCOPE_FIELD_DESC = "Host to add to scope"
+SCOPE_FIELD_ID = "scope-add-host"   # the sheet field's identifier (#318); the page's copy is scope-page-add-host
+
+
 def open_scope_sheet() -> bool:
-    """Proxy ▸ Scope… navigates to the page first; a second press opens the Edit Scope sheet."""
-    for _ in range(2):
+    """Proxy ▸ Scope… navigates to the page first; a second press opens the Edit Scope sheet.
+    The sheet is open only when the dump has the SHEET field's identifier `scope-add-host`; the page
+    carries its own copy of the field (`scope-page-add-host`, same description), which is what the
+    0.5.18 run A matched and then typed into nothing (MAC-5, harness defect)."""
+    for _ in range(3):
         menu("Proxy", "Scope…")
         time.sleep(1.0)
-        if "Host to add to scope" in ax():
+        dump = ax()
+        if has_text_field(dump, SCOPE_FIELD_ID):
             return True
     return False
-
-
-SCOPE_FIELD_DESC = "Host to add to scope"
-SCOPE_FIELD_ID = "scope-add-host"   # the identifier the mac fix adds; the description is the fallback
 
 
 def click_scope_field() -> bool:
@@ -156,10 +161,18 @@ def click_scope_field() -> bool:
     through accessibility right before each click (identifier when present, else description) and
     refuses if it is gone or moved. The sheet does not focus the field itself when Scope already
     has hosts (run 5, MAC-5)."""
-    out = sh("bash", os.path.join(LIB, "click.sh"), SCOPE_FIELD_DESC, SCOPE_FIELD_ID)
+    # Focus through accessibility first: `ax_focus.sh` sets AXFocused on the element with the
+    # identifier (System Events' `click at {x,y}` does not land on a window with negative
+    # coordinates, e.g. a main window on an upper display; 0.5.18 run A). The point click stays
+    # as the fallback when the helper refuses.
+    out = sh("bash", os.path.join(LIB, "ax_focus.sh"), SCOPE_FIELD_ID)
+    ok = any(ln.strip() == f"focused {SCOPE_FIELD_ID}" for ln in out.splitlines())
+    if not ok:
+        out = sh("bash", os.path.join(LIB, "click.sh"), SCOPE_FIELD_DESC, SCOPE_FIELD_ID)
+        ok = any(ln.strip().startswith("clicked ") for ln in out.splitlines())
     time.sleep(0.4)
     globals()["last_click"] = out.strip()[:160]
-    return "clicked" in out
+    return ok
 
 
 def field_focused() -> bool:
@@ -278,7 +291,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
     elif not targets:
         step("MAC-5", "PASS", f"both hosts were already in Scope before the run ({pre}); nothing typed, nothing to remove later", f"scope.list {sc}")
     elif not open_scope_sheet():
-        step("MAC-5", "FAIL", "Proxy ▸ Scope… (twice) did not show the Edit Scope sheet's field 'Host to add to scope'; nothing typed")
+        step("MAC-5", "FAIL", "Proxy ▸ Scope… (three presses) never produced an AXTextField with identifier scope-add-host (the page field scope-page-add-host does not count); nothing typed")
     elif not click_scope_field():
         step("MAC-5", "FAIL", f"the Edit Scope field could not be clicked ({globals().get('last_click', 'click.sh gave no output')}); nothing typed")
     elif not field_focused():
@@ -340,8 +353,11 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 menu("Proxy", "Status")
                 time.sleep(1.2)
                 dump = ax()
-                on = "All Apps is on" in dump
-                step("MAC-7", "PASS" if on and cap.get("provider", {}).get("state") == "attached" else "FAIL", f"All Apps already on at start; Status page shows 'All Apps is on': {on}", tr)
+                save_dump("MAC-7-ax.txt", dump)
+                # Since #303 the lane reads "attached · n hosts in scope · m flows handed off" (or
+                # "on, core not attached · <reason>") instead of the literal "All Apps is on".
+                on = "All Apps is on" in dump or re.search(r"attached · \d+ hosts? in scope · \d+ flows? handed off", dump) is not None
+                step("MAC-7", "PASS" if on and cap.get("provider", {}).get("state") == "attached" else "FAIL", f"All Apps already on at start; Status page shows the All Apps lane as attached: {on}", tr)
         elif "MAC-7" not in YES or not WINDOW:
             step("MAC-7", "SKIP", "needs Matt's yes (ACCEPT_YES=MAC-7) and the window")
         elif hold:
@@ -354,7 +370,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             menu("Proxy", "Status")
             time.sleep(1.2)
             dump = ax()
-            word = "All Apps is on" in dump or "All Apps waiting for approval" in dump
+            word = "All Apps is on" in dump or "All Apps waiting for approval" in dump or re.search(r"attached · \d+ hosts? in scope|on, core not attached", dump) is not None
             step("MAC-7", "PASS" if cap2.get("enabled") and cap2.get("feeder", {}).get("state") == "listening" and word else "FAIL", f"{pressed.strip()}; Status word present {word}", f"capture.status {json.dumps({k: cap2.get(k) for k in ('enabled', 'capability', 'feeder', 'provider')})}")
 
         # MAC-8 — real browser rows (hand).
@@ -447,13 +463,29 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 core2 = find_embedded_core()
             except RuntimeError:
                 pass
+            # The new core must be back on 8080 before anything else probes the port: a cell that
+            # starts `aitm web` in the gap takes 8080 and the core falls back to an ephemeral port
+            # (0.5.18 run A). Wait up to 20 s and record who holds the port.
+            holder_pid = None
+            for _ in range(20):
+                if core2 is None:
+                    try:
+                        core2 = find_embedded_core()
+                    except RuntimeError:
+                        core2 = None
+                holder_pid = port_holder_pid(8080)
+                if core2 is not None and holder_pid == core2.pid:
+                    break
+                time.sleep(1)
+            holder = port_holder(8080) or "nobody"
+            on_8080 = core2 is not None and holder_pid == core2.pid
             bus2 = connect(core2) if core2 else None
             sc_after = bus2.call("scope.list", {}) if bus2 else None
             dump = ax()
             save_dump("MAC-13-ax.txt", dump)
             kept = sc_after is not None and all(h in sc_after for h in sc_before)
-            ok = bus2 is not None and bus2.call("proxy.status", {}).get("listening") is True and kept
-            step("MAC-13", "PASS" if ok and "Embedded core failed" not in dump else "FAIL", f"new core pid {core2.pid if core2 else None}; Scope rows kept {kept}; stale failed banner present {'Embedded core failed' in dump}", f"scope.list before {sc_before} after {sc_after}")
+            ok = bus2 is not None and bus2.call("proxy.status", {}).get("listening") is True and kept and on_8080
+            step("MAC-13", "PASS" if ok and "Embedded core failed" not in dump else "FAIL", f"new core pid {core2.pid if core2 else None}; Scope rows kept {kept}; back on 8080 {on_8080} (holder: {holder}); stale failed banner present {'Embedded core failed' in dump}", f"scope.list before {sc_before} after {sc_after}")
             if not is_manual():
                 step("N1-MAC", "SKIP", "needs --manual (a hand watches the restart) — the restart itself ran as MAC-13")
             elif not n1_clicked:

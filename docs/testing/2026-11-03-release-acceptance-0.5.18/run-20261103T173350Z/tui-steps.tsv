@@ -1,0 +1,14 @@
+TUI-1	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-2	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-3	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-4	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-5a	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-5b	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-6	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-7	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-8	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+N2-TUI	SKIP	port 8080 held by aitm pid 53844; aitm tui needs the default ports (quit the app first)		
+TUI-9	N/A	no All Apps control on this surface		UIs pending (per-host decryption decision)
+TUI-10	N/A	no Apps view on this surface on 0.5.10		
+N1-TUI	N/A	aitm tui owns its core on 0.5.10; the app's restart is seen only from aitm-tui --bus		
+N3-TUI	SKIP	CA stays trusted (un-trusting is Matt's yes; words read from source)		

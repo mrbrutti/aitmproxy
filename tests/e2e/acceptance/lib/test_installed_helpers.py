@@ -20,7 +20,8 @@ import time
 
 E2E = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, E2E)
-from aitm_e2e.installed import (  # noqa: E402
+from aitm_e2e.installed import (
+    has_text_field,  # noqa: E402
     field_center,
     SERVICES,
     TOOLING,
@@ -389,6 +390,13 @@ def test_field_center() -> None:
         "AXTextField\t\t\tHost to add to scope\tscope-add-host\t500,600\t200,24",
         "AXTextField\t\t\tHost to add to scope\t\t0,0\t0,0",
     ])
+    # has_text_field: the sheet field counts, the page's same-description copy does not
+    page_row = "AXTextField\tmissing value\tmissing value\tHost to add to scope\tscope-page-add-host\t771,-1164\t1037,28"
+    sheet_row = "AXTextField\tmissing value\tmissing value\tHost to add to scope\tscope-add-host\t506,-448\t195,16"
+    check(has_text_field(page_row, "scope-add-host") is False, "page field (scope-page-add-host) does not count as the sheet field")
+    check(has_text_field(page_row + "\n" + sheet_row, "scope-add-host") is True, "sheet field (scope-add-host) is found")
+    check(has_text_field("AXButton\tmissing value\tmissing value\tScope, 1", "scope-add-host") is False, "4-column rows never match")
+
     check(field_center(dump, "Host to add to scope", "scope-add-host") == (600, 612), "the identifier row wins over an earlier description match")
     check(field_center(dump, "Host to add to scope", "no-such-id") == (400, 412), "falls back to the first description match with a real size")
     check(field_center(dump, "Host to add to scope") == (400, 412), "no identifier asked: first description match")
