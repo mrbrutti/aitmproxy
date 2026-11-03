@@ -1,0 +1,2 @@
+cli-livecore	SKIP	CLI-0   SKIP    release run only; brew upgrade is Matt's
+mac	FAIL	exit 1

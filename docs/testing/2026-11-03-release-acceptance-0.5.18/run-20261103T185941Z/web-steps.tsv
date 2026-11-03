@@ -1,0 +1,18 @@
+WEB-1	PASS	card lines 16 on stderr (0 loader lines; stdout 0 lines); Web UI line: True, Proxy line: True, Browser line (SSRF-filtered): True, Bus ready: True, stdout empty: True, Scope line (Scope empty): True; Operator line present; config scope empty True; /healthz {"ok":true}		
+WEB-4	SKIP	bypass list absent in config.yaml system_proxy.bypass (none); add it through Settings first		
+WEB-2	PASS	banner true; pill "aitmproxyv0.5.18WorkingPinnedSaved0AllApps0Domains0aitmproxyScope0ScanFindings0Browser1 tabScripts49 activeL4offAgent0/min⌘⇧Faitmproxy · listening 127.0.0.1:8080 · sys-proxy off · CA trustedAgent0Operator session — sensitive commands are enabled.AllHTTPHTTPSWebSocketTCPUDPL4h1h2JS		
+WEB-3	PASS	host example.com; empty-state before true; row listed true; status "1 host in scope"; toast ""	audit scope.add entries since start: 1	
+N2-WEB	PASS	pill "sys-proxy off"; empty grid words true; rows 1 (zero rows is correct here)		
+WEB-4	SKIP	needs Matt's yes (ACCEPT_YES=WEB-4)	scutil: not 8080; ExceptionsList carries the tooling False; identical to before: True	
+WEB-5	BLOCKED	WEB-4 did not set the route	judged from the page (grid rows) by the mjs; the web cell has no bus client	
+WEB-6a	PASS	status bar "Intercept armed — every request pauses here Disarm i Rules…"; Disarm true; Rules… true		
+WEB-6b	BLOCKED	WEB-4		
+WEB-6c	BLOCKED	WEB-6b		
+WEB-6d	PASS	bar gone true		
+WEB-7	SKIP	nothing to restore (WEB-4 did not run)	scutil: not 8080; ExceptionsList carries the tooling False; identical to before: True	
+N5-WEB	PASS	banner verbatim		
+WEB-8	PASS	exit 0; ports free True; scutil identical True; run/cores pointers left []	audit: no proxy.system.set left unmatched	
+WEB-9	N/A	no All Apps control on this surface		UIs pending (per-host decryption decision)
+WEB-10	N/A	no Apps view on this surface on 0.5.10		
+N1-WEB	N/A	aitm web owns its core: a core restart under an open tab is not performable here (words pinned in D7)		
+N3-WEB	SKIP	CA stays trusted (un-trusting is Matt's yes; words read from source)		

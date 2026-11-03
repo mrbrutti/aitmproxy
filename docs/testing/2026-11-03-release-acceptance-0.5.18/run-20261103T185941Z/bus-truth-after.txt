@@ -1,0 +1,1 @@
+[SKIP] the installed app's embedded core is not running

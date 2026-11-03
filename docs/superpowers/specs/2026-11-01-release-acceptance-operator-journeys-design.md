@@ -96,7 +96,7 @@ that fails blocks the release until it is fixed or Matt accepts it in writing in
   `--bus-endpoint-file` + the config's `mcp.operator_token` for a terminal core. The client is
   `tests/e2e/aitm_e2e/bus.py` (token line, then newline-delimited JSON-RPC). The token is read
   into a variable and never echoed.
-- **Driving the UIs:** the mac app through System Events menu presses, keystrokes and clicks
+- **Driving the UIs:** the mac app through System Events menu presses, keystrokes and clicks, and keyboard focus set through `AXUIElementSetAttributeValue(AXFocused)` on an element found by accessibility identifier (`lib/ax_focus.sh`, window-gated) where a point click cannot land;
   while it is frontmost (probe focus with one harmless character first; `pbcopy`+⌘V for text the
   keyboard cannot type; `screencapture -l <win>` in a background loop for transient states), the
   TUI through a Python pty with `TIOCSWINSZ` set before the first read and the cell-diff stream
@@ -186,7 +186,7 @@ a proxied flow carries none.
 | MAC-4 | auto | Flows page, empty | "No flows yet" with one row per closed route carrying the full line and its button(s) (the MAC-3 words). | `flow.table.flows == []` |
 | MAC-5 | auto | Proxy ▸ Scope… (⇧⌘O), then on the page the Edit Scope sheet: type `example.com:80` (then `httpbin.org:443`) into the field with placeholder "host:443 or host:80 (for now), host:port or *.wildcard:port", press "Add" (⌘⏎) | The host appears as a normal row (not tertiary "pending") within one poll (≤ 2 s). Status bar shows no "add to scope:" error. Overview/sidebar Scope count rises. | `scope.list` contains the entry; audit has one `scope.add` with `origin: operator`, `result: "ok"`. Persisted: after MAC-13's restart, `scope.list` still contains it (spec 2026-10-31-macos-scope-persistence). |
 | MAC-6 | **yes** (precondition: the Settings ▸ Proxy "Bypass hosts" key is set and carries the operator's tooling; an unset key means the app would pass its own default, which the run cannot read back, so the step is SKIP `bypass list absent in the app's Settings` until Matt saves the field once) | Proxy ▸ "Set as System Proxy" (⌥⌘P) — or the first-run row 1 / Status button | Status step becomes "system proxy on · 127.0.0.1:8080"; menu item title flips to "Restore System Proxy"; Flows banner no longer names the system proxy. `scutil --proxy` shows `HTTPEnable 1`, `HTTPSEnable 1`, `HTTPProxy 127.0.0.1`, `HTTPPort 8080` and the bypass list. | `proxy.system.status` = `{state: "points_at_us", managed_by_us: true}`; `proxy.status.system_proxy.state == "points_at_us"`; audit `proxy.system.set` ok; `system-proxy-state.json` written (0600). |
-| MAC-7 | **yes** | Proxy ▸ "Capture All Apps" (⌃⌘A) | Status All Apps step "All Apps is on"; lane card "on" (or "on, nothing in scope" before MAC-5). If macOS asks: "All Apps waiting for approval — approve the extension in System Settings" and the Apps empty state "Waiting for approval". | `capture.status` = `{enabled: true, feeder.state: "listening", provider.state: "attached"}`; `systemextensionsctl list` shows `[activated enabled]`. |
+| MAC-7 | **yes** | Proxy ▸ "Capture All Apps" (⌃⌘A) | Status All Apps lane word "all apps on · <n> hosts in scope", detail "attached · <n> hosts in scope · <m> flows handed off" (or "on, core not attached · <reason>") — #303, 2026-11-03; the Getting Started step title "All Apps is on" counts only while that card is shown (or "on, nothing in scope" before MAC-5). If macOS asks: "All Apps waiting for approval — approve the extension in System Settings" and the Apps empty state "Waiting for approval". | `capture.status` = `{enabled: true, feeder.state: "listening", provider.state: "attached"}`; `systemextensionsctl list` shows `[activated enabled]`. |
 | MAC-8 | hand | In Safari (or Chrome), open `http://example.com/` then `https://httpbin.org/get` | Flows rows: `GET http://example.com/ 200` and `GET https://httpbin.org/get 200` with tunnel "decrypted" (not "passthrough"); a `CONNECT` row for httpbin. Sidebar Flows/Domains counts rise. No banner about the CA. | `flow.table` rows with `authority` = the hosts, `status 200`, `tunnel == "decrypted"`, `tunnel_reason == null`; a row from the extension carries `capture_interface == "macos-ne"` and a `source_app`; a proxied row carries `source_app == null`. |
 | MAC-9a | auto (depends on MAC-7) | Apps sidebar, extension-captured flows | A group for the browser with its flow count. The group name for Safari's `com.apple.WebKit.Networking` is **"WebKit Networking"** at `c65ed0f2` (`AppIdentifier.knownUnbundled`, "a shared service is never a host app"); the flow row's client label for the same id is "Safari" (`ClientInfo.knownSourceApps`). The two Kit tables disagree; the acceptance quotes both and the mac-app-icons-and-names spec decides which wins. Chrome shows "Google Chrome". | `flow.table`: `source_app` non-null and `capture_interface == "macos-ne"` for those rows. |
 | MAC-9b | auto (depends on MAC-6) | Apps sidebar, proxied flows (system proxy only, All Apps off or Scope empty for the extension) | **Required:** the proxied flow is attributed to its client app and grouped. **0.5.10:** no app is shown and the table has an empty client column; the empty state "No app attribution yet" appears only when there are no flows at all. Expected FAIL on 0.5.10 (Matt's "NOTHING is there"); Explains: missing feature, session core-name-the-client-app. | `flow.table` rows: `source_app == null` on every proxied row. |
@@ -338,15 +338,16 @@ Where each negative is observed (its cell):
   the text field through accessibility right before EACH of two clicks 0.9 s apart, frontmost first,
   and refuses if the field is gone or moved — no stale coordinates) used on the Edit Scope field
   before the focus probe — the sheet does not focus its field when Scope already has hosts (run 5,
-  MAC-5); the field is located by accessibility identifier when the app exposes one (`scope-add-host`
-  once the mac fix lands), else by its description "Host to add to scope"; `lib/ax_texts.sh` is the
+  MAC-5); the Edit Scope sheet is recognised only by the sheet field's identifier `scope-add-host` (#318; the
+  page's copy of the field is `scope-page-add-host`, same description, and does not count); the click
+  fallback locates by identifier, else by the description "Host to add to scope"; `lib/ax_texts.sh` is the
   read-only accessibility read of window 1 (rows `role · title · value · description`, text fields
   also `identifier · x,y · w,h`; `menu <Menu>` and `bounds` sub-modes): a compiled AXUIElement walk
   (`lib/ax_texts.swift`, built once per source hash into `${AX_TEXTS_CACHE:-/tmp/claude/acceptance/
   ax-cache}`), falling back to the System Events `entire contents` walk when `swiftc` is absent. It
   performs no click, keystroke or focus change and refuses unless exactly one
   `/Applications/Aitmproxy.app` process is running and the terminal holds Accessibility permission.
-  Every `ax_texts.sh` call in the cell has a 30 s budget; since the compiled walk returns in well
+  `lib/ax_focus.sh` gives one element keyboard focus by accessibility identifier (AXFocused), the harness's only UI-state write besides typing, window-gated. Every `ax_texts.sh` call in the cell has a 30 s budget; since the compiled walk returns in well
   under a second, a dump that exceeds it indicts the app's accessibility tree, not the harness;
   `screencapture -R` loop for N1. tui: `aitm_e2e/tui_pty.py` (extracted from `tests/e2e/tui/test_tui_flows_render.py`:
   `TIOCSWINSZ` and the grid replayer; a plan task, not an existing module). web: Playwright
@@ -607,3 +608,26 @@ Panel (quality PASS, 8 Minors applied: distinct build-failure message with `buil
 via temp + `mv`, `exec`, visited-set cycle guard with a truncation notice, 2 s AX messaging timeout,
 `\r`/`\t` flattening, numeric-pid refusal, comment wording; spec FAIL → this row and the D9
 sentence; cache moved under `/tmp/claude/acceptance/`).
+
+Run follow-up (2026-11-03, `fix/acceptance-0.5.18-harness`, installed 0.5.18 runs A/B): (1) MAC-5 was the
+harness, not the app — `open_scope_sheet` accepted the Scope PAGE's field (same description "Host to add
+to scope", identifier `scope-page-add-host`) as the sheet, and System Events' `click at {x,y}` does not
+land on a window at negative screen coordinates (Matt's main window sits on the upper display); the sheet
+is now recognised only by the sheet field's identifier `scope-add-host` (#318), and focus is set through
+`lib/ax_focus.sh` (AXUIElement `AXFocused := true` on the element by identifier; the point click remains
+the fallback). (2) N4-TUI entered its alternate screen and N4-WEB started `aitm web` seconds after MAC-13's Restart
+Core had freed 8080 (the n5 cell ran right after the mac cell); `aitm web` bound 8080–8082, published a
+pointer naming the operator's real config, ignored SIGTERM (orchestrator's Terminal checks, registry
+2026-11-03) and left the restarted embedded core on an ephemeral port — both N4 steps now refuse unless the
+installed core holds 8080 by pid identity, N4-WEB kills a child that outlives the cap and records whether
+it died and who holds 8080 afterwards; MAC-13 waits up to 20 s for the new core to be back on 8080 and
+asserts it. (3) MAC-7 reads the #303 lane detail ("attached · n hosts in scope · m flows handed off" /
+"on, core not attached · <reason>") besides the Getting Started title "All Apps is on", which MAC-3 saw and
+MAC-7 did not in run A (the card is gone once every step is done); the MAC-7 row is amended and the cell
+saves `MAC-7-ax.txt`. (4) TUI-1 waits for the
+`sys-proxy` / `CA trusted` pills (drawn on the first bus tick) instead of reading the first frame. Product
+follow-ups recorded for cards: the embedded core's fallback port is silent while Set as System Proxy still
+points at 8080; `aitm web` does not exit on SIGTERM. Evidence on the installed 0.5.18 with this harness
+(`docs/testing/2026-11-03-release-acceptance-0.5.18/run-20261103T192247Z`): MAC-5 PASS (sheet by identifier,
+focus via `ax_focus.sh`, both hosts typed and shown), MAC-7 PASS, MAC-13 PASS "back on 8080 True", N4-TUI and
+N4-WEB PASS behind the pid gate; TUI-1's pill wait awaits a ports-free run.

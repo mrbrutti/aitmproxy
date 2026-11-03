@@ -1,0 +1,3 @@
+N5-CLI	N/A	the one-shot refusal is CLI-6's row (no separate step on this surface)		
+N5-TUI	PASS	exact refusal sentence shown; TUI stays open with the message	core 127.0.0.1:62960 refused the token line (unauthorized)	
+N4-TUI	FAIL	panel False; exit None (None = still running after 5 s, stopped by the cell); alternate screen entered True; missing ['headline without a trailing period', 'holder sentence', 'free-it sentence', 'fix line (`fix:` or `▸` + lsof)']		

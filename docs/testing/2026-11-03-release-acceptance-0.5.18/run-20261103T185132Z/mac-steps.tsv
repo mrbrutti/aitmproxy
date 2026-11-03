@@ -1,0 +1,24 @@
+MAC-0	SKIP	release run only; brew upgrade is Matt's		
+N3-MAC	SKIP	CA stays trusted (un-trusting is Matt's yes; words read from source)		
+N4-MAC	SKIP	needs a plain 8080 listener before launch — yes (it blocks his app's core)		
+N5-MAC	SKIP	hand: Settings ▸ Bus field		
+MAC-1	PASS	app running (bundle 0.5.18); embedded core pid 53844 listening 127.0.0.1:8080 version 0.5.18; lane words: 'running' True, 'connected' True, 'operator ·' True	proxy.status.listening True, version 0.5.18; start marker in audit: True	
+MAC-2	PASS	first-run sheet not shown (already dismissed or every row done); recorded as such		
+MAC-3	PASS	Status page words present: ['system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core.', 'All Apps is on']; missing: []	scope.list ['wikipedia.org']; capture True/attached; system proxy off	
+MAC-4	PASS	rows exist: banner case applies	flow.table rows 8	
+N2-MAC	SKIP	not the N2 state: scope 1 host(s), system proxy off, All Apps True		
+MAC-5	FAIL	the sheet's field did not take the focus probe (typed '1' not read back); refusing to type into an unknown target		
+MAC-6	PASS	pressed Proxy > Set as System Proxy (enabled=true); menu now has Restore System Proxy: True; scutil 8080: True; bypass applied: True	proxy.system.status points_at_us managed_by_us True	
+MAC-7	FAIL	All Apps already on at start; Status page shows 'All Apps is on': False	capture.status enabled True feeder listening provider attached handed off {'tcp': 0, 'udp': 0}	
+MAC-8	BLOCKED	needs MAC-5 and a route (MAC-6 or MAC-7)		
+MAC-9a	BLOCKED	no extension-captured rows (All Apps on but Scope empty → the extension claims nothing)	capture.status flows_handed_off {'tcp': 0, 'udp': 0}	
+MAC-9b	PASS	30 proxied rows, 30 carry a source_app → Apps sidebar shows them	flow.table source_app null ×0	
+MAC-10	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-11	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-12	BLOCKED	needs MAC-8 rows, the window and a hand (reload in Safari)		
+MAC-13	PASS	new core pid 68292; Scope rows kept True; stale failed banner present False	scope.list before ['wikipedia.org'] after ['wikipedia.org']	
+N1-MAC	SKIP	needs --manual (a hand watches the restart) — the restart itself ran as MAC-13		
+MAC-14	SKIP	All Apps was already on at start (operator's state) — not turned off by the run		
+MAC-15	SKIP	8080 holder is nobody, not this app's core pid 68292; a yes press would act on the wrong core — the trap will restore		
+MAC-16	SKIP	the app was already running at start; not quit by the run (Matt's app)		
+RESTORE	PASS	restored; scutil identical True; errors []		
