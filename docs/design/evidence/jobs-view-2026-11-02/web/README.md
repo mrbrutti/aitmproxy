@@ -1,32 +1,32 @@
 # Live proof, web Part 3: the Jobs view (W2) against a real core
 
-Run 7 of `proof.sh` (this folder; it lived at `/tmp/claude/web-proof.sh`), on `feat/scan-jobs-view-web` 27f09cb6, in the Terminal outside the sandbox.
+Run 8 (the merged head: `origin/main` 565daff6 = #320 in, base `main`; runs 2–7 are in plan gap 80) of `proof.sh` (this folder; it lived at `/tmp/claude/web-proof.sh`), on `feat/scan-jobs-view-web` fac356d1, in the Terminal outside the sandbox.
 
 **What ran.** `apps/web` built from the tree (`npm run build`), `aitm` and `aitm-testtarget-serve` built `--release` from the same tree, then `node scripts/scan-live.mjs` (Task 3.11's driver): a fresh run directory under `$TMPDIR`, `aitm` on random loopback ports with the operator bridge, `aitm-testtarget-serve --latency-ms 400` as the target, headless Chrome driven over CDP with real pointer and keyboard input (`scripts/cua-driver.mjs`), the witness being the driver's own bus connection (`scan.list` / `scan.status` / `scan.start` with the operator token). Steps 01–08 are the scanner driver that already existed (gap 56 matcher updates); 09–12 are the Jobs-view steps this PR adds. Viewport 1440 × 900 for the stills.
 
 **Launch guard (#310, the rule for every proof).** Both audit logs of the written harness config sit under the run directory, read from the file the core was started with, at startup and again after the 08b restart; the run aborts otherwise. Matt's real logs are digested before and after:
 
 ```
-# at startup: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-VNtZPR/config.yaml
-run dir: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-VNtZPR
-mcp:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-VNtZPR/audit.jsonl"
-ca:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-VNtZPR/ca-audit.jsonl"
+# at startup: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-gN4s8a/config.yaml
+run dir: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-gN4s8a
+mcp:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-gN4s8a/audit.jsonl"
+ca:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-gN4s8a/ca-audit.jsonl"
 verdict: both inside the run dir
 
-# after the 08b restart: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-lswyTH/config.yaml
-run dir: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-lswyTH
-mcp:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-lswyTH/audit.jsonl"
-ca:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-lswyTH/ca-audit.jsonl"
+# after the 08b restart: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-W5gY0M/config.yaml
+run dir: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-W5gY0M
+mcp:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-W5gY0M/audit.jsonl"
+ca:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-W5gY0M/ca-audit.jsonl"
 verdict: both inside the run dir
 ```
 
 ```
 operator store: /Users/matt/Library/Application Support/aitmproxy
-before 2026-11-03T08:39:22.677Z
-  audit.jsonl size=94174 sha256=c46ffd72f578a93465317f149afae706dcf6e2921b6cc6d5418c5e9a4e6b6d41
+before 2026-11-03T17:48:22.785Z
+  audit.jsonl size=100387 sha256=d77844b13c4cd861267e504a4581960c9bfd346e521de4602d4cfe40e7e08a8f
   ca-audit.jsonl size=20889 sha256=ed14b58f15856db8a3d0dbef3a5da3f51d3e028bb205158b5c924a23ec1c42c8
-after 2026-11-03T08:49:52.490Z
-  audit.jsonl size=94174 sha256=c46ffd72f578a93465317f149afae706dcf6e2921b6cc6d5418c5e9a4e6b6d41
+after 2026-11-03T17:58:52.785Z
+  audit.jsonl size=100387 sha256=d77844b13c4cd861267e504a4581960c9bfd346e521de4602d4cfe40e7e08a8f
   ca-audit.jsonl size=20889 sha256=ed14b58f15856db8a3d0dbef3a5da3f51d3e028bb205158b5c924a23ec1c42c8
 verdict: UNCHANGED
 ```
@@ -58,7 +58,7 @@ verdict: UNCHANGED
 | PASS | 10b the end sentence elapsed is the witness elapsed_ms (±1 s) |
 | PASS | 10c no [data-field=stopped] line for a cancelled job (D4) |
 | PASS | 10d the run directory audit log holds exactly one scan.cancel for the job |
-| NOTE | 11 start — standard against http://127.0.0.1:57592 (port 57592, never listened on) over the witness: scan-4c192124 |
+| NOTE | 11 start — standard against http://127.0.0.1:53354 (port 53354, never listened on) over the witness: scan-f6c95499 |
 | PASS | 11a [data-field=stopped] reads the D4 sentence for stopped_reason errors |
 | PASS | 11c the attention line reads `<n> checks could not run` with n = the witness checks.errors |
 | PASS | 11c the attention details opens on a real click |
@@ -68,7 +68,7 @@ verdict: UNCHANGED
 
 ## AC58 (a): running · auditing with the now mark (`status-09.json`, `09-jobs-auditing.png`)
 
-Job `scan-ee950cc5`, profile `standard`. Each capture followed a poll of the witness's `scan.status` *state* (`running · auditing`), never the rendered word; the bracket is a witness read before and one after the DOM read, with a third read 2 s earlier for the now tag.
+Job `scan-9b98b419`, profile `standard`. Each capture followed a poll of the witness's `scan.status` *state* (`running · auditing`), never the rendered word; the bracket is a witness read before and one after the DOM read, with a third read 2 s earlier for the now tag.
 
 | Block | Rendered | Witness (before → after) |
 | --- | --- | --- |
@@ -82,19 +82,19 @@ Job `scan-ee950cc5`, profile `standard`. Each capture followed a poll of the wit
 
 ## AC58 (b): cancelled by one press (`status-10.json`, `10-jobs-cancelled.png`)
 
-Job `scan-ee950cc5`: one real click on the card's `Cancel scan scan-ee950cc5`; the witness's first read after the press (`cancelled` in `status-10.json`) already read `cancelled` (the `10 witness` NOTE above gives the delay).
+Job `scan-9b98b419`: one real click on the card's `Cancel scan scan-9b98b419`; the witness's first read after the press (`cancelled` in `status-10.json`) already read `cancelled` (the `10 witness` NOTE above gives the delay).
 
 | Block | Rendered | Witness `scan.status` (final) |
 | --- | --- | --- |
 | chip / row state | `Cancelled` / `Cancelled` | `cancelled` |
-| end sentence | `Cancelled after 0:18; 467 of 1,072 checks had run. What it found stays.` | elapsed_ms 18033 (0:18); checks.done 467 of scheduled 1072 |
+| end sentence | `Cancelled after 0:18; 467 of 1,072 checks had run. What it found stays.` | elapsed_ms 18034 (0:18); checks.done 467 of scheduled 1072 |
 | `[data-field=stopped]` | absent | `stopped_reason` `cancelled` (D4: no Stopped line for a cancel) |
 | row progress | `467 of 1,072` | |
 | run-dir audit log | exactly one `scan.cancel` for the job (10d) | |
 
 ## AC58 (c): dead target, done + `stopped_reason: errors` (`status-11.json`, `11-jobs-dead.png`, `11-jobs-dead-attention.png`)
 
-Job `scan-4c192124`, `standard` against a port nothing listens on (asserted distinct from the proxy, web and target ports and refused by a connect; step 00's NOTE), started over the witness bus because the editor's origin picker is a native `<select>` headless Chrome cannot drive.
+Job `scan-f6c95499`, `standard` against a port nothing listens on (asserted distinct from the proxy, web and target ports and refused by a connect; step 00's NOTE), started over the witness bus because the editor's origin picker is a native `<select>` headless Chrome cannot drive.
 
 | Block | Rendered | Witness |
 | --- | --- | --- |
@@ -131,15 +131,15 @@ Not in the comp and present in the stills: the app's sidebar, toolbar and flow t
 | Result | Step |
 | --- | --- |
 | NOTE | 00 audit-log preflight at startup — mcp "<run dir>/audit.jsonl" · ca "<run dir>/ca-audit.jsonl" (inside <run dir>) |
-| NOTE | 00 dead port at startup — 57592 is none of {"proxy":57595,"web":57597,"target":57594} nor of the config's [57595,57596], and a connect is refused |
+| NOTE | 00 dead port at startup — 53354 is none of {"proxy":53357,"web":53359,"target":53356} nor of the config's [53357,53358], and a connect is refused |
 | NOTE | 03c transient phases — seen by the witness for under 1000 ms, not judged: passive (1 ms) |
 | NOTE | 03 job state after the phase track — running · auditing (94 probes) |
 | NOTE | 04 issue pick — no hinted-class row (listed: security-header, reflection, cookie-flag, headers); first row |
 | GAP | 04d PoC ref — security-header (security-header, firm) carries no poc_ref and no hinted-class issue was listed |
-| NOTE | 05 first job — terminal 555278 ms after step 4 ended |
+| NOTE | 05 first job — terminal 555384 ms after step 4 ended |
 | NOTE | 07 panel left for the inspector — the Scan panel unmounted |
 | NOTE | 00 audit-log preflight after the 08b restart — mcp "<run dir>/audit.jsonl" · ca "<run dir>/ca-audit.jsonl" (inside <run dir>) |
-| NOTE | 00 dead port after the 08b restart — 57592 is none of {"proxy":60336,"web":60338,"target":57594} nor of the config's [60336,60337], and a connect is refused |
+| NOTE | 00 dead port after the 08b restart — 53354 is none of {"proxy":56106,"web":56108,"target":53356} nor of the config's [56106,56107], and a connect is refused |
 | NOTE | 08b witness scan.start — status "needs_confirmation" |
 
 The full log is `scan-live.log` (run directories replaced by `<run dir>`; the token lines dropped).

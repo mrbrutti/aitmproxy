@@ -1,23 +1,23 @@
 {
-  "job": "scan-4c192124",
+  "job": "scan-f6c95499",
   "terminal": {
     "checks": {
       "done": 7,
       "error_samples": [
         {
           "check": "headers",
-          "detail": "error: check-security-headers:49 — hook 'anon$054414bd93e1beac' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
-          "point": "origin:http://127.0.0.1:57592"
+          "detail": "error: check-security-headers:49 — hook 'anon$da3d941ba4ab17b6' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:53354"
         },
         {
           "check": "cors",
-          "detail": "error: check-cors:54 — hook 'anon$b095be9f2b3f24f9' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
-          "point": "origin:http://127.0.0.1:57592"
+          "detail": "error: check-cors:54 — hook 'anon$31aa29c4db9a1bd7' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:53354"
         },
         {
           "check": "methods",
-          "detail": "error: check-http-methods:49 — hook 'anon$64621cd75dc5afd2' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
-          "point": "origin:http://127.0.0.1:57592"
+          "detail": "error: check-http-methods:49 — hook 'anon$22acfb1da3447ed6' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:53354"
         }
       ],
       "errors": 3,
@@ -36,9 +36,9 @@
       "pages": 0,
       "queued": 0
     },
-    "elapsed_ms": 6,
+    "elapsed_ms": 5,
     "error": null,
-    "finished_at": 1793695790613,
+    "finished_at": 1793728730894,
     "issues": {
       "by_confidence": {
         "certain": 0,
@@ -54,7 +54,7 @@
       },
       "total": 0
     },
-    "job": "scan-4c192124",
+    "job": "scan-f6c95499",
     "l4": null,
     "lanes": {
       "requested": [
@@ -95,7 +95,7 @@
       "lost": false,
       "reused": false
     },
-    "started_at": 1793695790607,
+    "started_at": 1793728730889,
     "started_by": {
       "client_label": "web-bridge",
       "frontend": "operator"
@@ -103,7 +103,7 @@
     "state": "done",
     "stopped_reason": "errors",
     "targets": [
-      "http://127.0.0.1:57592"
+      "http://127.0.0.1:53354"
     ]
   },
   "final": {
@@ -112,18 +112,18 @@
       "error_samples": [
         {
           "check": "headers",
-          "detail": "error: check-security-headers:49 — hook 'anon$054414bd93e1beac' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
-          "point": "origin:http://127.0.0.1:57592"
+          "detail": "error: check-security-headers:49 — hook 'anon$da3d941ba4ab17b6' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:53354"
         },
         {
           "check": "cors",
-          "detail": "error: check-cors:54 — hook 'anon$b095be9f2b3f24f9' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
-          "point": "origin:http://127.0.0.1:57592"
+          "detail": "error: check-cors:54 — hook 'anon$31aa29c4db9a1bd7' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:53354"
         },
         {
           "check": "methods",
-          "detail": "error: check-http-methods:49 — hook 'anon$64621cd75dc5afd2' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
-          "point": "origin:http://127.0.0.1:57592"
+          "detail": "error: check-http-methods:49 — hook 'anon$22acfb1da3447ed6' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:53354"
         }
       ],
       "errors": 3,
@@ -142,9 +142,9 @@
       "pages": 0,
       "queued": 0
     },
-    "elapsed_ms": 6,
+    "elapsed_ms": 5,
     "error": null,
-    "finished_at": 1793695790613,
+    "finished_at": 1793728730894,
     "issues": {
       "by_confidence": {
         "certain": 0,
@@ -160,7 +160,7 @@
       },
       "total": 0
     },
-    "job": "scan-4c192124",
+    "job": "scan-f6c95499",
     "l4": null,
     "lanes": {
       "requested": [
@@ -201,7 +201,7 @@
       "lost": false,
       "reused": false
     },
-    "started_at": 1793695790607,
+    "started_at": 1793728730889,
     "started_by": {
       "client_label": "web-bridge",
       "frontend": "operator"
@@ -209,7 +209,7 @@
     "state": "done",
     "stopped_reason": "errors",
     "targets": [
-      "http://127.0.0.1:57592"
+      "http://127.0.0.1:53354"
     ]
   },
   "rendered": {
@@ -221,6 +221,6 @@
     "opened": true,
     "sub": "Stopped early: too many errors from the target.",
     "subTitle": "Stopped early: too many errors from the target.",
-    "cardText": "Done 127.0.0.1:57592 Stopped early: too many errors from the target. standard · started 00:49 by web-bridge · finished 00:49 Show Site Map Show Issues Scan Again crawl 0 pages audit 7 checks done Done in 0:00 · 0 points · 9 checks. started 00:49 elapsed 0:00 no issues probe budget 0 of 2,000 Progress — Checks 7 of 9 Probes 0 of 2,000 Points audited 0 of 0 Issues 0 no issues 3 checks could not run headers · error: check-security-headers:49 — hook 'anon$054414bd93e1beac' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. cors · error: check-cors:54 — hook 'anon$b095be9f2b3f24f9' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. methods · error: check-http-methods:49 — hook 'anon$64621cd75dc5afd2' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. The crawl fetched 0 pages and hit 1 error — the target refused the connection stopped_reason: errors crawl.last_error: connect_refused"
+    "cardText": "Done 127.0.0.1:53354 Stopped early: too many errors from the target. standard · started 09:58 by web-bridge · finished 09:58 Show Site Map Show Issues Scan Again crawl 0 pages audit 7 checks done Done in 0:00 · 0 points · 9 checks. started 09:58 elapsed 0:00 no issues probe budget 0 of 2,000 Progress — Checks 7 of 9 Probes 0 of 2,000 Points audited 0 of 0 Issues 0 no issues 3 checks could not run headers · error: check-security-headers:49 — hook 'anon$da3d941ba4ab17b6' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. cors · error: check-cors:54 — hook 'anon$31aa29c4db9a1bd7' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. methods · error: check-http-methods:49 — hook 'anon$22acfb1da3447ed6' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. The crawl fetched 0 pages and hit 1 error — the target refused the connection stopped_reason: errors crawl.last_error: connect_refused"
   }
 }

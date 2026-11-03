@@ -1,8 +1,8 @@
 operator store: /Users/matt/Library/Application Support/aitmproxy
-before 2026-11-03T08:39:22.677Z
-  audit.jsonl size=94174 sha256=c46ffd72f578a93465317f149afae706dcf6e2921b6cc6d5418c5e9a4e6b6d41
+before 2026-11-03T17:48:22.785Z
+  audit.jsonl size=100387 sha256=d77844b13c4cd861267e504a4581960c9bfd346e521de4602d4cfe40e7e08a8f
   ca-audit.jsonl size=20889 sha256=ed14b58f15856db8a3d0dbef3a5da3f51d3e028bb205158b5c924a23ec1c42c8
-after 2026-11-03T08:49:52.490Z
-  audit.jsonl size=94174 sha256=c46ffd72f578a93465317f149afae706dcf6e2921b6cc6d5418c5e9a4e6b6d41
+after 2026-11-03T17:58:52.785Z
+  audit.jsonl size=100387 sha256=d77844b13c4cd861267e504a4581960c9bfd346e521de4602d4cfe40e7e08a8f
   ca-audit.jsonl size=20889 sha256=ed14b58f15856db8a3d0dbef3a5da3f51d3e028bb205158b5c924a23ec1c42c8
 verdict: UNCHANGED

@@ -1,12 +1,12 @@
-# at startup: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-VNtZPR/config.yaml
-run dir: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-VNtZPR
-mcp:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-VNtZPR/audit.jsonl"
-ca:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-VNtZPR/ca-audit.jsonl"
+# at startup: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-gN4s8a/config.yaml
+run dir: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-gN4s8a
+mcp:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-gN4s8a/audit.jsonl"
+ca:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-gN4s8a/ca-audit.jsonl"
 verdict: both inside the run dir
 
-# after the 08b restart: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-lswyTH/config.yaml
-run dir: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-lswyTH
-mcp:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-lswyTH/audit.jsonl"
-ca:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-lswyTH/ca-audit.jsonl"
+# after the 08b restart: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-W5gY0M/config.yaml
+run dir: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-W5gY0M
+mcp:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-W5gY0M/audit.jsonl"
+ca:   audit_log: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-live-W5gY0M/ca-audit.jsonl"
 verdict: both inside the run dir
 
