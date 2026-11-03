@@ -271,12 +271,33 @@ Recorded here so the plan is the single order of work; none of it is a task.
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Kept by the orchestrating session during stage 6. One row per finding. Round 1 reviewed `4349822b..60e1f284`; round 2 reviewed the fix range `60e1f284..c6e180f9` plus the spec commit `4232ea3c`.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
-| 1 | live proof (orchestrating session) | Critical | `AitmApplication` never loads: `[NSApp class]` is `SwiftUI.AppKitApplication`; SwiftUI `@main` ignores `NSPrincipalClass` | spec revised 2026-11-03 (D1 replaced; D5, D6, AC8-AC10 withdrawn); fixed by Task 2 |
+| 1 | live proof | — | The NSPrincipalClass subclass never loaded: SwiftUI's `@main` installs `SwiftUI.AppKitApplication` (lldb) | Superseded by Task 2 (spec revision cd449f60; Task 1 artefacts reverted in 87b96aa1) |
+| 2 | live proof | — | One ⌘Q run and the Setup-sheet menu run still refused: `endSheet` detach lags AppKit's check | Fixed in bf0cce5e (D2 amendment 7d50af02: clear `preventsApplicationTerminationWhenModal` on sheet windows first) |
+| 2+fix | security | Minor | The Rules sheet keeps a local draft until Save; a quit now discards it silently where it used to refuse | Accepted by the orchestrating session under Matt's autonomous-approve mode; spec D4 corrected in 4232ea3c; moving the draft into `Session` is a follow-up |
+| 2+fix | quality | Minor | `Quit.swift` doc comments contradicted themselves after the D2 amendment | Fixed in c6e180f9 |
+| 2+fix | quality | Minor | The end-sheets loop re-queried `NSApp.windows` and relied on the detach the amendment showed can lag | Fixed in c6e180f9 (one snapshot sorted innermost-first, each sheet visited once) |
+| 2+fix | quality | Minor | `QuitRoutesTests` banned any `applicationWillFinishLaunching` | Fixed in 6dbf06e7 (pins `kAEQuitApplication` exactly once instead) |
+| 2+fix | quality | Minor | `thePrincipalClassDetourIsGone` guards a dead end that never reached `main` | Kept: it is spec D6′ item 3 / AC14 as written; flagged to Matt on the PR for trimming later |
+| 2+fix | quality (round 2) | Minor | `Quit.swift` type doc still said every sheet is work-free, which the D4 correction retracted | Fixed in 909443ad (doc comment points at spec D4) |
+| 2+fix | spec | Important | AC12 not fully evidenced: tripwires without output, `selftest-live-embedded.sh` not run | Tripwire output recorded (/tmp/claude/qes/tripwires.log, four EXIT 0). `selftest-live-embedded.sh` runs `./build.sh` (installs over ~/Applications) and quits the installed app by name, both forbidden here; AC12 amended in 4232ea3c: normal-quit teardown proven by the dev-bundle matrix, menu walk by `tools/selftest-live.sh` with `APP_BIN` = dev binary against an external core from the dev bundle (LIVE SELFTEST PASS 99 checks) |
+| 2+fix | spec | Minor | AC7 shown by timing (Termination commencing → complete ≈ 0.12 s inside the 5 s SIGTERM grace), not by core log lines | Accepted as the AC7 evidence |
+| 2+fix | spec | Minor | Compose proof logs printed `sheets=0` beside PASS (a re-query after the gate) | Harness fixed; the final matrix carries the corrected line |
+| 2+fix | spec | Minor | AC6 new-window count and AC14 command-modifier attribute not queried literally | Accepted: process exit ~0.4 s after `terminate:` and the ⌘Q route itself are stronger evidence |
+| 2+fix | spec | Minor | The plan's Terminal red run at 437386f5 was a sandbox probe | Accepted: the AC13 negative control (CommandGroup removed → suite fails; restored → passes) substitutes |
+| 2+fix | spec | Minor | Rust gate not run on the branch | Run in the Terminal (/tmp/claude/qes/rust-gate.log); no Rust changed |
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+Branch `claude/gallant-hawking-61d70e`, PR against `main` opened 2026-11-03 by the session of the same name; merged by the orchestrator (fill the merge SHA at integration).
+
+**What merged.** `Quit.endSheetsAndTerminate()` (`apps/mac/Sources/Aitmproxy/Quit.swift`): clears `preventsApplicationTerminationWhenModal` on every attached sheet window, ends the sheets innermost first, then `NSApp.terminate(nil)`. Two callers in `App.swift`: the replaced `.appTermination` command ("Quit Aitmproxy", ⌘Q) and a `kAEQuitApplication` Apple event handler registered in `applicationDidFinishLaunching`. `QuitRoutesTests` pins both routes, the helper's shape and order, and the absence of the principal-class detour. One Layout line in `apps/mac/CLAUDE.md`.
+
+**What was cut.** Task 1's `NSApplication` subclass named by `NSPrincipalClass` (SwiftUI's `@main` ignores it; proven with lldb) and with it the `snap-dev.sh` plist carry and `PrincipalClassTests`. `tools/selftest-live-embedded.sh` as an AC12 item for this change (it installs over `~/Applications`); replaced by the dev-bundle matrix and `tools/selftest-live.sh` on the dev binary.
+
+**Evidence.** Twelve live-proof runs on the dev bundle (Edit Scope over two hosts, Compose, Setup first-run, no sheet × menu Quit, ⌘Q keystroke, quit Apple event by pid), each logging `Asking app delegate whether applicationShouldTerminate:` → `applicationShouldTerminate: NSTerminateNow` → `Termination complete`, one `1st attempt`, no `blocked by modal sheet`, embedded core reaped; negative control on the unfixed build: all three routes refused with an orphaned core. `swift test` 924 + 37 green; four `apps/mac` tripwires exit 0; `LIVE SELFTEST PASS 99 checks` on the dev binary; cargo gate exit 0 (no Rust changed). Harness: `qes-proof.sh` / `qes-run-all.sh` in the orchestrator's side-notes folder.
+
+**Follow-ups.** (1) Move the Rules sheet's breakpoint-rule draft into `Session` so a quit or Escape no longer discards it silently (security Minor, accepted). (2) A SIGTERM handler for the app so `kill <pid>` also reaps the embedded core (pre-existing note in `snap-dev.sh`). (3) Matt may trim `thePrincipalClassDetourIsGone` at a later integration (quality Minor, kept by spec). (4) The acceptance harness's MAC-5b/SHEET steps that cite "card task_15c30fb3 (quit ends open sheets)" can drop their Escape-before-quit workaround once a release carries this change.
