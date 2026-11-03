@@ -953,10 +953,20 @@ final class ScanPanelState {
     /// never bumps the generation; the other causes bump it when the job actually
     /// changes. Picking another job also takes the inline Scan Again error down (the
     /// Kit's `select(job:)`, D13).
+    ///
+    /// The keyboard transaction sets `disablesAnimations` (fix 2.12e): that flag is
+    /// what the card's implicit `.animation(_:value:)` modifiers (counter ticks, lane
+    /// fill and mark, chip and edge, the swap) consult, so none of them eases across the
+    /// swap. `Transaction(animation: nil)` alone is the default transaction and left
+    /// every one of them running, which the live proof saw as a half-swapped card. The
+    /// transaction rides only this one state change, so the new job's later ticks ease
+    /// again on the next beat.
     func select(_ job: String, cause: ScanSelectionCause) {
         let previous = surface.selectedJob
         if cause == .keyboard {
-            withTransaction(Transaction(animation: nil)) { surface.select(job: job) }
+            var still = Transaction(animation: nil)
+            still.disablesAnimations = true
+            withTransaction(still) { surface.select(job: job) }
         } else {
             surface.select(job: job)
         }

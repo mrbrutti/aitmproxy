@@ -722,9 +722,12 @@ struct ScanIssueLedger: View {
                                 .frame(width: CardMetrics.markWidth, height: CardMetrics.markHeight)
                                 .transition(arrival)
                         }
+                        // The word keeps its ideal width (fix 2.12e): with two groups the stack
+                        // offered the second word less than it needs and it drew as `…`.
                         Text(verbatim: group.word)
                             .foregroundStyle(ink)
                             .monospacedDigit()
+                            .fixedSize()
                             .counterTick(value: group.word, reduceMotion: reduceMotion)
                             .padding(.leading, Tok.Metric.gapTight - CardMetrics.markGap)
                     }
