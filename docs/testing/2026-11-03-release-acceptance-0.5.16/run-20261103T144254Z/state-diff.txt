@@ -1,0 +1,12 @@
+125,129c125,129
+< {"at":<ms>,"origin":"operator","client_label":"anim-verify","connection_id":"conn_17094bd8d85bb7d8-5","command":"scope.add","args":"{\"host\":\"127.0.0.1:<port>\"}","result":"ok"}
+< {"at":<ms>,"origin":"operator","client_label":"anim-verify","connection_id":"conn_17094bd8d85bb7d8-7","command":"scan.profile.save","args":"{\"profile\":{\"accuracy\":\"normal\",\"audit\":{\"frequent_point_threshold\":8,\"ignore\":[{\"kind\":null,\"name_regex\":null,\"trait\":\"session\"}],
+< {"at":<ms>,"origin":"operator","client_label":"anim-verify","connection_id":"conn_17094bd8d85bb7d8-8","command":"scan.start","args":"{\"profile_name\":\"standard\",\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:<port>\"]}}}","result":"ok"}
+< {"at":<ms>,"marker":"start","pid":46334,"schema":1,"stream":"control","version":"0.5.15"}
+< {"at":<ms>,"marker":"start","pid":52405,"schema":1,"stream":"control","version":"0.5.16"}
+---
+> {"at":<ms>,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_ad34ba4a477a74aa-4","command":"scope.add","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+> {"at":<ms>,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_ad34ba4a477a74aa-6","command":"scope.remove","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+> {"at":<ms>,"marker":"start","pid":58991,"schema":1,"stream":"control","version":"0.5.16"}
+> {"at":<ms>,"marker":"start","pid":59279,"schema":1,"stream":"control","version":"0.5.16"}
+> {"at":<ms>,"marker":"start","pid":59285,"schema":1,"stream":"control","version":"0.5.16"}

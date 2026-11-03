@@ -1,0 +1,4 @@
+cli-livecore	SKIP	CLI-0   SKIP    release run only; brew upgrade is Matt's
+mac	FAIL	exit 1
+n5	PASS
+cli-nocore	SKIP	CLI-1   SKIP    port 8080 held by aitm pid 76513; the no-core half needs 8080, 8081 and 8082 free
