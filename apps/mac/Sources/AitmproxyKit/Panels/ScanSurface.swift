@@ -393,21 +393,10 @@ public struct ScanCheckTree: Hashable, Sendable {
         var klass: String
 
         static func < (lhs: GroupKey, rhs: GroupKey) -> Bool {
-            let (l, r) = (laneOrder(lhs.lane), laneOrder(rhs.lane))
+            let (l, r) = (lhs.lane.displayOrder, rhs.lane.displayOrder)
             if l != r { return l < r }
             if lhs.lane.rawValue != rhs.lane.rawValue { return lhs.lane.rawValue < rhs.lane.rawValue }
             return lhs.klass < rhs.klass
-        }
-
-        /// HTTP, WebSocket, L4 packet, L4 stream, then anything newer.
-        private static func laneOrder(_ lane: ScanLane) -> Int {
-            switch lane {
-            case .http: 0
-            case .ws: 1
-            case .l4Packet: 2
-            case .l4Stream: 3
-            default: 4
-            }
         }
     }
 
@@ -424,6 +413,21 @@ public struct ScanCheckTree: Hashable, Sendable {
 
     public static func setAll(_ choice: Choice, ids: [String], in selection: inout ScanCheckSelection) {
         for id in ids { set(choice, for: id, in: &selection) }
+    }
+}
+
+extension ScanLane {
+    /// The one display order (Jobs view D21): HTTP 0, WebSocket 1, L4 packet 2, L4
+    /// stream 3, anything newer 4. The check tree's groups and the wells' `Probes by
+    /// lane` row both sort by it, then by wire name.
+    var displayOrder: Int {
+        switch self {
+        case .http: 0
+        case .ws: 1
+        case .l4Packet: 2
+        case .l4Stream: 3
+        case .other: 4
+        }
     }
 }
 
@@ -677,6 +681,27 @@ public enum ScanEndText {
     public static func rawCrawlErrorLine(_ kind: ScanCrawlErrorKind) -> String {
         "crawl.last_error: \(kind.rawValue)"
     }
+
+    /// The stopped-reason sentence for a terminal job whose status has landed and carries
+    /// a `stopped_reason` (Jobs view D21); nil otherwise, and `stoppedReason`'s own nils
+    /// stand (`cancelled` on a cancelled job, `failed` with an error). The row's sub-line
+    /// and the card's finding line both read it.
+    public static func reasonLine(_ facts: ScanJobFacts) -> String? {
+        let summary = facts.summary
+        guard summary.state.isTerminal, let status = facts.status, let reason = status.stoppedReason else { return nil }
+        return stoppedReason(reason, state: summary.state, probesBudget: summary.probes.budget, error: status.error)
+    }
+
+    /// A finished row's second line (Jobs view D10, D21): `reasonLine`, else the first
+    /// non-empty line of `status.error`; nil for a live job, before the status lands, and
+    /// when neither exists.
+    public static func rowSubLine(_ facts: ScanJobFacts) -> String? {
+        guard facts.summary.state.isTerminal, let status = facts.status else { return nil }
+        if let sentence = reasonLine(facts) { return sentence }
+        guard let error = status.error else { return nil }
+        let first = error.split(whereSeparator: \.isNewline).first.map(String.init) ?? error
+        return first.isEmpty ? nil : first
+    }
 }
 
 // MARK: - The derived progress model (Jobs view D8, D9)
@@ -720,6 +745,13 @@ public struct ScanJobProgress: Equatable, Sendable {
     public var percentText: String?
     /// The card's progress line; `""` for a terminal job (the card shows the end sentence, D9).
     public var phaseLine: String
+    /// The table's Progress cell (Jobs view D10, D21), set in the same switch as
+    /// `phaseLine`: `—` whenever no status has landed, while queued and for an unknown
+    /// state; `50 % · 3,236 of 6,468` while running or cancelling in auditing with
+    /// something scheduled, `Scheduling checks` with nothing scheduled; the crawl line
+    /// (`46 pages, 12 queued`); `Passive checks`; `Writing results`; the phase word for
+    /// a phase D8 does not name; `3,236 of 6,468` for a terminal job (`0 of 0` included).
+    public var rowText: String
     /// `Now: xss-reflected` / `Now: xss-reflected and 3 more`; nil when `checks.running`
     /// is empty. The parity spelling the web and the TUI share.
     public var nowLine: String?
@@ -731,6 +763,10 @@ public struct ScanJobProgress: Equatable, Sendable {
     public var checksToGoText: String?
     /// `now · xss-reflected and 3 more`: the lane's spelling of `nowLine`; nil with it.
     public var nowTag: String?
+    /// `nowTag` in parts (Jobs view D21): `now · ` (plain), the first running id
+    /// (`.checkId`) and, for more than one, ` and 3 more` (plain); joined, they are
+    /// `nowTag`; nil with it. The lane inks the id by its role.
+    public var nowTagParts: [ScanFindingLine.Part]?
     /// `at this pace, about 1:04 to go`; only while running in auditing with a derivable pace.
     public var estimateText: String?
     /// `Derived from the counters: 3,236 checks done in 1:04, about 51 checks per
@@ -739,6 +775,8 @@ public struct ScanJobProgress: Equatable, Sendable {
 
     static let waitingLine = "Waiting for the engine to start this job."
     static let passiveLine = "Passive checks over captured traffic"
+    /// The Progress cell's passive form: the row has no room for the card's line.
+    static let passiveRowLine = "Passive checks"
     static let schedulingLine = "Scheduling checks"
     static let reportingLine = "Writing results"
     static let unknownHelp = "Progress is not known yet"
@@ -753,6 +791,11 @@ public struct ScanJobProgress: Equatable, Sendable {
 
         nowLine = Self.nowLine(running)
         nowTag = running.first.map { "now · " + Self.nowIds(running, first: $0) }
+        nowTagParts = running.first.map { first in
+            var parts = [ScanFindingLine.Part(text: "now · ", role: .plain), .init(text: first, role: .checkId)]
+            if running.count > 1 { parts.append(.init(text: " and \(running.count - 1) more", role: .plain)) }
+            return parts
+        }
 
         let checksFraction: Double? = checks.flatMap { Self.fraction(of: $0.done, over: $0.scheduled) }
         let pagesFraction: Double? = crawl.flatMap { Self.fraction(of: $0.pages, over: $0.pages + $0.queued) }
@@ -768,6 +811,7 @@ public struct ScanJobProgress: Equatable, Sendable {
 
         var ring: Ring = .indeterminate
         var line = ""
+        var row = ScanFormat.missingValue
         var help: String? = nil
         var toGo: String? = nil
         var pace: ScanPace? = nil
@@ -785,15 +829,19 @@ public struct ScanJobProgress: Equatable, Sendable {
                 if let pagesFraction { ring = .determinate(pagesFraction) }
                 line = ScanFormat.plural(crawl.pages, "page", grouped: true) + ", "
                     + ScanFormat.grouped(crawl.queued) + " queued"
+                row = line
                 help = pagesHelp
             case .passive:
                 line = Self.passiveLine
+                row = Self.passiveRowLine
             case .auditing:
                 if let checksFraction {
                     ring = .determinate(checksFraction)
                     line = Self.checksLine(checks)
+                    row = "\(Self.percent(checksFraction)) · \(Self.checksOf(checks))"
                 } else {
                     line = Self.schedulingLine
+                    row = Self.schedulingLine
                 }
                 help = checksHelp
                 if summary.state == .running {
@@ -804,15 +852,18 @@ public struct ScanJobProgress: Equatable, Sendable {
             case .reporting:
                 ring = .determinate(1)
                 line = Self.reportingLine
+                row = Self.reportingLine
                 help = checksHelp
                 if summary.state == .running {
                     toGo = ScanFormat.checksToGo(done: checks.done, scheduled: checks.scheduled)
                 }
             case .queued, .done, .other:
                 line = summary.phase.word
+                row = line
             }
         case .done, .cancelled, .failed:
             ring = .finished(checksFraction ?? pagesFraction)
+            if let checks { row = Self.checksOf(checks) }
             help = checksFraction != nil ? checksHelp : pagesHelp
         case .other:
             ring = .none
@@ -821,9 +872,10 @@ public struct ScanJobProgress: Equatable, Sendable {
 
         self.ring = ring
         phaseLine = line
+        rowText = row
         if case .determinate(let value) = ring {
             fraction = value
-            percentText = "\(Int((value * 100).rounded(.down)))\u{00A0}%"
+            percentText = Self.percent(value)
         } else {
             fraction = nil
             percentText = nil
@@ -843,6 +895,17 @@ public struct ScanJobProgress: Equatable, Sendable {
     /// `3,236 of 6,468 checks`.
     private static func checksLine(_ checks: ScanCheckCounters) -> String {
         ScanFormat.grouped(checks.done) + " of " + ScanFormat.plural(checks.scheduled, "check", grouped: true)
+    }
+
+    /// `3,236 of 6,468`: the row's form, no unit.
+    private static func checksOf(_ checks: ScanCheckCounters) -> String {
+        "\(ScanFormat.grouped(checks.done)) of \(ScanFormat.grouped(checks.scheduled))"
+    }
+
+    /// `50 %` (U+00A0 before the sign), floored: the one spelling `percentText` and the
+    /// auditing `rowText` share.
+    private static func percent(_ fraction: Double) -> String {
+        "\(Int((fraction * 100).rounded(.down)))\u{00A0}%"
     }
 
     /// `done / total` when `total > 0`, clamped at 1 so a core reporting `done` past
@@ -1787,6 +1850,71 @@ public struct ScanLedgerGroup: Equatable, Sendable {
     }
 }
 
+/// One skipped-points row of the Crawl well (Jobs view D21): the count and the words
+/// after it; `text` is the sentence, `722 skipped as repetitive`.
+public struct ScanPointSkipWords: Equatable, Sendable {
+    public var count: Int
+    public var words: String
+    /// `722 skipped as repetitive`.
+    public var text: String { "\(ScanFormat.grouped(count)) \(words)" }
+
+    init(count: Int, words: String) {
+        self.count = count
+        self.words = words
+    }
+}
+
+/// One value of a well row and the ink it is drawn in (Jobs view D21).
+public struct ScanWellCell: Equatable, Sendable {
+    public enum Ink: Equatable, Sendable {
+        /// The data ink.
+        case value
+        /// A severity count above zero, in that severity's ink.
+        case severity(ScanSeverity)
+        /// A severity count of zero, in the tertiary ink.
+        case muted
+    }
+
+    public var text: String
+    public var ink: Ink
+
+    init(text: String, ink: Ink) {
+        self.text = text
+        self.ink = ink
+    }
+
+    /// A cell in the data ink.
+    static func value(_ text: String) -> ScanWellCell { ScanWellCell(text: text, ink: .value) }
+}
+
+/// One key-value row of a well (Jobs view D11, D21): the key and one cell per value.
+public struct ScanWellRow: Equatable, Sendable {
+    public var key: String
+    public var cells: [ScanWellCell]
+    /// The cells joined by `ScanFormat.wellCellSeparator`: `0 · 1 · 0`.
+    public var text: String { cells.map(\.text).joined(separator: ScanFormat.wellCellSeparator) }
+
+    init(key: String, cells: [ScanWellCell]) {
+        self.key = key
+        self.cells = cells
+    }
+
+    init(_ key: String, _ text: String) {
+        self.init(key: key, cells: [.value(text)])
+    }
+}
+
+/// The two wells' rows (Jobs view D11, D21), in the wells' order.
+public struct ScanWellRows: Equatable, Sendable {
+    public var crawl: [ScanWellRow]
+    public var issues: [ScanWellRow]
+
+    init(crawl: [ScanWellRow], issues: [ScanWellRow]) {
+        self.crawl = crawl
+        self.issues = issues
+    }
+}
+
 extension ScanFormat {
     // MARK: Fixed words (D10, D11, D17)
 
@@ -1876,46 +2004,24 @@ extension ScanFormat {
         hosts(facts) ?? missingValue
     }
 
-    /// The Progress cell: `50 % · 3,236 of 6,468` while auditing with something
-    /// scheduled; the pages line while crawling; `Passive checks`; `Scheduling checks`;
-    /// `Writing results`; `—` while queued or before the status lands; the checks
-    /// `3,236 of 6,468` when terminal (`0 of 0` is the bus truth, shown as such).
+    /// The Progress cell: `ScanJobProgress.rowText`, derived in the progress model's one
+    /// switch (Jobs view D21); `facts` is the progress's own, kept for the callers' shape.
     public static func rowProgressText(_ facts: ScanJobFacts, _ progress: ScanJobProgress) -> String {
-        guard let status = facts.status else { return missingValue }
-        let checks = status.checks
-        switch facts.summary.state {
-        case .queued, .other:
-            return missingValue
-        case .running, .cancelling:
-            switch facts.summary.phase {
-            case .crawling:
-                return progress.phaseLine
-            case .passive:
-                return "Passive checks"
-            case .auditing:
-                guard checks.scheduled > 0, let percent = progress.percentText else { return ScanJobProgress.schedulingLine }
-                return "\(percent) · \(grouped(checks.done)) of \(grouped(checks.scheduled))"
-            case .reporting:
-                return ScanJobProgress.reportingLine
-            case .queued, .done, .other:
-                return progress.phaseLine
-            }
-        case .done, .cancelled, .failed:
-            return "\(grouped(checks.done)) of \(grouped(checks.scheduled))"
-        }
+        progress.rowText
     }
 
     /// `4 low` / `1 high, 3 low`; `no issues yet` for a live job with none, `no issues` otherwise.
     public static func severityWords(by: BySeverity, running: Bool) -> String {
         let parts = severityWordParts(by: by)
         guard !parts.isEmpty else { return running ? "no issues yet" : "no issues" }
-        return parts.map(\.1).joined(separator: ", ")
+        return parts.map(\.word).joined(separator: ", ")
     }
 
-    /// `[(.high, "1 high"), (.low, "3 low")]`, critical → info, zero counts omitted;
-    /// the view inks each in its severity's colour.
-    public static func severityWordParts(by: BySeverity) -> [(ScanSeverity, String)] {
-        severityCounts(by).map { ($0, "\(grouped($1)) \($0.rawValue)") }
+    /// `[(.high, "1 high"), (.low, "3 low")]`, critical → info, zero counts omitted: the
+    /// ledger's groups as `(severity, word)` (one word rule, Jobs view D21); the app
+    /// draws each in its severity's ink through one builder.
+    public static func severityWordParts(by: BySeverity) -> [(severity: ScanSeverity, word: String)] {
+        ledgerGroups(by: by).map { ($0.severity, $0.word) }
     }
 
     /// The non-zero tallies, critical → info.
@@ -2019,7 +2125,7 @@ extension ScanFormat {
         let terminal = summary.state.isTerminal
         var clauses: [[ScanFindingLine.Part]] = []
         var agent = false
-        var reason: String?
+        let reason: String?
         if !terminal { clauses.append(issuesSoFarParts(summary.issues.bySeverity)) }
         if let status = facts.status {
             if !terminal, let now = nowClauseParts(status.checks.running) { clauses.append(now) }
@@ -2029,16 +2135,11 @@ extension ScanFormat {
             clauses.append([
                 plain("started\(when) by "), .init(text: startedByWords(status.startedBy), role: agent ? .agent : .plain),
             ])
-            if terminal {
-                if let finishedAt = status.finishedAt, finishedAt > 0 {
-                    clauses.append([plain("finished \(clock(ms: finishedAt, timeZone: timeZone))")])
-                }
-                if let stopped = status.stoppedReason {
-                    reason = ScanEndText.stoppedReason(
-                        stopped, state: summary.state, probesBudget: summary.probes.budget, error: status.error)
-                }
+            if terminal, let finishedAt = status.finishedAt, finishedAt > 0 {
+                clauses.append([plain("finished \(clock(ms: finishedAt, timeZone: timeZone))")])
             }
         }
+        reason = ScanEndText.reasonLine(facts)
         var parts: [ScanFindingLine.Part] = []
         for (index, clause) in clauses.enumerated() {
             if index > 0 { parts.append(plain(" · ")) }
@@ -2096,7 +2197,7 @@ extension ScanFormat {
     public static func issuesTileHelp(by: BySeverity) -> String {
         let parts = severityWordParts(by: by)
         guard !parts.isEmpty else { return "no issues" }
-        return "\(plural(by.total, "issue", grouped: true)): \(parts.map(\.1).joined(separator: ", "))"
+        return "\(plural(by.total, "issue", grouped: true)): \(parts.map(\.word).joined(separator: ", "))"
     }
 
     /// `of 6,468`: the unit after a KPI or cell numeral.
@@ -2116,12 +2217,122 @@ extension ScanFormat {
 
     /// The Crawl well's skipped-points rows, one per reason, zeros included:
     /// `722 skipped as repetitive`, `6 skipped by rule`, `0 skipped at the per-request cap`.
-    public static func pointSkipWords(_ skipped: ScanPointCounters.Skipped) -> [String] {
+    public static func pointSkipWords(_ skipped: ScanPointCounters.Skipped) -> [ScanPointSkipWords] {
         [
-            "\(grouped(skipped.frequent)) skipped as repetitive",
-            "\(grouped(skipped.ignored)) skipped by rule",
-            "\(grouped(skipped.limit)) skipped at the per-request cap",
+            ScanPointSkipWords(count: skipped.frequent, words: "skipped as repetitive"),
+            ScanPointSkipWords(count: skipped.ignored, words: "skipped by rule"),
+            ScanPointSkipWords(count: skipped.limit, words: "skipped at the per-request cap"),
         ]
+    }
+
+    // MARK: The wells' rows (D11, D21)
+
+    /// Between a row's cells: `0 · 1 · 0`.
+    public static let wellCellSeparator = " · "
+
+    /// The two wells' rows in D11's order (Jobs view D21), every key a `WellKey`, every
+    /// number `grouped`, `—` for a status-only value until the status lands. Crawl and
+    /// points: the crawl counters, Crawl errors (only when > 0), the point counters, the
+    /// three skipped-points rows (key = the words, one cell = the count), Lanes, one
+    /// `Lane skipped` row per skipped lane, Probes by lane (one cell per lane in
+    /// `displayOrder` then wire name), Session (only with one), the four L4 rows (only
+    /// with `l4`). Issues: `Critical · High · Medium`, Low, Info (each count `.severity`
+    /// above zero, `.muted` at zero), the confidence tally, the probe trouble tally, and
+    /// the four check counts (one `—` before the status lands).
+    public static func wellRows(_ facts: ScanJobFacts) -> ScanWellRows {
+        ScanWellRows(crawl: crawlRows(facts), issues: issueRows(facts))
+    }
+
+    private static func crawlRows(_ facts: ScanJobFacts) -> [ScanWellRow] {
+        typealias Key = WellKey
+        let summary = facts.summary
+        let status = facts.status
+        var rows: [ScanWellRow] = [
+            ScanWellRow(Key.pagesFetched, number(status?.crawl.pages)),
+            ScanWellRow(Key.pagesWaiting, number(status?.crawl.queued)),
+            ScanWellRow(Key.depth, number(status?.crawl.depth)),
+            ScanWellRow(Key.formsSubmitted, number(status?.crawl.formsSubmitted)),
+            ScanWellRow(Key.formsNotSubmitted, number(status?.crawl.formsSkipped)),
+        ]
+        if let errors = status?.crawl.errors, errors > 0 {
+            rows.append(ScanWellRow(Key.crawlErrors, number(errors)))
+        }
+        rows += [
+            ScanWellRow(Key.pointsFound, number(summary.points.found)),
+            ScanWellRow(Key.waitingForAudit, number(summary.points.queued)),
+            ScanWellRow(Key.audited, number(summary.points.audited)),
+        ]
+        rows += pointSkipWords(summary.points.skipped).map { ScanWellRow($0.words, grouped($0.count)) }
+        rows.append(ScanWellRow(Key.lanes, status.flatMap { laneWords($0.lanes.run) } ?? missingValue))
+        rows += (status?.lanes.skipped ?? []).map { ScanWellRow(Key.laneSkipped, skippedLaneWords($0)) }
+        rows.append(ScanWellRow(key: Key.probesByLane, cells: probesByLaneCells(summary.probes.byLane)))
+        if let session = status?.session {
+            rows.append(ScanWellRow(key: Key.session, cells: sessionWords(session).map(ScanWellCell.value)))
+        }
+        if let l4 = status?.l4 {
+            rows += [
+                ScanWellRow(Key.l4Cases, number(l4.cases)),
+                ScanWellRow(Key.l4Crashes, number(l4.crashes)),
+                ScanWellRow(Key.l4LivenessFailures, number(l4.livenessFailures)),
+                ScanWellRow(Key.l4RetiredElements, number(l4.retiredElements)),
+            ]
+        }
+        return rows
+    }
+
+    private static func issueRows(_ facts: ScanJobFacts) -> [ScanWellRow] {
+        typealias Key = WellKey
+        let summary = facts.summary
+        let by = summary.issues.bySeverity
+        let confidence = summary.issues.byConfidence
+        return [
+            ScanWellRow(key: Key.criticalHighMedium, cells: [
+                severityCell(.critical, by.critical), severityCell(.high, by.high), severityCell(.medium, by.medium),
+            ]),
+            ScanWellRow(key: Key.low, cells: [severityCell(.low, by.low)]),
+            ScanWellRow(key: Key.info, cells: [severityCell(.info, by.info)]),
+            ScanWellRow(key: Key.certainFirmTentative, cells: counts([confidence.certain, confidence.firm, confidence.tentative])),
+            ScanWellRow(key: Key.probeErrors, cells: counts([summary.probes.errors, summary.probes.timeouts, summary.probes.rateWaits])),
+            ScanWellRow(
+                key: Key.checks,
+                cells: facts.status.map { counts([$0.checks.scheduled, $0.checks.done, $0.checks.errors, $0.checks.skipped]) }
+                    ?? [.value(missingValue)]),
+        ]
+    }
+
+    /// A grouped number, or the missing mark before the status lands.
+    private static func number(_ value: Int?) -> String {
+        value.map(grouped) ?? missingValue
+    }
+
+    /// Several counts, one cell each, every one grouped.
+    private static func counts(_ values: [Int]) -> [ScanWellCell] {
+        values.map { .value(grouped($0)) }
+    }
+
+    /// One severity tally: its severity's ink when > 0, muted when 0 (D11).
+    private static func severityCell(_ severity: ScanSeverity, _ count: Int) -> ScanWellCell {
+        ScanWellCell(text: grouped(count), ink: count > 0 ? .severity(severity) : .muted)
+    }
+
+    /// `HTTP, WebSocket`; nil for none.
+    private static func laneWords(_ lanes: [ScanLane]) -> String? {
+        lanes.isEmpty ? nil : lanes.map(\.word).joined(separator: ", ")
+    }
+
+    /// `HTTP 240` · `WebSocket 47`, one cell per lane in `displayOrder` then wire name;
+    /// one `—` when the bus listed none.
+    private static func probesByLaneCells(_ byLane: [String: Int]) -> [ScanWellCell] {
+        guard !byLane.isEmpty else { return [.value(missingValue)] }
+        return byLane.keys
+            .compactMap(ScanLane.init(rawValue:))
+            .sorted { ($0.displayOrder, $0.rawValue) < ($1.displayOrder, $1.rawValue) }
+            .map { .value("\($0.word) \(grouped(byLane[$0.rawValue] ?? 0))") }
+    }
+
+    /// `yes` · `no` · `ok` · `no`: reused · lost · canary · browser partial.
+    private static func sessionWords(_ session: ScanSessionStatus) -> [String] {
+        [yesNo(session.reused), yesNo(session.lost), canaryWord(session.canary), yesNo(session.browserPartial)]
     }
 
     // MARK: Accessibility (D14)
