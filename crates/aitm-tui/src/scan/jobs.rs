@@ -2770,4 +2770,86 @@ mod tests {
             (Ring::Finished(None), Source::None)
         );
     }
+
+    /// Tester round 2 (AC60, hostile ticks): `list_overdue` is `due`'s
+    /// saturating comparison at the ends of the tick range. A stamp ahead
+    /// of the clock never underflows, a clock at the end of its range
+    /// compares like any other, a limit of the whole range fires only when
+    /// the whole range has passed, a limit of zero fires at once, and no
+    /// list in flight is never overdue whatever the clock says.
+    #[test]
+    fn list_overdue_survives_the_ends_of_the_tick_range() {
+        assert!(list_overdue(u64::MAX, Some(0), 80));
+        assert!(
+            !list_overdue(0, Some(u64::MAX), 80),
+            "a stamp ahead of the clock never underflows"
+        );
+        assert!(!list_overdue(u64::MAX, Some(u64::MAX), 80));
+        assert!(list_overdue(u64::MAX, Some(u64::MAX - 80), 80));
+        assert!(!list_overdue(u64::MAX, Some(u64::MAX - 79), 80));
+        assert!(list_overdue(u64::MAX, Some(0), u64::MAX));
+        assert!(!list_overdue(u64::MAX - 1, Some(0), u64::MAX));
+        assert!(list_overdue(40, Some(40), 0), "a zero limit fires at once");
+        assert!(!list_overdue(u64::MAX, None, 0));
+    }
+
+    /// Tester round 2 (AC60; spec D19 amendment): the detector's numbers
+    /// and words are the spec's. `LIST_OVERDUE_TICKS` is 80, two list
+    /// periods (`2 × LIST_POLL_TICKS`), so the steady-cadence banner first
+    /// appears `LIST_POLL_TICKS + LIST_OVERDUE_TICKS` = 120 ticks after the
+    /// last fold; the sentence the banner carries is `scan.list: the bus did
+    /// not reply in time` byte for byte, and the refusal toast is `scan.cancel
+    /// not sent: the bus did not reply in time`.
+    #[test]
+    fn detector_constants_are_the_specs() {
+        use crate::scan::{CANCEL_NOT_SENT, LIST_OVERDUE_TICKS, LIST_POLL_TICKS};
+        assert_eq!(LIST_OVERDUE_TICKS, 80);
+        assert_eq!(LIST_OVERDUE_TICKS, 2 * LIST_POLL_TICKS);
+        assert_eq!(LIST_POLL_TICKS + LIST_OVERDUE_TICKS, 120);
+        assert!(!list_overdue(119, Some(40), LIST_OVERDUE_TICKS));
+        assert!(list_overdue(120, Some(40), LIST_OVERDUE_TICKS));
+        assert_eq!(NOT_IN_TIME, "the bus did not reply in time");
+        assert_eq!(
+            CANCEL_NOT_SENT,
+            "scan.cancel not sent: the bus did not reply in time"
+        );
+        assert_eq!(
+            ScanError::uncoded("scan.list", NOT_IN_TIME).wording(),
+            "scan.list: the bus did not reply in time"
+        );
+    }
+
+    /// Tester round 2 (AC60, hostile words): `unanswered` is exact on the
+    /// sentence. The same words with a trailing space, in another case, or
+    /// inside a longer detail read false; a coded `scan.list` error whose
+    /// detail happens to be the sentence (a core echoing it after a D9 code)
+    /// reads false, since the detector only ever records an uncoded one;
+    /// the sentence under `scan.status` with no key reads false too.
+    #[test]
+    fn unanswered_is_exact_on_the_sentence() {
+        let mut jobs = JobsState::default();
+        for detail in [
+            "the bus did not reply in time ",
+            " the bus did not reply in time",
+            "The bus did not reply in time",
+            "x the bus did not reply in time",
+            "the bus did not reply in time: x",
+            "",
+        ] {
+            jobs.error = Some(ScanError::uncoded("scan.list", detail));
+            assert!(!jobs.unanswered(), "{detail:?}");
+        }
+        let coded = ScanError::from_message("scan.list", &format!("scan: busy: {NOT_IN_TIME}"));
+        assert!(coded.code.is_some(), "{coded:?}");
+        assert_eq!(coded.detail, NOT_IN_TIME);
+        jobs.error = Some(coded);
+        assert!(
+            !jobs.unanswered(),
+            "a coded error is the core's, not the detector's"
+        );
+        jobs.error = Some(ScanError::uncoded("scan.status", NOT_IN_TIME));
+        assert!(!jobs.unanswered());
+        jobs.error = Some(ScanError::uncoded("scan.list", NOT_IN_TIME));
+        assert!(jobs.unanswered());
+    }
 }

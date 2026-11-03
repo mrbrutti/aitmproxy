@@ -1234,3 +1234,422 @@ fn detail_empty_label_rows_are_cut_to_the_pane_with_an_ellipsis() {
     let first = line_with(&tiny, "Cancelled after").expect("the first line");
     assert_eq!(first, "│ Cancelled after 1:55; 3,236 of 6,468…│");
 }
+
+/// Tester round 2 (AC60, the re-arm and the dedupe; Jobs view D19
+/// amendment): a second ask for a list while one is in flight (a tick-80
+/// timer, a re-entry into the Scan view at tick 60) sends nothing and does
+/// not move the stamp, so the detector still counts from tick 40 and fires
+/// at 120; the late reply at 121 clears it; the next timer list at 160
+/// re-arms the detector for its own request, and 80 ticks later the banner
+/// is back with the age counted from the fold at 121 (`29s`: 119 ticks of
+/// 250 ms, floored).
+#[test]
+fn the_detector_rearms_for_the_next_list_and_a_deduped_ask_does_not_push_it() {
+    let list = tagged("scan.list", "scan.list", json!({}));
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    app.ticks = 0;
+    app.scan.jobs.listed_ok_at_tick = Some(0);
+
+    let mut reqs = Vec::new();
+    for _ in 0..40 {
+        reqs = app.update(Action::Tick);
+    }
+    assert!(reqs.contains(&list), "{reqs:?}");
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(40));
+
+    // Tick 60: coming back to the Scan view asks for a list; the tag dedupe
+    // keeps it, and the stamp stays the first request's.
+    for _ in 0..20 {
+        let _ = app.update(Action::Tick);
+    }
+    assert_eq!(app.ticks, 60);
+    let reqs = app.update(Action::OpenScan);
+    assert!(!reqs.contains(&list), "deduped: {reqs:?}");
+    assert_eq!(app.scan.tab, ScanTab::Jobs, "the open restores the tab");
+    assert_eq!(
+        app.scan.jobs.list_sent_at_tick,
+        Some(40),
+        "the stamp did not move"
+    );
+    assert_eq!(
+        app.scan
+            .inflight
+            .iter()
+            .filter(|t| t.as_str() == "scan.list")
+            .count(),
+        1
+    );
+
+    // Tick 80: the timer finds the list in flight and sends nothing.
+    let mut reqs = Vec::new();
+    for _ in 0..20 {
+        reqs = app.update(Action::Tick);
+    }
+    assert_eq!(app.ticks, 80);
+    assert!(!reqs.contains(&list), "tick 80 timer deduped: {reqs:?}");
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(40));
+    assert_eq!(app.scan.jobs.error, None);
+
+    for _ in 0..40 {
+        let _ = app.update(Action::Tick);
+    }
+    assert_eq!(app.ticks, 120);
+    assert!(app.scan.jobs.unanswered(), "{:?}", app.scan.jobs.error);
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(
+        strip
+            .trim_end_matches(['│', ' '])
+            .ends_with("scan.list: the bus did not reply in time · showing values from 30s ago"),
+        "{strip:?}"
+    );
+
+    let _ = app.update(Action::Tick);
+    let _ = app.on_bus(list_reply());
+    assert_eq!(app.ticks, 121);
+    assert_eq!(app.scan.jobs.error, None);
+    assert_eq!(app.scan.jobs.list_sent_at_tick, None);
+    assert!(
+        !app.scan.inflight.contains("scan.list"),
+        "the reply settled the tag"
+    );
+
+    // The next timer list leaves at 160 and arms the detector again.
+    let mut reqs = Vec::new();
+    for _ in 0..39 {
+        reqs = app.update(Action::Tick);
+    }
+    assert_eq!(app.ticks, 160);
+    assert!(reqs.contains(&list), "the tick-160 list: {reqs:?}");
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(160));
+    for _ in 0..79 {
+        let _ = app.update(Action::Tick);
+    }
+    assert_eq!(app.ticks, 239);
+    assert_eq!(
+        app.scan.jobs.error, None,
+        "tick 239: the second list is not yet overdue"
+    );
+    assert!(!app.scan.jobs.unanswered());
+    let _ = app.update(Action::Tick);
+    assert_eq!(app.ticks, 240);
+    assert!(app.scan.jobs.unanswered());
+    assert_eq!(
+        app.scan.jobs.list_sent_at_tick, None,
+        "fired once for the second list"
+    );
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(
+        strip
+            .trim_end_matches(['│', ' '])
+            .ends_with("scan.list: the bus did not reply in time · showing values from 29s ago"),
+        "{strip:?}"
+    );
+    assert_eq!(
+        app.update(Action::ScanCancel),
+        Vec::new(),
+        "x is refused again under the second sentence"
+    );
+    assert_eq!(
+        toast(&app),
+        "scan.cancel not sent: the bus did not reply in time"
+    );
+}
+
+/// Tester round 2 (AC60, the limit tick; hostile ordering): a reply that
+/// lands on tick 119, one tick before the limit, stands the detector down
+/// and tick 120 sets nothing; a reply that lands on tick 120 after the
+/// detector fired clears the sentence at once, the banner loses both
+/// clauses, the fold is stamped at 120 and the tag is free for the next
+/// timer list at 160.
+#[test]
+fn a_reply_on_either_side_of_the_limit_tick_settles_the_detector() {
+    let list = tagged("scan.list", "scan.list", json!({}));
+
+    // One tick before the limit.
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    app.ticks = 0;
+    app.scan.jobs.listed_ok_at_tick = Some(0);
+    for _ in 0..119 {
+        let _ = app.update(Action::Tick);
+    }
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(40));
+    let _ = app.on_bus(list_reply());
+    assert_eq!(app.scan.jobs.list_sent_at_tick, None);
+    let _ = app.update(Action::Tick);
+    assert_eq!(app.ticks, 120);
+    assert_eq!(
+        app.scan.jobs.error, None,
+        "answered on 119: nothing to flag on 120"
+    );
+    assert!(!app.scan.jobs.unanswered());
+    assert_eq!(app.scan.jobs.listed_ok_at_tick, Some(119));
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(!strip.contains("did not reply"), "{strip:?}");
+    assert!(!strip.contains("showing values"), "{strip:?}");
+
+    // On the limit tick, after the detector fired.
+    let mut app = self::app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    app.ticks = 0;
+    app.scan.jobs.listed_ok_at_tick = Some(0);
+    for _ in 0..120 {
+        let _ = app.update(Action::Tick);
+    }
+    assert!(app.scan.jobs.unanswered());
+    let _ = app.on_bus(list_reply());
+    assert_eq!(app.ticks, 120);
+    assert_eq!(app.scan.jobs.error, None);
+    assert!(!app.scan.jobs.unanswered());
+    assert_eq!(app.scan.jobs.listed_ok_at_tick, Some(120));
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(!strip.contains("did not reply"), "{strip:?}");
+    assert!(!strip.contains("showing values"), "{strip:?}");
+    assert_eq!(
+        app.update(Action::ScanCancel),
+        vec![cancel_request()],
+        "x is live again on the running job"
+    );
+    let mut reqs = Vec::new();
+    for _ in 0..40 {
+        reqs = app.update(Action::Tick);
+    }
+    assert_eq!(app.ticks, 160);
+    assert!(
+        reqs.contains(&list),
+        "the tag is free for the next list: {reqs:?}"
+    );
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(160));
+}
+
+/// Tester round 2 (AC60, the list errors AND is overdue; Jobs view D19
+/// amendment: "a late error reply replaces the sentence with its own
+/// text"): after the detector fired, a `scan.list` error reply puts its own
+/// D9 wording on the banner with the age clause still counted from the last
+/// fold, `unanswered()` reads false and `x` sends the cancel. In the other
+/// order, an error reply before the limit stands the detector down: the
+/// error stays its own through tick 200 and never turns into the sentence.
+#[test]
+fn a_late_list_error_replaces_the_sentence_and_an_early_one_disarms_it() {
+    const BUSY: &str = "Scanner busy: the job limit is reached or this origin already has a running job; wait or cancel one in Jobs (x): full";
+
+    // Overdue first, then the error.
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    app.ticks = 0;
+    app.scan.jobs.listed_ok_at_tick = Some(0);
+    for _ in 0..120 {
+        let _ = app.update(Action::Tick);
+    }
+    assert!(app.scan.jobs.unanswered());
+    let _ = app.on_bus(failed("scan.list", "scan.list", "scan: busy: full"));
+    assert!(!app.scan.jobs.unanswered());
+    assert_eq!(
+        app.scan
+            .jobs
+            .error
+            .as_ref()
+            .map(ScanError::wording)
+            .as_deref(),
+        Some(BUSY)
+    );
+    assert_eq!(app.scan.jobs.list_sent_at_tick, None);
+    assert!(
+        !app.scan.inflight.contains("scan.list"),
+        "the error settled the tag"
+    );
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(
+        strip
+            .trim_end_matches(['│', ' '])
+            .ends_with(&format!("{BUSY} · showing values from 30s ago")),
+        "{strip:?}"
+    );
+    assert!(!strip.contains("did not reply"), "{strip:?}");
+    assert_eq!(
+        app.update(Action::ScanCancel),
+        vec![cancel_request()],
+        "x is live under the core's own error"
+    );
+
+    // The error first, before the limit.
+    let mut app = self::app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    app.ticks = 0;
+    app.scan.jobs.listed_ok_at_tick = Some(0);
+    for _ in 0..50 {
+        let _ = app.update(Action::Tick);
+    }
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(40));
+    let _ = app.on_bus(failed("scan.list", "scan.list", "scan: busy: full"));
+    assert_eq!(
+        app.scan.jobs.list_sent_at_tick, None,
+        "the error reply settled the list"
+    );
+    // Tick 80 sends a new list (the tag is free) and arms the detector for
+    // it; through tick 159 the banner carries the core's error alone.
+    let mut reqs = Vec::new();
+    for _ in 0..30 {
+        reqs = app.update(Action::Tick);
+    }
+    assert_eq!(app.ticks, 80);
+    assert!(
+        reqs.contains(&tagged("scan.list", "scan.list", json!({}))),
+        "{reqs:?}"
+    );
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(80));
+    for _ in 0..79 {
+        let _ = app.update(Action::Tick);
+    }
+    assert_eq!(app.ticks, 159);
+    assert_eq!(
+        app.scan
+            .jobs
+            .error
+            .as_ref()
+            .map(ScanError::wording)
+            .as_deref(),
+        Some(BUSY),
+        "the first list's error, not the sentence, at 119 ticks past its send"
+    );
+    assert!(!app.scan.jobs.unanswered());
+    let _ = app.update(Action::Tick);
+    assert_eq!(app.ticks, 160);
+    assert!(
+        app.scan.jobs.unanswered(),
+        "the second list, 80 ticks unanswered, is flagged"
+    );
+}
+
+/// Tester round 2 (AC60, connection drop mid-flight; Jobs view D19
+/// amendment, "cleared when the bus drops"): a bus drop at tick 60 with a
+/// list in flight disarms the detector; through tick 140, where the old
+/// list would have been 80 overdue, no sentence is set and `x` is not
+/// refused for it. (A Jobs cursor survives the drop; the cancel the key
+/// then issues is the ordinary one, since `has_tool` still knows the verb.)
+#[test]
+fn a_bus_drop_disarms_the_detector() {
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    app.ticks = 0;
+    app.scan.jobs.listed_ok_at_tick = Some(0);
+    for _ in 0..60 {
+        let _ = app.update(Action::Tick);
+    }
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(40));
+    let _ = app.on_bus(BusEvent::Disconnected("connection reset".into()));
+    assert_eq!(app.scan.jobs.list_sent_at_tick, None);
+    assert!(app.scan.inflight.is_empty());
+    for _ in 0..80 {
+        let _ = app.update(Action::Tick);
+        assert!(
+            !app.scan.jobs.unanswered(),
+            "tick {}: the dropped list is not flagged",
+            app.ticks
+        );
+    }
+    assert_eq!(app.ticks, 140);
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(!strip.contains("did not reply"), "{strip:?}");
+}
+
+/// Tester round 2 (AC42, the header after the ring/source split; AC60's age
+/// clause against `aitm_tui::TICK`): the header's words are exactly `job
+/// profile targets state progress budget points issues el.` in that order
+/// with nothing else (a `contains` per word would also pass an old
+/// `state/phase  probes` header); the age clause counts the runtime's
+/// `TICK` (250 ms) and, at the end of the tick range, saturates to the
+/// hours form instead of overflowing.
+#[test]
+fn header_words_are_exact_and_the_age_clause_counts_the_runtime_tick() {
+    use aitm_tui::ui::scan::values_age_text;
+
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    let text = screen(&app);
+    let header = line_with(&text, "progress").expect("the header");
+    assert_eq!(
+        header
+            .trim_matches(['│', ' '])
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["job", "profile", "targets", "state", "progress", "budget", "points", "issues", "el."]
+    );
+    let row = line_with(&text, JOB).expect("the row");
+    assert!(
+        row.contains("auditing   180/240 ━━━━──  418/2000  80/120"),
+        "{row:?}"
+    );
+
+    assert_eq!(aitm_tui::TICK, std::time::Duration::from_millis(250));
+    assert_eq!(
+        values_age_text(120, Some(0)).as_deref(),
+        Some("showing values from 30s ago")
+    );
+    assert_eq!(
+        values_age_text(240, Some(121)).as_deref(),
+        Some("showing values from 29s ago")
+    );
+    assert_eq!(
+        values_age_text(u64::MAX, Some(0)).as_deref(),
+        Some("showing values from 5124095576030h25m ago"),
+        "u64::MAX ticks × 250 ms overflows u64 and saturates to u64::MAX ms"
+    );
+    assert_eq!(
+        values_age_text(u64::MAX, Some(u64::MAX)).as_deref(),
+        Some("showing values from 0s ago")
+    );
+}
+
+/// Tester round 2 (Task 4.5c (1), hostile widths): at 60 columns (an
+/// inner width of 58) the end sentence is cut to 57 cells after the
+/// leading space with the `…` in the pane's last cell; the view's minimum
+/// (40×4) draws without panic, and every size under it draws the
+/// `needs at least 40×4` screen instead of the pane, down to 0×0.
+#[test]
+fn detail_cut_survives_tiny_terminals() {
+    let mut app = app();
+    let mut body = status_in("cancelled", "done");
+    body["elapsed_ms"] = json!(115_000);
+    body["checks"]["done"] = json!(3236);
+    body["checks"]["scheduled"] = json!(6468);
+    body["checks"]["running"] = json!([]);
+    body["checks"]["errors"] = json!(1);
+    body["checks"]["error_samples"] = json!([
+        { "check": "http.sqli-error", "point": "p", "detail": "d".repeat(120) }
+    ]);
+    body["stopped_reason"] = json!("cancelled");
+    let _ = app.on_bus(status_reply(body));
+
+    let _ = app.update(Action::Resize(60, 24));
+    let text = text_of(&app, 60, 24);
+    let first = line_with(&text, "Cancelled").unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(
+        first,
+        "│ Cancelled after 1:55; 3,236 of 6,468 checks had run. Wha…│"
+    );
+    assert_eq!(width(first.trim_end_matches('│')), 59);
+
+    let _ = app.update(Action::Resize(40, 4));
+    let _ = text_of(&app, 40, 4);
+
+    for (w, h) in [(39, 50), (40, 3), (24, 50), (8, 8), (3, 3), (1, 1), (0, 0)] {
+        let _ = app.update(Action::Resize(w, h));
+        let text = text_of(&app, w, h);
+        assert!(!text.contains("Cancelled"), "{w}x{h}: {text:?}");
+        if w >= 39 {
+            assert!(
+                text.contains("aitm-tui needs at least 40×4"),
+                "{w}x{h}: {text:?}"
+            );
+        } else if w >= 24 {
+            // The notice itself is clipped to the width: its first 23
+            // cells still fit.
+            assert!(
+                text.contains("aitm-tui needs at least"),
+                "{w}x{h}: {text:?}"
+            );
+        }
+    }
+}
