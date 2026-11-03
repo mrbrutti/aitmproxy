@@ -5,14 +5,14 @@ AXGroup						2453	-1140	240	820
 AXStaticText		aitmproxy			true	2469	-1126	86	16	
 AXScrollArea						2453	-1095	240	731	
 AXStaticText		TRAFFIC			true	2469	-1075	51	14	
-AXButton			Flows, 256		true	2461	-1053	224	28	
+AXButton			Flows, 257		true	2461	-1053	224	28	
 AXButton			Apps, 1		true	2461	-1025	224	28	
-AXButton			Domains, 4		true	2461	-997	224	28	
+AXButton			Domains, 3		true	2461	-997	224	28	
 AXButton			Pinned, 0		true	2461	-969	224	28	
 AXButton			Connection Log		true	2461	-941	224	28	
 AXButton			Overview		true	2461	-913	224	28	
 AXStaticText		TESTING			true	2469	-865	53	14	
-AXButton			Scope, 5		true	2461	-843	224	28	
+AXButton			Scope, 3		true	2461	-843	224	28	
 AXButton			Scan		true	2461	-815	224	28	
 AXButton			Findings		true	2461	-787	224	28	
 AXButton			Browser, 0 tabs		true	2461	-759	224	28	
@@ -27,86 +27,71 @@ AXGroup						2694	-1140	1199	820
 AXHeading			SCAN		true	2714	-1129	34	14	
 AXScrollArea						2716	-1104	1149	36	
 AXButton			Profiles		true	2716	-1104	58	36	
-AXButton			Jobs 4		true	2776	-1104	54	36	
+AXButton			Jobs 3		true	2776	-1104	54	36	
 AXButton			Site map		true	2832	-1104	66	36	
 AXButton			Issues		true	2900	-1104	51	36	
 AXScrollArea						2694	-1068	1199	748	
-AXStaticText		Bus disconnected · showing values from 0:47 ago · reconnecting…			true	2730	-1040	376	15	
-AXUnknown			Error: Unable to list jobs: the bus connection closed. Showing values from 0:47 ago; retrying every 2 s.		true	2718	-993	545	15	
-AXStaticText		Done			true	2742	-931	61	22	
-AXHeading			127.0.0.1:8121		true	2815	-934	208	28	
-AXButton			Show Site Map		false	3537	-932	102	28	
-AXButton			Show Issues		false	3647	-932	88	28	
-AXButton			Scan Again		false	3743	-931	85	26	
-AXStaticText		Stopped early: too many errors from the target.			true	2742	-902	305	17	
-AXStaticText		standard · started 18:03 by anim-verify · finished 18:04			true	2742	-881	355	17	
-AXUnknown			Progress		true	2742	-863	1086	134	
-AXUnknown			no issues		true	2742	-713	55	15	
-AXUnknown			Probe budget, 1 of 2,000		true	2742	-681	1086	15	
-AXStaticText		Progress, —			true	2758	-632	54	53	
-AXStaticText		Checks, 49, of 135			true	2975	-632	84	53	
-AXStaticText		Probes, 1, of 2,000			true	3193	-632	79	53	
-AXStaticText		Points audited, 0, of 14			true	3410	-632	87	53	
-AXStaticText		Issues, 0, no issues			true	3628	-632	83	53	
-AXDisclosureTriangle		true	7 checks could not run		true	2720	-541	172	16	
-AXStaticText		headers			true	2745	-517	52	15	
-AXStaticText		error: check-security-headers:49 — hook 'anon$d24fa5f6b588a735' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)  help: the flow was forwarded unchanged. Fix the 			true	2809	-517	1017	30	
-AXStaticText		crlf			true	2745	-483	30	15	
-AXStaticText		error: check-crlf-injection:58 — hook 'anon$9e5c585422c45947' failed: probe.send failed: header point 43b38039-9b4b-4666-bcd3-4867afe42ce4:header:0 produced a value that cannot go on the wire  help: t			true	2787	-483	980	30	
-AXStaticText		header-reflection			true	2745	-449	127	15	
-AXStaticText		error: check-header-reflection:63 — hook 'anon$18afc689587f65ad' failed: probe.send failed: scan: probe failed: Connection refused (os error 61)  help: the flow was forwarded unchanged. Fix the hook a			true	2884	-449	913	30	
-AXStaticText		xss-reflected			true	2745	-415	97	15	
-AXStaticText		every one of the 3 reflection probes was refused			true	2854	-415	357	15	
-AXStaticText		crlf			true	2745	-396	30	15	
-AXStaticText		error: check-crlf-injection:58 — hook 'anon$9e5c585422c45947' failed: probe.send failed: header point 43b38039-9b4b-4666-bcd3-4867afe42ce4:header:1 produced a value that cannot go on the wire  help: t			true	2787	-396	980	30	
-AXStaticText		The crawl fetched 1 page and hit 1 error			true	2742	-358	240	16	
-AXStaticText		stopped_reason: errors			true	2742	-334	150	14	
-AXGroup			4 jobs · 1 running		true	2718	-280	1134	212	
-AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.		true	2718	-247	1134	44	scan-job-scan-ff39b41e
-AXButton			Auditing, light-http, 127.0.0.1:8120, 4 issues: 4 low, 1 minute 14 seconds.		true	2718	-202	1134	44	scan-job-scan-ca4cd51f
-AXButton			Done, standard, 127.0.0.1:8121, no issues, 30 seconds.		true	2718	-157	1134	44	scan-job-scan-b5e32649
-AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 55 seconds.		true	2718	-280	1134	212	scan-job-scan-8094e0c0
-AXGroup			Crawl and points		true	2718	-40	559	490	
-AXHeading			Crawl and points, what the job found to test		true	2738	-24	519	17	
-AXStaticText		Pages fetched, 1			true	2738	6	519	16	
-AXStaticText		Pages waiting, 0			true	2738	35	519	16	
-AXStaticText		Depth, 0			true	2738	64	519	16	
-AXStaticText		Forms submitted, 0			true	2738	93	519	16	
-AXStaticText		Forms not submitted, 0			true	2738	122	519	16	
-AXStaticText		Crawl errors, 1			true	2738	151	519	16	
-AXStaticText		Points found, 14			true	2738	180	519	16	
-AXStaticText		Waiting for audit, 135			true	2738	209	519	16	
-AXStaticText		Audited, 0			true	2738	238	519	16	
-AXStaticText		skipped as repetitive, 0			true	2738	267	519	16	
-AXStaticText		skipped by rule, 0			true	2738	296	519	16	
-AXStaticText		skipped at the per-request cap, 0			true	2738	325	519	16	
-AXStaticText		Lanes, HTTP, WebSocket			true	2738	354	519	16	
-AXStaticText		Probes by lane, HTTP 1			true	2738	383	519	16	
-AXStaticText		Session, no · no · off · no			true	2738	412	519	16	
-AXGroup			Issues		true	3293	-40	559	229	
-AXHeading			Issues, by severity and confidence		true	3313	-24	519	17	
-AXStaticText		Critical · High · Medium, 0 · 0 · 0			true	3313	6	519	16	
-AXStaticText		Low, 0			true	3313	35	519	16	
-AXStaticText		Info, 0			true	3313	64	519	16	
-AXStaticText		Certain · Firm · Tentative, 0 · 0 · 0			true	3313	93	519	16	
-AXStaticText		Probe errors · timeouts · rate waits, 10 · 0 · 0			true	3313	122	519	16	
-AXStaticText		Checks scheduled · done · errors · skipped, 135 · 49 · 7 · 0			true	3313	151	519	16	
+AXStaticText		Bus disconnected · showing values from 0:46 ago · reconnecting…			true	2730	-1040	376	15	
+AXUnknown			Error: Unable to read job scan-7826b373: the bus connection closed. Showing values from 0:46 ago; retrying every 2 s.		true	2718	-993	642	15	
+AXStaticText		Auditing			true	2742	-931	79	22	
+AXHeading			127.0.0.1:8117		true	2833	-934	208	28	
+AXButton			Show Site Map		false	3530	-932	102	28	
+AXButton			Show Issues		false	3640	-932	88	28	
+AXButton			Cancel Scan		false	3736	-931	92	26	
+AXStaticText		5 issues so far: 1 high, 4 low · xss-reflected running now · standard · started 19:35 by anim-verify			true	2742	-902	652	17	
+AXUnknown			Progress		true	2742	-884	1086	134	
+AXUnknown			5 issues: 1 high, 4 low		true	2742	-734	145	16	
+AXUnknown			Probe budget, 1,248 of 2,000		true	2742	-702	1086	15	
+AXStaticText		Progress, 58 %			true	2758	-653	70	53	
+AXStaticText		Checks, 4,279, of 7,320			true	2975	-653	148	53	
+AXStaticText		Probes, 1,248, of 2,000			true	3193	-653	148	53	
+AXStaticText		Points audited, 267, of 1,166			true	3410	-653	113	53	
+AXStaticText		Issues, 5, 1 high, 4 low			true	3628	-653	102	53	
+AXDisclosureTriangle		false	182 checks could not run		true	2720	-562	187	16	
+AXGroup			3 jobs · 2 running		true	2718	-502	1134	167	
+AXButton			Auditing, standard, 127.0.0.1:8117, 58 percent, 4,279 of 7,320 checks, 5 issues: 1 high, 4 low, 8 minutes 23 seconds.		true	2718	-469	1134	44	scan-job-scan-7826b373
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.		true	2718	-424	1134	44	scan-job-scan-6ba2caf1
+AXButton			Auditing, light-http, 127.0.0.1:8120, 76 percent, 3,565 of 4,654 checks, 5 issues: 1 high, 4 low, 9 minutes 49 seconds.		true	2718	-379	1134	44	scan-job-scan-0788234b
+AXGroup			Crawl and points		true	2718	-307	559	461	
+AXHeading			Crawl and points, what the job found to test		true	2738	-291	519	17	
+AXStaticText		Pages fetched, 46			true	2738	-261	519	16	
+AXStaticText		Pages waiting, 0			true	2738	-232	519	16	
+AXStaticText		Depth, 0			true	2738	-203	519	16	
+AXStaticText		Forms submitted, 5			true	2738	-174	519	16	
+AXStaticText		Forms not submitted, 0			true	2738	-145	519	16	
+AXStaticText		Points found, 1,166			true	2738	-116	519	16	
+AXStaticText		Waiting for audit, 7,320			true	2738	-87	519	16	
+AXStaticText		Audited, 267			true	2738	-58	519	16	
+AXStaticText		skipped as repetitive, 879			true	2738	-29	519	16	
+AXStaticText		skipped by rule, 0			true	2738	0	519	16	
+AXStaticText		skipped at the per-request cap, 0			true	2738	29	519	16	
+AXStaticText		Lanes, HTTP, WebSocket			true	2738	58	519	16	
+AXStaticText		Probes by lane, HTTP 1,248			true	2738	87	519	16	
+AXStaticText		Session, no · no · off · no			true	2738	116	519	16	
+AXGroup			Issues		true	3293	-307	559	229	
+AXHeading			Issues, by severity and confidence		true	3313	-291	519	17	
+AXStaticText		Critical · High · Medium, 0 · 1 · 0			true	3313	-261	519	16	
+AXStaticText		Low, 4			true	3313	-232	519	16	
+AXStaticText		Info, 0			true	3313	-203	519	16	
+AXStaticText		Certain · Firm · Tentative, 2 · 2 · 1			true	3313	-174	519	16	
+AXStaticText		Probe errors · timeouts · rate waits, 0 · 0 · 0			true	3313	-145	519	16	
+AXStaticText		Checks scheduled · done · errors · skipped, 7,320 · 4,279 · 182 · 0			true	3313	-116	519	16	
 AXScrollBar		0			true	3875	-1069	19	750	
-AXValueIndicator		0				3879	-1065	11	358	
+AXValueIndicator		0				3879	-1065	11	442	
 AXButton						3876	-1068	0	0	
 AXButton						3876	-1068	0	0	
-AXButton						3879	-706	11	383	
+AXButton						3879	-622	11	299	
 AXButton						3879	-1065	11	0	
 AXButton			Clear		true	2465	-316	44	20	
 AXButton			Filter		true	2517	-316	43	20	
 AXButton			Auto-select		true	2568	-316	78	20	
-AXStaticText		0 / 256 rows			true	3116	-314	71	15	
-AXStaticText		5 hosts in scope			true	3201	-314	93	15	
+AXStaticText		0 / 257 rows			true	3116	-314	70	15	
+AXStaticText		3 hosts in scope			true	3200	-314	93	15	
 AXStaticText		↑ 0 B/s			true	3763	-314	52	15	
 AXStaticText		↓ 0 B/s			true	3829	-314	52	15	
 AXToolbar						2453	-1192	1440	52	
 AXGroup						2863	-1192	621	52	
-AXButton		127.0.0.1:62195, This build has no extension	aitmproxy: core: running, bus: connecting…, all apps: no extension		true	2867	-1180	418	28	
+AXButton		127.0.0.1:49233, This build has no extension	aitmproxy: core: running, bus: connecting…, all apps: no extension		true	2867	-1180	418	28	
 AXCheckBox		1	Proxy		false	3293	-1180	82	28	
 AXCheckBox		0	All Apps		false	3383	-1180	97	28	
 AXButton			Toggle Sidebar		true	2545	-1192	47	52	

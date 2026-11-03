@@ -5,9 +5,9 @@ AXGroup						2453	-1140	240	820
 AXStaticText		aitmproxy			true	2469	-1126	86	16	
 AXScrollArea						2453	-1095	240	731	
 AXStaticText		TRAFFIC			true	2469	-1075	51	14	
-AXButton			Flows, 87		true	2461	-1053	224	28	
+AXButton			Flows, 257		true	2461	-1053	224	28	
 AXButton			Apps, 1		true	2461	-1025	224	28	
-AXButton			Domains, 2		true	2461	-997	224	28	
+AXButton			Domains, 3		true	2461	-997	224	28	
 AXButton			Pinned, 0		true	2461	-969	224	28	
 AXButton			Connection Log		true	2461	-941	224	28	
 AXButton			Overview		true	2461	-913	224	28	
@@ -27,7 +27,7 @@ AXGroup						2694	-1140	1199	820
 AXHeading			SCAN		true	2714	-1129	34	14	
 AXScrollArea						2716	-1104	1149	36	
 AXButton			Profiles		true	2716	-1104	58	36	
-AXButton			Jobs 2		true	2776	-1104	54	36	
+AXButton			Jobs 3		true	2776	-1104	54	36	
 AXButton			Site map		true	2832	-1104	66	36	
 AXButton			Issues		true	2900	-1104	51	36	
 AXScrollArea						2694	-1068	1199	748	
@@ -37,54 +37,55 @@ AXButton			Show Site Map		true	3537	-1026	102	28
 AXButton			Show Issues		true	3647	-1026	88	28	
 AXButton			Scan Again		true	3743	-1025	85	26	
 AXStaticText		Stopped early: the time budget ran out.			true	2742	-996	254	17	
-AXStaticText		light-http · started 18:45 by anim-verify · finished 18:55			true	2742	-975	358	17	
+AXStaticText		light-http · started 19:34 by anim-verify · finished 19:45			true	2742	-975	358	17	
 AXUnknown			Progress		true	2742	-957	1086	134	
-AXUnknown			5 issues: 1 high, 4 low		true	2742	-807	125	16	
-AXUnknown			Probe budget, 1,482 of 2,000		true	2742	-775	1086	15	
+AXUnknown			5 issues: 1 high, 4 low		true	2742	-807	145	16	
+AXUnknown			Probe budget, 1,459 of 2,000		true	2742	-775	1086	15	
 AXStaticText		Progress, —			true	2758	-726	54	53	
-AXStaticText		Checks, 3,555, of 4,624			true	2975	-726	148	53	
-AXStaticText		Probes, 1,482, of 2,000			true	3193	-726	148	53	
-AXStaticText		Points audited, 400, of 967			true	3410	-726	101	53	
+AXStaticText		Checks, 3,571, of 4,654			true	2975	-726	148	53	
+AXStaticText		Probes, 1,459, of 2,000			true	3193	-726	148	53	
+AXStaticText		Points audited, 401, of 976			true	3410	-726	101	53	
 AXStaticText		Issues, 5, 1 high, 4 low			true	3628	-726	102	53	
 AXStaticText		stopped_reason: time			true	2742	-639	136	14	
-AXGroup			2 jobs		true	2718	-585	1134	122	
-AXButton			Done, standard, 127.0.0.1:8121, no issues, 30 seconds.		true	2718	-552	1134	44	scan-job-scan-4020dada
-AXButton			Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes.		true	2718	-507	1134	44	scan-job-scan-54c57eae
-AXGroup			Crawl and points		true	2718	-435	559	461	
-AXHeading			Crawl and points, what the job found to test		true	2738	-419	519	17	
-AXStaticText		Pages fetched, 46			true	2738	-389	519	16	
-AXStaticText		Pages waiting, 0			true	2738	-360	519	16	
-AXStaticText		Depth, 0			true	2738	-331	519	16	
-AXStaticText		Forms submitted, 5			true	2738	-302	519	16	
-AXStaticText		Forms not submitted, 0			true	2738	-273	519	16	
-AXStaticText		Points found, 967			true	2738	-244	519	16	
-AXStaticText		Waiting for audit, 4,624			true	2738	-215	519	16	
-AXStaticText		Audited, 400			true	2738	-186	519	16	
-AXStaticText		skipped as repetitive, 0			true	2738	-157	519	16	
-AXStaticText		skipped by rule, 0			true	2738	-128	519	16	
-AXStaticText		skipped at the per-request cap, 0			true	2738	-99	519	16	
-AXStaticText		Lanes, HTTP			true	2738	-70	519	16	
-AXStaticText		Probes by lane, HTTP 1,482			true	2738	-41	519	16	
-AXStaticText		Session, no · no · off · no			true	2738	-12	519	16	
-AXGroup			Issues		true	3293	-435	559	229	
-AXHeading			Issues, by severity and confidence		true	3313	-419	519	17	
-AXStaticText		Critical · High · Medium, 0 · 1 · 0			true	3313	-389	519	16	
-AXStaticText		Low, 4			true	3313	-360	519	16	
-AXStaticText		Info, 0			true	3313	-331	519	16	
-AXStaticText		Certain · Firm · Tentative, 2 · 2 · 1			true	3313	-302	519	16	
-AXStaticText		Probe errors · timeouts · rate waits, 0 · 0 · 0			true	3313	-273	519	16	
-AXStaticText		Checks scheduled · done · errors · skipped, 4,624 · 3,555 · 0 · 0			true	3313	-244	519	16	
+AXGroup			3 jobs		true	2718	-585	1134	167	
+AXButton			Cancelled, standard, 127.0.0.1:8117, 5 issues: 1 high, 4 low, 9 minutes 16 seconds.		true	2718	-552	1134	44	scan-job-scan-7826b373
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.		true	2718	-507	1134	44	scan-job-scan-6ba2caf1
+AXButton			Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes 35 seconds.		true	2718	-462	1134	44	scan-job-scan-0788234b
+AXGroup			Crawl and points		true	2718	-390	559	461	
+AXHeading			Crawl and points, what the job found to test		true	2738	-374	519	17	
+AXStaticText		Pages fetched, 46			true	2738	-344	519	16	
+AXStaticText		Pages waiting, 0			true	2738	-315	519	16	
+AXStaticText		Depth, 0			true	2738	-286	519	16	
+AXStaticText		Forms submitted, 5			true	2738	-257	519	16	
+AXStaticText		Forms not submitted, 0			true	2738	-228	519	16	
+AXStaticText		Points found, 976			true	2738	-199	519	16	
+AXStaticText		Waiting for audit, 4,654			true	2738	-170	519	16	
+AXStaticText		Audited, 401			true	2738	-141	519	16	
+AXStaticText		skipped as repetitive, 0			true	2738	-112	519	16	
+AXStaticText		skipped by rule, 0			true	2738	-83	519	16	
+AXStaticText		skipped at the per-request cap, 0			true	2738	-54	519	16	
+AXStaticText		Lanes, HTTP			true	2738	-25	519	16	
+AXStaticText		Probes by lane, HTTP 1,459			true	2738	4	519	16	
+AXStaticText		Session, no · no · off · no			true	2738	33	519	16	
+AXGroup			Issues		true	3293	-390	559	229	
+AXHeading			Issues, by severity and confidence		true	3313	-374	519	17	
+AXStaticText		Critical · High · Medium, 0 · 1 · 0			true	3313	-344	519	16	
+AXStaticText		Low, 4			true	3313	-315	519	16	
+AXStaticText		Info, 0			true	3313	-286	519	16	
+AXStaticText		Certain · Firm · Tentative, 2 · 2 · 1			true	3313	-257	519	16	
+AXStaticText		Probe errors · timeouts · rate waits, 1 · 0 · 0			true	3313	-228	519	16	
+AXStaticText		Checks scheduled · done · errors · skipped, 4,654 · 3,571 · 0 · 0			true	3313	-199	519	16	
 AXScrollBar		0			true	3875	-1069	19	750	
-AXValueIndicator		0				3879	-1065	11	492	
+AXValueIndicator		0				3879	-1065	11	473	
 AXButton						3876	-1068	0	0	
 AXButton						3876	-1068	0	0	
-AXButton						3879	-572	11	249	
+AXButton						3879	-591	11	268	
 AXButton						3879	-1065	11	0	
 AXButton			Clear		true	2465	-316	44	20	
 AXButton			Filter		true	2517	-316	43	20	
 AXButton			Auto-select		true	2568	-316	78	20	
-AXStaticText		0 / 87 rows			true	3120	-314	63	15	
-AXStaticText		3 hosts in scope			true	3197	-314	93	15	
+AXStaticText		0 / 257 rows			true	3116	-314	70	15	
+AXStaticText		3 hosts in scope			true	3200	-314	93	15	
 AXStaticText		↑ 0 B/s			true	3763	-314	52	15	
 AXStaticText		↓ 0 B/s			true	3829	-314	52	15	
 AXToolbar						2453	-1192	1440	52	

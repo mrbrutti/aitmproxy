@@ -996,3 +996,149 @@ rows: 2
 down
 [19:03:02] targets stopped
 [19:05:31] AC50 pass A7 stills re-cut from the selection change at t01652 (the click's HID event landed ~1.1 s after the recording clock's +527 ms mark: leftclick activates the app first): click+0..+600 ms
+[19:27:18] note: Logger.info lines live only in the in-memory log store; a 3 h re-query at 19:08 returned nothing, so 74-announce-log.txt is rebuilt from the lines proof.log captured at 18:19 (pass A4) and 18:37 (pass A5); pass A8 captures its line within a minute of the end
+[19:34:02] == pass A8 (relaunch): app and core from the bundle tree ad4b9b71 = feat/scan-jobs-view-redesign 4b7d8016 + #310
+[19:34:02] real audit log size before: 94174
+share
+app pid 41726
+core pid 41790 proxy port 49228 bus 127.0.0.1:49233
+[19:34:23] #310 PASS: audit log under the isolated store
+pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[19:34:29] == light-http on 8120 alone for its crawl (AC48 at the end)
+[19:34:29] light-http job scan-0788234b
+[19:35:19] == AC47 + AC29 announce: tiny-budget selected while it ends; frame within 3 s of done; announce line captured at once
+[19:35:19] tiny-budget job scan-6ba2caf1
+left-clicked 3285 -585 in pid 41726 via HID tap
+selected now: scan-job-scan-6ba2caf1 (wanted scan-job-scan-6ba2caf1)
+[19:35:46] frame 43-tiny-budget-ended
+[19:35:46] AC47 end frame 3261 ms after the 1 s poll saw done
+AXStaticText		Done		true
+AXButton			Scan Again	true
+AXStaticText		Stopped early: the probe budget of 50 was spent. Raise it in the profile to go further.		true
+AXUnknown			Probe budget, 50 of 50	true
+AXStaticText		stopped_reason: budget		true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.	true
+[19:35:47] AC46 done edge (tiny-budget card): 266 300 #85ECAA 267 300 #84ECAA 
+2026-11-02 19:35:43.416 I  Aitmproxy-jobsux[41726:a5f5f60] [com.mrbrutti.aitmproxy:scan] announce: scan-6ba2caf1 <private>
+[19:35:52] AC29 announce lines captured for this pass: 1 for scan-6ba2caf1
+[19:35:52] == AC19: the Done row's context menu (Scan Again, no Cancel) and hover on/off on a running row
+right-clicked 3285 -498 in pid 41726 via HID tap
+AXMenuItem	
+AXMenuItem	
+AXMenuItem	
+AXMenuItem	
+AXMenuItem	
+AXMenuItem	
+[19:35:55] frame 15-context-menu-done (region capture)
+[19:35:57] standard job scan-7826b373
+[19:36:20] standard phase: auditing
+left-clicked 3285 -408 in pid 41726 via HID tap
+selected now: scan-job-scan-0788234b (wanted scan-job-scan-0788234b)
+hover 3285 -585 in pid 41726
+[19:36:27] frame 12-hover-on
+[19:36:27] AC19 hover-on action column sample (x 1300..1380, row y from the dump): 607
+[19:36:28]   Cancel ink at hover-on: 1340 607 #2A2A2C 1350 607 #2A2A2C 1360 607 #98989B 
+hover 700 60 in pid 41726
+[19:36:31] frame 12-hover-off
+[19:36:31]   same at hover-off: 1340 607 #1E1E20 1350 607 #1E1E20 1360 607 #1E1E20 
+2652.54 (0.00204671)[19:36:32] AC19 hover diff AE=2652.54 (0.00204671) -> 12-hover-diff.png (ticking values also differ; the action column is the Cancel word)
+[19:36:32] == AC50 keyboard: row 1 (scan-0788234b light-http) selected, HID Down selects row 2 (scan-7826b373 standard); stills cut from the frame where the highlight moves
+left-clicked 3285 -495 in pid 41726 via HID tap
+selected now: scan-job-scan-0788234b (wanted scan-job-scan-0788234b)
+hid key 125 flags 0 to pid 41726
+captured 149 changed frames in 2.5 s -> /tmp/claude/jobsux-proof/pr2/keydown
+121 changed frames, last change at 3167 ms
+[19:44:02] AC50 keyboard stills cut offline from the frame with the first large AE spike in keydown-diff.txt (t875; the swap), plus the frame before it
+[19:44:14] == pass A8b on the running app (bundle ad4b9b71); real audit size 94174
+1 scan-7826b373 running auditing
+2 scan-6ba2caf1 done done
+3 scan-0788234b running auditing
+[19:44:14] standard running: scan-7826b373; light-http: scan-0788234b
+[19:44:14] == AC30 frames with the window fronted (standard selected): before, 10 s, 35 s, reconnect, recovered
+left-clicked 3285 -585 in pid 41726 via HID tap
+selected now: scan-job-scan-7826b373 (wanted scan-job-scan-7826b373)
+[19:44:20] frame 49-before-stop
+[19:44:20] core stopped
+[19:44:32] frame 50-stopped-10s
+[19:44:32] AC30 10 s: banner/error lines = 0 (expect 0)
+[19:44:59] frame 51-stopped-35s
+AXStaticText		The core is not answering · showing values from 0:40 ago · retrying every 2 s		true
+AXUnknown			Error: Unable to list jobs: the bus did not reply in time. Showing values from 0:40 ago; retrying every 2 s.	true
+AXButton			Cancel Scan	false
+pressed Proxy > Reconnect Bus -> 0
+[19:45:05] frame 52-reconnecting
+AXStaticText		Bus disconnected · showing values from 0:46 ago · reconnecting…	
+[19:45:05] core continued
+[19:45:12] frame 53-recovered
+[19:45:13] AC30 recovered at +5 s: banner/error lines = 0 (expect 0); Cancel Scan enabled: true
+[19:45:13] AC30 frame md5s (49, 50, 53 must differ): a40fbc51 45a18b27 bfca4fb2 
+[19:45:13] standard cancelled (cleanup)
+[19:45:13] == AC48: wait for light-http scan-0788234b, select it: ledger words (fix 2.12e), end sentence
+[19:45:13] light-http ended: done
+AC48 status done time {'critical': 0, 'high': 1, 'info': 0, 'low': 4, 'medium': 0}
+left-clicked 3285 -429 in pid 41726 via HID tap
+selected now: scan-job-scan-0788234b (wanted scan-job-scan-0788234b)
+[19:45:19] frame 61-light-http-card
+AXButton			Flows, 257	true
+AXButton			Scan Again	true
+AXStaticText		Stopped early: the time budget ran out.		true
+AXUnknown			5 issues: 1 high, 4 low	true
+AXStaticText		Issues, 5, 1 high, 4 low		true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 5 issues: 1 high, 4 low, 9 minutes 16 seconds.	true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.	true
+AXButton			Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes 35 seconds.	true
+[19:45:20] == AC47 end-frame timing: tiny-budget selected; 1 s poll + 0.8 s settle
+[19:45:21] tiny-budget job scan-f65d1847
+left-clicked 3285 -530 in pid 41726 via HID tap
+selected now: scan-job-scan-f65d1847 (wanted scan-job-scan-f65d1847)
+[19:45:47] frame 44-tiny-budget-ended-fast
+[19:45:47] AC47 end frame 2554 ms after the 1 s poll saw done (the poll may lag the state by up to 1 s)
+AXButton			Scan Again	true
+AXStaticText		Stopped early: the probe budget of 50 was spent. Raise it in the profile to go further.		true
+AXUnknown			Probe budget, 50 of 50	true
+AXStaticText		stopped_reason: budget		true
+[19:45:48] AC47 chip/edge in the fast frame: 266 300 #85ECAA 267 300 #84ECAA  (done = #86EFAC within 4)
+[19:45:48] real audit log size after: 94174 (before 94174) -> #310 PASS
+[19:45:48] == evidence copy
+[19:45:49] == done pass A8b; quitting the bundle (quit-when-idle rule)
+down
+[19:45:51] targets stopped
+[19:48:39] == pass A10 (relaunch): app and core from the bundle tree ad4b9b71 = feat/scan-jobs-view-redesign 4b7d8016 + #310
+share
+app pid 46755
+core pid 46761 proxy port 53822 bus 127.0.0.1:53828
+[19:48:55] #310 PASS: audit log under the isolated store
+pressed AXButton '' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[19:49:01] standard job scan-e766458a (becomes row 2)
+[19:49:09] standard job scan-9bd7c5b0 (row 1, newest)
+[19:49:12] phases: scan-9bd7c5b0 auditing, scan-e766458a auditing
+left-clicked 3285 -541 in pid 46755 via HID tap
+selected now: scan-job-scan-9bd7c5b0 (wanted scan-job-scan-9bd7c5b0)
+[19:49:17] == AC50 keyboard: top row (scan-9bd7c5b0) selected; HID Down -> row 2 (scan-e766458a); recording 2.5 s, key at +0.6 s
+hid key 125 flags 0 to pid 46755
+[19:49:18] key posted between +627 and +1340 ms
+captured 146 changed frames in 2.5 s -> /tmp/claude/jobsux-proof/pr2/keydown
+116 changed frames, last change at 3114 ms
+scan-job-scan-9bd7c5b0	AXButton	selected=nil	focused=nil
+scan-job-scan-e766458a	AXButton	selected=true	focused=nil
+rows: 2
+[19:49:51] keyboard swap frame (first diff spike after the key): t905
+[19:49:51] still +0 ms -> frame t905
+[19:49:51] still +17 ms -> frame t923
+[19:49:51] still +34 ms -> frame t941
+[19:49:51] still +60 ms -> frame t977
+[19:49:51] still +100 ms -> frame t1014
+[19:49:51] still +200 ms -> frame t1121
+[19:49:51] still +400 ms -> frame t1316
+[19:49:51] jobs cancelled (cleanup)
+[19:49:51] real audit log size after: 94174 (before 94174) -> #310 PASS
+[19:49:51] == done pass A10; quitting the bundle (quit-when-idle rule)
+down
+[19:51:37] AC50 keyboard (pass A10): the swap is the AE-1148 spike at t1282 (the t905 spike, AE 7429, is the pointer leaving the row after the click: hover ground off); stills re-cut from t1282, plus the frame before
+[19:52:13] AC50 keyboard (pass A10) correction: the swap is the AE-7429 spike at t905 (the key fired ~0.9 s into the recording after hidkey's activation delay); the t1282 spike is a status beat. Stills re-cut from t905 with the frame before

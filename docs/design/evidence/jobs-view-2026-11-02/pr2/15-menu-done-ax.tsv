@@ -1,0 +1,6 @@
+AXMenuItem	Scan Again				true	3286	-494	122	24	menuAction:
+AXMenuItem	Show Issues				true	3286	-470	122	24	menuAction:
+AXMenuItem	Show Site Map				true	3286	-446	122	24	menuAction:
+AXMenuItem					false	3286	-422	122	11	
+AXMenuItem	Copy Job ID				true	3286	-411	122	24	menuAction:
+AXMenuItem					false	3286	-499	0	0	
