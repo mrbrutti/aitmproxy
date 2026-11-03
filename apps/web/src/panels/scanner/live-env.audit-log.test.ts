@@ -149,3 +149,100 @@ describe('live-env startAitm wiring (AC5)', () => {
     }
   });
 });
+
+// Tester additions (Task 3): the guard must compare against the run dir rather than merely find the
+// keys, the quoting claim in Design 1 must round-trip, malformed inputs must refuse rather than
+// pass, and the AC5 ordering must hold statically for mkdtemp and the written file too.
+describe('live-env audit-log isolation: tester edge cases', () => {
+  it('the guard refuses the isolated document when it names a different run dir', async () => {
+    const { assertAuditLogIsolated } = await liveEnv();
+    // AC2's document carries both keys; only the dir is wrong. A presence-only check would accept it.
+    const path = writeDoc(AC2_DOC);
+    expect(() => assertAuditLogIsolated(path, '/r/other')).toThrow(
+      `live-env: refusing to start aitm: ${path} must carry mcp.audit_log "/r/other/audit.jsonl" and ca.audit_log "/r/other/ca-audit.jsonl" so the core's audit logs stay in the run dir; missing: mcp.audit_log, ca.audit_log`,
+    );
+    // The same dir with a trailing slash normalises to the same two paths and is accepted.
+    expect(assertAuditLogIsolated(path, '/r/run/')).toBeUndefined();
+  });
+
+  it('a quote or backslash in auditLogDir is JSON-quoted and round-trips through the guard', async () => {
+    const { renderConfig, assertAuditLogIsolated } = await liveEnv();
+    const weird = '/r/we"ird\\dir';
+    const doc = renderConfig({ ...BASE, auditLogDir: weird });
+    expect(doc).toContain('ca:\n  audit_log: "/r/we\\"ird\\\\dir/ca-audit.jsonl"\nmcp:\n');
+    expect(doc).toContain('  operator_token: opsecret-x\n  audit_log: "/r/we\\"ird\\\\dir/audit.jsonl"\n  transport:\n');
+    expect(doc.split('\n').filter((l) => l.includes('audit_log'))).toHaveLength(2);
+    expect(assertAuditLogIsolated(writeDoc(doc), weird)).toBeUndefined();
+  });
+
+  it('an empty-string auditLogDir is refused like any other relative path', async () => {
+    const { renderConfig } = await liveEnv();
+    expect(() => renderConfig({ ...BASE, auditLogDir: '' })).toThrow(
+      /^live-env: auditLogDir must be an absolute path; got ""$/,
+    );
+    expect(() => renderConfig({ ...BASE, auditLogDir: './run' })).toThrow(
+      /^live-env: auditLogDir must be an absolute path; got "\.\/run"$/,
+    );
+  });
+
+  it('the guard refuses an empty file, a CRLF file, an indented-only file and a missing file', async () => {
+    const { assertAuditLogIsolated } = await liveEnv();
+    const both = /missing: mcp\.audit_log, ca\.audit_log$/;
+    expect(() => assertAuditLogIsolated(writeDoc(''), '/r/run')).toThrow(both);
+    expect(() => assertAuditLogIsolated(writeDoc(AC2_DOC.replace(/\n/g, '\r\n')), '/r/run')).toThrow(both);
+    // Every line indented: no block header, so neither line can belong to `mcp:` or `ca:`.
+    expect(() => assertAuditLogIsolated(writeDoc(AC2_DOC.replace(/^/gm, ' ')), '/r/run')).toThrow(both);
+    // The audit_log lines under the right headers but with the key spelled differently or an extra
+    // indent are not the exact line the core would read as `mcp.audit_log` / `ca.audit_log`.
+    expect(() => assertAuditLogIsolated(writeDoc(AC2_DOC.replace(/  audit_log:/g, '   audit_log:')), '/r/run')).toThrow(both);
+    expect(() => assertAuditLogIsolated(writeDoc(AC2_DOC.replace(/audit_log:/g, 'audit_log :')), '/r/run')).toThrow(both);
+    // A path that does not exist must throw (the read fails), never return undefined.
+    const gone = join(mkdtempSync(join(tmpdir(), 'live-env-audit-')), 'absent.yaml');
+    expect(() => assertAuditLogIsolated(gone, '/r/run')).toThrow(/ENOENT/);
+  });
+
+  it('startAitm inspects AITM_AUDIT_LOG before the binary check and mkdtemp, and checks the written file', () => {
+    const src = readFileSync(LIVE_ENV_PATH, 'utf8');
+    const start = src.indexOf('export async function startAitm(');
+    const end = src.indexOf('\nexport ', start + 1);
+    const body = src.slice(start, end);
+
+    const envCheck = body.indexOf('process.env.AITM_AUDIT_LOG');
+    const binCheck = body.indexOf('existsSync(aitmBin)');
+    const mkdtemp = body.indexOf('mkdtempSync(');
+    const write = body.indexOf('writeFileSync(cfg');
+    const guard = body.indexOf('assertAuditLogIsolated(cfg, dir)');
+    const spawnAt = body.indexOf('spawn(aitmBin');
+    for (const at of [envCheck, binCheck, mkdtemp, write, guard, spawnAt]) expect(at).toBeGreaterThanOrEqual(0);
+    expect(envCheck).toBeLessThan(binCheck);
+    expect(binCheck).toBeLessThan(mkdtemp);
+    expect(mkdtemp).toBeLessThan(write);
+    expect(write).toBeLessThan(guard);
+    expect(guard).toBeLessThan(spawnAt);
+
+    // The spawn env is exactly the spec's: nothing sets AITM_AUDIT_LOG, so nothing defaults it to off.
+    expect(body).toContain("env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info' }");
+    expect(body).not.toContain('AITM_AUDIT_LOG:');
+    // `off` is tolerated by exact comparison, not a case-insensitive or prefix one.
+    expect(body).toContain("=== 'off'");
+  });
+
+  it('startAitm treats OFF, off with whitespace and an empty string as values other than off', async () => {
+    const { startAitm } = await liveEnv();
+    const saved = process.env.AITM_AUDIT_LOG;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const v of ['OFF', 'off ', ' off', '', 'false', '0']) {
+        process.env.AITM_AUDIT_LOG = v;
+        await expect(startAitm({ aitmBin: '/nonexistent/aitm' })).rejects.toThrow(
+          /^live-env: AITM_AUDIT_LOG is set to a value other than off/,
+        );
+      }
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      if (saved === undefined) delete process.env.AITM_AUDIT_LOG;
+      else process.env.AITM_AUDIT_LOG = saved;
+      errorSpy.mockRestore();
+    }
+  });
+});
