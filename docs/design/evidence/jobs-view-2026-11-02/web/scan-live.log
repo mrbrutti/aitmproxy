@@ -1,0 +1,215 @@
+[aitm] 2026-11-03T08:39:22.572180Z  WARN aitm: embedded browser unavailable; browser.* commands will error engine=Obscura error=obscura (the embedded browser engine) was not found.
+Looked in: /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/target/release/obscura, /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/target/release/../libexec/obscura.
+To get it:
+  - dev checkout: run `scripts/fetch-obscura-dev.sh` to drop obscura next to the aitm binary
+  - installed:    install an aitmproxy package (.deb/.rpm) or the release tarball, which bundle obscura beside aitm
+  - custom path:  set AITM_OBSCURA_BIN=/path/to/obscura, or browser.obscura.binary in your config
+NOTE 00 audit-log preflight at startup — mcp "<run dir>/audit.jsonl" · ca "<run dir>/ca-audit.jsonl" (inside <run dir>)
+NOTE 00 dead port at startup — 57592 is none of {"proxy":57595,"web":57597,"target":57594} nor of the config's [57595,57596], and a connect is refused
+
+== 01 the core offers the engine and the Scan panel opens
+PASS 01a the sidebar shows Scan
+  click button "Scan" within aside[aria-label="Sources"] @ 120,316
+PASS 01b the v2 surface lists the standard profile
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/01-01-the-core-offers-the-engine-and-the-sc.png
+
+== 02 start a standard scan against the test target
+  click [role=listbox][aria-label="Profiles"] [data-profile="standard"] @ 400,803
+  click radio "http" within [role=radiogroup][aria-label="Origin scheme"] @ 644,800
+  Origin port is disabled (host carries the port); not typed
+  click button "Add origin" @ 1149,788
+PASS 02a the origin picker composed the target origin
+  click button "Start" within section[aria-label="Scanner"] @ 1564,958
+PASS 02b the Jobs row id equals the witness scan.list[0].job
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/02-02-start-a-standard-scan-against-the-tes.png
+
+== 03 probes and phase track the witness
+PASS 03a rendered probes bracketed by witness scan.status (a)
+PASS 03a rendered probes bracketed by witness scan.status (b)
+PASS 03b rendered probes strictly increase over 2 s
+[aitm] 2026-11-03T08:39:52.451845Z  WARN aitm::scanner: the check reported an error: error: check-crlf-injection:58 — hook 'anon$c5b167d527623af3' failed: probe.send failed: header point 697a4c3a-9f72-4b02-a7ee-6be4d7ef2684:header:4 produced a value that cannot go on the wire
+  help: the flow was forwarded unchanged. Fix the hook and rel job=scan-80e90f3f check=crlf point=697a4c3a-9f72-4b02-a7ee-6be4d7ef2684:header:4
+[aitm] 2026-11-03T08:39:54.068399Z  WARN aitm::scanner: the check reported an error: error: check-crlf-injection:58 — hook 'anon$c5b167d527623af3' failed: probe.send failed: header point 697a4c3a-9f72-4b02-a7ee-6be4d7ef2684:header:5 produced a value that cannot go on the wire
+  help: the flow was forwarded unchanged. Fix the hook and rel job=scan-80e90f3f check=crlf point=697a4c3a-9f72-4b02-a7ee-6be4d7ef2684:header:5
+NOTE 03c transient phases — seen by the witness for under 1000 ms, not judged: passive (1 ms)
+PASS 03c every phase the witness saw was rendered or the terminal word was
+NOTE 03 job state after the phase track — running · auditing (94 probes)
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/03-03-probes-and-phase-track-the-witness.png
+
+== 04 issues, evidence, flow, PoC and the false_positive round trip
+  click tab "Issues" within section[aria-label="Scanner"] [role=tablist][aria-label="Scan views"] @ 617,523
+PASS 04a issue group counts equal the witness by_severity (zero groups absent)
+NOTE 04 issue pick — no hinted-class row (listed: security-header, reflection, cookie-flag, headers); first row
+  click section[aria-label="Scanner"] [data-issue="issue-074a11dc"] @ 400,779
+[aitm] 2026-11-03T08:40:07.782069Z  WARN aitm::scanner: the check reported an error: error: check-crlf-injection:58 — hook 'anon$c5b167d527623af3' failed: probe.send failed: header point 073ac27d-6c8d-4c3c-85cd-041dccba67ca:header:4 produced a value that cannot go on the wire
+  help: the flow was forwarded unchanged. Fix the hook and rel job=scan-80e90f3f check=crlf point=073ac27d-6c8d-4c3c-85cd-041dccba67ca:header:4
+[aitm] 2026-11-03T08:40:09.397692Z  WARN aitm::scanner: the check reported an error: error: check-crlf-injection:58 — hook 'anon$c5b167d527623af3' failed: probe.send failed: header point 073ac27d-6c8d-4c3c-85cd-041dccba67ca:header:5 produced a value that cannot go on the wire
+  help: the flow was forwarded unchanged. Fix the hook and rel job=scan-80e90f3f check=crlf point=073ac27d-6c8d-4c3c-85cd-041dccba67ca:header:5
+PASS 04b the detail payload is the witness payload verbatim
+  click button "Open flow d172c94c-6c9f-48c7-9d2e-c235d9cbba63" @ 731,962
+PASS 04c the probe flow opens selected in the inspector
+  click button "Scan" within aside[aria-label="Sources"] @ 120,372
+  click tab "Issues" within section[aria-label="Scanner"] [role=tablist][aria-label="Scan views"] @ 617,529
+GAP  04d PoC ref — security-header (security-header, firm) carries no poc_ref and no hinted-class issue was listed
+  click textarea[aria-label="Note"] @ 1020,937
+  key ⌘a (focus: textarea[aria-label=Note])
+  type "intended behaviour" into textarea[aria-label=Note]
+  click button "Update status" @ 1393,958
+PASS 04e false_positive round-trips through scan.issue.update
+PASS 04f the note reached the core verbatim
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/04-04-issues-evidence-flow-poc-and-the-fals.png
+
+== 05 cancel
+[aitm] 2026-11-03T08:40:19.493291Z  WARN aitm::scanner: the check reported an error: error: check-crlf-injection:58 — hook 'anon$c5b167d527623af3' failed: probe.send failed: header point 112856ae-dad8-477e-964d-42c38c99da94:header:2 produced a value that cannot go on the wire
+  help: the flow was forwarded unchanged. Fix the hook and rel job=scan-80e90f3f check=crlf point=112856ae-dad8-477e-964d-42c38c99da94:header:2
+[aitm] 2026-11-03T08:40:21.107446Z  WARN aitm::scanner: the check reported an error: error: check-crlf-injection:58 — hook 'anon$c5b167d527623af3' failed: probe.send failed: header point 112856ae-dad8-477e-964d-42c38c99da94:header:3 produced a value that cannot go on the wire
+  help: the flow was forwarded unchanged. Fix the hook and rel job=scan-80e90f3f check=crlf point=112856ae-dad8-477e-964d-42c38c99da94:header:3
+[aitm] 2026-11-03T08:40:29.576827Z  WARN aitm::scanner: the check reported an error: error: check-crlf-injection:58 — hook 'anon$c5b167d527623af3' failed: probe.send failed: header point 8a1dd329-c02b-42e9-a8d6-3a45fcd09623:header:2 produced a value that cannot go on the wire
+  help: the flow was forwarded unchanged. Fix the hook and rel job=scan-80e90f3f check=crlf point=8a1dd329-c02b-42e9-a8d6-3a45fcd09623:header:2
+[aitm] 2026-11-03T08:40:31.190672Z  WARN aitm::scanner: the check reported an error: error: check-crlf-injection:58 — hook 'anon$c5b167d527623af3' failed: probe.send failed: header point 8a1dd329-c02b-42e9-a8d6-3a45fcd09623:header:3 produced a value that cannot go on the wire
+  help: the flow was forwarded unchanged. Fix the hook and rel job=scan-80e90f3f check=crlf point=8a1dd329-c02b-42e9-a8d6-3a45fcd09623:header:3
+2026-11-03T08:40:31.190697Z  WARN aitm::scanner: check error samples are full (8); further distinct errors are counted only job=scan-80e90f3f
+NOTE 05 first job — terminal 555278 ms after step 4 ended
+  click tab "Profiles" within section[aria-label="Scanner"] [role=tablist][aria-label="Scan views"] @ 352,529
+  click [role=listbox][aria-label="Profiles"] [data-profile="standard"] @ 400,835
+  click button "Start" within section[aria-label="Scanner"] @ 1564,958
+  click Cancel scan scan-51a2c66a 257 ms after the launch began
+PASS 05a the row or strip reads cancelling or cancelled immediately
+PASS 05b the row reads cancelled within 5 s
+PASS 05c the witness scan.status.state is cancelled
+  click [role=listbox][aria-label="Jobs"] [data-job="scan-80e90f3f"] @ 920,942
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/05-05-cancel.png
+
+== 06 the site map renders the witness nodes and insertion points
+  click tab "Site map" within section[aria-label="Scanner"] [role=tablist][aria-label="Scan views"] @ 485,523
+PASS 06a every witness path_template is rendered
+PASS 06b the insertion-point kind:name set equals the witness
+  click [role=listbox][aria-label="Site map"] [data-node="n-6c634ca8d04394db"] @ 400,657
+PASS 06c selecting a node marks it aria-selected
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/06-06-the-site-map-renders-the-witness-node.png
+
+== 07 the scan surface survives leaving the panel
+NOTE 07 panel left for the inspector — the Scan panel unmounted
+  click button "Scan" within aside[aria-label="Sources"] @ 120,372
+PASS 07a the Site map tab is still the selected tab
+PASS 07b the selected job is unchanged
+PASS 07c the same site-map node is still selected
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/07-07-the-scan-surface-survives-leaving-the.png
+
+== 08a an L4 profile is blocked without an L4 scope entry
+  click tab "Profiles" within section[aria-label="Scanner"] [role=tablist][aria-label="Scan views"] @ 352,529
+  click [role=listbox][aria-label="Profiles"] [data-profile="l4-stream-safe"] @ 400,675
+  click input[aria-label="L4 target IP"] @ 631,958
+  key ⌘a (focus: input[aria-label=L4 target IP])
+  type "127.0.0.1" into input[aria-label=L4 target IP]
+  click input[aria-label="L4 target port"] @ 774,958
+  key ⌘a (focus: input[aria-label=L4 target port])
+  type "57594" into input[aria-label=L4 target port]
+  click button "Add L4 target" @ 1138,946
+PASS 08a Start is disabled for an L4 profile with no L4 scope
+PASS 08a the refusal reason carries the D11 hint
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/08-08a-an-l4-profile-is-blocked-without-an-.png
+
+== 08b with an L4 scope entry the confirm dialog shows the core prompt verbatim
+[aitm] 2026-11-03T08:49:29.514057Z  WARN aitm: embedded browser unavailable; browser.* commands will error engine=Obscura error=obscura (the embedded browser engine) was not found.
+Looked in: /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/target/release/obscura, /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/target/release/../libexec/obscura.
+To get it:
+  - dev checkout: run `scripts/fetch-obscura-dev.sh` to drop obscura next to the aitm binary
+  - installed:    install an aitmproxy package (.deb/.rpm) or the release tarball, which bundle obscura beside aitm
+  - custom path:  set AITM_OBSCURA_BIN=/path/to/obscura, or browser.obscura.binary in your config
+NOTE 00 audit-log preflight after the 08b restart — mcp "<run dir>/audit.jsonl" · ca "<run dir>/ca-audit.jsonl" (inside <run dir>)
+NOTE 00 dead port after the 08b restart — 57592 is none of {"proxy":60336,"web":60338,"target":57594} nor of the config's [60336,60337], and a connect is refused
+  click button "Scan" within aside[aria-label="Sources"] @ 120,316
+  click tab "Profiles" within section[aria-label="Scanner"] [role=tablist][aria-label="Scan views"] @ 352,529
+  click [role=listbox][aria-label="Profiles"] [data-profile="l4-stream-safe"] @ 400,675
+  click input[aria-label="L4 target IP"] @ 631,958
+  key ⌘a (focus: input[aria-label=L4 target IP])
+  type "127.0.0.1" into input[aria-label=L4 target IP]
+  click input[aria-label="L4 target port"] @ 774,958
+  key ⌘a (focus: input[aria-label=L4 target port])
+  type "57594" into input[aria-label=L4 target port]
+  click button "Add L4 target" @ 1138,946
+NOTE 08b witness scan.start — status "needs_confirmation"
+PASS 08b the dialog shows the core prompt verbatim
+  click button "Start scan" @ 1004,553
+PASS 08b the confirmed L4 scan starts — scan.list grew from 2 to 3
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/09-08b-with-an-l4-scope-entry-the-confirm-d.png
+
+== 09 Jobs view: auditing with the now mark
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+  key ArrowUp (focus: div[role=separator][aria-label=Resize inspector])
+NOTE 09 lower region — aitm.split.h null -> "0.85" (ArrowUp on the separator)
+  click tab "Profiles" within section[aria-label="Scanner"] [role=tablist][aria-label="Scan views"] @ 352,249
+  click [role=listbox][aria-label="Profiles"] [data-profile="standard"] @ 400,555
+NOTE 09 origins — the standard draft lost its origin (Origins reads "No origins yet."); re-adding it
+  click radio "http" within [role=radiogroup][aria-label="Origin scheme"] @ 644,552
+  Origin port is disabled (host carries the port); not typed
+  click button "Add origin" @ 1149,540
+  click button "Start" within section[aria-label="Scanner"] @ 1404,858
+  still /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/09-jobs-auditing.png
+  still /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/09-jobs-auditing-table.png
+PASS 09a the card chip reads Auditing while the witness reads running · auditing
+PASS 09a the row state word reads Auditing
+PASS 09b the now tag names a check the witness had running (the union of three reads)
+PASS 09b the now tag reads `now · <id>`
+NOTE 09b now tag vs running[0] — "crlf" equals a witness running[0] of the three reads (["xss-reflected","xss-reflected","crlf"])
+PASS 09c the lane data-fraction is within 0.02 of the witness done / scheduled
+PASS 09d the KPI Progress numeral is within 1 of floor(100 · done / scheduled)
+PASS 09e the row progress reads `<n> % · <done> of <scheduled>` with U+00A0 before %
+PASS 09e the row percent equals the KPI percent
+PASS 09e the row done / scheduled are the witness counts (bracket)
+PASS 09f the KPI Checks numeral is the witness checks.done, grouped (bracket)
+PASS 09g the row probes cell reads `<sent> of <budget>` inside the witness bracket
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/10-09-jobs-view-auditing-with-the-now-mark.png
+
+== 10 Jobs view: cancelled
+[aitm] 2026-11-03T08:49:49.210295Z  WARN aitm::scanner: the check reported an error: error: check-ldap-injection:40 — hook 'anon$550954ed35d5c161' failed: probe.send failed: scan: probe failed: probe refused: the job was cancelled
+  help: the flow was forwarded unchanged. Fix the hook and reload the script. job=scan-ee950cc5 check=ldapi point=725f4d48-8dc1-4c40-99ab-374e1b8b2e08:body_param:2
+  click Cancel scan scan-ee950cc5
+NOTE 10 witness — cancelled 1 ms after the press
+  still /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/10-jobs-cancelled.png
+  still /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/10-jobs-cancelled-table.png
+PASS 10a the card chip reads Cancelled after the witness read cancelled
+PASS 10a the row state word reads Cancelled
+PASS 10b the end sentence is `Cancelled after m:ss; N of M checks had run. What it found stays.` with the witness numbers
+PASS 10b the end sentence elapsed is the witness elapsed_ms (±1 s)
+PASS 10c no [data-field=stopped] line for a cancelled job (D4)
+PASS 10d the run directory audit log holds exactly one scan.cancel for the job
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/11-10-jobs-view-cancelled.png
+
+== 11 Jobs view: dead target done
+NOTE 11 start — standard against http://127.0.0.1:57592 (port 57592, never listened on) over the witness: scan-4c192124
+[aitm] 2026-11-03T08:49:50.611466Z  WARN aitm::scanner: the check reported an error: error: check-security-headers:49 — hook 'anon$054414bd93e1beac' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)
+  help: the flow was forwarded unchanged. Fix the hook and reload the script. job=scan-4c192124 check=headers point=origin:http://127.0.0.1:57592
+2026-11-03T08:49:50.611905Z  WARN aitm::scanner: the check reported an error: error: check-cors:54 — hook 'anon$b095be9f2b3f24f9' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)
+  help: the flow was forwarded unchanged. Fix the hook and reload the script. job=scan-4c192124 check=cors point=origin:http://127.0.0.1:57592
+[aitm] 2026-11-03T08:49:50.613469Z  WARN aitm::scanner: the check reported an error: error: check-http-methods:49 — hook 'anon$64621cd75dc5afd2' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)
+  help: the flow was forwarded unchanged. Fix the hook and reload the script. job=scan-4c192124 check=methods point=origin:http://127.0.0.1:57592
+  click [role=listbox][aria-label="Jobs"] [data-job="scan-4c192124"] @ 840,261
+  click section[aria-label="Scanner"] [role=region][aria-label="Selected job"][data-job="scan-4c192124"] [data-field=attention] details > summary @ 840,240
+  still /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/11-jobs-dead-attention.png
+  still /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/11-jobs-dead.png
+  still /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/11-jobs-dead-table.png
+PASS 11a [data-field=stopped] reads the D4 sentence for stopped_reason errors
+PASS 11c the attention line reads `<n> checks could not run` with n = the witness checks.errors
+PASS 11c the attention details opens on a real click
+PASS 11e the row sub-line carries the D4 sentence (title = the full sentence)
+PASS 11f the row and the chip read Done
+  shot /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/12-11-jobs-view-dead-target-done.png
+PASS 12 Matt's real audit.jsonl and ca-audit.jsonl are unchanged by the run (size and sha256)
+
+51 PASS · 0 FAIL · 1 GAP · screenshots in /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan · transcript /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-web/apps/web/.cua-shots/scan/bus-transcript.jsonl

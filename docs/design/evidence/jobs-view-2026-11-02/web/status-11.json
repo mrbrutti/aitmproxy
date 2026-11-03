@@ -1,0 +1,226 @@
+{
+  "job": "scan-4c192124",
+  "terminal": {
+    "checks": {
+      "done": 7,
+      "error_samples": [
+        {
+          "check": "headers",
+          "detail": "error: check-security-headers:49 — hook 'anon$054414bd93e1beac' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:57592"
+        },
+        {
+          "check": "cors",
+          "detail": "error: check-cors:54 — hook 'anon$b095be9f2b3f24f9' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:57592"
+        },
+        {
+          "check": "methods",
+          "detail": "error: check-http-methods:49 — hook 'anon$64621cd75dc5afd2' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:57592"
+        }
+      ],
+      "errors": 3,
+      "running": [],
+      "scheduled": 9,
+      "skipped": 0,
+      "skipped_samples": []
+    },
+    "clamped": [],
+    "crawl": {
+      "depth": 0,
+      "errors": 1,
+      "forms_skipped": 0,
+      "forms_submitted": 0,
+      "last_error": "connect_refused",
+      "pages": 0,
+      "queued": 0
+    },
+    "elapsed_ms": 6,
+    "error": null,
+    "finished_at": 1793695790613,
+    "issues": {
+      "by_confidence": {
+        "certain": 0,
+        "firm": 0,
+        "tentative": 0
+      },
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "info": 0,
+        "low": 0,
+        "medium": 0
+      },
+      "total": 0
+    },
+    "job": "scan-4c192124",
+    "l4": null,
+    "lanes": {
+      "requested": [
+        "http",
+        "ws"
+      ],
+      "run": [
+        "http",
+        "ws"
+      ],
+      "skipped": []
+    },
+    "phase": "done",
+    "points": {
+      "audited": 0,
+      "found": 0,
+      "queued": 9,
+      "skipped": {
+        "frequent": 0,
+        "ignored": 0,
+        "limit": 0
+      }
+    },
+    "probes": {
+      "budget": 2000,
+      "by_lane": {},
+      "errors": 10,
+      "rate_waits": 0,
+      "sent": 0,
+      "timeouts": 0
+    },
+    "profile_name": "standard",
+    "session": {
+      "browser_partial": false,
+      "canary": {
+        "kind": "none"
+      },
+      "lost": false,
+      "reused": false
+    },
+    "started_at": 1793695790607,
+    "started_by": {
+      "client_label": "web-bridge",
+      "frontend": "operator"
+    },
+    "state": "done",
+    "stopped_reason": "errors",
+    "targets": [
+      "http://127.0.0.1:57592"
+    ]
+  },
+  "final": {
+    "checks": {
+      "done": 7,
+      "error_samples": [
+        {
+          "check": "headers",
+          "detail": "error: check-security-headers:49 — hook 'anon$054414bd93e1beac' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:57592"
+        },
+        {
+          "check": "cors",
+          "detail": "error: check-cors:54 — hook 'anon$b095be9f2b3f24f9' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:57592"
+        },
+        {
+          "check": "methods",
+          "detail": "error: check-http-methods:49 — hook 'anon$64621cd75dc5afd2' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61)\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "origin:http://127.0.0.1:57592"
+        }
+      ],
+      "errors": 3,
+      "running": [],
+      "scheduled": 9,
+      "skipped": 0,
+      "skipped_samples": []
+    },
+    "clamped": [],
+    "crawl": {
+      "depth": 0,
+      "errors": 1,
+      "forms_skipped": 0,
+      "forms_submitted": 0,
+      "last_error": "connect_refused",
+      "pages": 0,
+      "queued": 0
+    },
+    "elapsed_ms": 6,
+    "error": null,
+    "finished_at": 1793695790613,
+    "issues": {
+      "by_confidence": {
+        "certain": 0,
+        "firm": 0,
+        "tentative": 0
+      },
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "info": 0,
+        "low": 0,
+        "medium": 0
+      },
+      "total": 0
+    },
+    "job": "scan-4c192124",
+    "l4": null,
+    "lanes": {
+      "requested": [
+        "http",
+        "ws"
+      ],
+      "run": [
+        "http",
+        "ws"
+      ],
+      "skipped": []
+    },
+    "phase": "done",
+    "points": {
+      "audited": 0,
+      "found": 0,
+      "queued": 9,
+      "skipped": {
+        "frequent": 0,
+        "ignored": 0,
+        "limit": 0
+      }
+    },
+    "probes": {
+      "budget": 2000,
+      "by_lane": {},
+      "errors": 10,
+      "rate_waits": 0,
+      "sent": 0,
+      "timeouts": 0
+    },
+    "profile_name": "standard",
+    "session": {
+      "browser_partial": false,
+      "canary": {
+        "kind": "none"
+      },
+      "lost": false,
+      "reused": false
+    },
+    "started_at": 1793695790607,
+    "started_by": {
+      "client_label": "web-bridge",
+      "frontend": "operator"
+    },
+    "state": "done",
+    "stopped_reason": "errors",
+    "targets": [
+      "http://127.0.0.1:57592"
+    ]
+  },
+  "rendered": {
+    "chip": "Done",
+    "rowState": "Done",
+    "stopped": "Stopped early: too many errors from the target.",
+    "stoppedRaw": "stopped_reason: errors",
+    "attentionLine": "3 checks could not run",
+    "opened": true,
+    "sub": "Stopped early: too many errors from the target.",
+    "subTitle": "Stopped early: too many errors from the target.",
+    "cardText": "Done 127.0.0.1:57592 Stopped early: too many errors from the target. standard · started 00:49 by web-bridge · finished 00:49 Show Site Map Show Issues Scan Again crawl 0 pages audit 7 checks done Done in 0:00 · 0 points · 9 checks. started 00:49 elapsed 0:00 no issues probe budget 0 of 2,000 Progress — Checks 7 of 9 Probes 0 of 2,000 Points audited 0 of 0 Issues 0 no issues 3 checks could not run headers · error: check-security-headers:49 — hook 'anon$054414bd93e1beac' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. cors · error: check-cors:54 — hook 'anon$b095be9f2b3f24f9' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. methods · error: check-http-methods:49 — hook 'anon$64621cd75dc5afd2' failed: probe.raw failed: scan: probe_raw failed: Connection refused (os error 61) help: the flow was forwarded unchanged. Fix the hook and reload the script. The crawl fetched 0 pages and hit 1 error — the target refused the connection stopped_reason: errors crawl.last_error: connect_refused"
+  }
+}

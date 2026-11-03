@@ -1,0 +1,296 @@
+{
+  "job": "scan-ee950cc5",
+  "early": {
+    "checks": {
+      "done": 463,
+      "error_samples": [],
+      "errors": 0,
+      "running": [
+        "xss-reflected"
+      ],
+      "scheduled": 1072,
+      "skipped": 0,
+      "skipped_samples": []
+    },
+    "clamped": [],
+    "crawl": {
+      "depth": 0,
+      "errors": 0,
+      "forms_skipped": 0,
+      "forms_submitted": 5,
+      "last_error": null,
+      "pages": 33,
+      "queued": 0
+    },
+    "elapsed_ms": 15024,
+    "error": null,
+    "finished_at": null,
+    "issues": {
+      "by_confidence": {
+        "certain": 1,
+        "firm": 2,
+        "tentative": 1
+      },
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "info": 0,
+        "low": 4,
+        "medium": 0
+      },
+      "total": 4
+    },
+    "job": "scan-ee950cc5",
+    "l4": null,
+    "lanes": {
+      "requested": [
+        "http",
+        "ws"
+      ],
+      "run": [
+        "http",
+        "ws"
+      ],
+      "skipped": []
+    },
+    "phase": "auditing",
+    "points": {
+      "audited": 5,
+      "found": 154,
+      "queued": 1072,
+      "skipped": {
+        "frequent": 66,
+        "ignored": 0,
+        "limit": 0
+      }
+    },
+    "probes": {
+      "budget": 2000,
+      "by_lane": {
+        "http": 36
+      },
+      "errors": 0,
+      "rate_waits": 0,
+      "sent": 36,
+      "timeouts": 0
+    },
+    "profile_name": "standard",
+    "session": {
+      "browser_partial": false,
+      "canary": {
+        "kind": "none"
+      },
+      "lost": false,
+      "reused": false
+    },
+    "started_at": 1793695771177,
+    "started_by": {
+      "client_label": "web-bridge",
+      "frontend": "operator"
+    },
+    "state": "running",
+    "stopped_reason": null,
+    "targets": [
+      "http://127.0.0.1:57594"
+    ]
+  },
+  "before": {
+    "checks": {
+      "done": 463,
+      "error_samples": [],
+      "errors": 0,
+      "running": [
+        "xss-reflected"
+      ],
+      "scheduled": 1072,
+      "skipped": 0,
+      "skipped_samples": []
+    },
+    "clamped": [],
+    "crawl": {
+      "depth": 0,
+      "errors": 0,
+      "forms_skipped": 0,
+      "forms_submitted": 5,
+      "last_error": null,
+      "pages": 33,
+      "queued": 0
+    },
+    "elapsed_ms": 15727,
+    "error": null,
+    "finished_at": null,
+    "issues": {
+      "by_confidence": {
+        "certain": 1,
+        "firm": 2,
+        "tentative": 1
+      },
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "info": 0,
+        "low": 4,
+        "medium": 0
+      },
+      "total": 4
+    },
+    "job": "scan-ee950cc5",
+    "l4": null,
+    "lanes": {
+      "requested": [
+        "http",
+        "ws"
+      ],
+      "run": [
+        "http",
+        "ws"
+      ],
+      "skipped": []
+    },
+    "phase": "auditing",
+    "points": {
+      "audited": 5,
+      "found": 154,
+      "queued": 1072,
+      "skipped": {
+        "frequent": 66,
+        "ignored": 0,
+        "limit": 0
+      }
+    },
+    "probes": {
+      "budget": 2000,
+      "by_lane": {
+        "http": 36
+      },
+      "errors": 0,
+      "rate_waits": 0,
+      "sent": 36,
+      "timeouts": 0
+    },
+    "profile_name": "standard",
+    "session": {
+      "browser_partial": false,
+      "canary": {
+        "kind": "none"
+      },
+      "lost": false,
+      "reused": false
+    },
+    "started_at": 1793695771177,
+    "started_by": {
+      "client_label": "web-bridge",
+      "frontend": "operator"
+    },
+    "state": "running",
+    "stopped_reason": null,
+    "targets": [
+      "http://127.0.0.1:57594"
+    ]
+  },
+  "after": {
+    "checks": {
+      "done": 465,
+      "error_samples": [],
+      "errors": 0,
+      "running": [
+        "crlf"
+      ],
+      "scheduled": 1072,
+      "skipped": 0,
+      "skipped_samples": []
+    },
+    "clamped": [],
+    "crawl": {
+      "depth": 0,
+      "errors": 0,
+      "forms_skipped": 0,
+      "forms_submitted": 5,
+      "last_error": null,
+      "pages": 33,
+      "queued": 0
+    },
+    "elapsed_ms": 17034,
+    "error": null,
+    "finished_at": null,
+    "issues": {
+      "by_confidence": {
+        "certain": 1,
+        "firm": 2,
+        "tentative": 1
+      },
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "info": 0,
+        "low": 4,
+        "medium": 0
+      },
+      "total": 4
+    },
+    "job": "scan-ee950cc5",
+    "l4": null,
+    "lanes": {
+      "requested": [
+        "http",
+        "ws"
+      ],
+      "run": [
+        "http",
+        "ws"
+      ],
+      "skipped": []
+    },
+    "phase": "auditing",
+    "points": {
+      "audited": 6,
+      "found": 154,
+      "queued": 1072,
+      "skipped": {
+        "frequent": 66,
+        "ignored": 0,
+        "limit": 0
+      }
+    },
+    "probes": {
+      "budget": 2000,
+      "by_lane": {
+        "http": 40
+      },
+      "errors": 0,
+      "rate_waits": 0,
+      "sent": 40,
+      "timeouts": 0
+    },
+    "profile_name": "standard",
+    "session": {
+      "browser_partial": false,
+      "canary": {
+        "kind": "none"
+      },
+      "lost": false,
+      "reused": false
+    },
+    "started_at": 1793695771177,
+    "started_by": {
+      "client_label": "web-bridge",
+      "frontend": "operator"
+    },
+    "state": "running",
+    "stopped_reason": null,
+    "targets": [
+      "http://127.0.0.1:57594"
+    ]
+  },
+  "rendered": {
+    "chip": "Auditing",
+    "rowState": "Auditing",
+    "nowId": "crlf",
+    "nowTag": "now · crlf",
+    "laneFraction": "0.4338",
+    "kpiProgress": "43 %",
+    "kpiChecks": "465",
+    "rowProgress": "43 % · 465 of 1,072",
+    "rowProbes": "40 of 2,000"
+  }
+}
