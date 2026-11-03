@@ -6,6 +6,7 @@ SwiftData database and no server.
 ## Layout
 
 - `Sources/Aitmproxy/` the app. `App.swift` has the window, menus, and the database location.
+- `Sources/Aitmproxy/AitmApplication.swift` the `NSApplication` subclass named by `Info.plist.in`'s `NSPrincipalClass`; its `terminate(_:)` ends open sheets before `super` so Quit is never refused by an attached sheet.
 - `Sources/AitmproxyKit/` rules and data logic with no SwiftUI. Tests in `Tests/AitmproxyKitTests/`.
 - `Package.swift` a Swift package. There is no Xcode project.
 - `build.sh` builds, signs, and installs `~/Applications/Aitmproxy.app`. Only `--ne` builds the Network Extension and installs to `/Applications`.

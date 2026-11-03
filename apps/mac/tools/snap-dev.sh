@@ -56,6 +56,10 @@ else
   sed -e "s/__BUILD__/0/" -e "s/__VERSION__/0.0.0-dev/" "$here/Info.plist.in" > "$dev/Contents/Info.plist"
 fi
 plutil -replace CFBundleExecutable -string "$exe" "$dev/Contents/Info.plist"
+# The borrowed installed plist predates the NSApplication subclass and would silently run stock
+# NSApplication; the value comes from the template rather than being spelled here, so it cannot drift.
+principal_class="$(plutil -extract NSPrincipalClass raw -o - "$here/Info.plist.in")"
+plutil -replace NSPrincipalClass -string "$principal_class" "$dev/Contents/Info.plist"
 # The installed bundle's embedded core (aitm + obscura), when present, so the dev build runs
 # LIVE against its own core for end-to-end checks.
 # CORE_DIR=<dir with aitm + obscura> (e.g. the repo's target/release) overrides the installed
@@ -68,7 +72,7 @@ if [[ -n "${CORE_DIR:-}" && -x "$CORE_DIR/aitm" ]]; then
 elif [[ -d "$installed/Contents/Resources/core" ]]; then
   cp -R "$installed/Contents/Resources/core" "$dev/Contents/Resources/core"
 fi
-echo "== bundle $dev ($exe)"
+echo "== bundle $dev ($exe) · principal class $principal_class"
 
 if [[ ${NO_LAUNCH:-} == 1 ]]; then
   echo "== build only (NO_LAUNCH=1) · $dev"
