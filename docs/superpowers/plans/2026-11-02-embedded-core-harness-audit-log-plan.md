@@ -201,6 +201,11 @@ root, rustfmt the leaf file only if needed): (a) tests only, (b) production.
 | fix 1 | quality | Minor | Q2-2: host-list Unicode line-break refusal inherited but untested | fixed in 2b2fdb16 (round-2 fix) (NEL host case) |
 | fix 1 | spec | Minor | P2-1: AC4's U+2029 case not exercised through `yaml()` on `auditLogFile` | fixed in 2b2fdb16 (round-2 fix) |
 | fix 2 | security, quality, spec | — | round 3 on `59f7d042..2b2fdb16`: PASS, PASS, PASS, no findings; the branch has no open finding (S-3 accepted) | — |
+| 5 | security | — | Task 5 (`066417e6..34069bec`): PASS, no findings; remove-not-abort for an inherited `AITM_AUDIT_LOG` judged sound and complete (no other env key reaches `mcp.audit_log` once the path is explicit) | — |
+| 5 | quality | Minor | Q5-1: the `// MARK: - Core pointer isolation` extension now also holds `auditLogEnvironmentKey` / `childEnvironment`; heading lags | accepted by the orchestrator for Matt 2026-11-03 (autonomous mode): navigation only, no behaviour; fold into the `isHarnessRun` follow-up |
+| 5 | quality | Minor | Q5-2: the `env.rs` precedence rationale is repeated in the helper doc, the spawn comment and the test comment | accepted by the orchestrator for Matt 2026-11-03: the reviewer marked it optional; the helper doc is canonical |
+| 5 | spec | Minor | P5-1: the Terminal mac-gate log ran the three tripwires under zsh (bash scripts), so they read red for a harness reason | fixed: re-run with bash on 34069bec, `/tmp/claude/auditiso-tripwires-final.log`, all exit 0 |
+| 5 | spec | Minor | P5-2: the AC9 proof log does not itself record that `AITM_AUDIT_LOG=on` was exported | fixed: the PR body quotes the script's export line; the script now logs the export for re-runs |
 
 ## Shipped
 
