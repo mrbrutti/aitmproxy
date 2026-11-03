@@ -2315,8 +2315,9 @@ Live web criteria (numbered after AC57 so no reference moves):
     Some(full))` gives `fraction ≈ 0.5003`, `phase_line == "3,236 of 6,468
     checks"`; `progress_bar(Some(0.5), 6) == "━━━───"`, `progress_bar(None,
     6) == "──────"`, `progress_bar(Some(1.0), 6) == "━━━━━━"`;
-    `end_sentence(done, 69_000, 1020, 6468) == "Done in 1:09 · 1,020 points
-    · 6,468 checks."`; `state_phase_text(Running, Auditing) == "auditing"`, `(Cancelling, Auditing) == "cancelling"`,
+    `end_sentence(Done, 69_000, 1020, 0, 6468) == Some("Done in 1:09 · 1,020
+    points · 6,468 checks.")` (state, elapsed, points found, checks done,
+    checks scheduled: the five arguments of plan Task 4.1; gap 65); `state_phase_text(Running, Auditing) == "auditing"`, `(Cancelling, Auditing) == "cancelling"`,
     `(Done, Done) == "done"`.
 42. **AC42 (T2, D19; unit).** The header line reads `job  profile  targets
     state  progress  budget  points  issues  el.` in the full layout; a row
