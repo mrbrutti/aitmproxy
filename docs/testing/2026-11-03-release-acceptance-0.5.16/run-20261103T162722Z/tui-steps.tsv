@@ -1,0 +1,14 @@
+TUI-1	FAIL	missing ['sys-proxy', 'CA trusted']; no-flows line exact False — observed `(no 'No flows yet' line)`; status bar `bus … · operator` False; startup toast False; screen head: ›•‹ aitmproxy 0.5.16		
+TUI-2	FAIL	prompt True, hint False, toast True, listed True, in-scope count None, audit scope.add ok 0	[{"at": 1793723247449, "marker": "start", "pid": 78408, "schema": 1, "stream": "control", "version": "0.5.16"}]	
+N2-TUI	FAIL	pill `· sys-proxy off` but the flows pane does not show the empty-state sentence		
+TUI-3	SKIP	bypass list absent in config.yaml system_proxy.bypass (none); add it through the surface's Settings first		
+TUI-4	BLOCKED	TUI-3 did not set the route		
+TUI-5b	BLOCKED	TUI-3	no route / no hand: park and resume cannot be judged	
+TUI-5a	FAIL	armed bar False; toast `Intercept disarmed` True	bus truth: audit only	
+TUI-6	FAIL	prompt True, hint False, cancelled False, ca-audit rows 0		
+TUI-7	SKIP	nothing to restore (TUI-3 did not set it)		
+TUI-8	PASS	exit 0, no child left, scutil unchanged	audit: last entries from this pid	
+TUI-9	N/A	no All Apps control on this surface		UIs pending (per-host decryption decision)
+TUI-10	N/A	no Apps view on this surface on 0.5.10		
+N1-TUI	N/A	aitm tui owns its core on 0.5.10; the app's restart is seen only from aitm-tui --bus		
+N3-TUI	SKIP	CA stays trusted (un-trusting is Matt's yes; words read from source)		

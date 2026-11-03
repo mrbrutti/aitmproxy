@@ -1,0 +1,12 @@
+CLI-0	SKIP	release run only; brew upgrade is Matt's		
+CLI-4	SKIP	no core on 8080; the live-core half needs the app's embedded core up		
+CLI-5	SKIP	no core on 8080; the live-core half needs the app's embedded core up		
+CLI-9	SKIP	no core on 8080; the live-core half needs the app's embedded core up		
+CLI-10	SKIP	no core on 8080; the live-core half needs the app's embedded core up		
+N4-CLI	SKIP	no core on 8080; the live-core half needs the app's embedded core up		
+CLI-7	PASS	user installed=present trusted=yes (keychain has 1 aitmproxy cert); 0 loader lines before the JSON	ca.status over the bus agrees	regression after #271 (loader noise)
+CLI-1	PASS	aitm 0.5.16		
+CLI-2	PASS	exit 0, synopsis on stdout (tui, web, operator-token listed)		
+CLI-3	PASS	ready card on stderr, stdout empty: aitmproxy 0.5.16 config /Users/matt/Library/Application Support/aitmproxy/config.yaml CA loaded · /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt p		
+CLI-6	PASS	refused, exit 1: error: no running core found		
+CLI-8	SKIP	could not hold 8082 with a plain listener (holder: ); not starting aitm web against a live port		
