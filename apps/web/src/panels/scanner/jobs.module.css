@@ -1,0 +1,830 @@
+/* Scan › Jobs (spec D18 W2, plan Task 3.7). The locked comp `docs/design/mockup/scan-jobs/committed.html`
+   rewritten as a CSS module on the 0.2.0 tokens: one column on the surface holding the bus banner, the
+   selected job's card (raised, a tone edge, one staggered entrance), the jobs table and the two wells.
+   Every colour is a `var(--color-*)`, every duration and curve a `var(--motion-*)`, every geometric
+   constant the comp needs beyond the token scale is declared once below on `.jobs` (the web's
+   `CardMetrics`). Severity ink is painted only on `[data-severity=…]`. `styles.test.ts` pins all of it.
+
+   Markup the rules assume (Tasks 3.8–3.8c read this sheet):
+   .jobs > .banner, section.card[data-tone][data-entrance] > (.titleRow.enter, .scanAgainError,
+   .lane.enter > (.track > (.crawl, .audit[--jobs-f] > (.segLabel, .segSub, .nowMark > .nowDot, .nowTag),
+   .toGo, .endSentence.endSwap), .scale, .ledger > .group > (.mark[data-severity]*, .ledgerWord.sev),
+   .gauge[data-warn] > (span, .track > .gaugeFill, span)), .kpis.enter > .kpi > (.kpiLabel, .kpiValue >
+   (.tick, .kpiUnit | .sev)), .attention), .head > .cell*9, .rows[role=listbox].enter > .row > .cell*9,
+   .wells.enter > .well > (.wellTitle > .wellSub, .kv*). The now mark and the now tag are children of the
+   audit fill, so they ride its trailing edge and its width transition (plan gap 54). */
+
+/* ---------- metrics: the web's CardMetrics; the one place a unit literal lives ---------- */
+.jobs {
+  --jobs-hairline: 1px; /* every border and rule: .card, .kpis, td/.kv border-top */
+  --jobs-edge: 3px; /* .card::before width; tr.sel td:first-child inset 3px */
+  --jobs-chip-height: 22px; /* .chip height and line-height */
+  --jobs-chip-pad: 9px; /* .chip padding 0 9px */
+  --jobs-dot: 6px; /* .chip i, .who, .pend, .ok: 6px dots */
+  --jobs-dot-halo: 3px; /* .who box-shadow 0 0 0 3px agent tint */
+  --jobs-now-mark: 2px; /* .now width */
+  --jobs-now-overshoot: 10px; /* .now top:-10px bottom:-10px */
+  --jobs-now-dot: 10px; /* .now::after 10x10 */
+  --jobs-halo: 3px; /* .now box-shadow 0 0 0 3px */
+  --jobs-halo-mix: 12%; /* .now halo: the primary ink at .12 */
+  --jobs-track-highlight: 3%; /* .track inset highlight: white at .03 */
+  --jobs-crawl-cap: 80px; /* .seg.crawl width (the comp's 7% of the track) */
+  --jobs-lane-label-top: 10px; /* .seg .lbl top:10px; .seg .sub bottom:10px; .rest top:10px */
+  --jobs-lane-label-left: 12px; /* .seg .lbl left:12px; .rest right:12px */
+  --jobs-lane-sub-opacity: 0.75; /* .seg .sub opacity:.75 */
+  --jobs-tag-gap: 12px; /* .nowtag top:76px = track 64 + 12 */
+  --jobs-scale-gap: 40px; /* .scale margin-top:40px (room for the now tag) */
+  --jobs-mark-width: 8px; /* .group i width */
+  --jobs-mark-height: 16px; /* .group i height */
+  --jobs-mark-radius: 2px; /* .group i and .gauge border-radius */
+  --jobs-mark-gap: 3px; /* .group gap */
+  --jobs-gauge: 3px; /* .gauge height */
+  --jobs-ring-stroke: 2.5px; /* .ring circle stroke-width */
+  --jobs-row: 44px; /* td height (CardMetrics row) */
+  --jobs-row-sub: 60px; /* a row with a sub-line (CardMetrics rowWithSub) */
+  --jobs-header: 32px; /* th height */
+  --jobs-col-state: 148fr; /* CardMetrics tableState share */
+  --jobs-col-profile: 120px; /* CardMetrics tableProfile */
+  --jobs-col-target: 220fr; /* CardMetrics tableTarget share */
+  --jobs-col-progress: 220fr; /* CardMetrics tableProgress share */
+  --jobs-col-probes: 120px; /* CardMetrics tableProbes */
+  --jobs-col-points: 120px; /* CardMetrics tablePoints */
+  --jobs-col-issues: 124px; /* CardMetrics tableIssues */
+  --jobs-col-elapsed: 80px; /* CardMetrics tableElapsed */
+  --jobs-col-action: 84px; /* th:last-child width:84px */
+  --jobs-entrance-rise: 8px; /* .enter translateY(8px) */
+  --jobs-mark-travel: 3px; /* @keyframes rise translateY(3px) */
+  --jobs-mark-scale: 0.6; /* @keyframes rise scaleY(.6) */
+  --jobs-swap-travel: 2px; /* the end swap's 2px rise (D12) */
+  --jobs-tick-travel: 3px; /* .tick.changing translateY(-3px) */
+  --jobs-tick-floor: 0.35; /* .tick.changing opacity:.35 */
+  --jobs-breath-floor: 0.4; /* @keyframes breathe to opacity:.4 */
+  --jobs-heading-tracking: -0.01em; /* h1 letter-spacing:-.01em */
+  --jobs-kpi-pad-y: 14px; /* .kpis div padding 14px 16px */
+}
+
+/* ---------- shared ---------- */
+/* The bus banner (D15) above the card. */
+.banner {
+  margin-bottom: var(--space-4);
+}
+[data-ink='muted'] {
+  color: var(--color-text-tertiary);
+}
+[data-ink='accent'] {
+  color: var(--color-accent-base);
+}
+/* A number: the data face, tabular (the comp's .num). */
+.unit {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}
+.visuallyHidden {
+  position: absolute;
+  width: var(--jobs-hairline);
+  height: var(--jobs-hairline);
+  margin: calc(-1 * var(--jobs-hairline));
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- the job card: raised, real depth; its parts enter once, staggered ---------- */
+.card {
+  position: relative;
+  overflow: hidden;
+  margin-bottom: var(--space-5);
+  padding: var(--space-5) var(--space-6);
+  border: var(--jobs-hairline) solid var(--color-line-border);
+  border-radius: var(--radius-floating);
+  background: var(--color-ground-card);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-float);
+}
+/* The tone edge: the comp's .card::before, recoloured over the state duration. */
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--jobs-edge);
+  background: var(--color-accent-base);
+  transition:
+    color var(--motion-popover) var(--motion-ease-out),
+    background-color var(--motion-popover) var(--motion-ease-out);
+}
+.card[data-tone='progress']::before {
+  background: var(--color-accent-base);
+}
+.card[data-tone='pending']::before {
+  background: var(--color-intercept-base);
+}
+.card[data-tone='success']::before {
+  background: var(--color-state-success-fg);
+}
+.card[data-tone='danger']::before {
+  background: var(--color-state-danger-fg);
+}
+.card[data-tone='neutral']::before {
+  background: var(--color-state-neutral-fg);
+}
+
+/* The entrance (D12): each block rises and fades in once, `--jobs-i` blocks of stagger late. The card
+   plays it on a pointer selection, a start or the first list (`data-entrance='play'`); the table and the
+   wells carry the attribute themselves. Keyboard selection leaves `data-entrance='none'`: static. */
+.card[data-entrance='play'] .enter,
+.enter[data-entrance='play'] {
+  animation: jobsEnter var(--motion-sheet) var(--motion-ease-out) both;
+  animation-delay: calc(var(--motion-stagger) * var(--jobs-i, 0));
+}
+@keyframes jobsEnter {
+  from {
+    opacity: 0;
+    transform: translateY(var(--jobs-entrance-rise));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes jobsEnterFade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ---------- title row: chip, heading, reason and finding lines, the verbs ---------- */
+.titleRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+.heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  margin: 0;
+  font-family: var(--font-data);
+  font-size: var(--font-size-xxl);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  letter-spacing: var(--jobs-heading-tracking);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}
+/* The state chip: a pill in the tone pair; its pair crossfades over the state duration. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+  height: var(--jobs-chip-height);
+  padding: 0 var(--jobs-chip-pad);
+  border-radius: var(--radius-pill);
+  background: var(--color-accent-tint);
+  color: var(--color-accent-base);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--jobs-chip-height);
+  letter-spacing: normal;
+  white-space: nowrap;
+  transition:
+    color var(--motion-popover) var(--motion-ease-out),
+    background-color var(--motion-popover) var(--motion-ease-out);
+}
+.chip[data-tone='progress'] {
+  color: var(--color-accent-base);
+  background: var(--color-accent-tint);
+}
+.chip[data-tone='pending'] {
+  color: var(--color-intercept-base);
+  background: var(--color-intercept-tint);
+}
+.chip[data-tone='success'] {
+  color: var(--color-state-success-fg);
+  background: var(--color-state-success-bg);
+}
+.chip[data-tone='danger'] {
+  color: var(--color-state-danger-fg);
+  background: var(--color-state-danger-bg);
+}
+.chip[data-tone='neutral'] {
+  color: var(--color-state-neutral-fg);
+  background: var(--color-state-neutral-bg);
+}
+/* The chip's dot takes the chip's ink; it breathes only while cancelling (`.breathe`, gap 52). */
+.chipDot {
+  display: inline-block;
+  flex: none;
+  width: var(--jobs-dot);
+  height: var(--jobs-dot);
+  border-radius: 50%;
+  background: currentColor;
+}
+.reason {
+  margin: var(--space-1) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-base);
+  line-height: var(--line-height-text);
+}
+.finding {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-base);
+  line-height: var(--line-height-text);
+}
+/* The finding line's and the now tag's parts: figures and check ids in the primary ink, the check id
+   in the data face, the agent in its hue. */
+.part[data-role='figure'] {
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.part[data-role='checkId'] {
+  color: var(--color-text-primary);
+  font-family: var(--font-data);
+}
+.part[data-role='agent'] {
+  color: var(--color-agent-base);
+}
+.verbs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+.scanAgainError {
+  margin: var(--space-2) 0 0;
+  color: var(--color-status-server-error);
+  font-size: var(--font-size-sm);
+}
+
+/* ---------- the scan lane ---------- */
+.lane {
+  margin-top: var(--space-5);
+}
+/* The track: a 64 px rail on the raised ground with a hairline highlight; the now mark overshoots it. */
+.track {
+  position: relative;
+  height: var(--size-row-card);
+  border-radius: var(--radius-panel);
+  background: var(--color-ground-raised);
+  overflow: visible;
+  box-shadow: inset 0 var(--jobs-hairline) 0 color-mix(in srgb, var(--color-text-primary) var(--jobs-track-highlight), transparent);
+}
+/* The crawl cap sits at the left in the deep accent; the audit fill follows it in the accent and eases
+   to each new fraction (`--jobs-f` is set inline by the card). */
+.crawl {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--jobs-crawl-cap);
+  border-start-start-radius: var(--radius-panel);
+  border-end-start-radius: var(--radius-panel);
+  background: var(--color-accent-deep);
+  transition: width var(--motion-progress) var(--motion-ease-out);
+}
+.audit {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--jobs-crawl-cap);
+  width: calc((100% - var(--jobs-crawl-cap)) * var(--jobs-f, 0));
+  background: var(--color-accent-base);
+  transition: width var(--motion-progress) var(--motion-ease-out);
+}
+.segLabel {
+  position: absolute;
+  top: var(--jobs-lane-label-top);
+  left: var(--jobs-lane-label-left);
+  color: var(--color-text-on-accent);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height-tight);
+  white-space: nowrap;
+}
+.segSub {
+  position: absolute;
+  bottom: var(--jobs-lane-label-top);
+  left: var(--jobs-lane-label-left);
+  color: var(--color-text-on-accent);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-tight);
+  opacity: var(--jobs-lane-sub-opacity);
+  white-space: nowrap;
+}
+/* `checksToGoText` at the track's right. */
+.toGo {
+  position: absolute;
+  top: var(--jobs-lane-label-top);
+  right: var(--jobs-lane-label-left);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-tight);
+  white-space: nowrap;
+}
+/* The now mark rides the audit fill's trailing edge: a 2 px bar in the primary ink overshooting the
+   track by 10 px, with a 12 % halo; its dot sits on the top end and breathes while the job is live. */
+.nowMark {
+  position: absolute;
+  top: calc(-1 * var(--jobs-now-overshoot));
+  bottom: calc(-1 * var(--jobs-now-overshoot));
+  right: 0;
+  width: var(--jobs-now-mark);
+  transform: translateX(50%);
+  border-radius: var(--radius-pill);
+  background: var(--color-text-primary);
+  box-shadow: 0 0 0 var(--jobs-halo) color-mix(in srgb, var(--color-text-primary) var(--jobs-halo-mix), transparent);
+}
+.nowDot {
+  position: absolute;
+  top: calc((var(--jobs-now-mark) - var(--jobs-now-dot)) / 2);
+  left: calc((var(--jobs-now-mark) - var(--jobs-now-dot)) / 2);
+  width: var(--jobs-now-dot);
+  height: var(--jobs-now-dot);
+  border-radius: 50%;
+  background: var(--color-text-primary);
+}
+/* The now tag hangs under the mark; the end sentence takes its place under the track when the job ends. */
+.nowTag {
+  position: absolute;
+  top: calc(var(--size-row-card) + var(--jobs-tag-gap));
+  right: 0;
+  transform: translateX(50%);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-tight);
+  white-space: nowrap;
+}
+.endSentence {
+  position: absolute;
+  top: calc(var(--size-row-card) + var(--jobs-tag-gap));
+  left: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-tight);
+  white-space: nowrap;
+}
+/* started · elapsed · estimate */
+.scale {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--jobs-scale-gap);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-sm);
+}
+
+/* ---------- the issue ledger ---------- */
+.ledger {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-height: var(--jobs-mark-height);
+  margin-top: var(--space-3);
+}
+.group {
+  display: flex;
+  align-items: center;
+  gap: var(--jobs-mark-gap);
+}
+/* One mark per issue, 8 × 16 in the severity's ink; a new mark rises in. */
+.mark {
+  display: block;
+  width: var(--jobs-mark-width);
+  height: var(--jobs-mark-height);
+  border-radius: var(--jobs-mark-radius);
+  background: var(--color-text-tertiary);
+  animation: jobsRise var(--motion-sheet) var(--motion-ease-out) both;
+}
+.mark[data-severity='critical'] {
+  background: var(--color-severity-critical-fg);
+}
+.mark[data-severity='high'] {
+  background: var(--color-severity-high-fg);
+}
+.mark[data-severity='medium'] {
+  background: var(--color-severity-medium-fg);
+}
+.mark[data-severity='low'] {
+  background: var(--color-severity-low-fg);
+}
+.mark[data-severity='info'] {
+  background: var(--color-severity-info-fg);
+}
+@keyframes jobsRise {
+  from {
+    opacity: 0;
+    transform: translateY(var(--jobs-mark-travel)) scaleY(var(--jobs-mark-scale));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.ledgerWord {
+  margin-left: var(--space-2);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+/* Severity words everywhere (the ledger, the KPI strip, the rows, the wells): the level's ink. */
+.sev[data-severity='critical'] {
+  color: var(--color-severity-critical-fg);
+}
+.sev[data-severity='high'] {
+  color: var(--color-severity-high-fg);
+}
+.sev[data-severity='medium'] {
+  color: var(--color-severity-medium-fg);
+}
+.sev[data-severity='low'] {
+  color: var(--color-severity-low-fg);
+}
+.sev[data-severity='info'] {
+  color: var(--color-severity-info-fg);
+}
+
+/* ---------- the probe gauge: `probe budget` · a 3 px track · `287 of 2,000` ---------- */
+.gauge {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+/* The gauge's track is the lane's rail cut down to 3 px. */
+.gauge .track {
+  flex: 1 1 0;
+  height: var(--jobs-gauge);
+  border-radius: var(--jobs-mark-radius);
+  overflow: hidden;
+  box-shadow: none;
+}
+.gaugeFill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: var(--jobs-mark-radius);
+  background: var(--color-text-tertiary);
+  transition:
+    width var(--motion-progress) var(--motion-ease-out),
+    background-color var(--motion-popover) var(--motion-ease-out);
+}
+.gauge[data-warn='true'] .gaugeFill {
+  background: var(--color-intercept-base);
+}
+
+/* ---------- the KPI strip inside the card ---------- */
+.kpis {
+  display: flex;
+  margin-top: var(--space-5);
+  border: var(--jobs-hairline) solid var(--color-line-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-ground-surface);
+  overflow: hidden;
+}
+.kpi {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: var(--jobs-kpi-pad-y) var(--space-4);
+  border-left: var(--jobs-hairline) solid var(--color-line-border);
+  transition: background-color var(--motion-hover) var(--motion-ease-out);
+}
+.kpi:first-child {
+  border-left: 0;
+}
+.kpiLabel {
+  display: block;
+  margin-bottom: var(--space-1);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-md);
+}
+.kpiValue {
+  display: inline-flex;
+  align-items: baseline;
+  font-family: var(--font-data);
+  font-size: var(--font-size-display);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-tight);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+  white-space: nowrap;
+}
+.kpiUnit {
+  margin-left: var(--space-2);
+  color: var(--color-text-secondary);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-md);
+}
+.kpiValue .sev {
+  margin-left: var(--space-2);
+  font-size: var(--font-size-md);
+}
+/* A counter: the span is keyed by its text, so a new value remounts it and the tick plays once. */
+.tick {
+  display: inline-block;
+  animation: jobsTick var(--motion-counter) var(--motion-ease-out);
+}
+@keyframes jobsTick {
+  from {
+    opacity: var(--jobs-tick-floor);
+    transform: translateY(calc(-1 * var(--jobs-tick-travel)));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------- the attention block ---------- */
+.attention {
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: var(--jobs-hairline) solid var(--color-line-rule);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-text);
+}
+.attention summary {
+  cursor: default;
+  color: var(--color-text-primary);
+}
+.errorText {
+  color: var(--color-status-server-error);
+}
+.rawLine {
+  margin: var(--space-1) 0 0;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-data);
+  font-size: var(--font-size-xs);
+}
+.notices {
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+/* ---------- the end swap: the now tag gives way to the end sentence, the verb to Scan Again ---------- */
+.endSwap {
+  animation: jobsSwap var(--motion-sheet) var(--motion-ease-out) both;
+}
+@keyframes jobsSwap {
+  from {
+    opacity: 0;
+    transform: translateY(var(--jobs-swap-travel));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------- breathing: the now mark's dot while live, the cancelling dots; nowhere else ---------- */
+.breathe {
+  animation: jobsBreathe var(--motion-intercept-pulse) var(--motion-pulse) infinite alternate;
+}
+@keyframes jobsBreathe {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: var(--jobs-breath-floor);
+  }
+}
+
+/* ---------- the table: a header row over the listbox, one grid ---------- */
+.head,
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, var(--jobs-col-state)) var(--jobs-col-profile) minmax(0, var(--jobs-col-target)) minmax(0, var(--jobs-col-progress)) var(--jobs-col-probes) var(--jobs-col-points) var(--jobs-col-issues) var(--jobs-col-elapsed) var(--jobs-col-action);
+  align-items: center;
+}
+.head {
+  height: var(--jobs-header);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
+}
+.rows {
+  margin: 0;
+  margin-bottom: var(--space-6);
+  padding: 0;
+  list-style: none;
+  outline: none;
+}
+.row {
+  position: relative;
+  height: var(--jobs-row);
+  border-top: var(--jobs-hairline) solid var(--color-line-rule);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-md);
+  cursor: default;
+  transition: background-color var(--motion-hover) var(--motion-ease-out);
+}
+.row:has(.sub) {
+  height: var(--jobs-row-sub);
+}
+.row[aria-selected='true'] {
+  background: var(--color-ground-active);
+  box-shadow: inset var(--jobs-edge) 0 0 var(--color-accent-base);
+}
+/* Keyboard focus on the listbox: a hairline focus ring inside the selected row, over its edge. */
+.rows:focus-visible .row[aria-selected='true'] {
+  box-shadow:
+    inset 0 0 0 var(--jobs-hairline) var(--color-line-focus),
+    inset var(--jobs-edge) 0 0 var(--color-accent-base);
+}
+.cell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  height: 100%;
+  padding: 0 var(--space-2);
+  overflow: hidden;
+  white-space: nowrap;
+}
+/* Probes, Points, Issues, Elapsed and the action column sit right (the comp's .r). */
+.cell:nth-child(n + 5) {
+  justify-content: flex-end;
+  text-align: right;
+}
+/* The ring: `pathLength="1"` on the arc, so the fraction is the dash offset and no circumference
+   constant appears; the arc eases to each new value. Indeterminate: a static quarter arc (builder note). */
+.ring {
+  flex: none;
+  width: var(--size-icon-toolbar);
+  height: var(--size-icon-toolbar);
+  vertical-align: middle;
+}
+.ringTrack {
+  fill: none;
+  stroke: var(--color-line-control);
+  stroke-width: var(--jobs-ring-stroke);
+}
+.ringArc {
+  fill: none;
+  stroke: var(--color-accent-base);
+  stroke-width: var(--jobs-ring-stroke);
+  stroke-linecap: round;
+  stroke-dasharray: 1;
+  stroke-dashoffset: calc(1 - var(--jobs-f, 0));
+  transform: rotate(-90deg);
+  transform-origin: 50% 50%;
+  transition: stroke-dashoffset var(--motion-progress) var(--motion-ease-out);
+}
+.ring[data-indeterminate='true'] .ringArc {
+  stroke-dashoffset: var(--jobs-lane-sub-opacity);
+}
+/* The tone dot of a row that has no ring; the agent dot beside the state word. */
+.dot {
+  display: inline-block;
+  flex: none;
+  width: var(--jobs-dot);
+  height: var(--jobs-dot);
+  border-radius: 50%;
+  background: var(--color-state-neutral-fg);
+}
+.dot[data-tone='progress'] {
+  background: var(--color-accent-base);
+}
+.dot[data-tone='pending'] {
+  background: var(--color-intercept-base);
+}
+.dot[data-tone='success'] {
+  background: var(--color-state-success-fg);
+}
+.dot[data-tone='danger'] {
+  background: var(--color-state-danger-fg);
+}
+.dot[data-tone='neutral'] {
+  background: var(--color-state-neutral-fg);
+}
+.agentDot {
+  display: inline-block;
+  flex: none;
+  width: var(--jobs-dot);
+  height: var(--jobs-dot);
+  border-radius: 50%;
+  background: var(--color-agent-base);
+  box-shadow: 0 0 0 var(--jobs-dot-halo) var(--color-agent-tint);
+}
+.stateWord {
+  display: block;
+  color: var(--color-text-primary);
+}
+.sub {
+  display: block;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-tight);
+}
+/* The hover Cancel in the action column: pointer-only, fades in over the hover duration. */
+.hoverCancel {
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  cursor: default;
+  opacity: 0;
+  transition: opacity var(--motion-hover) var(--motion-ease-out);
+}
+.row:hover .hoverCancel {
+  opacity: 1;
+}
+@media (hover: hover) and (pointer: fine) {
+  .row:hover {
+    background: var(--color-ground-hover);
+  }
+  .kpi:hover {
+    background: var(--color-ground-hover);
+  }
+}
+
+/* ---------- the wells ---------- */
+.wells {
+  display: flex;
+  gap: var(--space-4);
+}
+.well {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: var(--space-4) var(--space-5);
+  border: var(--jobs-hairline) solid var(--color-line-border);
+  border-radius: var(--radius-floating);
+  background: var(--color-ground-card);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-rest);
+}
+.wellTitle {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+}
+.wellSub {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
+}
+.kv {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  height: var(--size-row-dense);
+  border-top: var(--jobs-hairline) solid var(--color-line-rule);
+  font-size: var(--font-size-md);
+  white-space: nowrap;
+}
+
+/* ---------- Reduce Motion (D12's right-hand column). base.css zeroes every duration with `!important`
+   under this query; these class-level rules are more specific than its `*` and keep the opacity fades:
+   the entrance (stagger kept, travel dropped), the ledger marks, the end swap, the hover Cancel and the
+   chip/edge colour. Breathing stops; the counter tick is gone; the lane fill, the ring and the gauge
+   are left to the blanket rule (instant). ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .card[data-entrance='play'] .enter,
+  .enter[data-entrance='play'] {
+    animation-name: jobsEnterFade !important;
+    animation-duration: var(--motion-sheet) !important;
+  }
+  .mark {
+    animation-name: jobsEnterFade !important;
+    animation-duration: var(--motion-sheet) !important;
+  }
+  .endSwap {
+    animation-name: jobsEnterFade !important;
+    animation-duration: var(--motion-sheet) !important;
+  }
+  .hoverCancel {
+    transition-duration: var(--motion-hover) !important;
+  }
+  .chip,
+  .card::before {
+    transition-duration: var(--motion-popover) !important;
+  }
+  .breathe {
+    animation: none !important;
+  }
+  .tick {
+    animation-name: none !important;
+  }
+}
