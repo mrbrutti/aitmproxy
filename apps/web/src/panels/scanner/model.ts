@@ -687,8 +687,12 @@ const MAX_LIST = 1024;
 export const STR_MAX = 400;
 /** The cap on a profile name, a client label, a clamped field. */
 export const TOKEN_MAX = 64;
-/** The engine's cap on `error_samples`, `skipped_samples` and `checks.running`; held against `lanes.skipped` and `clamped` too. */
+/** The cap on one target origin (the Kit's `ScanWire.targetMax`); the list holds `MAX_SAMPLES`. */
+export const TARGET_MAX = 200;
+/** The engine's cap on `error_samples`, `skipped_samples` and `checks.running`; held against `lanes.skipped`, `clamped` and `targets` too. */
 export const MAX_SAMPLES = 8;
+/** The largest millisecond stamp a `Date` can hold (±8.64e15; the wire's stamps are epoch ms, so only the positive side). */
+const STAMP_MAX = 8.64e15;
 
 /** Control, format, line and paragraph separator scalars: none of them belongs in a row. */
 const UNPRINTABLE = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
@@ -777,6 +781,20 @@ function num(v: unknown, fallback = 0): number {
 
 function optNum(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+/**
+ * A millisecond stamp the Jobs view puts through `clock`: an integer in `0 … STAMP_MAX`, or `0`
+ * (the card's "unknown", read as `started —`). `num` alone would pass a finite `1e300`, which no
+ * `Date` holds and the clock would print as `00:00`.
+ */
+function stamp(v: unknown): number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= STAMP_MAX ? v : 0;
+}
+
+/** `stamp` for an optional one: a stamp `stamp` would reject, like an absent value, is `null` (not known). */
+function optStamp(v: unknown): number | null {
+  return typeof v === 'number' && stamp(v) === v ? v : null;
 }
 
 /** A finite number of either sign: a regression slope or a correlation coefficient. */
@@ -1034,10 +1052,10 @@ export function parseJobStatus(raw: unknown): JobStatus | null {
     state,
     phase,
     profile_name: boundedStr(o.profile_name, TOKEN_MAX),
-    targets: strList(o.targets),
+    targets: boundedStrList(o.targets, TARGET_MAX),
     started_by: startedBy(o.started_by),
-    started_at: num(o.started_at),
-    finished_at: optNum(o.finished_at),
+    started_at: stamp(o.started_at),
+    finished_at: optStamp(o.finished_at),
     elapsed_ms: num(o.elapsed_ms),
     stopped_reason: token(STOPPED_REASONS, o.stopped_reason),
     probes: probeCounters(o.probes),

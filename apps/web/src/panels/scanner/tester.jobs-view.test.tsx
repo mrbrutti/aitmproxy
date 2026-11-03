@@ -257,32 +257,34 @@ describe('tester: a hostile status through the model, the helpers and the compon
     expect(h.field(h.card(), 'notices').querySelectorAll('li')).toHaveLength(8);
   });
 
-  it('unbounded_target_pins_the_gap (GAP, for the coder): a 10,000-char target with a bidi override reaches every host cell uncut and uncleaned', () => {
-    // Task 3.1b bounded every string of a status the Jobs view draws except `targets` (still
-    // `strList`: 1,024 entries of any length, no cleaning). The Kit cuts each target to
-    // `ScanWire.targetMax` (200 scalars) and the list to `listMax` (8); the TUI bounds them in
-    // `bound_status`. Until the web does the same, this is what a hostile core can put on the
-    // card's heading, the row's Target cell and its title, the accessibility label and the Scan
-    // Again help. The row survives (every other cell is right) because `.cell` clips with
-    // `overflow: hidden; white-space: nowrap`; the heading (`.heading`) has no such rule.
+  it('bounded_target: a 10,000-char target with a bidi override reaches every host cell cut to 200 clean chars; nine targets hold eight', () => {
+    // Task 3.1c (gap 78): `targets` joins the bounded strings of Task 3.1b. Each target is cut to
+    // `TARGET_MAX` (the Kit's `ScanWire.targetMax`, 200 scalars) with the U+202E dropped first,
+    // and the list to `MAX_SAMPLES` (`listMax`, 8), so the card's heading, the row's Target cell
+    // and its title, the accessibility label and the Scan Again help all carry the same 193-char
+    // host (`http://` takes seven of the 200; the `:8117` never arrives).
     const host = `${'a'.repeat(5000)}\u202E${'b'.repeat(4999)}`;
     expect(host.length).toBe(10_000);
+    const cut = 'a'.repeat(193);
     const f = factsOf(compStatus({ targets: [`http://${host}:8117`] }));
-    expect(f.status!.targets[0]).toBe(`http://${host}:8117`); // GAP: not cut to 200, the U+202E kept.
-    expect(hostsText(f)).toBe(`${host}:8117`);
-    expect(jobHeading(f)).toBe(`${host}:8117`);
+    expect(f.status!.targets).toEqual([`http://${cut}`]);
+    expect(f.status!.targets[0]!.length).toBe(200);
+    expect(UNPRINTABLE.test(f.status!.targets[0]!)).toBe(false);
+    expect(hostsText(f)).toBe(cut);
+    expect(jobHeading(f)).toBe(cut);
 
     const h = mountParts(f);
     const heading = h.card().querySelector('h2')!;
-    expect(heading.textContent).toBe(`${host}:8117`);
-    expect(heading.textContent!.length).toBe(10_005);
-    expect(UNPRINTABLE.test(heading.textContent!)).toBe(true); // GAP: a format scalar in the DOM.
+    expect(heading.textContent).toBe(cut);
+    expect(heading.textContent!.length).toBe(193);
+    expect(UNPRINTABLE.test(heading.textContent!)).toBe(false);
     const target = h.field(h.row(), 'target');
-    expect(target.textContent).toBe(`${host}:8117`);
-    expect(target.getAttribute('title')).toBe(`${host}:8117`);
-    expect(h.row().getAttribute('aria-label')!.length).toBeGreaterThan(10_000);
-    expect(jobAccessibilityLabel(f).startsWith(`Auditing, standard, ${host}:8117, 50 percent, `)).toBe(true);
-    // The rest of the row is intact: the host did not break the grid's other cells.
+    expect(target.textContent).toBe(cut);
+    expect(target.getAttribute('title')).toBe(cut);
+    expect(h.row().getAttribute('aria-label')).toBe(jobAccessibilityLabel(f));
+    expect(jobAccessibilityLabel(f).startsWith(`Auditing, standard, ${cut}, 50 percent, `)).toBe(true);
+    expect(UNPRINTABLE.test(h.row().getAttribute('aria-label')!)).toBe(false);
+    // The rest of the row is intact.
     expect(h.text(h.row(), 'state')).toBe('Auditing');
     expect(h.text(h.row(), 'profile')).toBe('standard');
     expect(h.text(h.row(), 'progress')).toBe('50\u00a0% · 3,236 of 6,468');
@@ -292,16 +294,21 @@ describe('tester: a hostile status through the model, the helpers and the compon
     expect(h.text(h.row(), 'elapsed')).toBe('1:04');
     expect(h.text(h.card(), 'now')).toBe('now · xss-reflected and 3 more');
 
-    // Nine targets: the Kit would hold eight (`a0.test and 7 more`); the web keeps all nine.
+    // Nine targets: eight held, `a0.test and 7 more`, the help listing the eight.
     const many = factsOf(compStatus({ targets: Array.from({ length: 9 }, (_, i) => `http://a${i}.test`) }));
-    expect(many.status!.targets).toHaveLength(9); // GAP: not cut to 8.
-    expect(jobHeading(many)).toBe('a0.test and 8 more');
-    // A done job's Scan Again carries the uncut host into its help and its `scan.start` origins.
+    expect(many.status!.targets).toHaveLength(8);
+    expect(jobHeading(many)).toBe('a0.test and 7 more');
+    h.setFacts(many);
+    expect(h.card().querySelector('h2')!.textContent).toBe('a0.test and 7 more');
+    expect(h.card().querySelector('h2')!.getAttribute('title')).toBe(
+      Array.from({ length: 8 }, (_, i) => `a${i}.test`).join(', '),
+    );
+    // A done job's Scan Again carries the cut host into its help, never the 10,000-char one.
     const done = factsOf(compStatus({ state: 'done', phase: 'done', targets: [`http://${host}:8117`] }));
-    expect(scanAgainHelp(done.status!)).toBe(`Start a new job with profile standard against ${host}:8117`);
+    expect(scanAgainHelp(done.status!)).toBe(`Start a new job with profile standard against ${cut}`);
   });
 
-  it('hostile_started_at: the clock refuses what no date holds; the card reads `started —` for a rejected stamp and `started 00:00` for an absurd one', () => {
+  it('hostile_started_at: the clock refuses what no date holds; the card reads `started —` for a rejected or an absurd stamp', () => {
     // `clock` itself (the Kit's `ScanFormat.clock(ms:timeZone:)`): out of `Date`'s range, or not a number, is `00:00`.
     expect(clock(Number.NaN, 'UTC')).toBe('00:00');
     expect(clock(Number.POSITIVE_INFINITY, 'UTC')).toBe('00:00');
@@ -327,14 +334,17 @@ describe('tester: a hostile status through the model, the helpers and the compon
     expect(scale()).toEqual(['started —', 'elapsed 1:04', 'at this pace, about 1:04 to go']);
     expect(h.text(h.card(), 'finding').endsWith(' · standard · started by the operator')).toBe(true);
 
-    // A finite but absurd stamp passes `num` and prints `00:00` (the clock's floor) rather than `—`:
-    // pinned so the panel sees it; the honest reading for a stamp no date holds would be `started —`.
+    // A finite but absurd stamp (Task 3.1c, gap 78): the model's `stamp` reads it as 0 too, so the
+    // card says `started —` and the finding line drops the clock, never `00:00` (the clock's floor).
+    for (const absurd of [1e300, 8.64e15 + 1]) {
+      expect(parseJobStatus(compStatus({ started_at: absurd }))!.started_at, String(absurd)).toBe(0);
+    }
     h.setFacts(factsOf(compStatus({ started_at: 1e300 })));
-    expect(scale()).toEqual(['started 00:00', 'elapsed 1:04', 'at this pace, about 1:04 to go']);
-    expect(h.text(h.card(), 'finding').endsWith(' · standard · started 00:00 by the operator')).toBe(true);
-    // The same floor on `finished_at`.
+    expect(scale()).toEqual(['started —', 'elapsed 1:04', 'at this pace, about 1:04 to go']);
+    expect(h.text(h.card(), 'finding').endsWith(' · standard · started by the operator')).toBe(true);
+    // The same on `finished_at`: an absurd stamp reads `null` and the `finished` clause is not written.
     h.setFacts(factsOf(compStatus({ state: 'done', phase: 'done', finished_at: 1e300, checks: { scheduled: 6468, done: 6468, running: [] } })));
-    expect(h.text(h.card(), 'finding')).toBe(`standard · started ${clock(STARTED_AT, zone())} by the operator · finished 00:00`);
+    expect(h.text(h.card(), 'finding')).toBe(`standard · started ${clock(STARTED_AT, zone())} by the operator`);
   });
 
   it('empty_status_values: no targets, no profile name, no budget, nothing running, no issues', () => {

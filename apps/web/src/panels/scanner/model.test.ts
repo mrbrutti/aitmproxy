@@ -12,6 +12,7 @@ import {
   MAX_SAMPLES,
   SCAN_ERROR_CODES,
   STR_MAX,
+  TARGET_MAX,
   TOKEN_MAX,
   parseCheckMeta,
   parseChecksResult,
@@ -218,6 +219,50 @@ describe('parseJobStatus', () => {
     expect(same.lanes.skipped).toEqual([{ lane: 'ws', reason: 'lane not available on this build' }]);
     expect(same.clamped).toEqual([]);
     expect(same.error).toBeNull();
+  });
+
+  it('bounds targets to 200 chars and 8 entries and rejects a stamp no date holds', () => {
+    // Task 3.1c (gap 78, web AC1b): the Kit's `ScanWire.targetMax` (200) and `listMax` (8) on
+    // `targets`, which Task 3.1b left on `strList`; and a millisecond stamp that is not an integer
+    // in `0 … 8.64e15` (what `Date` holds) reads 0, the card's "unknown", so `clock` never prints
+    // `00:00` for garbage.
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const host = `${'a'.repeat(5000)}\u202E${'b'.repeat(4999)}`;
+    expect(host.length).toBe(10_000);
+    expect(TARGET_MAX).toBe(200);
+
+    // 10,000 chars with a bidi override: the first 200 clean chars (`http://` and 193 of the host).
+    const one = parseJobStatus({ ...raw, targets: [`http://${host}:8117`] })!;
+    expect(one.targets).toEqual([`http://${'a'.repeat(193)}`]);
+    expect(one.targets[0]!.length).toBe(200);
+    expect(one.targets[0]).not.toMatch(/\u202E/);
+    // Nine targets: the first eight; a non-string entry is dropped.
+    const nine = parseJobStatus({ ...raw, targets: Array.from({ length: 9 }, (_, i) => `http://a${i}.test`) })!;
+    expect(nine.targets).toHaveLength(8);
+    expect(nine.targets[7]).toBe('http://a7.test');
+    const mixed = parseJobStatus({ ...raw, targets: ['http://a.test', 7, null, 'http://b.test'] })!;
+    expect(mixed.targets).toEqual(['http://a.test', 'http://b.test']);
+
+    // `started_at`: out of range, negative, non-finite, fractional, a string or absent → 0; in range kept whole.
+    for (const bad of [1e300, 8.64e15 + 1, -5, Number.NaN, Number.POSITIVE_INFINITY, 1.5, '1782901920000', null, undefined]) {
+      expect(parseJobStatus({ ...raw, started_at: bad })!.started_at, String(bad)).toBe(0);
+    }
+    expect(parseJobStatus({ ...raw, started_at: 1_782_901_920_000 })!.started_at).toBe(1_782_901_920_000);
+    expect(parseJobStatus({ ...raw, started_at: 8.64e15 })!.started_at).toBe(8.64e15);
+    expect(parseJobStatus({ ...raw, started_at: 0 })!.started_at).toBe(0);
+    // `finished_at` is optional: `null`, absent, out of range or negative all read `null` (not known); in range kept whole.
+    expect(parseJobStatus({ ...raw, finished_at: null })!.finished_at).toBeNull();
+    expect(parseJobStatus({ ...raw, finished_at: 1e300 })!.finished_at).toBeNull();
+    expect(parseJobStatus({ ...raw, finished_at: 8.64e15 + 1 })!.finished_at).toBeNull();
+    expect(parseJobStatus({ ...raw, finished_at: -1 })!.finished_at).toBeNull();
+    expect(parseJobStatus({ ...raw, finished_at: 0 })!.finished_at).toBe(0);
+    expect(parseJobStatus({ ...raw, finished_at: 1_782_901_984_000 })!.finished_at).toBe(1_782_901_984_000);
+
+    // The fixture's targets are under the cap and its stamps in range: they read as before.
+    const same = parseJobStatus(raw)!;
+    expect(same.targets).toEqual(raw.targets);
+    expect(same.started_at).toBe(1_761_900_000_000);
+    expect(same.finished_at).toBeNull();
   });
 });
 
