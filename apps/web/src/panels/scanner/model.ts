@@ -137,6 +137,10 @@ export type L4Transport = (typeof L4_TRANSPORTS)[number];
 export const CRAWL_STRATEGIES = ['fast', 'normal', 'thorough'] as const;
 export type CrawlStrategy = (typeof CRAWL_STRATEGIES)[number];
 
+/** Why an all-failing client crawl failed (`CrawlCounters.last_error`, job.rs `CrawlErrorKind`). */
+export const CRAWL_ERROR_KINDS = ['h2_not_negotiated', 'connect_refused', 'tls', 'timeout', 'transport', 'other'] as const;
+export type CrawlErrorKind = (typeof CRAWL_ERROR_KINDS)[number];
+
 export const USE_BROWSER = ['auto', 'always', 'never'] as const;
 export type UseBrowser = (typeof USE_BROWSER)[number];
 
@@ -201,6 +205,8 @@ export interface CrawlCounters {
   errors: number;
   /** Forms the crawler saw but did not submit (`submit_forms: false`, or a form it would not fill). Absent → 0. */
   forms_skipped: number;
+  /** Why every request of the crawl failed, when it did. Absent or an unknown token → `null`. */
+  last_error: CrawlErrorKind | null;
 }
 
 export interface SkippedPoints {
@@ -216,10 +222,25 @@ export interface PointCounters {
   skipped: SkippedPoints;
 }
 
+/** One sampled check `error` (or skip): which check, the first point it hit, and its detail. */
+export interface CheckErrorSample {
+  check: string;
+  point: string;
+  detail: string;
+}
+
 export interface CheckCounters {
   scheduled: number;
   done: number;
   running: string[];
+  /** Checks that ended in an `error` verdict. Absent → 0. */
+  errors: number;
+  /** The engine keeps the first few distinct `(check, detail)` pairs. Absent → `[]`. */
+  error_samples: CheckErrorSample[];
+  /** Checks skipped (a lane that hosts nothing, a point the check does not fit). Absent → 0. */
+  skipped: number;
+  /** Samples of the skips, apart from the errors so a skip never reads as a failure. Absent → `[]`. */
+  skipped_samples: CheckErrorSample[];
 }
 
 export interface IssueCounters {
@@ -843,6 +864,7 @@ function crawlCounters(v: unknown): CrawlCounters {
     forms_submitted: num(o.forms_submitted),
     errors: num(o.errors),
     forms_skipped: num(o.forms_skipped),
+    last_error: token(CRAWL_ERROR_KINDS, o.last_error),
   };
 }
 
@@ -857,9 +879,24 @@ function pointCounters(v: unknown): PointCounters {
   };
 }
 
+/** A sample is `#[serde(default)]` on the engine: a missing key reads `''`; a non-object is dropped. */
+function checkErrorSample(v: unknown): CheckErrorSample | null {
+  const o = dict(v);
+  if (!o) return null;
+  return { check: str(o.check), point: str(o.point), detail: str(o.detail) };
+}
+
 function checkCounters(v: unknown): CheckCounters {
   const o = dict(v) ?? {};
-  return { scheduled: num(o.scheduled), done: num(o.done), running: strList(o.running) };
+  return {
+    scheduled: num(o.scheduled),
+    done: num(o.done),
+    running: strList(o.running),
+    errors: num(o.errors),
+    error_samples: rows(o.error_samples, checkErrorSample),
+    skipped: num(o.skipped),
+    skipped_samples: rows(o.skipped_samples, checkErrorSample),
+  };
 }
 
 function issueCounters(v: unknown): IssueCounters {

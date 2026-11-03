@@ -84,6 +84,64 @@ describe('parseJobStatus', () => {
     expect(status!.state).toBe('cancelling');
     expect(status!.stopped_reason).toBe('cancelled');
   });
+
+  // Spec AC33 (D18 W1), the web copy of AC1 and AC2: the check-error and crawl-error fields the
+  // Jobs view's sentences read, with 0 / [] / null defaults so an older core still parses.
+  it('reads check errors, samples, skips and the crawl last_error', () => {
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const checks = {
+      scheduled: 4,
+      done: 3,
+      running: [],
+      errors: 7,
+      error_samples: [{ check: 'http.xss', point: 'p1', detail: 'Connection refused (os error 61)' }],
+      skipped: 3,
+      skipped_samples: [{ check: 'fake.point', point: 'p2', detail: 'the lane hosts nothing' }],
+    };
+    const crawl = {
+      pages: 1,
+      queued: 0,
+      depth: 0,
+      forms_submitted: 0,
+      errors: 1,
+      forms_skipped: 2,
+      last_error: 'connect_refused',
+    };
+    const status = parseJobStatus({ ...raw, checks, crawl })!;
+    expect(status.checks.errors).toBe(7);
+    expect(status.checks.error_samples.length).toBe(1);
+    expect(status.checks.error_samples[0]).toEqual({
+      check: 'http.xss',
+      point: 'p1',
+      detail: 'Connection refused (os error 61)',
+    });
+    expect(status.checks.error_samples[0]!.detail).toBe('Connection refused (os error 61)');
+    expect(status.checks.skipped).toBe(3);
+    expect(status.checks.skipped_samples.length).toBe(1);
+    expect(status.checks.skipped_samples[0]!.check).toBe('fake.point');
+    expect(status.crawl.errors).toBe(1);
+    expect(status.crawl.forms_skipped).toBe(2);
+    expect(status.crawl.last_error).toBe('connect_refused');
+
+    // An unknown token is null, not a string the view would print as-is.
+    expect(parseJobStatus({ ...raw, crawl: { ...crawl, last_error: 'weird' } })!.crawl.last_error).toBeNull();
+
+    // The fixture pack predates these keys: 0, [], 0, [], null.
+    const old = parseJobStatus(raw)!;
+    expect(old.checks.errors).toBe(0);
+    expect(old.checks.error_samples).toEqual([]);
+    expect(old.checks.skipped).toBe(0);
+    expect(old.checks.skipped_samples).toEqual([]);
+    expect(old.crawl.last_error).toBeNull();
+
+    // A sample missing a key reads it as '' (the engine's `#[serde(default)]`); a non-object
+    // sample is dropped, not kept as a half-built row.
+    const sparse = parseJobStatus({
+      ...raw,
+      checks: { ...checks, error_samples: [{ check: 'http.xss' }, 'junk', null, 7] },
+    })!;
+    expect(sparse.checks.error_samples).toEqual([{ check: 'http.xss', point: '', detail: '' }]);
+  });
 });
 
 describe('parseJobSummary', () => {
