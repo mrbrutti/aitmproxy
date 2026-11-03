@@ -1,0 +1,4 @@
+1 scan-ff39b41e done
+2 scan-ca4cd51f running
+3 scan-b5e32649 done
+4 scan-8094e0c0 cancelled

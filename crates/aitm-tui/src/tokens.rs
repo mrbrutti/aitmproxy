@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn version_matches_tokens_json() {
-        assert_eq!(TOKENS_VERSION, "0.1.0");
+        assert_eq!(TOKENS_VERSION, "0.2.0");
     }
 
     #[test]
@@ -96,16 +96,17 @@ mod tests {
 
     #[test]
     fn tables_cover_every_token() {
-        // Counted by hand from tokens.json (0.1.0, with the `mark` group the
-        // GUI surfaces added on 2026-10-28 and the `syntax.currentLine` +
-        // `syntax.match` JSON-viewer tokens):
-        //   single colours: ground 6 + line 4 + text 6 + accent 3 + intercept 4
+        // Counted by hand from tokens.json (0.2.0, with the `mark` group the
+        // GUI surfaces added on 2026-10-28, the `syntax.currentLine` +
+        // `syntax.match` JSON-viewer tokens, and `ground.card` added 2026-11-02
+        // for the Jobs view card and wells):
+        //   single colours: ground 7 + line 4 + text 6 + accent 3 + intercept 4
         //                 + agent 3 + status 7 + syntax 11 + mark 11
-        //                 + l4 3 (base/deep/tint, added 2026-10-29 for the L4 badge) = 58
+        //                 + l4 3 (base/deep/tint, added 2026-10-29 for the L4 badge) = 59
         //   pairs:          method 9 + severity 5 + syntax 2 (diffAdd/diffRemove)
         //                 + l4.badge 1 + state 4 (success/warning/danger/neutral,
         //                   added 2026-10-30 for the semantic CA/script badges) = 21
-        assert_eq!(ALL_COLORS.len(), 58);
+        assert_eq!(ALL_COLORS.len(), 59);
         assert_eq!(ALL_PAIRS.len(), 21);
         assert_eq!(
             color::mark::TEAL.ansi,

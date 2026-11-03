@@ -174,9 +174,9 @@ Every state below is a real-app frame in the live proof.
 | State | Table row | Job card (when selected) |
 | --- | --- | --- |
 | Empty | Keep: glyph, "No jobs yet — pick a profile and Start Scan.", `Open Profiles`. No table header, no card, no wells. | none |
-| Queued | Small indeterminate spinner in the State column, "Queued"; profile; target; progress "—"; probes `0 of 2,000`; "no issues yet"; elapsed. | Chip "Queued" (neutral pair), heading = the target host, finding line "no issues so far · standard · started 11:32 by this app". Lane empty with the phase line "Waiting for the engine to start this job." inside the track; no now mark; scale row started · elapsed; no estimate. KPI Progress "—". Cancel Scan enabled. |
+| Queued | Small indeterminate spinner in the State column, "Queued"; profile; target; progress "—"; probes `0 of 2,000`; "no issues yet"; elapsed. | Chip "Queued" (progress pair, D11), heading = the target host, finding line "no issues so far · standard · started 11:32 by this app". Lane empty with the phase line "Waiting for the engine to start this job." inside the track; no now mark; scale row started · elapsed; no estimate. KPI Progress "—". Cancel Scan enabled. |
 | Running | 18 pt ring in accent at the progress fraction (6 pt teal dot beside it when agent-started), "Auditing"; "standard"; host in the data face; `50 % · 3,236 of 6,468`; `287 of 2,000`; `97 of 1,020`; "4 low" in the low ink; `1:04`; Cancel at the trailing edge on hover. | Chip "Auditing" (accent pair), heading host, finding line "4 low issues so far · xss-reflected and 3 more checks running now · standard · started 11:32 by this app". Lane: crawl cap (accent.deep, "crawl" / "46 pages"), audit fill (accent, "audit" / "3,236 checks done") at the true checks fraction, "3,232 checks to go" at the right, the now mark with its breathing dot at the fill's edge, "now · xss-reflected and 3 more" under it; scale row "started 11:32 · elapsed 1:04 · at this pace, about 1:04 to go". Ledger: four low marks + "4 low". Gauge 14 % grey, "287 of 2,000". KPI strip: Progress 50 % (accent) · Checks 3,236 of 6,468 · Probes 287 of 2,000 · Points audited 97 of 1,020 · Issues 4, "4 low". Verbs: Show Site Map · Show Issues · **Cancel Scan**. Attention lines only when non-zero. |
-| Crawling / Passive / Reporting | Ring: pages ÷ (pages + queued) while crawling; indeterminate spinner for passive; full ring for reporting. Progress text "46 pages, 12 queued" / "Passive checks over captured traffic" / "Writing results". | Lane while crawling: one crawl segment at pages ÷ (pages + queued) with "crawl" / "46 pages, 12 queued", no now mark, no estimate; passive: empty track with the phase line inside, no estimate; reporting: full fill, "Writing results" in the now tag's place. KPI Progress "—" / "—" / "100 %". |
+| Crawling / Passive / Reporting | Ring: pages ÷ (pages + queued) while crawling; indeterminate spinner for passive; full ring for reporting. Progress text "46 pages, 12 queued" / "Passive checks" (the row cell; D8's `phaseLine` keeps the long form on the card) / "Writing results". | Lane while crawling: one crawl segment at pages ÷ (pages + queued) with "crawl" / "46 pages, 12 queued", no now mark, no estimate; passive: empty track with the phase line inside, no estimate; reporting: full fill, "Writing results" in the now tag's place. KPI Progress "—" / "—" / "100 %". |
 | Cancelling | 6 pt intercept dot breathing, "Cancelling"; the ring is gone; values frozen at their last read. | Chip "Cancelling" (intercept pair), the card's left edge intercept; lane frozen at its value, the now mark's dot stops breathing and the mark fades; primary verb disabled and titled "Cancelling…". |
 | Done | 6 pt success dot, "Done"; when a stopped reason exists, its sentence on a second 12 pt line under the word, tail-truncated with the full sentence in the tooltip. Progress "6,468 of 6,468" (checks). | Chip "Done" (success pair), left edge success. Finding line "standard · started 11:32 by this app · finished 11:33" (preceded by the stopped-reason sentence when present). Lane frozen; the now tag is replaced by the end sentence "Done in 1:09 · 1,020 points · 6,468 checks."; no estimate. Verbs: Show Site Map · Show Issues · **Scan Again**. |
 | Cancelled | 6 pt neutral dot, "Cancelled"; progress "3,236 of 6,468". | Chip "Cancelled" (neutral pair), left edge neutral; the lane's end sentence "Cancelled after 1:55; 3,236 of 6,468 checks had run. What it found stays." Scan Again. |
@@ -760,9 +760,11 @@ the probe rule and every existing string except the *Stopped* section's. It
 adds no motion, no new layout and no Scan Again. It is reviewable as a
 behaviour fix plus a decoder extension, and it is the base PR 2 is cut from.
 
-**Amendment (2026-11-02, PR 1 panel).** The Cancel help text stays PR 1's
-words, `Stop this job; its issues stay (⌥⌘.)`, now one Kit constant
-(`ScanFormat.cancelHelpText`); the hover-help wording of the UX section is
+**Amendment (2026-11-02, PR 1 panel).** PR 1 kept its own Cancel help,
+`Stop this job; its issues stay (⌥⌘.)` (`ScanFormat.cancelHelpText`). From PR 2
+fix 2.12b the row's hover Cancel and the card's Cancel Scan both read
+`cancelScanHelp` and `cancelHelpText` is deleted: one Cancel help on screen,
+the hover-help wording of the UX section, which is
 PR 2's (D11). The Stopped section shows only for a terminal job (D4
 amendment); a live job with crawl errors shows nothing there in PR 1.
 
@@ -800,7 +802,8 @@ Rules (the UX section's, made total):
 
 `percentText` is `Int((fraction * 100).rounded(.down))` + ` %` with a
 non-breaking space; it never reads `100 %` for a running job unless
-`done == scheduled`. `nowLine` is `Now: <first id>` for one running check,
+`done >= scheduled` (the derived fraction is clamped at 1, so a core reporting
+`done > scheduled` reads `100 %`; fix 2.11b). `nowLine` is `Now: <first id>` for one running check,
 `Now: <first id> and <n> more` for more (`checks.running` is already capped at
 8 by the engine). The fraction may fall when `scheduled` grows; the model
 reports the new value and D12's motion eases to it.
@@ -828,14 +831,14 @@ extension ScanFormat {
     public static func checksToGo(done: Int, scheduled: Int) -> String?
 }
 extension ScanJobProgress {
-    public var checksToGoText: String?   // while auditing or reporting with scheduled > 0; nil otherwise and when terminal
+    public var checksToGoText: String?   // while running in auditing or reporting with scheduled > 0; nil otherwise (incl. cancelling and terminal)
     public var nowTag: String?           // "now · xss-reflected" / "now · xss-reflected and 3 more"; nil when nowLine is nil
     public var estimateText: String?     // "at this pace, about 1:04 to go"
     public var estimateHelp: String?     // "Derived from the counters: 3,236 checks done in 1:04, about 51 checks per second, 3,232 to go."
 }
 ```
 
-`paceEstimate`: `checksPerSecond = done / (elapsedMs / 1000)`;
+`paceEstimate` (nil, never a trap, when the seconds-to-go quotient exceeds 2^53 / 1000 — the decoder's ceiling leaves the arithmetic finite; fix 2.12a): `checksPerSecond = done / (elapsedMs / 1000)`;
 `secondsToGo = ceil((scheduled - done) / checksPerSecond)`; nil while
 crawling, passive, reporting, queued, cancelling or terminal, when
 `elapsedMs == 0`, `done == 0` (rate 0), `scheduled == 0` or `done >=
@@ -895,13 +898,15 @@ The Jobs tab is one scrolling column: banner (D15) → job card (D11) → jobs
 table → wells (D11). The table is `ScanJobsTable` in `ScanPanel+Jobs.swift`:
 a header row and one `ScanJobRow` per job, newest first, both laid out by one
 `ScanJobsColumns` definition so cells align (builder's call: a SwiftUI `Grid`
-or an `HStack` of fixed frames). Columns: **State** (flexible, min 148 pt),
-**Profile** (120), **Target** (flexible, min 220, data face), **Progress**
-(flexible, min 220, data face), **Probes** · **Points** · **Issues** ·
+or an `HStack` of fixed frames). Columns: **State** (flexible, share 148),
+**Profile** (120), **Target** (flexible, share 220, data face), **Progress**
+(flexible, share 220, data face), **Probes** · **Points** · **Issues** ·
 **Elapsed** (120 · 120 · 124 · 80, right-aligned, tabular), and a trailing
-84 pt action column. Header: 32 pt, labels UI sm `Tok.Ink.tertiary` sentence
+84 pt action column (the three flexible columns split the leftover width in
+148:220:220 shares, as the comp's auto table does; the literal minimums would
+overflow the 1,152 pt usable width, gap 36). Header: 32 pt, labels UI sm `Tok.Ink.tertiary` sentence
 case (`ScanFormat.tableHeaders`: `State`, `Profile`, `Target`, `Progress`,
-`Probes`, `Points`, `Issues`, `Elapsed`), no fill, no rule under it. Rows:
+`Probes`, `Points`, `Issues`, `Elapsed`), no fill; rows are split by `Tok.Line.rule` (the comp's `td { border-top }`). Rows:
 44 pt pitch (the comp's 46 on the 4 pt grid; a row with a sub-line grows to
 60), `Rule(color: Tok.Line.rule)` between rows, padding `Space.sm` horizontal
 per cell.
@@ -960,8 +965,8 @@ per cell.
 
 #### D11. The job card and the wells (locked comp)
 
-The job card replaces the inspector. `ScanJobCard(facts:progress:link:…)` in
-`ScanJobCard.swift` is composed of small views: `ScanJobTitleRow`, `ScanLane`,
+The job card replaces the inspector. `ScanJobCard(state:facts:progress:reduceMotion:generation:…)` (no clock-driven `link`: the verb slot reads the state's clock-free `verbsEnabled`, gap 34d) in
+`ScanJobCard.swift` is composed of small views: `ScanJobTitleRow`, `ScanJobLane`,
 `ScanIssueLedger`, `ScanProbeGauge`, `ScanKPIStrip`, `ScanAttentionBlock`;
 the wells are `ScanJobWells` in `ScanJobWells.swift`. The card's **tone** is
 a Kit value, `ScanFormat.tone(facts) -> ScanJobTone` (`.progress` while
@@ -982,7 +987,8 @@ horizontal, a 3 pt left edge in the tone's colour clipped to the radius,
 
 1. **Title row** (`ScanJobTitleRow`): the **chip** (`ScanStateChip`: 22 pt
    pill, `Tok.Radius.pill`, padding 9 pt, UI sm 500, the tone pair, a 6 pt
-   dot in the foreground colour before the word, static), the **heading**
+   dot in the foreground colour before the word; static while running, breathing
+   while cancelling as the row's does, D12), the **heading**
    `ScanFormat.jobHeading(facts)` = the hosts (`127.0.0.1:8117`; `a.test,
    b.test`; `a.test and 2 more` with `.help(jobHeadingHelp)`; the chip, not
    the heading, carries the state now), data face `Tok.Typography.Size.xxl`
@@ -1017,11 +1023,11 @@ horizontal, a 3 pt left edge in the tone's colour clipped to the radius,
    primary: `PrimaryButton("Cancel Scan")` while live (disabled and titled
    `Cancelling…` while cancelling or a cancel is in flight, D2) or
    `PrimaryButton("Scan Again")` when terminal (D13). The slot is disabled
-   while `!link.verbsEnabled` (D6, D15); the first enabled button takes
+   while `!state.verbsEnabled` (D6, D15; clock-free); the first enabled button takes
    `.focused(inspectorFocused)`; `.onExitCommand` returns focus to the table
    and clears `scanAgainError`. `Unable to scan again: <display>` renders
    under the title row (D13).
-2. **Scan lane** (`ScanLane(progress:facts:reduceMotion:)`): a 64 pt track
+2. **Scan lane** (`ScanJobLane(progress:facts:reduceMotion:)`; `ScanLane` is the Kit's lane enum, Task 2.6): a 64 pt track
    (`Tok.Size.Row.card`) on `Tok.Ground.raised`, `Tok.Radius.panel`, with a
    1 pt top highlight at 3 % of `Tok.Ink.primary`. While auditing, reporting
    or terminal with `scheduled > 0`: a **crawl cap** in `Tok.Accent.deep` as
@@ -1077,7 +1083,7 @@ horizontal, a 3 pt left edge in the tone's colour clipped to the radius,
    > 0.8 × budget`, `budget > 0`); text `ScanFormat.probeBudgetText(sent:budget:)`
    (`287 of 2,000`; `287 probes` with the track hidden when `budget == 0`,
    Architect's call) in the data face, `Tok.Ink.secondary`, `numericText`.
-   One accessibility element `Probe budget, 287 of 2,000`;
+   One accessibility element `Probe budget, 287 of 2,000` (`ScanFormat.gaugeAccessibilityLabel(sent:budget:)`);
    `.help(ScanFormat.probesTileHelp(sent:budget:))`.
 5. **KPI strip** (`ScanKPIStrip(facts:progress:)`): one container on
    `Tok.Ground.surface`, 1 pt `Tok.Line.border`, `Tok.Radius.panel`, 20 pt
@@ -1117,7 +1123,7 @@ Pages fetched · Pages waiting · Depth · Forms submitted · Forms not submitte
 · Crawl errors (only when > 0) · Points found · Waiting for audit · Audited ·
 one row per `pointSkipWords` entry (`722 skipped as repetitive`, `6 skipped
 by rule`, `0 skipped at the per-request cap`) · Lanes (`HTTP, WebSocket`;
-skipped lanes with reasons as further rows) · Probes by lane (`HTTP 240 ·
+skipped lanes with reasons as further rows) · Probes by lane (at most 8 lanes, the first 8 keys in sorted order — `counts("by_lane")` is capped like every other list, fix 2.12a; `HTTP 240 ·
 WebSocket 47`) · Session (only when `status.session != nil`: `reused · lost ·
 canary · browser partial` as `no · no · ok · no`) · L4 rows (only when
 present). **Issues** ("by severity and confidence"): `Critical · High ·
@@ -1130,7 +1136,7 @@ and `Skipped frequent` is `skipped as repetitive` (C9). The Session and Lanes
 sections of the old inspector are gone as sections (C9); their facts survive
 as the rows above **(Architect's call)**.
 
-**Tokens, exhaustively**: grounds `Tok.Ground.surface / card / raised /
+**Tokens** (every colour, radius and duration the card reads; the comp's geometric constants live once in `enum CardMetrics`, 40 values after Tasks 2.6–2.10, pinned by `ScanJobsViewPinsTests`): grounds `Tok.Ground.surface / card / raised /
 active / hover`; lines `Tok.Line.border / rule / control`; inks
 `Tok.Ink.primary / secondary / tertiary / onAccent`; accent `Tok.Accent.base
 / deep / tint`; `Tok.Agent.base / tint`; `Tok.Intercept.base / tint`;
@@ -1142,7 +1148,7 @@ sizes `Tok.Size.badge / controlLg / Row.card`; spacing `Space.*`. The comp's
 geometric constants that are not tokens (edge 3, now mark 2, overshoot 10,
 dot 10 and 6, halo 3, gauge 3, mark 8 × 16 radius 2, ring stroke 2.5, crawl
 cap 80, row pitch 44, header 32, action column 84, halo opacity 0.12,
-breathing floor 0.4) live once in `private enum CardMetrics` in
+breathing floor 0.4) live once in `enum CardMetrics` in
 `ScanJobCard.swift` with a comment naming the comp's CSS rule; no colour,
 radius or duration literal appears in `ScanPanel+Jobs.swift`,
 `ScanJobCard.swift`, `ScanJobWells.swift` or `ScanProgressViews.swift`
@@ -1196,7 +1202,7 @@ animate. Reduced-motion drops travel, keeps opacity." `$version` bumps to
 
 | Change | Mechanism (mac) | Reduce Motion |
 | --- | --- | --- |
-| Entrance | `ScanPanelState.entranceGeneration: Int` increments when the selection changes by pointer, by a start this app or another client made, or by the first list; never by keyboard (`moveSelection` runs inside `withTransaction(Transaction(animation: nil))` and does not bump it) and never by a status beat. The card's title row, lane (with ledger and gauge), KPI strip, and the wells carry `.id(generation)` with `.transition(.opacity.combined(with: .offset(y: 8)))` and `.animation(ScanMotion.ease(ScanMotion.entrance).delay(Double(index) * ScanMotion.stagger), value: generation)` for block index 0…3; the table takes part only on the first generation (the tab's first selected job): on a row click the operator is pointing at the table, which must not move **(Architect's call)** | `.transition(.opacity)` with the same delays |
+| Entrance | `ScanPanelState.entranceGeneration: Int` increments when the selection changes by pointer, by a start this app or another client made, or by the first list; never by keyboard (`moveSelection` runs inside a `Transaction` with `disablesAnimations = true` (fix 2.12e: `Transaction(animation: nil)` is the default transaction and suppresses nothing) and does not bump it) and never by a status beat. The card's title row, lane (with ledger and gauge), KPI strip, and the wells carry `.id(generation)` with `.transition(.opacity.combined(with: .offset(y: 8)))` and `.animation(ScanMotion.ease(ScanMotion.entrance).delay(Double(index) * ScanMotion.stagger), value: generation)` for block index 0…3; the table takes part only on the first generation (the tab's first selected job): on a row click the operator is pointing at the table, which must not move **(Architect's call)** | `.transition(.opacity)` with the same delays |
 | Lane fill, now mark, ring | frame widths / offsets / `trim(to:)` under `.animation(ScanMotion.ease(ScanMotion.progress), value: fraction)`; a falling value (scheduled grew) eases down, never clamps | `.animation(nil)` |
 | Counter ticks | `.contentTransition(.numericText())` on every number `Text` (KPI numerals, lane labels, row cells, elapsed) under `.animation(ScanMotion.ease(ScanMotion.counter), value: <the number>)` | `.contentTransition(.identity)` |
 | Ledger mark arrival | marks in a `ForEach` keyed by group and index with `.transition(.opacity.combined(with: .offset(y: 3)).combined(with: .scale(scale: 0.6, anchor: .bottom)))` under `.animation(ScanMotion.ease(ScanMotion.entrance), value: groups)` | `.transition(.opacity)` |
@@ -1243,7 +1249,7 @@ public static func scanAgainHelp(_ status: ScanJobStatus) -> String
   for the first target host not in `scopeHosts`; `scanL4Hint` when
   `status.lanes.requested` has an L4 lane and `l4InjectScopeKnown != true`;
   `"Select a finished job."` when the status is missing or non-terminal.
-  The button is additionally disabled while `!link.verbsEnabled`,
+  The button is additionally disabled while `!state.verbsEnabled`,
   `launchInFlight`, or `confirm != nil`; its `.help` is the refusal when
   there is one, else `scanAgainHelp`.
 - **Send path**: `ScanPanelState.scanAgain(job:)` reuses `send(tool:args:)`,
@@ -1338,7 +1344,7 @@ not memoise them.
 #### D17. Words added by this spec (D12 of the mac spec extended)
 
 Every string lives in `ScanSurface.swift` (`ScanFormat` or `ScanEndText`).
-New buttons: `Scan Again`, `Cancelling…`. New sentences: D4's table, D8's
+New button titles: `Scan Again` (a view literal, as the plan writes the verb titles; gap 37), `Cancelling…` (`ScanFormat.cancellingTitle`). New sentences: D4's table, D8's
 phase lines and derived texts (`3,232 checks to go`, `now · …`, `at this
 pace, about 1:04 to go` and its help), D9's attention lines, D15's banners,
 the help strings of the UX section verbatim, `Unable to scan again:
@@ -1846,8 +1852,10 @@ row it closes.
     with the table).
 32. **AC32 (P2, D16, D17; gate).** `grep -nwiE 'stop|abort|finding|task'`
     over the string literals of `ScanSurface.swift`'s Jobs words finds no
-    operator-facing string (`"Stop this job; …"` in the help is the one
-    allowed verb use, listed in the UX section); `grep -n 'Timer\|Task.sleep\|TimelineView'`
+    operator-facing string (two allowances, both listed in the UX section:
+    `"Stop this job; …"` in the Cancel help, and D4's PR 1 sentence
+    `Stopped early: the session was lost and the profile says stop when that
+    happens.`, kept as shipped; the test excepts exactly those two by name); `grep -n 'Timer\|Task.sleep\|TimelineView'`
     over `ScanPanel+Jobs.swift`, `ScanJobCard.swift`, `ScanJobWells.swift`
     and `ScanProgressViews.swift` prints nothing.
 
@@ -1999,7 +2007,7 @@ Locked-comp additions (numbered after the existing 43 so no reference moves):
   `.transition` + delayed animation, or a per-block `onChange`), as long as
   AC50 holds and keyboard selection shows none.
 - The attention disclosures' default open/closed state.
-- Whether the chip draws its 6 pt dot (the comp does; it is static).
+- Whether the chip draws its 6 pt dot (the comp does; it is static while running and breathes while cancelling — ruled at the Part 2 panel, 2026-11-02).
 
 ## Open questions
 
@@ -2025,6 +2033,6 @@ autonomous mode; Matt may overrule any of them at the PR 2 review:
    in the comp notes); it collides with the glossary's *Lane* (a protocol a
    job scans over). The word never appears on screen (the element's
    accessibility label is `Progress`; its segments read `crawl` / `audit`),
-   so the glossary is untouched; the view type is `ScanLane`.
+   so the glossary is untouched; the view type is `ScanJobLane` (`ScanLane` is the Kit's lane enum).
 7. Web W2 is re-cut to the comp before Part 3 opens (D18 amendment); the
    TUI keeps its own layout and gains only the derived words.

@@ -1,0 +1,2 @@
+1:listen: "127.0.0.1:52412"
+9:  audit_log: "/tmp/Aitmproxy-dev-state-jobsux/audit.jsonl"

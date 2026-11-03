@@ -872,17 +872,21 @@ extension ScanModelTests {
         let rounded = try ScanJobStatus(json: ScanPack.edited(status, path: ["probes", "sent"], to: 9_007_199_254_740_993))
         #expect(rounded.probes.sent == top)
 
-        // Every tally at the top of the range: the sum the Kit takes still fits, and the bar divides.
+        // Every tally at the top of the range: the sum the Kit takes still fits, and the
+        // words that read it (the ledger's and the Issues cells' counts) spell every count
+        // in full, grouped (fix 2.12b: `severityCountsInWords` is gone; these are its readers).
         var all = status
         for key in ["critical", "high", "medium", "low", "info"] {
             all = ScanPack.edited(all, path: ["issues", "by_severity", key], to: 9_007_199_254_740_992)
         }
         let full = try ScanJobStatus(json: all)
         #expect(full.issues.bySeverity.total == 45_035_996_273_704_960)
-        let segments = ScanSurfaceModel.severityBarSegments(full.issues.bySeverity)
-        #expect(segments.count == 5)
-        let evenFifths = segments.allSatisfy { abs($0.fraction - 0.2) < 1e-9 }
-        #expect(evenFifths)
+        #expect(ScanFormat.issuesTileHelp(by: full.issues.bySeverity)
+                == "45,035,996,273,704,960 issues: 9,007,199,254,740,992 critical, 9,007,199,254,740,992 high, "
+                    + "9,007,199,254,740,992 medium, 9,007,199,254,740,992 low, 9,007,199,254,740,992 info")
+        #expect(ScanFormat.severityWordParts(by: full.issues.bySeverity).map(\.1)
+                == ["9,007,199,254,740,992 critical", "9,007,199,254,740,992 high", "9,007,199,254,740,992 medium",
+                    "9,007,199,254,740,992 low", "9,007,199,254,740,992 info"])
 
         // The formatters subtract and divide a top-of-range stamp without a trap.
         // Tester finding T-F2: `elapsed(ms:)` formats its 64-bit hour count with `%d`, so
@@ -895,7 +899,7 @@ extension ScanModelTests {
         #expect(ScanFormat.relative(ms: 0, now: top) == "2501999792 h ago")
         let late = try ScanJobStatus(json: ScanPack.edited(status, path: ["elapsed_ms"], to: 9_007_199_254_740_992))
         #expect(late.elapsedMs == top)
-        #expect(ScanFormat.jobRowLine2(late.summary).hasPrefix("probes 418 / 2000 · points 80 / 120 audited · "))
+        #expect(ScanFormat.elapsed(ms: late.summary.elapsedMs) == "2501999792:59:00")
 
         // The other whole-number readers of a status refuse the same way.
         #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["elapsed_ms"], to: -1)) }
@@ -1216,5 +1220,92 @@ extension ScanModelTests {
         var members = try #require(try ScanPack.load("scan.status.json").objectValue)
         members.removeValue(forKey: "job")
         #expect(throws: BusError.self) { try ScanJobStatus(json: .object(members)) }
+    }
+
+    /// Fix 2.12a (PR 2 security minor): `lanes.skipped`, `clamped` (on a status and on a
+    /// start result) and `probes.by_lane` are cut to the engine's cap of 8 at decode like
+    /// every other list (`ScanWire.listMax`), so a hostile core cannot draw ten thousand
+    /// notice rows or run the Notices de-dup over them. `by_lane` keeps its first eight
+    /// keys in sorted order: the parser's object is a Swift dictionary, so wire order is
+    /// not available. The Notices list still de-duplicates against the launch's notices.
+    @Test func skippedClampedAndByLaneAreBoundedAtDecode() throws {
+        let nineSkipped = JSONValue.array((0..<9).map { i in .object(["lane": "ws", "reason": .string("r\(i)")]) })
+        let nineClamped = JSONValue.array((0..<9).map { i in
+            .object(["field": .string("f\(i)"), "requested": 9, "applied": .number(Double(i))])
+        })
+        var nineLanes: [String: JSONValue] = [:]
+        for i in 0..<9 { nineLanes["lane\(i)"] = .number(Double(i)) }
+
+        var status = try ScanPack.load("scan.status.json")
+        status = ScanPack.edited(status, path: ["lanes", "skipped"], to: nineSkipped)
+        status = ScanPack.edited(status, path: ["clamped"], to: nineClamped)
+        status = ScanPack.edited(status, path: ["probes", "by_lane"], to: .object(nineLanes))
+        let decoded = try ScanJobStatus(json: status)
+        #expect(decoded.lanes.skipped.count == 8)
+        #expect(decoded.lanes.skipped.first == ScanSkippedLane(lane: .ws, reason: "r0"))
+        #expect(decoded.lanes.skipped.last == ScanSkippedLane(lane: .ws, reason: "r7"))
+        #expect(decoded.clamped.count == 8)
+        #expect(decoded.clamped.last == ScanClamped(field: "f7", requested: 9, applied: 7))
+        #expect(decoded.probes.byLane.count == 8)
+        #expect(decoded.probes.byLane.keys.sorted() == (0..<8).map { "lane\($0)" })
+        #expect(decoded.probes.byLane["lane7"] == 7)
+        #expect(decoded.probes.byLane["lane8"] == nil)
+
+        var start = try ScanPack.load("scan.start.json")
+        start = ScanPack.edited(start, path: ["clamped"], to: nineClamped)
+        start = ScanPack.edited(start, path: ["lanes", "skipped"], to: nineSkipped)
+        let started = try ScanStartResult(json: start)
+        #expect(started.clamped.count == 8)
+        #expect(started.clamped.last == ScanClamped(field: "f7", requested: 9, applied: 7))
+        #expect(started.lanes.skipped.count == 8)
+
+        // Eight clamped and eight skipped lines, two of them already spelled out by the
+        // launch: sixteen lines, the launch's first, nothing twice.
+        let notices = ScanEndText.notices(decoded, launchNotices: ["Clamped f0 9 → 0", "Skipped ws: r3"])
+        #expect(notices.count == 16)
+        #expect(notices[0] == "Clamped f0 9 → 0")
+        #expect(notices[1] == "Skipped ws: r3")
+        #expect(notices[2] == "Clamped f1 9 → 1")
+        #expect(notices[9] == "Skipped ws: r0")
+        #expect(notices.last == "Skipped ws: r7")
+        #expect(Set(notices).count == 16)
+    }
+
+    /// Fix 2.12c (PR 2 security minor, round 2): an unknown vocabulary token is cleaned
+    /// and cut to `ScanWire.tokenMax` at the one choke point (`vocab`, `optionalVocab`,
+    /// `vocabs`) and so are the keys `counts` keeps, so a `ScanLane.other` word or a
+    /// `by_lane` key, which the Jobs view draws verbatim, can carry neither a bidi
+    /// override nor a newline nor more than 64 scalars. Known tokens are short ASCII,
+    /// so the cleaning is identity on them and `.http` still decodes to its case.
+    @Test func unknownLaneTokensAreCleanedAtDecode() throws {
+        // 300 scalars: a newline, a right-to-left override, then "ab" 149 times.
+        let hostileKey = "\n\u{202E}" + String(repeating: "ab", count: 149)
+        #expect(hostileKey.unicodeScalars.count == 300)
+        var status = try ScanPack.load("scan.status.json")
+        status = ScanPack.edited(status, path: ["probes", "by_lane"], to: .object([hostileKey: 3]))
+        status = ScanPack.edited(status, path: ["lanes", "run"], to: .array(["http", "x\u{202E}y"]))
+        status = ScanPack.edited(status, path: ["lanes", "requested"], to: .array(["a\nb"]))
+        status = ScanPack.edited(
+            status, path: ["lanes", "skipped"], to: .array([.object(["lane": "l4\u{200B}_stream", "reason": "r"])]))
+        let decoded = try ScanJobStatus(json: status)
+
+        let kept = String(repeating: "ab", count: 32)
+        #expect(kept.unicodeScalars.count == 64)
+        #expect(decoded.probes.byLane == [kept: 3])
+        for key in decoded.probes.byLane.keys {
+            #expect(!key.contains("\n"))
+            #expect(!key.contains("\u{202E}"))
+        }
+        #expect(decoded.lanes.run == [.http, .other("xy")])
+        #expect(decoded.lanes.requested == [.other("ab")])
+        #expect(decoded.lanes.skipped == [ScanSkippedLane(lane: .other("l4_stream"), reason: "r")])
+
+        // A single unknown token through `vocab`, and a long one cut to 64.
+        var skipped = try ScanPack.load("scan.status.json")
+        skipped = ScanPack.edited(
+            skipped, path: ["lanes", "skipped"],
+            to: .array([.object(["lane": .string(String(repeating: "q", count: 100)), "reason": "r"])]))
+        let lane = try ScanJobStatus(json: skipped).lanes.skipped.first?.lane
+        #expect(lane == .other(String(repeating: "q", count: 64)))
     }
 }

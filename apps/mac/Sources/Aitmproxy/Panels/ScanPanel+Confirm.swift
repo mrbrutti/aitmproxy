@@ -68,6 +68,13 @@ private struct ScanConfirmSheet: View {
                     .foregroundStyle(Tok.Ink.primary.color)
                     .accessibilityAddTraits(.isHeader)
             }
+            // What is about to start (Jobs view D13): `Profile standard · 127.0.0.1:8117`,
+            // read from the arguments, for Start Scan and Scan Again alike.
+            Text(state.surface.confirm?.summaryLine ?? "")
+                .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                .foregroundStyle(Tok.Ink.secondary.color)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
             Text(state.surface.confirm?.request.prompt ?? "")
                 .font(Tok.Face.ui(Tok.Typography.Size.md))
                 .foregroundStyle(Tok.Ink.secondary.color)
