@@ -206,6 +206,8 @@ describe('live-env audit-log isolation: tester edge cases', () => {
     );
     // The same dir with a trailing slash normalises to the same two paths and is accepted.
     expect(assertAuditLogIsolated(path, '/r/run/')).toBeUndefined();
+    // Design 2: a blank line inside a block does not end it (YAML reads it the same way); panel round 2.
+    expect(assertAuditLogIsolated(writeDoc(AC2_DOC.replace('mcp:\n', 'mcp:\n\n')), '/r/run')).toBeUndefined();
   });
 
   it('a quote or backslash in auditLogDir is JSON-quoted and round-trips through the guard', async () => {
