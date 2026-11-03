@@ -21,7 +21,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::scan::{ScanError, ScanOffer, ScanTab, NO_SCANNER};
+use crate::scan::{elapsed_text, ScanError, ScanOffer, ScanTab, NO_SCANNER};
 use crate::text::{cells, fit, truncate, width};
 use crate::theme::Theme;
 use crate::tokens::color::status;
@@ -115,7 +115,9 @@ const ISSUES_DEGRADED: &str = "issues need scan.issues (scanner v2)";
 
 /// The one-line state of the active tab (D11, D13), in this order: no
 /// scanner at all, the last error of this tab (`error`, found once per
-/// frame by [`tab_error`]), the notice a key left (`already <state>`, which
+/// frame by [`tab_error`]; on Jobs with the age of the values on screen
+/// after it, ` · showing values from 42s ago`, Jobs view D19 T2 and
+/// [`values_age_text`]), the notice a key left (`already <state>`, which
 /// answers the operator's last key and so outranks a standing degraded
 /// text), the tab's degraded text (a legacy bus, or a v2 bus missing the
 /// tab's verb), a refresh in flight over an empty pane, or `idle`. The
@@ -126,7 +128,14 @@ fn banner(app: &App, error: Option<&ScanError>) -> String {
         return NO_SCANNER.to_string();
     }
     if let Some(e) = error {
-        return e.wording();
+        let mut text = e.wording();
+        if app.scan.tab == ScanTab::Jobs {
+            if let Some(age) = values_age_text(app.ticks, app.scan.jobs.listed_ok_at_tick) {
+                text.push_str(" · ");
+                text.push_str(&age);
+            }
+        }
+        return text;
     }
     if let Some(notice) = &app.scan.notice {
         return notice.clone();
@@ -139,6 +148,23 @@ fn banner(app: &App, error: Option<&ScanError>) -> String {
     }
     "idle".to_string()
 }
+
+/// How old the Jobs values on screen are (Jobs view D15, D19 T2): the
+/// ticks since the last `scan.list` that folded (`listed_ok_at_tick`,
+/// stamped by the reducer), 250 ms each, as `showing values from 42s ago`
+/// in the row's elapsed shape ([`elapsed_text`]); `None` before the first
+/// list lands. A core that stops answering leaves the banner's error on
+/// screen, and this says the numbers under it are from before it.
+pub fn values_age_text(now_tick: u64, listed_ok_at_tick: Option<u64>) -> Option<String> {
+    let since = now_tick.saturating_sub(listed_ok_at_tick?);
+    Some(format!(
+        "showing values from {} ago",
+        elapsed_text(since.saturating_mul(TICK_MS))
+    ))
+}
+
+/// The period of one `Tick`, in milliseconds (the runtime's interval).
+const TICK_MS: u64 = 250;
 
 /// The active tab's degraded text, when the bus cannot serve it (D2): on a
 /// legacy bus Profiles and Issues name what they need; on a v2 bus a tab

@@ -15,8 +15,9 @@ use aitm_scan_model::{BySeverity, JobStatus, JobSummary, LaneKind};
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::App;
 use aitm_tui::scan::{
-    probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ReadStatus, ScanTab,
-    DETAIL_LIST_MAX, DETAIL_VALUE_MAX, JOBS_MAX, PROFILE_MAX, TARGETS_MAX,
+    probe_bar, probe_fill, progress_bar, progress_fill, row, severity_bar, severity_runs,
+    JobsState, ReadStatus, ScanTab, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, JOBS_MAX, PROFILE_MAX,
+    TARGETS_MAX,
 };
 use aitm_tui::text::width;
 use common::*;
@@ -77,7 +78,10 @@ fn cancel_request() -> BusRequest {
 }
 
 /// T7-1, T7-8: one `scan.status` renders the row with every literal the
-/// plan names, profile and targets included.
+/// plan names, profile and targets included. Jobs view D19, T2 re-pinned
+/// the literals: the progress column reads the checks (180 of 240, a bar
+/// four cells of six), the budget column the probes as a number, the state
+/// cell the phase word.
 #[test]
 fn status_renders_the_row_literals() {
     let mut app = app();
@@ -85,9 +89,9 @@ fn status_renders_the_row_literals() {
     let text = screen(&app);
     let line = line_with(&text, JOB).unwrap_or_else(|| panic!("no row for {JOB}: {text}"));
     for literal in [
-        "418/2000 ━━────",
-        "80/120",
-        "running/audit",
+        "180/240 ━━━━──",
+        "418/2000  80/120",
+        "auditing",
         "standard",
         "http://127.0.0.1:8080",
         "▆▆▄▄▂▂",
@@ -98,14 +102,15 @@ fn status_renders_the_row_literals() {
             "the {JOB} row lacks {literal:?}: {line:?}"
         );
     }
-    let header = line_with(&text, "state/phase").unwrap_or_default();
+    assert!(!line.contains("running/audit"), "{line:?}");
+    let header = line_with(&text, "progress").unwrap_or_default();
     for col in [
-        "job", "profile", "targets", "probes", "points", "issues", "el.",
+        "job", "profile", "targets", "state", "progress", "budget", "points", "issues", "el.",
     ] {
         assert!(header.contains(col), "the header lacks {col:?}: {header:?}");
     }
     assert!(
-        line_index(&text, "state/phase") < line_index(&text, JOB),
+        line_index(&text, "progress") < line_index(&text, JOB),
         "the header sits above the first row"
     );
 }
@@ -319,9 +324,9 @@ fn rows_are_bounded_at_construction() {
     assert!(built.profile.ends_with('…'));
 
     let text = screen(&app);
-    let header = line_with(&text, "state/phase").unwrap_or_default();
+    let header = line_with(&text, "progress").unwrap_or_default();
     let from = col_of(header, "targets").expect("a targets column");
-    let to = col_of(header, "state/phase").expect("a state column");
+    let to = col_of(header, "state").expect("a state column");
     assert!(
         to - from <= TARGETS_MAX + 2,
         "the targets column spans {} cells",
@@ -446,33 +451,47 @@ fn detail_len_counts_what_detail_text_draws() {
     let mut jobs = JobsState::default();
     jobs.fold_status(status);
     assert_eq!(jobs.detail_len(), 1 + jobs.detail_text().len());
+    // Jobs view D19, T2: the progress line and the `now` line (the
+    // fixture's two running checks) open the pane.
     assert_eq!(
         jobs.detail_len(),
-        8,
-        "the id line and the seven fixed lines"
+        10,
+        "the id line, the progress line, the now line and the seven fixed lines"
     );
-    assert_eq!(jobs.detail_text()[0].0, "lanes");
-    // Jobs view D19, T1: a stopped job adds the sentence and the wire line.
+    assert_eq!(
+        jobs.detail_text()[0],
+        ("", "75\u{a0}% · 180 of 240 checks".to_string())
+    );
+    assert_eq!(
+        jobs.detail_text()[1],
+        ("now", "http.reflected-xss, http.sqli-error".to_string())
+    );
+    assert_eq!(jobs.detail_text()[2].0, "lanes");
+    // Jobs view D19, T1 and T2: a stopped job opens with the end sentence,
+    // then the stopped sentence and the wire line.
     let mut stopped = fixture("scan.status.json");
     stopped["state"] = json!("done");
     stopped["stopped_reason"] = json!("errors");
+    stopped["checks"]["running"] = json!([]);
     let stopped: JobStatus = serde_json::from_value(stopped).expect("the fixture parses");
     jobs.fold_status(stopped);
     assert_eq!(jobs.detail_len(), 1 + jobs.detail_text().len());
     assert_eq!(
         jobs.detail_len(),
-        10,
-        "the id line, the seven fixed lines, `stopped` and `wire`"
+        11,
+        "the id line, the sentence, `stopped`, `wire` and the seven fixed lines"
     );
     let lines = jobs.detail_text();
-    let tail: Vec<(&str, &str)> = lines[7..].iter().map(|(l, v)| (*l, v.as_str())).collect();
+    let head: Vec<(&str, &str)> = lines[..3].iter().map(|(l, v)| (*l, v.as_str())).collect();
     assert_eq!(
-        tail,
+        head,
         vec![
+            ("", "Done in 0:42 · 120 points · 240 checks."),
             ("stopped", "Stopped early: too many errors from the target."),
             ("wire", "stopped_reason: errors"),
         ]
     );
+    assert_eq!(lines[3].0, "lanes");
     let mut bare = JobsState::default();
     bare.order.push(JOB.to_string());
     assert_eq!(
@@ -521,8 +540,9 @@ fn detail_first_line_carries_profile_and_targets_only_when_the_table_dropped_the
     );
 }
 
-/// The row builder: `...` until a full status is known; the counters in the
-/// plan's `<sent>/<budget>` and `<audited>/<found>` shapes.
+/// The row builder: `...` until a full status is known (the progress too,
+/// which needs the status's check counters; Jobs view D19, T2); the
+/// counters in the `<sent>/<budget>` and `<audited>/<found>` shapes.
 #[test]
 fn row_reads_dots_until_the_status_is_known() {
     let status: JobStatus =
@@ -532,22 +552,36 @@ fn row_reads_dots_until_the_status_is_known() {
     assert_eq!(bare.id, JOB);
     assert_eq!(bare.profile, "...");
     assert_eq!(bare.targets, "...");
-    assert_eq!(bare.probes, "418/2000");
+    assert_eq!(bare.progress, "...");
+    assert_eq!(bare.progress_fill, 0);
+    assert_eq!(bare.budget, "418/2000");
     assert_eq!(bare.points, "80/120");
-    assert_eq!(bare.state_phase, "running/audit");
+    assert_eq!(bare.state_phase, "auditing");
     assert_eq!(bare.elapsed, "42s");
     assert_eq!(bare.issues.high, 1);
     let full = row(&summary, Some(&ReadStatus::new(status)));
     assert_eq!(full.profile, "standard");
     assert_eq!(full.targets, "http://127.0.0.1:8080");
+    assert_eq!(full.progress, "180/240");
+    assert_eq!(full.progress_fill, 4, "floor of 0.75 over six cells");
+    assert_eq!(full.budget, "418/2000");
 }
 
-/// The bars: progress rounds up so any probe shows, a zero budget is empty;
-/// the severity stack gives every non-zero severity a cell, graver first.
-/// The text bars are composed from the typed `probe_fill` and
-/// `severity_runs` the view styles (fix round C, C21, C23).
+/// The bars: the probe bar rounds up so any probe shows, a zero budget is
+/// empty; the progress bar (Jobs view D8, D19 T2) floors like its percent,
+/// so it reads full only at 1 and empty while indeterminate; the severity
+/// stack gives every non-zero severity a cell, graver first. The text bars
+/// are composed from the typed fills and `severity_runs` the view styles
+/// (fix round C, C21, C23).
 #[test]
 fn bars_are_box_drawing_cells() {
+    assert_eq!(progress_fill(Some(0.5), 6), 3);
+    assert_eq!(progress_fill(None, 6), 0);
+    assert_eq!(progress_fill(Some(0.75), 6), 4);
+    assert_eq!(progress_bar(Some(0.5), 6), "━━━───");
+    assert_eq!(progress_bar(None, 6), "──────");
+    assert_eq!(progress_bar(Some(1.0), 6), "━━━━━━");
+
     assert_eq!(probe_fill(418, 2000, 6), 2);
     assert_eq!(probe_fill(0, 2000, 6), 0);
     assert_eq!(probe_fill(5, 0, 4), 0);
@@ -781,7 +815,7 @@ fn the_state_cell_wears_its_states_hue() {
     let theme = theme();
     let fg = |style: ratatui::style::Style| style.fg.expect("the theme sets a foreground");
     let table = [
-        ("running", "auditing", "running/audit", fg(theme.accent())),
+        ("running", "auditing", "auditing", fg(theme.accent())),
         ("done", "done", "done", fg(theme.fg(&status::SUCCESS))),
         (
             "failed",
@@ -818,4 +852,126 @@ fn the_state_cell_wears_its_states_hue() {
             );
         }
     }
+}
+
+/// Jobs view AC42 (D19, T2): the Detail pane of a cancelled job opens with
+/// the end sentence, right under the id line, and the label-value lines
+/// follow it; a running job's opens with the percent and the phase line,
+/// then the `now` line.
+#[test]
+fn detail_of_a_cancelled_job_opens_with_the_end_sentence() {
+    let mut app = app();
+    let mut body = status_in("cancelled", "done");
+    body["elapsed_ms"] = json!(115_000);
+    body["checks"]["done"] = json!(3236);
+    body["checks"]["scheduled"] = json!(6468);
+    body["checks"]["running"] = json!([]);
+    body["stopped_reason"] = json!("cancelled");
+    let _ = app.on_bus(status_reply(body));
+    let text = screen(&app);
+    let lines: Vec<&str> = text.lines().collect();
+    let rule = lines
+        .iter()
+        .position(|l| l.starts_with("│─"))
+        .unwrap_or_else(|| panic!("no rule row under the table:\n{text}"));
+    assert!(
+        lines[rule + 1].contains(JOB),
+        "the id line under the rule: {:?}",
+        lines[rule + 1]
+    );
+    assert!(
+        lines[rule + 2]
+            .contains("Cancelled after 1:55; 3,236 of 6,468 checks had run. What it found stays."),
+        "the end sentence is the detail's first line: {:?}",
+        lines[rule + 2]
+    );
+    assert!(
+        lines[rule + 3].contains("wire stopped_reason: cancelled"),
+        "{:?}",
+        lines[rule + 3]
+    );
+    assert!(
+        lines[rule + 4].contains("lanes requested"),
+        "{:?}",
+        lines[rule + 4]
+    );
+    let row = line_with(&text, "cancelled").expect("the row");
+    assert!(
+        row.contains("3236/6468 ━━━───"),
+        "a finished bar keeps its fill: {row:?}"
+    );
+
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    let text = screen(&app);
+    let lines: Vec<&str> = text.lines().collect();
+    let rule = lines
+        .iter()
+        .position(|l| l.starts_with("│─"))
+        .expect("the rule row");
+    // The percent keeps its U+00A0 in the cell (the parity string, byte
+    // for byte); a terminal draws it as a blank.
+    assert!(
+        lines[rule + 2].contains("75\u{a0}% · 180 of 240 checks"),
+        "the live first line: {:?}",
+        lines[rule + 2]
+    );
+    assert!(
+        lines[rule + 3].contains("now http.reflected-xss, http.sqli-error"),
+        "{:?}",
+        lines[rule + 3]
+    );
+}
+
+/// Jobs view AC43's unit half (D19, T2): the Jobs banner's error carries
+/// how old the values on screen are, from the tick of the last `scan.list`
+/// that folded (250 ms a tick), so a stopped core reads as stale values
+/// rather than a frozen screen; without a folded list there is no clause.
+#[test]
+fn banner_carries_the_values_age() {
+    use aitm_tui::ui::scan::values_age_text;
+
+    assert_eq!(
+        values_age_text(168, Some(0)).as_deref(),
+        Some("showing values from 42s ago")
+    );
+    assert_eq!(
+        values_age_text(168, Some(160)).as_deref(),
+        Some("showing values from 2s ago")
+    );
+    assert_eq!(
+        values_age_text(1000, Some(0)).as_deref(),
+        Some("showing values from 4m10s ago")
+    );
+    assert_eq!(values_age_text(168, None), None);
+    assert_eq!(
+        values_age_text(5, Some(9)).as_deref(),
+        Some("showing values from 0s ago"),
+        "a tick behind never underflows"
+    );
+
+    let mut app = app();
+    assert_eq!(
+        app.scan.jobs.listed_ok_at_tick,
+        Some(app.ticks),
+        "the open's settled scan.list stamped the tick"
+    );
+    let _ = app.on_bus(list_reply());
+    app.ticks = 168;
+    let _ = app.on_bus(failed("scan.list", "scan.list", "scan: busy: full"));
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(
+        strip.trim_end_matches(['│', ' ']).ends_with("Scanner busy: the job limit is reached or this origin already has a running job; wait or cancel one in Jobs (x): full · showing values from 42s ago"),
+        "{strip:?}"
+    );
+    let _ = app.on_bus(list_reply());
+    assert_eq!(
+        app.scan.jobs.listed_ok_at_tick,
+        Some(168),
+        "the fold stamps the tick"
+    );
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(
+        !strip.contains("showing values"),
+        "no error, no age clause: {strip:?}"
+    );
 }

@@ -6,8 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 use aitm_scan_model::{
-    BySeverity, Canary, CanaryMethod, CrawlCounters, CrawlErrorKind, JobId, JobState, JobStatus,
-    JobSummary, LaneKind, ListResult, Phase, StoppedReason,
+    BySeverity, Canary, CanaryMethod, CheckCounters, CheckErrorSample, CrawlCounters,
+    CrawlErrorKind, JobId, JobState, JobStatus, JobSummary, LaneKind, ListResult, Phase,
+    StoppedReason,
 };
 
 use super::{
@@ -450,8 +451,8 @@ pub const UNKNOWN: &str = "...";
 
 /// One Jobs row, every cell already text and bounded except the severity
 /// tally, which the view draws as a stacked bar coloured per severity (spec
-/// D11, D13), and the probe bar's fill, typed so the view never parses the
-/// row's text back.
+/// D11, D13), and the progress bar's fill, typed so the view never parses
+/// the row's text back (Jobs view D19, T2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRow {
     pub id: String,
@@ -464,11 +465,15 @@ pub struct JobRow {
     pub targets: String,
     /// [`state_phase_text`].
     pub state_phase: String,
-    /// `<sent>/<budget>`.
-    pub probes: String,
-    /// [`probe_fill`] of the counters over [`PROBE_BAR_CELLS`]; 0 while the
-    /// counters are not known.
-    pub probe_fill: usize,
+    /// [`progress_text`]: `<done>/<scheduled>` checks while auditing,
+    /// `<pages>/<known>` while crawling, `...` while indeterminate or until
+    /// a full status is known.
+    pub progress: String,
+    /// [`progress_fill`] of the derived progress over [`PROBE_BAR_CELLS`];
+    /// 0 while indeterminate or unknown.
+    pub progress_fill: usize,
+    /// `<sent>/<budget>` probes, a number without a bar.
+    pub budget: String,
     /// `<audited>/<found>`.
     pub points: String,
     pub issues: BySeverity,
@@ -484,8 +489,9 @@ impl JobRow {
             profile: UNKNOWN.to_string(),
             targets: UNKNOWN.to_string(),
             state_phase: UNKNOWN.to_string(),
-            probes: UNKNOWN.to_string(),
-            probe_fill: 0,
+            progress: UNKNOWN.to_string(),
+            progress_fill: 0,
+            budget: UNKNOWN.to_string(),
             points: UNKNOWN.to_string(),
             issues: BySeverity::default(),
             elapsed: UNKNOWN.to_string(),
@@ -500,6 +506,8 @@ impl JobRow {
 /// hostile-core bounds), so this only copies bounded text and a frame's
 /// measuring and eliding runs over at most a few hundred cells per row.
 pub fn row(summary: &JobSummary, full: Option<&ReadStatus>) -> JobRow {
+    let status = full.map(|f| &f.status);
+    let p = progress(summary, status);
     JobRow {
         id: summary.job.clone(),
         profile: full.map_or_else(|| UNKNOWN.to_string(), |f| f.profile_name.clone()),
@@ -508,8 +516,9 @@ pub fn row(summary: &JobSummary, full: Option<&ReadStatus>) -> JobRow {
             |f| targets_text(&f.targets, f.dropped.targets),
         ),
         state_phase: state_phase_text(summary.state, summary.phase),
-        probes: format!("{}/{}", summary.probes.sent, summary.probes.budget),
-        probe_fill: probe_fill(summary.probes.sent, summary.probes.budget, PROBE_BAR_CELLS),
+        progress: progress_text(&p, summary, status),
+        progress_fill: progress_fill(p.bar_fraction(), PROBE_BAR_CELLS),
+        budget: format!("{}/{}", summary.probes.sent, summary.probes.budget),
         points: format!("{}/{}", summary.points.audited, summary.points.found),
         issues: summary.issues.by_severity,
         elapsed: elapsed_text(summary.elapsed_ms),
@@ -559,6 +568,189 @@ pub fn probe_bar(sent: u64, budget: u64, cells: usize) -> String {
     let mut bar = BAR_FILLED.repeat(filled);
     bar.push_str(&BAR_EMPTY.repeat(cells - filled));
     bar
+}
+
+/// The kind of ring the derived progress draws (Jobs view D8): the TUI's
+/// bar is the ring. `Finished` keeps the final fraction when the counters
+/// give one, so a finished bar keeps its fill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Ring {
+    None,
+    Indeterminate,
+    Determinate(f64),
+    Finished(Option<f64>),
+}
+
+/// The derived progress of a job (Jobs view D8; the parity pin P15–P22):
+/// computed from the summary's state and phase and, once `scan.status`
+/// has answered, the full counters; never from a text cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobProgress {
+    pub ring: Ring,
+    /// The determinate value, 0 to 1; `None` otherwise (a finished job
+    /// included: its card is the end sentence).
+    pub fraction: Option<f64>,
+    /// The card's progress line: `3,236 of 6,468 checks`, `46 pages, 12
+    /// queued`, …; empty for a finished job.
+    pub phase_line: String,
+    /// `Now: xss-reflected` / `Now: xss-reflected and 3 more`; `None` when
+    /// no check is running.
+    pub now_line: Option<String>,
+}
+
+impl JobProgress {
+    /// The fraction the bar draws: the determinate value while live, the
+    /// final one for a finished job (D8: a finished bar keeps its fill),
+    /// `None` for an indeterminate ring.
+    pub fn bar_fraction(&self) -> Option<f64> {
+        match self.ring {
+            Ring::Determinate(f) | Ring::Finished(Some(f)) => Some(f),
+            Ring::None | Ring::Indeterminate | Ring::Finished(None) => None,
+        }
+    }
+}
+
+/// D8's table, made total: `queued` waits; `running` and `cancelling` take
+/// the running rule for the phase (crawling over `pages + queued`,
+/// auditing over `scheduled`, passive indeterminate, reporting 1); a
+/// terminal state is finished over the final counters (the auditing rule,
+/// else the crawling rule, else none); running without a status yet is
+/// indeterminate with the phase word. The fraction is clamped at 1, so a
+/// core reporting more done than scheduled reads `100 %`, never more.
+pub fn progress(summary: &JobSummary, full: Option<&JobStatus>) -> JobProgress {
+    let now_line = full.and_then(|f| now_line(&f.checks.running));
+    let (ring, phase_line) = match (summary.state, full) {
+        (JobState::Queued, _) => (
+            Ring::Indeterminate,
+            "Waiting for the engine to start this job.".to_string(),
+        ),
+        (state, _) if state.is_terminal() => (
+            Ring::Finished(
+                full.and_then(|f| checks_fraction(&f.checks).or_else(|| crawl_fraction(&f.crawl))),
+            ),
+            String::new(),
+        ),
+        (_, None) => (Ring::Indeterminate, phase_word(summary.phase).to_string()),
+        (_, Some(full)) => match summary.phase {
+            Phase::Crawling => {
+                let c = &full.crawl;
+                (
+                    crawl_fraction(c).map_or(Ring::Indeterminate, Ring::Determinate),
+                    format!("{}, {} queued", plural(c.pages, "page"), grouped(c.queued)),
+                )
+            }
+            Phase::Passive => (
+                Ring::Indeterminate,
+                "Passive checks over captured traffic".to_string(),
+            ),
+            Phase::Auditing => match checks_fraction(&full.checks) {
+                Some(f) => (
+                    Ring::Determinate(f),
+                    format!(
+                        "{} of {}",
+                        grouped(full.checks.done),
+                        plural(full.checks.scheduled, "check")
+                    ),
+                ),
+                None => (Ring::Indeterminate, "Scheduling checks".to_string()),
+            },
+            Phase::Reporting => (Ring::Determinate(1.0), "Writing results".to_string()),
+            Phase::Queued | Phase::Done => {
+                (Ring::Indeterminate, phase_word(summary.phase).to_string())
+            }
+        },
+    };
+    let fraction = match ring {
+        Ring::Determinate(f) => Some(f),
+        Ring::None | Ring::Indeterminate | Ring::Finished(_) => None,
+    };
+    JobProgress {
+        ring,
+        fraction,
+        phase_line,
+        now_line,
+    }
+}
+
+/// The auditing rule: `done / scheduled`, clamped at 1; `None` while
+/// nothing is scheduled.
+fn checks_fraction(checks: &CheckCounters) -> Option<f64> {
+    (checks.scheduled > 0).then(|| (checks.done as f64 / checks.scheduled as f64).min(1.0))
+}
+
+/// The crawling rule: `pages / (pages + queued)`; `None` while nothing was
+/// fetched or queued.
+fn crawl_fraction(crawl: &CrawlCounters) -> Option<f64> {
+    let known = crawl.pages.saturating_add(crawl.queued);
+    (known > 0).then(|| crawl.pages as f64 / known as f64)
+}
+
+/// `Now: <first id>`, `Now: <first id> and <n> more`; `None` for none.
+fn now_line(running: &[String]) -> Option<String> {
+    let first = running.first()?;
+    Some(match running.len() - 1 {
+        0 => format!("Now: {first}"),
+        n => format!("Now: {first} and {n} more"),
+    })
+}
+
+/// The percent of a determinate fraction, floored (D8: it never reads
+/// `100 %` before the fraction is 1), with a U+00A0 before the `%` so the
+/// string is the mac's and the web's byte for byte (the parity pin P15);
+/// ratatui draws the no-break space as one blank cell. `None` for none.
+pub fn percent_text(fraction: Option<f64>) -> Option<String> {
+    fraction.map(|f| format!("{}\u{a0}%", (f.clamp(0.0, 1.0) * 100.0).floor() as u64))
+}
+
+/// How many of `cells` the progress bar fills for `fraction`: the floor of
+/// the fraction over the cells, like the percent, so the bar reads full
+/// only at 1; nothing for an indeterminate (`None`) or non-finite value.
+pub fn progress_fill(fraction: Option<f64>, cells: usize) -> usize {
+    let Some(f) = fraction else {
+        return 0;
+    };
+    if !f.is_finite() {
+        return 0;
+    }
+    let n = (f.clamp(0.0, 1.0) * cells as f64).floor();
+    usize::try_from(n as u64).unwrap_or(cells).min(cells)
+}
+
+/// The progress bar as `cells` box-drawing cells, [`progress_fill`] of
+/// them [`BAR_FILLED`] from the left, the rest [`BAR_EMPTY`] (Jobs view
+/// D8: an indeterminate bar is all empty; a finished bar keeps its fill).
+pub fn progress_bar(fraction: Option<f64>, cells: usize) -> String {
+    let filled = progress_fill(fraction, cells);
+    let mut bar = BAR_FILLED.repeat(filled);
+    bar.push_str(&BAR_EMPTY.repeat(cells - filled));
+    bar
+}
+
+/// The row's `progress` cell (Jobs view D19, T2): the counters the ring
+/// was derived from, `<done>/<scheduled>` checks while auditing (and for
+/// a finished job that scheduled any), `<pages>/<pages + queued>` while
+/// crawling (and for a finished job that scheduled none), `...` while
+/// indeterminate or until a full status is known.
+pub fn progress_text(p: &JobProgress, summary: &JobSummary, full: Option<&JobStatus>) -> String {
+    let Some(full) = full else {
+        return UNKNOWN.to_string();
+    };
+    let checks = || format!("{}/{}", full.checks.done, full.checks.scheduled);
+    let crawl = || {
+        format!(
+            "{}/{}",
+            full.crawl.pages,
+            full.crawl.pages.saturating_add(full.crawl.queued)
+        )
+    };
+    match p.ring {
+        Ring::Determinate(_) if summary.phase == Phase::Crawling => crawl(),
+        Ring::Determinate(_) | Ring::Finished(Some(_)) if full.checks.scheduled > 0 => checks(),
+        Ring::Finished(Some(_)) => crawl(),
+        Ring::None | Ring::Indeterminate | Ring::Determinate(_) | Ring::Finished(None) => {
+            UNKNOWN.to_string()
+        }
+    }
 }
 
 /// The severity bar's cell glyph per level, indexed like
@@ -639,20 +831,98 @@ pub fn severity_bar(b: &BySeverity, cells: usize) -> String {
 }
 
 /// How many lines [`detail_lines`] gives `status`, without building them:
-/// the seven fixed lines plus one each for `clamped`, `error` and `l4`
-/// when present, and for a stopped reason the `wire` line plus the
-/// `stopped` line when D4 gives it a sentence ([`stopped_sentence`]). Kept
-/// in step with `detail_lines` by its unit tests.
+/// the first line, for a stopped reason the `wire` line plus the `stopped`
+/// line when D4 gives it a sentence ([`stopped_sentence`]), the `now` line
+/// when a check is running, the attention lines
+/// ([`attention_line_count`]), the seven fixed lines, then one each for
+/// `clamped`, `error` and `l4` when present. Kept in step with
+/// `detail_lines` by its unit tests.
 fn detail_line_count(status: &JobStatus) -> usize {
     let stopped = match status.stopped_reason {
         None => 0,
         Some(reason) => 1 + usize::from(status_stopped_sentence(status, reason).is_some()),
     };
-    DETAIL_FIXED_LINES
+    1 + stopped
+        + usize::from(!status.checks.running.is_empty())
+        + attention_line_count(status)
+        + DETAIL_FIXED_LINES
         + usize::from(!status.clamped.is_empty())
-        + stopped
         + usize::from(status.error.is_some())
         + usize::from(status.l4.is_some())
+}
+
+/// The Detail pane's first line (Jobs view D19, T2): the end sentence for
+/// a terminal job ([`end_sentence`], the parity pin P1–P3), else the
+/// percent and the phase line of the derived progress (`50 % · 3,236 of
+/// 6,468 checks`), the phase line alone while indeterminate.
+fn first_line(status: &JobStatus) -> String {
+    if let Some(sentence) = end_sentence(
+        status.state,
+        status.elapsed_ms,
+        status.points.found,
+        status.checks.done,
+        status.checks.scheduled,
+    ) {
+        return sentence;
+    }
+    let p = progress(&status.summary(), Some(status));
+    match percent_text(p.fraction) {
+        Some(percent) => format!("{percent} · {}", p.phase_line),
+        None => p.phase_line,
+    }
+}
+
+/// The attention lines (Jobs view D9), in this order and only when
+/// non-zero: `7 checks could not run` with its samples as `<check>:
+/// <detail>` rows, `3 checks were skipped` (`1 check was skipped`, plan gap
+/// 26) with its samples, and the crawl trouble ([`crawl_trouble`]) with
+/// the last error's words after a dash when the core named one. The
+/// samples were cut to [`DETAIL_LIST_MAX`] and [`DETAIL_VALUE_MAX`] at
+/// fold ([`bound_status`]), so a row is never longer than a cell line.
+fn attention_lines(status: &JobStatus) -> Vec<String> {
+    let ch = &status.checks;
+    let mut lines = Vec::with_capacity(attention_line_count(status));
+    if ch.errors > 0 {
+        lines.push(format!("{} could not run", plural(ch.errors, "check")));
+        lines.extend(ch.error_samples.iter().map(sample_line));
+    }
+    if ch.skipped > 0 {
+        let verb = if ch.skipped == 1 { "was" } else { "were" };
+        lines.push(format!("{} {verb} skipped", plural(ch.skipped, "check")));
+        lines.extend(ch.skipped_samples.iter().map(sample_line));
+    }
+    if let Some(trouble) = crawl_trouble(&status.crawl) {
+        lines.push(match status.crawl.last_error {
+            Some(kind) => format!("{trouble} — {}", crawl_error_words(kind)),
+            None => trouble,
+        });
+    }
+    lines
+}
+
+/// How many lines [`attention_lines`] gives, without building them.
+fn attention_line_count(status: &JobStatus) -> usize {
+    let ch = &status.checks;
+    let errors = if ch.errors > 0 {
+        1 + ch.error_samples.len()
+    } else {
+        0
+    };
+    let skipped = if ch.skipped > 0 {
+        1 + ch.skipped_samples.len()
+    } else {
+        0
+    };
+    errors + skipped + usize::from(status.crawl.errors > 0)
+}
+
+/// `<check>: <detail>`; the check alone when the core gave no detail.
+fn sample_line(sample: &CheckErrorSample) -> String {
+    if sample.detail.is_empty() {
+        sample.check.clone()
+    } else {
+        format!("{}: {}", sample.check, sample.detail)
+    }
 }
 
 /// [`stopped_sentence`] for a status's own state, budget and error.
@@ -669,19 +939,40 @@ fn status_stopped_sentence(status: &JobStatus, reason: StoppedReason) -> Option<
 /// points, checks, session.
 const DETAIL_FIXED_LINES: usize = 7;
 
-/// The Detail pane's `label value` lines for a job (spec D11): lanes
-/// requested/run/skipped with reasons, who started it, the probe, crawl
-/// (with `· errors n (<last error words>)` when the crawl hit any; Jobs
-/// view D4, D19), point and check counters (with `· errors n · skipped n`
-/// when non-zero), the session, then `clamped`, `stopped` (D4's sentence,
-/// omitted when D4 says none) with the raw token under it on a `wire`
-/// line, `error` and `l4` only when present; a list the fold cut ends in
-/// `+n` (fix round G, G11). Plain text; the view styles the label. Read
-/// through [`JobsState::detail_text`], the one public reading of the pane
-/// (fix round E, E5).
+/// The Detail pane's lines for a job (spec D11; Jobs view D19, T2). First
+/// the [`first_line`] with an empty label (the end sentence, or the
+/// percent and phase line), then `stopped` (D4's sentence, omitted when D4
+/// says none) with the raw token under it on a `wire` line, `now` with the
+/// running check ids, the [`attention_lines`] (empty labels), and the
+/// `label value` lines: lanes requested/run/skipped with reasons, who
+/// started it, the probe, crawl (with `· errors n (<last error words>)`
+/// when the crawl hit any; Jobs view D4), point and check counters (with
+/// `· errors n · skipped n` when non-zero), the session, then `clamped`,
+/// `error` and `l4` only when present; a list the fold cut ends in `+n`
+/// (fix round G, G11). Plain text; the view styles the label. Read through
+/// [`JobsState::detail_text`], the one public reading of the pane (fix
+/// round E, E5).
 fn detail_lines(read: &ReadStatus) -> Vec<(&'static str, String)> {
     let status = &read.status;
-    let mut lines = Vec::with_capacity(DETAIL_FIXED_LINES + 5);
+    let mut lines = Vec::with_capacity(detail_line_count(status));
+    lines.push(("", first_line(status)));
+    if let Some(reason) = status.stopped_reason {
+        if let Some(sentence) = status_stopped_sentence(status, reason) {
+            lines.push(("stopped", sentence));
+        }
+        lines.push(("wire", format!("stopped_reason: {}", stopped_token(reason))));
+    }
+    if !status.checks.running.is_empty() {
+        lines.push((
+            "now",
+            format!(
+                "{}{}",
+                status.checks.running.join(", "),
+                more(read.dropped.running)
+            ),
+        ));
+    }
+    lines.extend(attention_lines(status).into_iter().map(|l| ("", l)));
     let lanes = &status.lanes;
     let mut lane_text = format!(
         "requested {} · run {}",
@@ -777,12 +1068,6 @@ fn detail_lines(read: &ReadStatus) -> Vec<(&'static str, String)> {
             "clamped",
             format!("{}{}", clamped.join(", "), more(read.dropped.clamped)),
         ));
-    }
-    if let Some(reason) = status.stopped_reason {
-        if let Some(sentence) = status_stopped_sentence(status, reason) {
-            lines.push(("stopped", sentence));
-        }
-        lines.push(("wire", format!("stopped_reason: {}", stopped_token(reason))));
     }
     if let Some(error) = &status.error {
         lines.push(("error", error.clone()));
@@ -1009,22 +1294,32 @@ pub fn state_text(state: JobState) -> &'static str {
     }
 }
 
-/// The row's `state/phase` cell: a non-terminal job reads
-/// `<state>/<short phase>`, a terminal one its state alone.
+/// The row's `state` cell (Jobs view D19, T2; the parity pin P23 in the
+/// TUI's lowercase): the phase word alone while `running` (`auditing`),
+/// the state word alone otherwise (`queued`, `cancelling`, `done`,
+/// `cancelled`, `failed`), as the other surfaces read it.
 pub fn state_phase_text(state: JobState, phase: Phase) -> String {
-    let word = state_text(state);
-    if state.is_terminal() {
-        return word.to_string();
+    match state {
+        JobState::Running => phase_word(phase),
+        JobState::Queued
+        | JobState::Cancelling
+        | JobState::Done
+        | JobState::Cancelled
+        | JobState::Failed => state_text(state),
     }
-    let short = match phase {
+    .to_string()
+}
+
+/// A phase's word, as the operator reads it in the row and on the card.
+fn phase_word(phase: Phase) -> &'static str {
+    match phase {
         Phase::Queued => "queued",
-        Phase::Crawling => "crawl",
+        Phase::Crawling => "crawling",
         Phase::Passive => "passive",
-        Phase::Auditing => "audit",
-        Phase::Reporting => "report",
+        Phase::Auditing => "auditing",
+        Phase::Reporting => "reporting",
         Phase::Done => "done",
-    };
-    format!("{word}/{short}")
+    }
 }
 
 #[cfg(test)]
@@ -1077,7 +1372,9 @@ mod tests {
             detail_line_count(&bare),
             detail_lines(&read_of(&bare)).len()
         );
-        assert_eq!(detail_line_count(&bare), 7);
+        // Jobs view D19, T2: the first line (the queued default's waiting
+        // line) sits over the seven fixed lines.
+        assert_eq!(detail_line_count(&bare), 8);
         let full = JobStatus {
             clamped: vec![aitm_scan_model::Clamped {
                 field: "budget.probes".into(),
@@ -1095,8 +1392,8 @@ mod tests {
         );
         assert_eq!(
             detail_line_count(&full),
-            12,
-            "seven fixed + clamped + stopped + wire + error + l4"
+            13,
+            "first line + stopped + wire + seven fixed + clamped + error + l4"
         );
     }
 
@@ -1516,10 +1813,12 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("stopped_reason: cancelled")
         );
+        // Jobs view D19, T2: the end sentence first, the `now` line for the
+        // fixture's two running checks.
         assert_eq!(
             detail_line_count(&read.status),
-            DETAIL_FIXED_LINES + 1,
-            "seven fixed and the wire line"
+            DETAIL_FIXED_LINES + 3,
+            "the sentence, the wire line, the now line and the seven fixed"
         );
 
         // P4 in the pane: the budget comes from the status's probes.
@@ -1581,5 +1880,397 @@ mod tests {
 
         let bare = ReadStatus::new(fixture_status(JobState::Running));
         assert_eq!(bare.dropped, StatusDropped::default());
+    }
+
+    /// Jobs view AC41 and the parity pin P15–P23 (plan Overview; spec D8,
+    /// D19): the derived progress, the bar and the state words. The percent
+    /// carries a U+00A0 before the `%`, so the string is byte-identical to
+    /// the mac and web pins; ratatui draws the no-break space as one blank
+    /// cell. P8 and P14's unknown tokens are closed enums here (see
+    /// `stopped_and_crawl_words_are_the_parity_sentences`).
+    #[test]
+    fn progress_and_bar_follow_the_parity_table() {
+        let near = |a: f64, b: f64| (a - b).abs() < 0.0001;
+        let status = |state: JobState, phase: Phase| JobStatus {
+            state,
+            phase,
+            ..Default::default()
+        };
+        let of = |s: &JobStatus| progress(&s.summary(), Some(s));
+
+        // P15.
+        let mut auditing = status(JobState::Running, Phase::Auditing);
+        auditing.checks.done = 3236;
+        auditing.checks.scheduled = 6468;
+        let p = of(&auditing);
+        assert!(p.fraction.is_some_and(|f| near(f, 0.5003)), "{p:?}");
+        assert!(
+            matches!(p.ring, Ring::Determinate(f) if near(f, 0.5003)),
+            "{p:?}"
+        );
+        assert_eq!(percent_text(p.fraction).as_deref(), Some("50\u{a0}%"));
+        assert_eq!(p.phase_line, "3,236 of 6,468 checks");
+        assert_eq!(p.now_line, None);
+
+        // P16, and the singular.
+        let mut crawling = status(JobState::Running, Phase::Crawling);
+        crawling.crawl.pages = 46;
+        crawling.crawl.queued = 12;
+        let p = of(&crawling);
+        assert!(p.fraction.is_some_and(|f| near(f, 0.7931)), "{p:?}");
+        assert_eq!(p.phase_line, "46 pages, 12 queued");
+        crawling.crawl.pages = 1;
+        crawling.crawl.queued = 0;
+        let p = of(&crawling);
+        assert_eq!(p.fraction, Some(1.0));
+        assert_eq!(p.phase_line, "1 page, 0 queued");
+        crawling.crawl.pages = 0;
+        let p = of(&crawling);
+        assert_eq!(p.ring, Ring::Indeterminate, "nothing fetched or queued yet");
+        assert_eq!(p.phase_line, "0 pages, 0 queued");
+
+        // P17.
+        let p = of(&status(JobState::Running, Phase::Passive));
+        assert_eq!(p.ring, Ring::Indeterminate);
+        assert_eq!(p.fraction, None);
+        assert_eq!(percent_text(p.fraction), None);
+        assert_eq!(p.phase_line, "Passive checks over captured traffic");
+
+        // P18.
+        let p = of(&status(JobState::Running, Phase::Reporting));
+        assert_eq!(p.ring, Ring::Determinate(1.0));
+        assert_eq!(p.fraction, Some(1.0));
+        assert_eq!(percent_text(p.fraction).as_deref(), Some("100\u{a0}%"));
+        assert_eq!(p.phase_line, "Writing results");
+
+        // P19.
+        let p = of(&status(JobState::Queued, Phase::Queued));
+        assert_eq!(p.ring, Ring::Indeterminate);
+        assert_eq!(p.fraction, None);
+        assert_eq!(p.phase_line, "Waiting for the engine to start this job.");
+
+        // P20.
+        let p = of(&status(JobState::Running, Phase::Auditing));
+        assert_eq!(p.ring, Ring::Indeterminate);
+        assert_eq!(p.fraction, None);
+        assert_eq!(p.phase_line, "Scheduling checks");
+
+        // P21.
+        let mut cancelled = status(JobState::Cancelled, Phase::Done);
+        cancelled.checks.done = 3236;
+        cancelled.checks.scheduled = 6468;
+        let p = of(&cancelled);
+        assert!(
+            matches!(p.ring, Ring::Finished(Some(f)) if near(f, 0.5003)),
+            "{p:?}"
+        );
+        assert_eq!(p.fraction, None);
+        assert_eq!(percent_text(p.fraction), None);
+        assert_eq!(p.phase_line, "");
+        assert_eq!(
+            p.bar_fraction().map(|f| near(f, 0.5003)),
+            Some(true),
+            "a finished bar keeps its fill"
+        );
+        let mut done = status(JobState::Done, Phase::Done);
+        done.crawl.pages = 46;
+        done.crawl.queued = 12;
+        assert!(
+            matches!(of(&done).ring, Ring::Finished(Some(f)) if near(f, 0.7931)),
+            "no checks scheduled: the crawling rule"
+        );
+        assert_eq!(
+            of(&status(JobState::Failed, Phase::Crawling)).ring,
+            Ring::Finished(None),
+            "no counters at all"
+        );
+
+        // P22.
+        let mut running = auditing.clone();
+        assert_eq!(of(&running).now_line, None);
+        running.checks.running = vec!["xss-reflected".into()];
+        assert_eq!(of(&running).now_line.as_deref(), Some("Now: xss-reflected"));
+        running.checks.running = vec![
+            "xss-reflected".into(),
+            "sqli-error".into(),
+            "ssrf".into(),
+            "open-redirect".into(),
+        ];
+        assert_eq!(
+            of(&running).now_line.as_deref(),
+            Some("Now: xss-reflected and 3 more")
+        );
+
+        // Cancelling keeps the running rule for its phase.
+        auditing.state = JobState::Cancelling;
+        let p = of(&auditing);
+        assert!(p.fraction.is_some_and(|f| near(f, 0.5003)), "{p:?}");
+        assert_eq!(p.phase_line, "3,236 of 6,468 checks");
+
+        // Running without a status yet: indeterminate, the phase word.
+        auditing.state = JobState::Running;
+        let p = progress(&auditing.summary(), None);
+        assert_eq!(p.ring, Ring::Indeterminate);
+        assert_eq!(p.fraction, None);
+        assert_eq!(p.phase_line, "auditing");
+        assert_eq!(p.now_line, None);
+
+        // A core reporting more done than scheduled clamps at 1.
+        auditing.checks.done = 7000;
+        let p = of(&auditing);
+        assert_eq!(p.fraction, Some(1.0));
+        assert_eq!(percent_text(p.fraction).as_deref(), Some("100\u{a0}%"));
+
+        // The row's progress text: checks while auditing, pages while
+        // crawling, `...` when indeterminate.
+        auditing.checks.done = 3236;
+        assert_eq!(
+            progress_text(&of(&auditing), &auditing.summary(), Some(&auditing)),
+            "3236/6468"
+        );
+        crawling.crawl.pages = 46;
+        crawling.crawl.queued = 12;
+        assert_eq!(
+            progress_text(&of(&crawling), &crawling.summary(), Some(&crawling)),
+            "46/58"
+        );
+        let passive = status(JobState::Running, Phase::Passive);
+        assert_eq!(
+            progress_text(&of(&passive), &passive.summary(), Some(&passive)),
+            "..."
+        );
+        assert_eq!(
+            progress_text(
+                &progress(&auditing.summary(), None),
+                &auditing.summary(),
+                None
+            ),
+            "..."
+        );
+        assert_eq!(
+            progress_text(&of(&cancelled), &cancelled.summary(), Some(&cancelled)),
+            "3236/6468",
+            "a finished row keeps its counters"
+        );
+
+        // The bar (AC41): floor of the fraction over the cells, like the
+        // percent's floor (D8), so it reads full only at 1.
+        assert_eq!(progress_bar(Some(0.5), 6), "━━━───");
+        assert_eq!(progress_bar(None, 6), "──────");
+        assert_eq!(progress_bar(Some(1.0), 6), "━━━━━━");
+        assert_eq!(progress_bar(Some(0.5003), 6), "━━━───");
+        assert_eq!(progress_bar(Some(0.99), 6), "━━━━━─");
+        assert_eq!(progress_bar(Some(2.0), 6), "━━━━━━", "capped");
+        assert_eq!(progress_fill(Some(0.5003), 6), 3);
+        assert_eq!(progress_fill(Some(f64::NAN), 6), 0);
+        assert_eq!(progress_fill(None, 6), 0);
+
+        // P1 again beside the words (AC41).
+        assert_eq!(
+            end_sentence(JobState::Done, 69_000, 1020, 0, 6468).as_deref(),
+            Some("Done in 1:09 · 1,020 points · 6,468 checks.")
+        );
+
+        // P23 (TUI spelling): the phase word while running, the state word
+        // otherwise.
+        assert_eq!(
+            state_phase_text(JobState::Running, Phase::Auditing),
+            "auditing"
+        );
+        assert_eq!(
+            state_phase_text(JobState::Running, Phase::Crawling),
+            "crawling"
+        );
+        assert_eq!(
+            state_phase_text(JobState::Running, Phase::Passive),
+            "passive"
+        );
+        assert_eq!(
+            state_phase_text(JobState::Running, Phase::Reporting),
+            "reporting"
+        );
+        assert_eq!(state_phase_text(JobState::Running, Phase::Queued), "queued");
+        assert_eq!(
+            state_phase_text(JobState::Cancelling, Phase::Auditing),
+            "cancelling"
+        );
+        assert_eq!(state_phase_text(JobState::Queued, Phase::Queued), "queued");
+        assert_eq!(state_phase_text(JobState::Done, Phase::Done), "done");
+        assert_eq!(
+            state_phase_text(JobState::Cancelled, Phase::Auditing),
+            "cancelled"
+        );
+        assert_eq!(
+            state_phase_text(JobState::Failed, Phase::Crawling),
+            "failed"
+        );
+
+        // The row carries the progress, its fill and the budget as a number.
+        let built = row(
+            &auditing.summary(),
+            Some(&ReadStatus::new(auditing.clone())),
+        );
+        assert_eq!(built.progress, "3236/6468");
+        assert_eq!(built.progress_fill, 3);
+        assert_eq!(built.budget, "0/0");
+        assert_eq!(built.state_phase, "auditing");
+        let bare = JobRow::unknown("scan-1a2b3c4d");
+        assert_eq!(
+            (
+                bare.progress.as_str(),
+                bare.progress_fill,
+                bare.budget.as_str()
+            ),
+            ("...", 0, "...")
+        );
+    }
+
+    /// Jobs view AC42 (D19, T2): the Detail pane opens with the end
+    /// sentence (terminal) or the percent and phase line (live), the
+    /// stopped lines right under a sentence, then `now`, the attention
+    /// lines, and only then the label-value lines; the count the scroll
+    /// clamps to mirrors every shape.
+    #[test]
+    fn detail_first_lines_are_the_sentence_or_the_progress() {
+        use aitm_scan_model::{CheckErrorSample, CrawlErrorKind};
+
+        let lines_of = |status: &JobStatus| {
+            let read = ReadStatus::new(status.clone());
+            let lines = detail_lines(&read);
+            assert_eq!(detail_line_count(&read.status), lines.len(), "{lines:?}");
+            lines
+        };
+        let text =
+            |lines: &[(&'static str, String)]| -> Vec<(&'static str, String)> { lines.to_vec() };
+
+        // A cancelled job: P2, the wire line (P6: no sentence), the labels.
+        let mut status = fixture_status(JobState::Cancelled);
+        status.elapsed_ms = 115_000;
+        status.checks.done = 3236;
+        status.checks.scheduled = 6468;
+        status.checks.running.clear();
+        status.stopped_reason = Some(StoppedReason::Cancelled);
+        let lines = lines_of(&status);
+        assert_eq!(
+            text(&lines[..3]),
+            vec![
+                (
+                    "",
+                    "Cancelled after 1:55; 3,236 of 6,468 checks had run. What it found stays."
+                        .to_string()
+                ),
+                ("wire", "stopped_reason: cancelled".to_string()),
+                ("lanes", lines[2].1.clone()),
+            ]
+        );
+
+        // Done on the budget: P1's shape, then P4 and its wire line.
+        status.state = JobState::Done;
+        status.stopped_reason = Some(StoppedReason::Budget);
+        let lines = lines_of(&status);
+        assert_eq!(lines[0].1, "Done in 1:55 · 120 points · 6,468 checks.");
+        assert_eq!(
+            lines[1],
+            (
+                "stopped",
+                "Stopped early: the probe budget of 2,000 was spent. Raise it in the profile to go further."
+                    .to_string()
+            )
+        );
+        assert_eq!(lines[2], ("wire", "stopped_reason: budget".to_string()));
+        assert_eq!(lines[3].0, "lanes");
+
+        // Failed: the sentence, the error line stays where it was.
+        status.state = JobState::Failed;
+        status.stopped_reason = Some(StoppedReason::Failed);
+        status.error = Some("boom".into());
+        status.elapsed_ms = 12_000;
+        let lines = lines_of(&status);
+        assert_eq!(lines[0].1, "Failed after 0:12.");
+        assert_eq!(lines[1], ("wire", "stopped_reason: failed".to_string()));
+        assert!(lines.iter().any(|(l, v)| *l == "error" && v == "boom"));
+
+        // A running job: the percent and the phase line, then `now`.
+        let mut status = fixture_status(JobState::Running);
+        status.checks.done = 3236;
+        status.checks.scheduled = 6468;
+        status.checks.running = vec!["xss-reflected".into()];
+        let lines = lines_of(&status);
+        assert_eq!(
+            lines[0],
+            ("", "50\u{a0}% · 3,236 of 6,468 checks".to_string())
+        );
+        assert_eq!(lines[1], ("now", "xss-reflected".to_string()));
+        assert_eq!(lines[2].0, "lanes");
+        status.checks.running.clear();
+        let lines = lines_of(&status);
+        assert_eq!(lines[1].0, "lanes", "no running check, no `now` line");
+
+        // The attention lines (D9): errors with their samples, skips with
+        // theirs (the singular, plan gap 26), the crawl trouble.
+        let sample = |check: &str, detail: &str| CheckErrorSample {
+            check: check.into(),
+            point: "p".into(),
+            detail: detail.into(),
+        };
+        status.checks.errors = 7;
+        status.checks.error_samples = vec![
+            sample("http.sqli-error", "timed out"),
+            sample("http.ssrf", ""),
+        ];
+        status.checks.skipped = 1;
+        status.checks.skipped_samples = vec![sample("http.xxe", "no XML body")];
+        status.crawl.errors = 1;
+        status.crawl.last_error = Some(CrawlErrorKind::ConnectRefused);
+        let lines = lines_of(&status);
+        assert_eq!(
+            text(&lines[1..7]),
+            vec![
+                ("", "7 checks could not run".to_string()),
+                ("", "http.sqli-error: timed out".to_string()),
+                ("", "http.ssrf".to_string()),
+                ("", "1 check was skipped".to_string()),
+                ("", "http.xxe: no XML body".to_string()),
+                (
+                    "",
+                    "The crawl fetched 37 pages and hit 1 error — the target refused the connection"
+                        .to_string()
+                ),
+            ]
+        );
+        assert_eq!(lines[7].0, "lanes");
+        status.crawl.last_error = None;
+        let lines = lines_of(&status);
+        assert_eq!(lines[6].1, "The crawl fetched 37 pages and hit 1 error");
+
+        // The samples are bounded by the fold: nine → DETAIL_LIST_MAX rows.
+        status.checks.error_samples = (0..9).map(|k| sample(&format!("c{k}"), "d")).collect();
+        let lines = lines_of(&status);
+        assert_eq!(lines[1].1, "7 checks could not run");
+        assert_eq!(
+            lines[1 + DETAIL_LIST_MAX].1,
+            format!("c{}: d", DETAIL_LIST_MAX - 1)
+        );
+        assert_eq!(lines[2 + DETAIL_LIST_MAX].1, "1 check was skipped");
+
+        // Indeterminate live states: the phase line alone.
+        let passive = fixture_status(JobState::Running);
+        let mut passive = JobStatus {
+            phase: Phase::Passive,
+            ..passive
+        };
+        passive.checks.running.clear();
+        assert_eq!(
+            lines_of(&passive)[0],
+            ("", "Passive checks over captured traffic".to_string())
+        );
+        let queued = JobStatus {
+            state: JobState::Queued,
+            ..passive
+        };
+        assert_eq!(
+            lines_of(&queued)[0],
+            ("", "Waiting for the engine to start this job.".to_string())
+        );
     }
 }

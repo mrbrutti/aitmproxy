@@ -6020,6 +6020,9 @@ impl App {
             "scan.list" => {
                 if let Some(list) = self.scan_reply::<ListResult>(tag, &value) {
                     let followups = self.scan.fold_job_list(list);
+                    // Jobs view D19, T2: the Jobs banner's age clause reads
+                    // this tick while the bus stays silent.
+                    self.scan.jobs.listed_ok_at_tick = Some(self.ticks);
                     self.request_scan_statuses(&followups, out);
                     // The list a `not_found` self-heal asked for clears the
                     // error it left (D13 as amended; fix round G, G74).
