@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 use aitm_scan_model::{
-    BySeverity, Canary, CanaryMethod, JobId, JobState, JobStatus, JobSummary, LaneKind, ListResult,
-    Phase, StoppedReason,
+    BySeverity, Canary, CanaryMethod, CrawlCounters, CrawlErrorKind, JobId, JobState, JobStatus,
+    JobSummary, LaneKind, ListResult, Phase, StoppedReason,
 };
 
 use super::{
@@ -59,6 +59,11 @@ pub struct JobsState {
     pub detail_scroll: u16,
     /// The tick of the last `scan.list` request.
     pub listed_at_tick: u64,
+    /// The tick of the last `scan.list` reply that folded (Jobs view D19,
+    /// T1; stamped by the reducer), so the Jobs banner can say how old the
+    /// values on screen are while the bus stays silent; `None` until the
+    /// first list lands.
+    pub listed_ok_at_tick: Option<u64>,
     /// The jobs this TUI started (spec D3): a `StartResult` fold inserts the
     /// id (Task 12), a `scan.list` that carries it removes it, and
     /// [`JobsState::fold_list`] keeps at the front exactly the marked ids a
@@ -138,10 +143,14 @@ impl JobsState {
     /// jobs in `order`, so a job the core forgot, or one learned only from a
     /// reply or a push line, leaves with the list. A row whose id is not in
     /// the wire form is skipped and the list is cut to [`JOBS_MAX`] rows
-    /// (D6 hostile-core bounds; fix round H, H36). Returns the listed ids
-    /// with no `full` entry yet and not in `healed` (G83), in list order,
-    /// for one `scan.status` each (the caller caps them at
-    /// [`super::MAX_STATUS_FOLLOWUPS`]).
+    /// (D6 hostile-core bounds; fix round H, H36). Returns, in list order,
+    /// the listed ids not in `healed` (G83) that need one `scan.status`
+    /// each (the caller caps them at [`super::MAX_STATUS_FOLLOWUPS`]): the
+    /// ids with no `full` entry yet, and the ids the list calls terminal
+    /// while `full[id].state` is still live (Jobs view D19, T1: `live()`
+    /// stops polling a job the moment the list calls it terminal, so
+    /// without this the stored status, and the Detail pane's checks line,
+    /// would stay at the last running read).
     pub fn fold_list(&mut self, mut list: ListResult) -> Vec<JobId> {
         list.jobs.retain(|j| is_job_id(&j.job));
         list.jobs.truncate(JOBS_MAX);
@@ -169,8 +178,16 @@ impl JobsState {
         self.summaries.retain(|id, _| kept.contains(id));
         let followups = order
             .iter()
-            .filter(|id| {
-                listed.contains(*id) && !self.full.contains_key(*id) && !self.healed.contains(*id)
+            .filter(|id| listed.contains(*id) && !self.healed.contains(*id))
+            .filter(|id| match self.full.get(*id) {
+                None => true,
+                Some(full) => {
+                    !full.state.is_terminal()
+                        && self
+                            .summaries
+                            .get(*id)
+                            .is_some_and(|s| s.state.is_terminal())
+                }
             })
             .cloned()
             .collect();
@@ -295,7 +312,7 @@ const WAITING_FOR_STATUS: &str = "waiting for scan.status...";
 /// lines print as `+n`.
 pub const DETAIL_LIST_MAX: usize = 8;
 
-/// How many entries [`bound_status`] cut off each of the three Detail lists
+/// How many entries [`bound_status`] cut off each of the Detail lists
 /// (fix round G, G11), so their lines can end in `+n`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StatusDropped {
@@ -304,6 +321,10 @@ pub struct StatusDropped {
     pub skipped: usize,
     /// Targets past [`DETAIL_LIST_MAX`] (fix round G, G102).
     pub targets: usize,
+    /// `checks.error_samples` past [`DETAIL_LIST_MAX`] (Jobs view D19, T1).
+    pub error_samples: usize,
+    /// `checks.skipped_samples` past [`DETAIL_LIST_MAX`] (Jobs view D19, T1).
+    pub skipped_samples: usize,
 }
 
 /// A full status as `JobsState::full` holds it (fix round G, G11,
@@ -337,11 +358,13 @@ impl Deref for ReadStatus {
 /// screen reads; `profile_name` cut to [`PROFILE_MAX`], every target to
 /// four times [`TARGETS_MAX`], and `error`, `started_by.frontend`,
 /// `client_label`, each `clamped[].field`, each `lanes.skipped[].reason`,
-/// each `checks.running[]` and the canary path to [`DETAIL_VALUE_MAX`]
-/// cells; the three lists and `targets` cut to [`DETAIL_LIST_MAX`] with
-/// the rest counted in the returned [`StatusDropped`] (G102);
-/// `lanes.requested` and `lanes.run` sorted and deduped (fix round H,
-/// H33: four kinds at most, so the Detail pane joins a bounded list).
+/// each `checks.running[]`, each `check`, `point` and `detail` of
+/// `checks.error_samples[]` and `checks.skipped_samples[]` (Jobs view D19,
+/// T1) and the canary path to [`DETAIL_VALUE_MAX`] cells; the three lists,
+/// `targets` and both sample lists cut to [`DETAIL_LIST_MAX`] with the rest
+/// counted in the returned [`StatusDropped`] (G102); `lanes.requested` and
+/// `lanes.run` sorted and deduped (fix round H, H33: four kinds at most, so
+/// the Detail pane joins a bounded list).
 fn bound_status(status: &mut JobStatus) -> StatusDropped {
     dedup_lanes(&mut status.lanes.requested);
     dedup_lanes(&mut status.lanes.run);
@@ -352,6 +375,8 @@ fn bound_status(status: &mut JobStatus) -> StatusDropped {
         clamped: cap(&mut status.clamped),
         skipped: cap(&mut status.lanes.skipped),
         targets: cap(&mut status.targets),
+        error_samples: cap(&mut status.checks.error_samples),
+        skipped_samples: cap(&mut status.checks.skipped_samples),
     };
     for target in &mut status.targets {
         *target = truncate(&clean(target), 4 * TARGETS_MAX);
@@ -363,6 +388,16 @@ fn bound_status(status: &mut JobStatus) -> StatusDropped {
     fields.extend(status.clamped.iter_mut().map(|c| &mut c.field));
     fields.extend(status.lanes.skipped.iter_mut().map(|s| &mut s.reason));
     fields.extend(status.checks.running.iter_mut());
+    let samples = status
+        .checks
+        .error_samples
+        .iter_mut()
+        .chain(status.checks.skipped_samples.iter_mut());
+    for sample in samples {
+        fields.push(&mut sample.check);
+        fields.push(&mut sample.point);
+        fields.push(&mut sample.detail);
+    }
     if let Some(session) = &mut status.session {
         if let Canary::Flow { path, .. } = &mut session.canary {
             fields.push(path);
@@ -604,14 +639,30 @@ pub fn severity_bar(b: &BySeverity, cells: usize) -> String {
 }
 
 /// How many lines [`detail_lines`] gives `status`, without building them:
-/// the seven fixed lines plus one each for `clamped`, `stopped`, `error`
-/// and `l4` when present. Kept in step with `detail_lines` by its unit test.
+/// the seven fixed lines plus one each for `clamped`, `error` and `l4`
+/// when present, and for a stopped reason the `wire` line plus the
+/// `stopped` line when D4 gives it a sentence ([`stopped_sentence`]). Kept
+/// in step with `detail_lines` by its unit tests.
 fn detail_line_count(status: &JobStatus) -> usize {
+    let stopped = match status.stopped_reason {
+        None => 0,
+        Some(reason) => 1 + usize::from(status_stopped_sentence(status, reason).is_some()),
+    };
     DETAIL_FIXED_LINES
         + usize::from(!status.clamped.is_empty())
-        + usize::from(status.stopped_reason.is_some())
+        + stopped
         + usize::from(status.error.is_some())
         + usize::from(status.l4.is_some())
+}
+
+/// [`stopped_sentence`] for a status's own state, budget and error.
+fn status_stopped_sentence(status: &JobStatus, reason: StoppedReason) -> Option<String> {
+    stopped_sentence(
+        reason,
+        status.state,
+        status.probes.budget,
+        status.error.as_deref(),
+    )
 }
 
 /// The lines every [`detail_lines`] has: lanes, started by, probes, crawl,
@@ -619,15 +670,18 @@ fn detail_line_count(status: &JobStatus) -> usize {
 const DETAIL_FIXED_LINES: usize = 7;
 
 /// The Detail pane's `label value` lines for a job (spec D11): lanes
-/// requested/run/skipped with reasons, who started it, the probe, crawl,
-/// point and check counters, the session, then `clamped`, `stopped`,
-/// `error` and `l4` only when present; a list the fold cut ends in `+n`
-/// (fix round G, G11). Plain text; the view styles the label. Read through
-/// [`JobsState::detail_text`], the one public reading of the pane (fix
-/// round E, E5).
+/// requested/run/skipped with reasons, who started it, the probe, crawl
+/// (with `· errors n (<last error words>)` when the crawl hit any; Jobs
+/// view D4, D19), point and check counters (with `· errors n · skipped n`
+/// when non-zero), the session, then `clamped`, `stopped` (D4's sentence,
+/// omitted when D4 says none) with the raw token under it on a `wire`
+/// line, `error` and `l4` only when present; a list the fold cut ends in
+/// `+n` (fix round G, G11). Plain text; the view styles the label. Read
+/// through [`JobsState::detail_text`], the one public reading of the pane
+/// (fix round E, E5).
 fn detail_lines(read: &ReadStatus) -> Vec<(&'static str, String)> {
     let status = &read.status;
-    let mut lines = Vec::with_capacity(DETAIL_FIXED_LINES + 4);
+    let mut lines = Vec::with_capacity(DETAIL_FIXED_LINES + 5);
     let lanes = &status.lanes;
     let mut lane_text = format!(
         "requested {} · run {}",
@@ -670,13 +724,17 @@ fn detail_lines(read: &ReadStatus) -> Vec<(&'static str, String)> {
     lines.push(("probes", probes));
 
     let c = &status.crawl;
-    lines.push((
-        "crawl",
-        format!(
-            "pages {} · queued {} · depth {} · forms {}",
-            c.pages, c.queued, c.depth, c.forms_submitted
-        ),
-    ));
+    let mut crawl = format!(
+        "pages {} · queued {} · depth {} · forms {}",
+        c.pages, c.queued, c.depth, c.forms_submitted
+    );
+    if c.errors > 0 {
+        crawl.push_str(&format!(" · errors {}", c.errors));
+        if let Some(kind) = c.last_error {
+            crawl.push_str(&format!(" ({})", crawl_error_words(kind)));
+        }
+    }
+    lines.push(("crawl", crawl));
 
     let pt = &status.points;
     lines.push((
@@ -694,6 +752,12 @@ fn detail_lines(read: &ReadStatus) -> Vec<(&'static str, String)> {
 
     let ch = &status.checks;
     let mut checks = format!("{}/{} done", ch.done, ch.scheduled);
+    if ch.errors > 0 {
+        checks.push_str(&format!(" · errors {}", ch.errors));
+    }
+    if ch.skipped > 0 {
+        checks.push_str(&format!(" · skipped {}", ch.skipped));
+    }
     if !ch.running.is_empty() {
         checks.push_str(" · running ");
         checks.push_str(&ch.running.join(", "));
@@ -715,7 +779,10 @@ fn detail_lines(read: &ReadStatus) -> Vec<(&'static str, String)> {
         ));
     }
     if let Some(reason) = status.stopped_reason {
-        lines.push(("stopped", stopped_text(reason).to_string()));
+        if let Some(sentence) = status_stopped_sentence(status, reason) {
+            lines.push(("stopped", sentence));
+        }
+        lines.push(("wire", format!("stopped_reason: {}", stopped_token(reason))));
     }
     if let Some(error) = &status.error {
         lines.push(("error", error.clone()));
@@ -770,18 +837,152 @@ fn lanes_text(lanes: &[LaneKind]) -> String {
         .join(" ")
 }
 
-/// Why a job stopped early, as the operator reads it.
-fn stopped_text(reason: StoppedReason) -> &'static str {
+/// Why a job stopped early, as the operator reads it: D4's sentence for
+/// the reason, identical on the mac, web and TUI surfaces (Jobs view D4,
+/// the parity pin). The budget sentence carries a literal `{budget}`
+/// placeholder that [`stopped_sentence`] fills with the grouped number.
+pub fn stopped_text(reason: StoppedReason) -> &'static str {
     match reason {
-        StoppedReason::Budget => "probe budget spent",
-        StoppedReason::Time => "time budget spent",
+        StoppedReason::Budget => {
+            "Stopped early: the probe budget of {budget} was spent. Raise it in the profile to go further."
+        }
+        StoppedReason::Time => "Stopped early: the time budget ran out.",
+        StoppedReason::Cancelled => "Stopped early: the job was cancelled.",
+        StoppedReason::SessionLost => {
+            "Stopped early: the session was lost and the profile says stop when that happens."
+        }
+        StoppedReason::Errors => "Stopped early: too many errors from the target.",
+        StoppedReason::Policy => "Stopped early: the agent policy changed to paused or read-only.",
+        StoppedReason::GuardRefused => "Stopped early: the L4 guard refused a target mid-run.",
+        StoppedReason::Failed => "Stopped early: an error ended the job.",
+    }
+}
+
+/// The stopped-reason sentence for the Detail pane (Jobs view D4): the
+/// `{budget}` of [`stopped_text`] filled with `probes_budget` grouped;
+/// `None` for a reason the state already says (`cancelled` on a cancelled
+/// job) or the error text already shows (`failed` with a non-empty
+/// `error`; an empty error counts as none, plan gap 8).
+pub fn stopped_sentence(
+    reason: StoppedReason,
+    state: JobState,
+    probes_budget: u64,
+    error: Option<&str>,
+) -> Option<String> {
+    match reason {
+        StoppedReason::Cancelled if state == JobState::Cancelled => None,
+        StoppedReason::Failed if error.is_some_and(|e| !e.is_empty()) => None,
+        StoppedReason::Budget => {
+            Some(stopped_text(reason).replace("{budget}", &grouped(probes_budget)))
+        }
+        _ => Some(stopped_text(reason).to_string()),
+    }
+}
+
+/// The wire token of a stopped reason, as `scan.status` carries it
+/// (`session_lost`, `guard_refused`, …): the Detail pane's `wire` line,
+/// `stopped_reason: <token>`, the one place the raw token is shown (Jobs
+/// view D4). Pinned against serde's spelling by the unit test.
+pub fn stopped_token(reason: StoppedReason) -> &'static str {
+    match reason {
+        StoppedReason::Budget => "budget",
+        StoppedReason::Time => "time",
         StoppedReason::Cancelled => "cancelled",
-        StoppedReason::SessionLost => "session lost",
-        StoppedReason::Errors => "per-host error ladder tripped",
-        StoppedReason::Policy => "agent policy paused or read-only",
-        StoppedReason::GuardRefused => "L4 guard refused a target",
+        StoppedReason::SessionLost => "session_lost",
+        StoppedReason::Errors => "errors",
+        StoppedReason::Policy => "policy",
+        StoppedReason::GuardRefused => "guard_refused",
         StoppedReason::Failed => "failed",
     }
+}
+
+/// The words for a `crawl.last_error` token (Jobs view D4): `transport`
+/// and `other` both read as a failed connection.
+pub fn crawl_error_words(kind: CrawlErrorKind) -> &'static str {
+    match kind {
+        CrawlErrorKind::ConnectRefused => "the target refused the connection",
+        CrawlErrorKind::Tls => "TLS handshake failed",
+        CrawlErrorKind::Timeout => "the target did not answer in time",
+        CrawlErrorKind::H2NotNegotiated => "the target does not speak HTTP/2",
+        CrawlErrorKind::Transport | CrawlErrorKind::Other => "the connection failed",
+    }
+}
+
+/// `The crawl fetched 1 page and hit 1 error` (Jobs view D4); `None` when
+/// the crawl hit none.
+pub fn crawl_trouble(crawl: &CrawlCounters) -> Option<String> {
+    if crawl.errors == 0 {
+        return None;
+    }
+    Some(format!(
+        "The crawl fetched {} and hit {}",
+        plural(crawl.pages, "page"),
+        plural(crawl.errors, "error")
+    ))
+}
+
+/// The one sentence for a terminal job (Jobs view D4, the parity pin P1 to
+/// P3): `Done in 1:09 · 1,020 points · 6,468 checks.`, `Cancelled after
+/// 1:55; 3,236 of 6,468 checks had run. What it found stays.`, `Failed
+/// after 0:12.` (the error text follows on its own line); `None` while
+/// the job is live.
+pub fn end_sentence(
+    state: JobState,
+    elapsed_ms: u64,
+    points_found: u64,
+    checks_done: u64,
+    checks_scheduled: u64,
+) -> Option<String> {
+    let elapsed = elapsed_clock(elapsed_ms);
+    match state {
+        JobState::Done => Some(format!(
+            "Done in {elapsed} · {} · {}.",
+            plural(points_found, "point"),
+            plural(checks_scheduled, "check")
+        )),
+        JobState::Cancelled => Some(format!(
+            "Cancelled after {elapsed}; {} of {} had run. What it found stays.",
+            grouped(checks_done),
+            plural(checks_scheduled, "check")
+        )),
+        JobState::Failed => Some(format!("Failed after {elapsed}.")),
+        JobState::Queued | JobState::Running | JobState::Cancelling => None,
+    }
+}
+
+/// The end sentences' elapsed time: `m:ss`, or `h:mm:ss` from an hour on
+/// (the mac Kit's `ScanFormat.elapsed`; the row keeps [`elapsed_text`]).
+fn elapsed_clock(ms: u64) -> String {
+    let total = ms / 1000;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// `1 point` / `1,020 points`: the one singular rule of the sentences, the
+/// count grouped ([`grouped`]).
+fn plural(n: u64, noun: &str) -> String {
+    let s = if n == 1 { "" } else { "s" };
+    format!("{} {noun}{s}", grouped(n))
+}
+
+/// A count with a `,` every three digits (`6,468`, `1,234,567`) whatever
+/// the locale (Jobs view D4, D11).
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// A job's elapsed time for the row: `42s`, `2m05s`, `1h02m`.
@@ -892,7 +1093,11 @@ mod tests {
             detail_line_count(&full),
             detail_lines(&read_of(&full)).len()
         );
-        assert_eq!(detail_line_count(&full), 11);
+        assert_eq!(
+            detail_line_count(&full),
+            12,
+            "seven fixed + clamped + stopped + wire + error + l4"
+        );
     }
 
     /// Fix round G, G64, G77: a started job lands at the front with the
@@ -955,5 +1160,426 @@ mod tests {
         assert_eq!(elapsed_text(999), "0s");
         assert_eq!(elapsed_text(60_000), "1m00s");
         assert_eq!(elapsed_text(3_600_000), "1h00m");
+    }
+
+    /// The status fixture as a `ReadStatus`, with `state` replaced.
+    fn fixture_status(state: JobState) -> JobStatus {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aitm-scan-model/fixtures/scan.status.json"
+        );
+        let text = std::fs::read_to_string(fixture).expect("the status fixture");
+        let mut status: JobStatus = serde_json::from_str(&text).expect("the fixture parses");
+        status.state = state;
+        status
+    }
+
+    /// A `scan.list` row for `id` in `state`.
+    fn listed(id: &str, state: JobState) -> JobSummary {
+        JobSummary {
+            job: id.to_string(),
+            state,
+            ..Default::default()
+        }
+    }
+
+    /// Jobs view AC39 (D19, T1): a list that turns a job terminal while its
+    /// stored status is still live asks for one more `scan.status` for it,
+    /// so the Detail pane's checks line is not left at the last running read
+    /// (the TUI's C1/C2 shape: `live()` stops polling it at once); a job
+    /// whose stored status is already terminal is not asked again; a job
+    /// with no stored status is still asked, as before.
+    #[test]
+    fn fold_list_rereads_a_job_the_list_turned_terminal() {
+        let mut jobs = JobsState::default();
+        assert_eq!(jobs.listed_ok_at_tick, None);
+        jobs.fold_status(fixture_status(JobState::Running));
+        assert_eq!(jobs.full["scan-1a2b3c4d"].state, JobState::Running);
+
+        let followups = jobs.fold_list(ListResult {
+            jobs: vec![listed("scan-1a2b3c4d", JobState::Done)],
+        });
+        assert_eq!(
+            followups,
+            vec!["scan-1a2b3c4d".to_string()],
+            "the list says done, the stored status still says running"
+        );
+        assert_eq!(jobs.summaries["scan-1a2b3c4d"].state, JobState::Done);
+        assert_eq!(
+            jobs.full["scan-1a2b3c4d"].state,
+            JobState::Running,
+            "the stale read stays until the follow-up lands"
+        );
+
+        jobs.fold_status(fixture_status(JobState::Done));
+        let followups = jobs.fold_list(ListResult {
+            jobs: vec![listed("scan-1a2b3c4d", JobState::Done)],
+        });
+        assert_eq!(
+            followups,
+            Vec::<JobId>::new(),
+            "both terminal: nothing to re-read"
+        );
+
+        let followups = jobs.fold_list(ListResult {
+            jobs: vec![
+                listed("scan-1a2b3c4d", JobState::Done),
+                listed("scan-55667788", JobState::Running),
+            ],
+        });
+        assert_eq!(
+            followups,
+            vec!["scan-55667788".to_string()],
+            "a job with no stored status is still asked"
+        );
+
+        jobs.healed.insert("scan-1a2b3c4d".to_string());
+        jobs.fold_status(fixture_status(JobState::Running));
+        let followups = jobs.fold_list(ListResult {
+            jobs: vec![listed("scan-1a2b3c4d", JobState::Done)],
+        });
+        assert_eq!(
+            followups,
+            Vec::<JobId>::new(),
+            "a healed job is not re-read even when the list turned it terminal"
+        );
+    }
+
+    /// Jobs view AC40 and the parity pin P1–P7, P9–P14 (plan Overview;
+    /// spec D4), byte for byte. P8 (an unknown reason token) has no Rust
+    /// form: `aitm_scan_model::StoppedReason` is a closed enum, so an
+    /// unknown token fails the status parse before any sentence is built.
+    /// P14's unknown crawl token likewise: `CrawlErrorKind` is closed; its
+    /// `Transport` and `Other` read the same words.
+    #[test]
+    fn stopped_and_crawl_words_are_the_parity_sentences() {
+        use aitm_scan_model::{CrawlCounters, CrawlErrorKind};
+
+        // P5, and the AC40 literal.
+        assert_eq!(
+            stopped_text(StoppedReason::Errors),
+            "Stopped early: too many errors from the target."
+        );
+        assert_eq!(
+            stopped_sentence(StoppedReason::Errors, JobState::Done, 2000, None).as_deref(),
+            Some("Stopped early: too many errors from the target.")
+        );
+        // The template carries a literal placeholder; the caller formats the number.
+        assert!(stopped_text(StoppedReason::Budget).contains("the probe budget of"));
+        assert!(stopped_text(StoppedReason::Budget).contains("{budget}"));
+        // P4.
+        assert_eq!(
+            stopped_sentence(StoppedReason::Budget, JobState::Done, 2000, None).as_deref(),
+            Some(
+                "Stopped early: the probe budget of 2,000 was spent. Raise it in the profile to go further."
+            )
+        );
+        // P6: the state sentence already says it.
+        assert_eq!(
+            stopped_sentence(StoppedReason::Cancelled, JobState::Cancelled, 2000, None),
+            None
+        );
+        assert_eq!(
+            stopped_sentence(StoppedReason::Cancelled, JobState::Done, 2000, None).as_deref(),
+            Some("Stopped early: the job was cancelled.")
+        );
+        // P7: the error text is shown instead; an empty error counts as none.
+        assert_eq!(
+            stopped_sentence(StoppedReason::Failed, JobState::Failed, 2000, Some("boom")),
+            None
+        );
+        assert_eq!(
+            stopped_sentence(StoppedReason::Failed, JobState::Failed, 2000, None).as_deref(),
+            Some("Stopped early: an error ended the job.")
+        );
+        assert_eq!(
+            stopped_sentence(StoppedReason::Failed, JobState::Failed, 2000, Some("")).as_deref(),
+            Some("Stopped early: an error ended the job.")
+        );
+        // The rest of D4's table.
+        assert_eq!(
+            stopped_text(StoppedReason::Time),
+            "Stopped early: the time budget ran out."
+        );
+        assert_eq!(
+            stopped_text(StoppedReason::SessionLost),
+            "Stopped early: the session was lost and the profile says stop when that happens."
+        );
+        assert_eq!(
+            stopped_text(StoppedReason::Policy),
+            "Stopped early: the agent policy changed to paused or read-only."
+        );
+        assert_eq!(
+            stopped_text(StoppedReason::GuardRefused),
+            "Stopped early: the L4 guard refused a target mid-run."
+        );
+        // P9: the raw token, as serde writes it on the wire.
+        for reason in [
+            StoppedReason::Budget,
+            StoppedReason::Time,
+            StoppedReason::Cancelled,
+            StoppedReason::SessionLost,
+            StoppedReason::Errors,
+            StoppedReason::Policy,
+            StoppedReason::GuardRefused,
+            StoppedReason::Failed,
+        ] {
+            let wire = serde_json::to_value(reason).expect("a token");
+            assert_eq!(Some(stopped_token(reason)), wire.as_str(), "{reason:?}");
+        }
+        assert_eq!(stopped_token(StoppedReason::Errors), "errors");
+        assert_eq!(stopped_token(StoppedReason::SessionLost), "session_lost");
+
+        // P13, P14 and the rest of the `last_error` words.
+        assert_eq!(
+            crawl_error_words(CrawlErrorKind::ConnectRefused),
+            "the target refused the connection"
+        );
+        assert_eq!(
+            crawl_error_words(CrawlErrorKind::Tls),
+            "TLS handshake failed"
+        );
+        assert_eq!(
+            crawl_error_words(CrawlErrorKind::Timeout),
+            "the target did not answer in time"
+        );
+        assert_eq!(
+            crawl_error_words(CrawlErrorKind::H2NotNegotiated),
+            "the target does not speak HTTP/2"
+        );
+        assert_eq!(
+            crawl_error_words(CrawlErrorKind::Transport),
+            "the connection failed"
+        );
+        assert_eq!(
+            crawl_error_words(CrawlErrorKind::Other),
+            "the connection failed"
+        );
+
+        // P10–P12.
+        let crawl = |pages: u64, errors: u64| CrawlCounters {
+            pages,
+            errors,
+            ..Default::default()
+        };
+        assert_eq!(
+            crawl_trouble(&crawl(1, 1)).as_deref(),
+            Some("The crawl fetched 1 page and hit 1 error")
+        );
+        assert_eq!(
+            crawl_trouble(&crawl(46, 2)).as_deref(),
+            Some("The crawl fetched 46 pages and hit 2 errors")
+        );
+        assert_eq!(crawl_trouble(&crawl(46, 0)), None);
+        assert_eq!(
+            crawl_trouble(&crawl(0, 1)).as_deref(),
+            Some("The crawl fetched 0 pages and hit 1 error")
+        );
+        assert_eq!(
+            crawl_trouble(&crawl(1200, 1000)).as_deref(),
+            Some("The crawl fetched 1,200 pages and hit 1,000 errors"),
+            "grouped"
+        );
+
+        // P1–P3, and nothing for a live job.
+        assert_eq!(
+            end_sentence(JobState::Done, 69_000, 1020, 0, 6468).as_deref(),
+            Some("Done in 1:09 · 1,020 points · 6,468 checks.")
+        );
+        assert_eq!(
+            end_sentence(JobState::Cancelled, 115_000, 0, 3236, 6468).as_deref(),
+            Some("Cancelled after 1:55; 3,236 of 6,468 checks had run. What it found stays.")
+        );
+        assert_eq!(
+            end_sentence(JobState::Failed, 12_000, 0, 0, 0).as_deref(),
+            Some("Failed after 0:12.")
+        );
+        assert_eq!(
+            end_sentence(JobState::Done, 3_723_000, 1, 0, 1).as_deref(),
+            Some("Done in 1:02:03 · 1 point · 1 check."),
+            "h:mm:ss from an hour on; the one singular rule"
+        );
+        assert_eq!(
+            end_sentence(JobState::Running, 69_000, 1020, 3236, 6468),
+            None
+        );
+        assert_eq!(
+            end_sentence(JobState::Cancelling, 69_000, 1020, 3236, 6468),
+            None
+        );
+        assert_eq!(end_sentence(JobState::Queued, 0, 0, 0, 0), None);
+
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(6468), "6,468");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    /// Jobs view AC40 (D19, T1): the Detail pane's `stopped` line is D4's
+    /// sentence (omitted when D4 says nil), the raw token follows on a
+    /// `wire` line, the `crawl` line names its errors and the last error's
+    /// words, the `checks` line its errors and skips; the count the scroll
+    /// clamps to mirrors every shape.
+    #[test]
+    fn detail_lines_carry_the_wire_and_error_clauses() {
+        use aitm_scan_model::CrawlErrorKind;
+
+        let mut status = fixture_status(JobState::Done);
+        status.stopped_reason = Some(StoppedReason::Errors);
+        status.crawl.errors = 1;
+        status.crawl.last_error = Some(CrawlErrorKind::ConnectRefused);
+        status.checks.errors = 7;
+        status.checks.skipped = 3;
+        let read = ReadStatus::new(status.clone());
+        let lines = detail_lines(&read);
+        assert_eq!(detail_line_count(&read.status), lines.len());
+        let value = |label: &str| {
+            lines
+                .iter()
+                .find(|(l, _)| *l == label)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_else(|| panic!("no {label} line: {lines:?}"))
+        };
+        assert_eq!(
+            value("stopped"),
+            "Stopped early: too many errors from the target."
+        );
+        assert_eq!(value("wire"), "stopped_reason: errors");
+        let stopped_at = lines.iter().position(|(l, _)| *l == "stopped");
+        let wire_at = lines.iter().position(|(l, _)| *l == "wire");
+        assert_eq!(
+            wire_at,
+            stopped_at.map(|i| i + 1),
+            "the raw token sits under the sentence"
+        );
+        assert_eq!(
+            value("crawl"),
+            "pages 37 · queued 0 · depth 3 · forms 4 · errors 1 (the target refused the connection)"
+        );
+        assert!(
+            value("crawl").ends_with("· errors 1 (the target refused the connection)"),
+            "{:?}",
+            value("crawl")
+        );
+        assert!(
+            value("checks").contains("· errors 7"),
+            "{:?}",
+            value("checks")
+        );
+        assert!(
+            value("checks").contains("· skipped 3"),
+            "{:?}",
+            value("checks")
+        );
+        assert_eq!(
+            value("checks"),
+            "180/240 done · errors 7 · skipped 3 · running http.reflected-xss, http.sqli-error"
+        );
+
+        // No last error: the count alone. No errors or skips: the old line.
+        status.crawl.last_error = None;
+        status.checks.errors = 0;
+        status.checks.skipped = 0;
+        let read = ReadStatus::new(status.clone());
+        let lines = detail_lines(&read);
+        assert_eq!(detail_line_count(&read.status), lines.len());
+        let crawl = &lines.iter().find(|(l, _)| *l == "crawl").expect("crawl").1;
+        assert_eq!(crawl, "pages 37 · queued 0 · depth 3 · forms 4 · errors 1");
+        let checks = &lines
+            .iter()
+            .find(|(l, _)| *l == "checks")
+            .expect("checks")
+            .1;
+        assert_eq!(
+            checks,
+            "180/240 done · running http.reflected-xss, http.sqli-error"
+        );
+        status.crawl.errors = 0;
+        let lines = detail_lines(&ReadStatus::new(status.clone()));
+        let crawl = &lines.iter().find(|(l, _)| *l == "crawl").expect("crawl").1;
+        assert_eq!(crawl, "pages 37 · queued 0 · depth 3 · forms 4");
+
+        // P6 in the pane: no `stopped` line, the `wire` line still.
+        status.state = JobState::Cancelled;
+        status.stopped_reason = Some(StoppedReason::Cancelled);
+        let read = ReadStatus::new(status.clone());
+        let lines = detail_lines(&read);
+        assert_eq!(detail_line_count(&read.status), lines.len());
+        assert!(
+            !lines.iter().any(|(l, _)| *l == "stopped"),
+            "cancelled on a cancelled job has no sentence: {lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .find(|(l, _)| *l == "wire")
+                .map(|(_, v)| v.as_str()),
+            Some("stopped_reason: cancelled")
+        );
+        assert_eq!(
+            detail_line_count(&read.status),
+            DETAIL_FIXED_LINES + 1,
+            "seven fixed and the wire line"
+        );
+
+        // P4 in the pane: the budget comes from the status's probes.
+        status.state = JobState::Done;
+        status.stopped_reason = Some(StoppedReason::Budget);
+        let lines = detail_lines(&ReadStatus::new(status));
+        assert_eq!(
+            lines.iter().find(|(l, _)| *l == "stopped").map(|(_, v)| v.as_str()),
+            Some(
+                "Stopped early: the probe budget of 2,000 was spent. Raise it in the profile to go further."
+            )
+        );
+    }
+
+    /// Jobs view AC40 (D19, T1; D6 hostile-core bounds): every sample
+    /// string is cut to `DETAIL_VALUE_MAX` cells at fold and both sample
+    /// lists to `DETAIL_LIST_MAX`, the rest counted.
+    #[test]
+    fn bound_status_cuts_the_samples() {
+        use crate::text::width;
+        use aitm_scan_model::CheckErrorSample;
+
+        let sample = |k: usize| CheckErrorSample {
+            check: format!("http.c{k}"),
+            point: format!("p{k}"),
+            detail: format!("d{k}"),
+        };
+        let mut status = fixture_status(JobState::Done);
+        status.checks.error_samples = (0..9).map(sample).collect();
+        status.checks.error_samples[0].detail = "x".repeat(1000);
+        status.checks.error_samples[1].check = "\t".repeat(10) + &"c".repeat(1000);
+        status.checks.error_samples[2].point = "y".repeat(1000);
+        status.checks.skipped_samples = (0..9).map(sample).collect();
+        status.checks.skipped_samples[0].detail = "z".repeat(1000);
+        let read = ReadStatus::new(status);
+
+        assert_eq!(read.checks.error_samples.len(), DETAIL_LIST_MAX);
+        assert_eq!(read.dropped.error_samples, 1);
+        assert_eq!(read.checks.skipped_samples.len(), DETAIL_LIST_MAX);
+        assert_eq!(read.dropped.skipped_samples, 1);
+        assert_eq!(
+            width(&read.checks.error_samples[0].detail),
+            DETAIL_VALUE_MAX
+        );
+        assert_eq!(width(&read.checks.error_samples[1].check), DETAIL_VALUE_MAX);
+        assert!(
+            !read.checks.error_samples[1].check.contains('\t'),
+            "control characters stripped"
+        );
+        assert_eq!(width(&read.checks.error_samples[2].point), DETAIL_VALUE_MAX);
+        assert_eq!(
+            width(&read.checks.skipped_samples[0].detail),
+            DETAIL_VALUE_MAX
+        );
+        assert_eq!(
+            read.checks.error_samples[3].detail, "d3",
+            "short ones untouched"
+        );
+
+        let bare = ReadStatus::new(fixture_status(JobState::Running));
+        assert_eq!(bare.dropped, StatusDropped::default());
     }
 }

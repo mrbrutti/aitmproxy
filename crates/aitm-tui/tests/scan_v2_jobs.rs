@@ -363,6 +363,11 @@ fn detail_fields_and_lists_are_bounded_at_fold() {
         .map(|k| json!({ "field": format!("f{k}"), "requested": 9, "applied": 1 }))
         .collect::<Vec<_>>());
     body["session"]["canary"]["path"] = json!("/p".repeat(1 << 16));
+    let samples: Vec<Value> = (0..9)
+        .map(|k| json!({ "check": format!("http.c{k}"), "point": format!("p{k}"), "detail": "d".repeat(1000) }))
+        .collect();
+    body["checks"]["error_samples"] = json!(samples);
+    body["checks"]["skipped_samples"] = json!(samples);
     let _ = app.on_bus(status_reply(body));
     let full = app.scan.jobs.full.get(JOB).expect("folded");
     let error = full.error.as_deref().unwrap_or_default();
@@ -383,6 +388,19 @@ fn detail_fields_and_lists_are_bounded_at_fold() {
     assert_eq!(full.dropped.running, 1000 - DETAIL_LIST_MAX);
     assert_eq!(full.dropped.skipped, 20 - DETAIL_LIST_MAX);
     assert_eq!(full.dropped.clamped, 20 - DETAIL_LIST_MAX);
+    // Jobs view D19, T1: the check samples are bounded at the same fold.
+    assert_eq!(full.checks.error_samples.len(), DETAIL_LIST_MAX);
+    assert_eq!(full.checks.skipped_samples.len(), DETAIL_LIST_MAX);
+    assert_eq!(full.dropped.error_samples, 9 - DETAIL_LIST_MAX);
+    assert_eq!(full.dropped.skipped_samples, 9 - DETAIL_LIST_MAX);
+    assert_eq!(
+        width(&full.checks.error_samples[0].detail),
+        DETAIL_VALUE_MAX
+    );
+    assert_eq!(
+        width(&full.checks.skipped_samples[0].detail),
+        DETAIL_VALUE_MAX
+    );
     let lines = app.scan.jobs.detail_text();
     let value = |label: &str| {
         lines
@@ -434,6 +452,27 @@ fn detail_len_counts_what_detail_text_draws() {
         "the id line and the seven fixed lines"
     );
     assert_eq!(jobs.detail_text()[0].0, "lanes");
+    // Jobs view D19, T1: a stopped job adds the sentence and the wire line.
+    let mut stopped = fixture("scan.status.json");
+    stopped["state"] = json!("done");
+    stopped["stopped_reason"] = json!("errors");
+    let stopped: JobStatus = serde_json::from_value(stopped).expect("the fixture parses");
+    jobs.fold_status(stopped);
+    assert_eq!(jobs.detail_len(), 1 + jobs.detail_text().len());
+    assert_eq!(
+        jobs.detail_len(),
+        10,
+        "the id line, the seven fixed lines, `stopped` and `wire`"
+    );
+    let lines = jobs.detail_text();
+    let tail: Vec<(&str, &str)> = lines[7..].iter().map(|(l, v)| (*l, v.as_str())).collect();
+    assert_eq!(
+        tail,
+        vec![
+            ("stopped", "Stopped early: too many errors from the target."),
+            ("wire", "stopped_reason: errors"),
+        ]
+    );
     let mut bare = JobsState::default();
     bare.order.push(JOB.to_string());
     assert_eq!(
