@@ -258,12 +258,22 @@ async function requireDeadPortIsolated(where) {
 // of witness phases, and every `[data-field=state]` read feeds one set of rendered words, so a job
 // that finishes before step 3's loop starts is still judged on what the witness and the UI showed.
 const witnessPhases = new Set();
+/** phase -> { first, last } wall-clock ms of the witness reads that saw it (03c's duration rule). */
+const witnessPhaseSpan = new Map();
 const witnessStates = new Set();
+/** The UI polls `scan.status` once a second (live.ts STATUS_POLL_MS): a phase the witness saw for less than that can be missed by every UI poll and is not judged. */
+const UI_STATUS_POLL_MS = 1000;
 const renderedStateWords = new Set();
 /** The witness's `scan.status { job }`, recorded into the phase/state sets. */
 async function status(job) {
   const st = await bus.call('scan.status', { job });
-  if (typeof st.phase === 'string' && st.phase !== '') witnessPhases.add(st.phase);
+  if (typeof st.phase === 'string' && st.phase !== '') {
+    witnessPhases.add(st.phase);
+    const now = Date.now();
+    const span = witnessPhaseSpan.get(st.phase);
+    if (span) span.last = now;
+    else witnessPhaseSpan.set(st.phase, { first: now, last: now });
+  }
   if (typeof st.state === 'string') witnessStates.add(st.state);
   return st;
 }
@@ -728,8 +738,15 @@ async function run() {
     // lowercase to it, and the terminal word is rendered when some words are a terminal state.
     const renderedPhaseWords = new Set([...renderedStateWords].map(phaseWord).filter(Boolean));
     const terminalRendered = [...renderedStateWords].map(terminalWord).find(Boolean) ?? null;
-    // `queued` is the pre-start phase: a job can leave it before the UI's first poll.
-    const judged = [...witnessPhases].filter((p) => p !== 'queued');
+    // `queued` is the pre-start phase: a job can leave it before the UI's first poll. A phase the
+    // witness saw for less than the UI's poll period (`passive`, ~0.5 s here in runs 5-6) can fall
+    // between two UI polls and is noted, not judged.
+    const transient = [...witnessPhases].filter((p) => {
+      const span = witnessPhaseSpan.get(p);
+      return p !== 'queued' && span && span.last - span.first < UI_STATUS_POLL_MS;
+    });
+    if (transient.length) note('03c transient phases', `seen by the witness for under ${UI_STATUS_POLL_MS} ms, not judged: ${transient.map((p) => `${p} (${witnessPhaseSpan.get(p).last - witnessPhaseSpan.get(p).first} ms)`).join(', ')}`);
+    const judged = [...witnessPhases].filter((p) => p !== 'queued' && !transient.includes(p));
     const missed = judged.filter((p) => !renderedPhaseWords.has(p));
     const detail = `witness phases [${[...witnessPhases].join(', ')}], witness states [${[...witnessStates].join(', ')}], rendered words ${j([...renderedStateWords])}, terminal word rendered ${j(terminalRendered)}`;
     if (witnessPhases.size === 0) {
