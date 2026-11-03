@@ -5994,18 +5994,24 @@ impl App {
         true
     }
 
+    /// A scan reply, `ok` or error, settles its tag (Jobs view Task 4.5d):
+    /// the single-slot `inflight` entry goes, and a `scan.list` reply,
+    /// contract match or not, stands the hung-core detector down (D19
+    /// amendment). `listed_at_tick` is the send stamp and stays.
+    fn settle_scan_tag(&mut self, tag: &str) {
+        self.scan.inflight.remove(tag);
+        if tag == "scan.list" {
+            self.scan.jobs.list_sent_at_tick = None;
+        }
+    }
+
     /// A tagged `scan.*` call answered: settle the tag and fold the reply by
     /// verb (spec D10) through [`App::scan_reply`]. A reply that does not
     /// match the contract leaves the state and records a
     /// `ScanError { code: None }`. No `Refresh` is ever pushed from here
     /// (D4). Later tasks add their verbs to this match.
     fn on_scan_ok(&mut self, tag: &str, name: &str, value: Value, out: &mut Vec<BusRequest>) {
-        self.scan.inflight.remove(tag);
-        if tag == "scan.list" {
-            // The list is answered, contract match or not: the hung-core
-            // detector stands down (Jobs view D19 amendment).
-            self.scan.jobs.list_sent_at_tick = None;
-        }
+        self.settle_scan_tag(tag);
         match name {
             "scan.start" | "scan.map" => {
                 // A `needs_confirmation` reply opens the shared overlay with
@@ -6275,11 +6281,7 @@ impl App {
     /// (`ScanState::refused_launch`), the UI-3 `blocked` text taking
     /// precedence over it (D13), so nothing more is kept for it here.
     fn on_scan_failed(&mut self, tag: &str, message: String, out: &mut Vec<BusRequest>) {
-        self.scan.inflight.remove(tag);
-        if tag == "scan.list" {
-            // An error reply settles the list too (Jobs view D19 amendment).
-            self.scan.jobs.list_sent_at_tick = None;
-        }
+        self.settle_scan_tag(tag);
         let err = ScanError::from_message(tag, &message);
         if err.verb == "scan.issue" {
             self.scan.issues.pending_read = None;

@@ -201,19 +201,22 @@ SECRET_PREFIX = 12
 
 REDACTED = "<seeded-secret-redacted>"
 JOB_ID_RE = re.compile(r"scan-[0-9a-f]{8}")
-# The state cell's words alone (Jobs view D19, T2, `state_phase_text`): the phase word
-# while running, the state word otherwise. Bounded so a `/` or a word character on either
-# side fails the match: an old `state/phase` cell (`running/crawl`, `running/audit`,
-# `cancelled/done`) reads None, never a word lifted out of it (AC61's negative control).
+# The state cell anchored by its position in the row, not by its vocabulary alone (Jobs
+# view D19, T2, `state_phase_text`; Task 4.5d, gap 72): group 1 is the phase word while
+# running or the state word otherwise, then the progress cell (`n/m`, or `...` while
+# indeterminate) right-aligned in its column, one space, and group 3, the row's 6-cell
+# progress bar (`BAR_FILLED` / `BAR_EMPTY`, `PROGRESS_BAR_CELLS` in ui/scan/mod.rs), then
+# the gap before the budget cell. A profile named `done`, a target `www.auditing.example`
+# or `?q=done` or `my-done.example`, or a target carrying six bar cells, is never the
+# state cell; the lookbehind keeps an old `state/phase` cell (`running/crawl`,
+# `cancelled/done`) reading None, never a word lifted out of it (AC61's negative control).
 STATE_RE = re.compile(
-    r"(?<![\w/])(queued|crawling|passive|auditing|reporting|cancelling|done|cancelled|failed)(?![\w/])"
+    r"(?<![\w/])(queued|crawling|passive|auditing|reporting|cancelling|done|cancelled|failed)"
+    r"\s+(\d+/\d+|\.\.\.) ([━─]{6})\s"
 )
 PROBES_RE = re.compile(r"(\d+)/(\d+)")
 # The phase words the state cell reads while a job is `running` (Jobs view D19, T2).
 RUNNING_PHASES = ("crawling", "passive", "auditing", "reporting")
-# The row's 6-cell progress bar (`BAR_FILLED` / `BAR_EMPTY`, PROBE_BAR_CELLS): the budget
-# cell is the first `n/m` after it.
-BAR_RE = re.compile(r"[━─]{6}")
 # The Scan view is drawn inside a box (`boxed(theme, "Scan", ..)`, crates/aitm-tui/src/ui/
 # scan/mod.rs), so every screen row starts with the box's left border `│` and the list
 # pane of each tab (Profiles, Jobs, the Site map's Nodes, Issues) sits at the box's inner
@@ -1001,26 +1004,28 @@ def row_tail(text, job):
 
 
 def row_probes(text, job):
-    """The budget cell as `(sent, budget)`: the first `n/m` after the progress bar (the
-    first run of six `━`/`─` cells after the job id), never the progress cell's `n/m`
-    before the bar, so it reads the same when that cell is `...` (Jobs view D19, T2; AC61).
-    None without a row or a bar."""
+    """The budget cell as `(sent, budget)`: the first `n/m` after the progress bar of the
+    anchored state cell (STATE_RE's bar group, the same match `row_state` reads its word
+    from), never the progress cell's `n/m` before the bar, so it reads the same when that
+    cell is `...` and a target carrying six bar cells is not the bar (Jobs view D19, T2;
+    AC61; Task 4.5d). None without a row or an anchored state cell."""
     tail = row_tail(text, job)
     if tail is None:
         return None
-    bar = BAR_RE.search(tail)
-    if bar is None:
+    cell = STATE_RE.search(tail)
+    if cell is None:
         return None
-    m = PROBES_RE.search(tail, bar.end())
+    m = PROBES_RE.search(tail, cell.end(3))
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def row_state(text, job):
+    """The state cell's word (STATE_RE's group 1), None without a row or an anchored cell."""
     tail = row_tail(text, job)
     if tail is None:
         return None
     m = STATE_RE.search(tail)
-    return m.group(0) if m else None
+    return m.group(1) if m else None
 
 
 def box_left(text):
@@ -3541,6 +3546,25 @@ def selftest():
             row_probes(determinate, JOB) == (418, 2000) and row_probes(indeterminate, JOB) == (418, 2000)
             and row_state(determinate, JOB) == "auditing" and row_state(indeterminate, JOB) == "auditing",
             f"{row_probes(determinate, JOB)} {row_probes(indeterminate, JOB)}")
+
+    def lured_row(profile, target):
+        # A crawling job whose profile or target carries a state word or six bar cells
+        # (Jobs view Task 4.5d, gap 72): the readers must anchor on the state cell by its
+        # position (the word, the progress cell, the bar, in that order), never on the
+        # vocabulary alone, so each lure reads the REAL cells: `crawling` and `12/400`.
+        return (f"│>{JOB}  {profile:<8}  {target:<28}  crawling  {JOB_PROGRESS:>8} {JOB_BAR}  "
+                f"{JOB_BUDGET:<6}  3/9     ······  12s")
+
+    lures = (("done", "http://127.0.0.1:8080"), ("standard", "http://www.auditing.example"),
+             ("standard", "http://h/?q=done"), ("standard", "http://my-done.example"),
+             ("standard", "http://h/━━━━━━"))
+    for profile, target in lures:
+        lure = lured_row(profile, target)
+        c.check(f"selftest: Jobs: a profile `{profile}` and a target `{target}` are not the state cell: "
+                "row_state reads the REAL `crawling` and row_probes the REAL `12/400` (the positional "
+                "anchor, Task 4.5d, gap 72)",
+                row_state(lure, JOB) == "crawling" and row_probes(lure, JOB) == (12, 400),
+                f"state {row_state(lure, JOB)!r} probes {row_probes(lure, JOB)}")
     c.check("selftest: Jobs: the Jobs footer is the tab's marker (H5)",
             re.search(TAB_MARKERS["2"], jobs) is not None and re.search(TAB_MARKERS["1"], jobs) is None,
             row_of(jobs, "cancel"))

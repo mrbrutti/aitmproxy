@@ -157,11 +157,8 @@ fn banner(app: &App, error: Option<&ScanError>) -> String {
 /// error on screen, and this says the numbers under it are from before it.
 pub fn values_age_text(now_tick: u64, listed_ok_at_tick: Option<u64>) -> Option<String> {
     let since = now_tick.saturating_sub(listed_ok_at_tick?);
-    let ms = u128::from(since).saturating_mul(crate::TICK.as_millis());
-    Some(format!(
-        "showing values from {} ago",
-        elapsed_text(u64::try_from(ms).unwrap_or(u64::MAX))
-    ))
+    let ms = since.saturating_mul(crate::TICK_MS);
+    Some(format!("showing values from {} ago", elapsed_text(ms)))
 }
 
 /// The active tab's degraded text, when the bus cannot serve it (D2): on a
@@ -943,12 +940,17 @@ mod tests {
         assert_eq!(short.detail, Rect::new(0, 2, 50, 0));
     }
 
-    /// Jobs view Task 4.5c (5): one tick period. The age clause counts
-    /// [`crate::TICK`] per tick, the runtime's own interval, so 168 ticks
-    /// of 250 ms read `42s`; the constant is the one the runtime polls on.
+    /// Jobs view Task 4.5c (5), 4.5d: one tick period. The age clause counts
+    /// [`crate::TICK_MS`] per tick, the runtime's own interval
+    /// ([`crate::TICK`] is built from the same number), so 168 ticks of
+    /// 250 ms read `42s`; the constant is the one the runtime polls on.
     #[test]
     fn values_age_counts_the_runtime_tick() {
-        assert_eq!(crate::TICK, std::time::Duration::from_millis(250));
+        assert_eq!(crate::TICK_MS, 250);
+        assert_eq!(
+            crate::TICK,
+            std::time::Duration::from_millis(crate::TICK_MS)
+        );
         assert_eq!(
             values_age_text(168, Some(0)).as_deref(),
             Some("showing values from 42s ago")
