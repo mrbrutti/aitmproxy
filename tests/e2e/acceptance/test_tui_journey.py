@@ -65,10 +65,12 @@ NO_FLOWS_GENERIC = "No flows yet: point a client at the proxy or open the browse
 TOAST_LOG = ("embedded proxy · log: ", "embedded proxy · log location not reported", "embedded proxy · logging disabled: could not open ")
 TOAST_LOG_RX = "|".join(re.escape(t) for t in TOAST_LOG)
 SUBSCRIBE_REGRESSION = "flow.subscribe failed"  # #255: the in-process transport must never call flow.subscribe
+ANSI_RX = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")  # CSI sequences: a style change mid-toast must not split a substring
 SCOPE_HINT = "host · host:port · *.wildcard (a human action)"
 SCOPE_EMPTY = "Scope is empty: every flow is dimmed and read-only. Press a to add a host."
 SIDEBAR_SCOPE_RX = re.compile(r"^\s*Scope\s+(\d+)", re.M)  # the host count; the status bar's ` · N in scope` counts flows
 ARMED_BAR_RX = r"Intercept armed: every request pauses here"
+ARMED_PILL = " · intercept armed"  # the toolbar pill's word while armed (`… · CA trusted · intercept armed`)
 CA_HINT = "y runs it · n / Esc cancels"
 PAUSE_HINT = "[a Resume] [A Resume all] [d Kill · abort mode: reset (429/503 need F3)] [e Edit] [i Disarm]"
 
@@ -86,6 +88,17 @@ def pgrep_lines(pattern: str) -> str:
     if r.returncode == 1:
         return ""
     return f"[pgrep error {r.returncode}: {r.stderr.strip()[:80]}]"
+
+
+def plain_raw(term: Terminal) -> str:
+    """Everything the TUI ever wrote, CSI styling stripped: a substring search here catches a toast
+    even after it cleared, and even when a style change was emitted in the middle of its words."""
+    return ANSI_RX.sub("", bytes(term.raw).decode("utf-8", "replace"))
+
+
+def armed_flag(st: object) -> bool | None:
+    """`intercept_armed` from an `aitm proxy status` object; None when the verb gave no object."""
+    return st.get("intercept_armed") if isinstance(st, dict) else None
 
 
 def audit_since(t0_ms: int) -> list[dict]:
@@ -172,7 +185,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         busbar = term.wait_for(r"bus \S.*? · operator", 5)
         toast = term.wait_for(TOAST_LOG_RX, 6)
         screen = term.text()
-        regression = SUBSCRIBE_REGRESSION in bytes(term.raw).decode("utf-8", "replace")
+        regression = SUBSCRIBE_REGRESSION in plain_raw(term)
         pill = next((ln for ln in screen.splitlines() if "aitmproxy" in ln and ("listening" in ln or "bus" in ln)), "")
         want = ["listening 127.0.0.1:8080", "sys-proxy", "CA trusted"]
         miss = [x for x in want if x not in screen]
@@ -211,10 +224,12 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         count = re.search(r" · (\d+) in scope", after)
         side = SIDEBAR_SCOPE_RX.search(after)
         side_n = int(side.group(1)) if side else 0
-        if prompt and hint and toast and listed and on_bus and side_n >= 1:
+        # A fresh scope reads `Scope 1`; a pre-existing host (his own entry) legitimately raises it.
+        side_ok = side_n == 1 or (pre_existing and side_n >= 1)
+        if prompt and hint and toast and listed and on_bus and side_ok:
             step("TUI-2", "PASS", f"prompt + hint shown, toast `Scope + {HOST}`, panel lists it, sidebar `Scope {side_n}`, status bar ` · {count.group(1) if count else '?'} in scope` (flows; recorded); Scope-empty words before: {scope_empty}" + (f"; the host was ALREADY in Scope before the run (config.yaml {HOST in config_scope}, panel {on_panel}; not removed at the end)" if pre_existing else ""), f"aitm scope list contains {HOST} ({len(scope_list)} hosts); bus truth: one-shot CLI")
         else:
-            step("TUI-2", "FAIL", f"prompt {prompt}, hint {hint}, toast {toast}, listed {listed}, sidebar Scope row {side.group(0).strip() if side else None}, status bar {count.group(0) if count else None}, aitm scope list has host {on_bus}", scope_note[:200])
+            step("TUI-2", "FAIL", f"prompt {prompt}, hint {hint}, toast {toast}, listed {listed}, sidebar `Scope {side_n}` (row {side.group(0).strip() if side else None}; want 1, or >= 1 for a pre-existing host), status bar {count.group(0) if count else None}, aitm scope list has host {on_bus}", scope_note[:200])
         term.press("\x1b", 0.4)
 
         # N2 — a host in Scope, no route: the pill word and the empty pane are what is judged.
@@ -269,8 +284,10 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         # TUI-5a — arm / disarm; TUI-5b — park / resume (needs a route and a hand).
         term.press("i", 0.5)
         armed = term.wait_for(ARMED_BAR_RX, 5)
+        pill_armed = ARMED_PILL in term.text()
+        save("TUI-5a-armed.txt", term.text())
         st_armed, note_armed = oneshot_json("proxy", "status")
-        bus_armed = isinstance(st_armed, dict) and st_armed.get("intercept_armed") is True
+        bus_armed = armed_flag(st_armed) is True
         if w.results.get("TUI-4") == "PASS" and is_manual():
             pause("Reload http://example.com/ in Safari, then press Enter here")
             parked = term.wait_for(r"1 paused\s+GET http://example\.com/", 15)
@@ -284,8 +301,13 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         term.press("i", 0.5)
         disarmed = term.wait_for(r"Intercept disarmed", 5)
         st_off, note_off = oneshot_json("proxy", "status")
-        bus_disarmed = isinstance(st_off, dict) and st_off.get("intercept_armed") is False
-        step("TUI-5a", "PASS" if armed and disarmed and bus_armed and bus_disarmed else "FAIL", f"armed bar {armed}; toast `Intercept disarmed` {disarmed}; aitm proxy status intercept_armed after arm {st_armed.get('intercept_armed') if isinstance(st_armed, dict) else None}, after disarm {st_off.get('intercept_armed') if isinstance(st_off, dict) else None}", f"bus truth: one-shot CLI ({note_armed}; {note_off})")
+        bus_disarmed = armed_flag(st_off) is False
+        ok_5a = armed and pill_armed and disarmed and bus_armed and bus_disarmed
+        detail_5a = (
+            f"armed bar {armed}; pill `{ARMED_PILL.strip()}` {pill_armed}; toast `Intercept disarmed` {disarmed}; "
+            f"aitm proxy status intercept_armed after arm {armed_flag(st_armed)}, after disarm {armed_flag(st_off)}"
+        )
+        step("TUI-5a", "PASS" if ok_5a else "FAIL", detail_5a, f"bus truth: one-shot CLI ({note_armed}; {note_off})")
 
         # TUI-6 — local confirm: CA panel, i, then n.
         term.press(":", 0.3)

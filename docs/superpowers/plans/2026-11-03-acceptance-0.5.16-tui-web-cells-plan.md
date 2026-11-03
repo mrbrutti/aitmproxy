@@ -32,9 +32,9 @@ Tasks 1, 2, 3 and 4 touch disjoint files and run in parallel. Task 5 is the live
 | TUI status bar | regex `bus \S.*? · operator` (reads `● bus in-process · operator`) |
 | TUI scope prompt hint | `host · host:port · *.wildcard (a human action)` |
 | TUI Scope panel, empty | `Scope is empty: every flow is dimmed and read-only. Press a to add a host.` |
-| TUI sidebar host count | regex `^\s*Scope\s+(\d+)` (the status bar's ` · N in scope` counts flows) |
-| TUI armed bar | `Intercept armed: every request pauses here`; pill gains ` · intercept armed`; toasts `Intercept armed: every request pauses` / `Intercept disarmed` |
-| TUI CA confirm | prompt `confirm: ca.install:`; hint `y runs it · n / Esc cancels` is **not asserted** (the description pushes it off 180 cols); `n` → toast `ca.install cancelled` |
+| TUI sidebar host count | regex `^\s*Scope\s+(\d+)`: exactly 1 for a fresh Scope, ≥ 1 when the host pre-existed (the status bar's ` · N in scope` counts flows) |
+| TUI armed bar | `Intercept armed: every request pauses here`; pill gains ` · intercept armed` (asserted while armed); toasts `Intercept armed: every request pauses` (transient, a survey fact in D12, not asserted) / `Intercept disarmed` (asserted) |
+| TUI CA confirm | prompt `confirm: ca.install` (the cell's regex `confirm: ca\.install`; the row continues `: <description> [y/N]`); hint `y runs it · n / Esc cancels` is **not asserted** (the description pushes it off 180 cols); `n` → toast `ca.install cancelled` |
 | TUI bus truth | `aitm scope list` (JSON array contains the host), `aitm proxy status` (`intercept_armed`) run as one-shot verbs on the operator's default config while `aitm tui` runs |
 | Web intercept bar | the `[role=status]` element whose text starts `Intercept armed — every request pauses here` (toolbar pill is also `[role=status]`); buttons by their text nodes only (`<kbd>` excluded): `Disarm`, `Rules…`, `Resume`, `Apply & Resume` |
 
@@ -92,7 +92,22 @@ Tasks 1, 2, 3 and 4 touch disjoint files and run in parallel. Task 5 is the live
 
 ## Review log
 
+Stage-6 panel on `abeda7d6..77c5aef4` (security, quality, spec; 2026-11-03): three PASS verdicts, no Critical or Important, twelve Minors.
+
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 1–5 | security | — | PASS, no findings; no `unsafe` in range | — |
+| 1 | quality | Minor | `push: bool` threaded positionally through `connector`/`bus::run`/`Session` (a 3-tuple) | Accepted 2026-11-03 (autonomous mode): the plan allowed the bool; a `pushes()` property on `BusTransport` is the follow-up if a fourth transport fact appears |
+| 1 | quality | Minor | tautological `flows.is_empty()` assert in the in-process handshake test | Fixed in the fix commit |
+| 1 | quality | Minor | reconnect timeout message hard-codes 6 s | Fixed in the fix commit |
+| 1 | quality | Minor | module doc line over-long after rewrap | Fixed in the fix commit |
+| 2 | quality | Minor | `test_tui_oneshot_json` covers two functions; stale docstring; env pop outside `finally`; E303 | Fixed in the fix commit (split, docstring, `finally`) |
+| 2 | quality | Minor | TUI-5a duplicated isinstance expression, 330-char step line | Fixed in the fix commit (`armed_flag` helper) |
+| 2 | quality | Minor | regression detector searches the raw escape stream | Fixed in the fix commit (escapes stripped before the search) |
+| 4 | quality | Minor | plan Literals row `confirm: ca.install:` vs cell regex without the colon | Fixed in the plan (row softened to what the cell pins) |
+| 4 | spec | Minor | D12 names no survey SHA (AC2 anchor) | Fixed: D12 heading names `abeda7d6` (survey tree) and `96101377` (Task 1 fix) |
+| 2/4 | spec | Minor | TUI-5 row lists the pill suffix and the arm toast, the cell asserted neither | Fixed: the cell asserts the pill ` · intercept armed`; the arm toast is a D12 survey fact, moved out of the "must show" words |
+| 2 | spec | Minor | sidebar count asserted `>= 1`, the row says `Scope 1` | Fixed: `== 1`, or `>= 1` when the host pre-existed |
+| 1/2 | spec | Minor | tester's tests ride in the coder commits, not `test(...): tester —` commits | Accepted 2026-11-03: the orchestrator committed the shared tree in three logical commits; the tests are doc-commented "Tester" |
 
 ## Shipped

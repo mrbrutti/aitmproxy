@@ -2,8 +2,9 @@
 //! (initialize → tools/list → proxy.status → flow.subscribe, the last only on
 //! a transport with a push sink), polls `flow.list` + `flow.get` on a timer
 //! (push lines are a trigger, the poll is the truth; scanner v2 D5/D6), runs
-//! the app's [`BusRequest`]s and reports everything as [`BusEvent`]s. Features the bus does not offer are simply
-//! not polled: the app reads `tools/list` and degrades (§2.10).
+//! the app's [`BusRequest`]s and reports everything as [`BusEvent`]s.
+//! Features the bus does not offer are simply not polled: the app reads
+//! `tools/list` and degrades (§2.10).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -468,23 +468,19 @@ async fn the_in_process_handshake_never_subscribes() {
     let (mut r, lines) = start_recording(refusing_subscribe, Duration::from_millis(50), false);
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
     let mut toasts = Vec::new();
-    let flows = loop {
+    loop {
         let ev = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
         match ev {
-            BusEvent::Flows(s) => break s,
+            BusEvent::Flows(_) => break,
             BusEvent::Toast(level, text) => toasts.push((level, text)),
             BusEvent::Disconnected(why) => panic!("the handshake lost the session: {why}"),
             _ => {}
         }
-    };
+    }
     assert_eq!(
         toasts,
         Vec::new(),
         "no toast between Connected and the first poll"
-    );
-    assert!(
-        flows.is_empty(),
-        "the first poll follows the handshake: {flows:?}"
     );
     let wire = sent(&lines);
     assert_eq!(
@@ -704,7 +700,7 @@ async fn drop_then_reconnect(push: bool) -> (Vec<Value>, Vec<(Level, String)>, u
         let left = deadline.saturating_duration_since(Instant::now());
         let ev = timeout(left, r.ev_rx.recv())
             .await
-            .expect("the reconnect completes within 6 s")
+            .unwrap_or_else(|_| panic!("the reconnect completes within {:?}", WAIT * 2))
             .expect("the bus task is alive");
         match ev {
             BusEvent::Connected { .. } => connected += 1,

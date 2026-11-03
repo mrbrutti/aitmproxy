@@ -4,8 +4,9 @@
 Plain `python3 tests/e2e/acceptance/lib/test_installed_helpers.py`; exit 0 = every check held,
 1 = a failure (printed). Nothing here touches the Mac: `replay` runs against a ScriptedRunner
 that records argv, `find_embedded_core` is exercised through `parse_core_lines` on canned
-`pgrep -fl` output, and StepWriter writes into a temp dir. Lives under lib/ so run.py never
-discovers it (AC10).
+`pgrep -fl` output, and StepWriter writes into a temp dir. It also exercises the TUI cell's
+one-shot helpers (`test_tui_journey.oneshot_json`, `pgrep_lines`) against a scripted `aitm` and
+a scripted `pgrep` in a temp dir. Lives under lib/ so run.py never discovers it (AC10).
 """
 from __future__ import annotations
 
@@ -433,92 +434,111 @@ def test_read_core_config_oserror() -> None:
         check((core.pid, core.bus_addr, core.operator_token) == (4242, "127.0.0.1:9100", "tok-value"), "pid, endpoint and operator token are read")
 
 
+def _import_cell(tmpdir: str):
+    """The TUI journey cell as a module. Importing it writes its fresh steps file, so ACCEPT_OUT
+    points at `tmpdir` first; the caller pops ACCEPT_OUT in a `finally`."""
+    os.environ["ACCEPT_OUT"] = tmpdir
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import test_tui_journey as cell  # noqa: E402
+
+    return cell
+
+
 def test_tui_oneshot_json() -> None:
     """test_tui_journey.oneshot_json (tester, plan 2026-11-03 Task 2): the one-shot CLI is the TUI
     cells' bus truth, so its four outcomes are pinned against a scripted `aitm` on PATH-less argv:
     JSON on exit 0 is parsed; a non-zero exit, non-JSON stdout and a timeout are None with a note
-    that carries the exit and stderr but never stdout (which could hold a token). Importing the cell
-    writes its fresh steps file, so ACCEPT_OUT points at a temp dir first."""
+    that carries the exit and stderr but never stdout (which could hold a token)."""
     print("test_tui_journey.oneshot_json")
+    fresh = "test_tui_journey" not in sys.modules
     with tempfile.TemporaryDirectory() as d:
-        os.environ["ACCEPT_OUT"] = d
-        fake = os.path.join(d, "aitm")
-        with open(fake, "w", encoding="utf-8") as f:
-            f.write(
-                "#!/bin/sh\n"
-                'case "$1 $2" in\n'
-                '  "scope list") printf \'["example.com","a.test"]\\n\' ;;\n'
-                '  "proxy status") printf \'{"intercept_armed":true}\\n\' ;;\n'
-                '  "scope fail") echo "stdout-tok3n"; echo "boom: refused" >&2; exit 3 ;;\n'
-                '  "scope text") echo "not json tok3n"; echo "warned" >&2 ;;\n'
-                "esac\n"
-            )
-        os.chmod(fake, 0o755)
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        import test_tui_journey as cell  # noqa: E402
-
-        check(os.path.isfile(os.path.join(d, "tui-steps.tsv")), "importing the cell writes its steps file under ACCEPT_OUT only")
-        cell.AITM = fake
-        v, note = cell.oneshot_json("scope", "list")
-        check(v == ["example.com", "a.test"], f"scope list: stdout JSON array parsed (got {v!r})")
-        check(note == "aitm scope list: exit 0", f"scope list note (got {note!r})")
-        v, note = cell.oneshot_json("proxy", "status")
-        check(isinstance(v, dict) and v.get("intercept_armed") is True, f"proxy status: object parsed (got {v!r})")
-        v, note = cell.oneshot_json("scope", "fail")
-        check(v is None, "non-zero exit -> None")
-        check(note.startswith("aitm scope fail: exit 3") and "boom: refused" in note, f"note carries the exit and stderr (got {note!r})")
-        check("tok3n" not in note, "note never carries stdout (a token could be there)")
-        v, note = cell.oneshot_json("scope", "text")
-        check(v is None, "exit 0 with non-JSON stdout -> None")
-        check("stdout not JSON" in note and "warned" in note, f"note says stdout was not JSON and carries stderr (got {note!r})")
-        check("tok3n" not in note, "non-JSON stdout is not echoed into the note")
-        v, note = cell.oneshot_json("scope", "missing-verb")
-        check(v is None and "stdout not JSON (0 bytes)" in note, f"empty stdout on exit 0 -> None, note says 0 bytes (got {note!r})")
-
-        class TimingOut:
-            TimeoutExpired = subprocess.TimeoutExpired
-
-            @staticmethod
-            def run(argv, **kw):
-                raise subprocess.TimeoutExpired(argv, kw.get("timeout", 0))
-
-        real = cell.subprocess
-        cell.subprocess = TimingOut
         try:
+            fake = os.path.join(d, "aitm")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'case "$1 $2" in\n'
+                    '  "scope list") printf \'["example.com","a.test"]\\n\' ;;\n'
+                    '  "proxy status") printf \'{"intercept_armed":true}\\n\' ;;\n'
+                    '  "scope fail") echo "stdout-tok3n"; echo "boom: refused" >&2; exit 3 ;;\n'
+                    '  "scope text") echo "not json tok3n"; echo "warned" >&2 ;;\n'
+                    "esac\n"
+                )
+            os.chmod(fake, 0o755)
+            cell = _import_cell(d)
+            check(not fresh or os.path.isfile(os.path.join(d, "tui-steps.tsv")), "importing the cell writes its steps file under ACCEPT_OUT only")
+            cell.AITM = fake
+            v, note = cell.oneshot_json("scope", "list")
+            check(v == ["example.com", "a.test"], f"scope list: stdout JSON array parsed (got {v!r})")
+            check(note == "aitm scope list: exit 0", f"scope list note (got {note!r})")
             v, note = cell.oneshot_json("proxy", "status")
-        finally:
-            cell.subprocess = real
-        check(v is None and note == "aitm proxy status: timeout 40s", f"timeout -> None with the 40 s note (got {note!r})")
+            check(isinstance(v, dict) and v.get("intercept_armed") is True, f"proxy status: object parsed (got {v!r})")
+            v, note = cell.oneshot_json("scope", "fail")
+            check(v is None, "non-zero exit -> None")
+            check(note.startswith("aitm scope fail: exit 3") and "boom: refused" in note, f"note carries the exit and stderr (got {note!r})")
+            check("tok3n" not in note, "note never carries stdout (a token could be there)")
+            v, note = cell.oneshot_json("scope", "text")
+            check(v is None, "exit 0 with non-JSON stdout -> None")
+            check("stdout not JSON" in note and "warned" in note, f"note says stdout was not JSON and carries stderr (got {note!r})")
+            check("tok3n" not in note, "non-JSON stdout is not echoed into the note")
+            v, note = cell.oneshot_json("scope", "missing-verb")
+            check(v is None and "stdout not JSON (0 bytes)" in note, f"empty stdout on exit 0 -> None, note says 0 bytes (got {note!r})")
 
-        # pgrep_lines: exit 1 is "" (nothing left), exit 0 is the matches, any other exit is a marker
-        # (a tool failure is never read as "nothing left"). Scripted: the sandbox's pgrep has no sysmond.
-        class Pgrep:
-            def __init__(self, rc: int, out: str = "", err: str = ""):
-                self.rc, self.out, self.err = rc, out, err
+            class TimingOut:
+                TimeoutExpired = subprocess.TimeoutExpired
 
-            def run(self, argv, **_):
-                self.argv = argv
+                @staticmethod
+                def run(argv, **kw):
+                    raise subprocess.TimeoutExpired(argv, kw.get("timeout", 0))
 
-                class R:
-                    returncode, stdout, stderr = self.rc, self.out, self.err
-
-                return R()
-
-        for rc, out, err, want in (
-            (1, "", "", ""),
-            (0, "4242 /opt/homebrew/bin/aitm tui\n", "", "4242 /opt/homebrew/bin/aitm tui"),
-            (3, "", "sysmon request failed", "[pgrep error 3: sysmon request failed]"),
-        ):
-            stub = Pgrep(rc, out, err)
-            cell.subprocess = stub
+            real = cell.subprocess
+            cell.subprocess = TimingOut
             try:
-                got = cell.pgrep_lines("/opt/homebrew/bin/aitm tui")
+                v, note = cell.oneshot_json("proxy", "status")
             finally:
                 cell.subprocess = real
-            check(got == want, f"pgrep_lines exit {rc} -> {want!r} (got {got!r})")
-        check(stub.argv[:2] == ["pgrep", "-fl"] and stub.argv[2] == re.escape("/opt/homebrew/bin/aitm tui"), f"pgrep_lines escapes the command line as a literal (argv {stub.argv})")
-        os.environ.pop("ACCEPT_OUT", None)
+            check(v is None and note == "aitm proxy status: timeout 40s", f"timeout -> None with the 40 s note (got {note!r})")
+        finally:
+            os.environ.pop("ACCEPT_OUT", None)
 
+
+def test_tui_pgrep_lines() -> None:
+    """test_tui_journey.pgrep_lines: exit 1 is "" (nothing left), exit 0 is the matches, any other
+    exit is a marker (a tool failure is never read as "nothing left"); the command line is passed
+    as a literal (`re.escape`). Scripted: the sandbox's pgrep has no sysmond."""
+    print("test_tui_journey.pgrep_lines")
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            cell = _import_cell(d)
+
+            class Pgrep:
+                def __init__(self, rc: int, out: str = "", err: str = ""):
+                    self.rc, self.out, self.err = rc, out, err
+
+                def run(self, argv, **_):
+                    self.argv = argv
+
+                    class R:
+                        returncode, stdout, stderr = self.rc, self.out, self.err
+
+                    return R()
+
+            real = cell.subprocess
+            for rc, out, err, want in (
+                (1, "", "", ""),
+                (0, "4242 /opt/homebrew/bin/aitm tui\n", "", "4242 /opt/homebrew/bin/aitm tui"),
+                (3, "", "sysmon request failed", "[pgrep error 3: sysmon request failed]"),
+            ):
+                stub = Pgrep(rc, out, err)
+                cell.subprocess = stub
+                try:
+                    got = cell.pgrep_lines("/opt/homebrew/bin/aitm tui")
+                finally:
+                    cell.subprocess = real
+                check(got == want, f"pgrep_lines exit {rc} -> {want!r} (got {got!r})")
+            check(stub.argv[:2] == ["pgrep", "-fl"] and stub.argv[2] == re.escape("/opt/homebrew/bin/aitm tui"), f"pgrep_lines escapes the command line as a literal (argv {stub.argv})")
+        finally:
+            os.environ.pop("ACCEPT_OUT", None)
 
 
 def main() -> int:
@@ -533,6 +553,7 @@ def main() -> int:
     test_tooling_mentioned()
     test_read_core_config_oserror()
     test_tui_oneshot_json()
+    test_tui_pgrep_lines()
     print()
     if failures:
         print(f"{len(failures)} FAILED:")
