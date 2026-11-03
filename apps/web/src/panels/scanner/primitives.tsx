@@ -8,6 +8,7 @@ import { Show, type Component, type JSX, type ParentComponent } from 'solid-js';
 import { Button } from '~/components';
 import { fmtClock } from '~/lib/format';
 import { fmtWhenFull } from '~/panels/findings/model';
+import { linkBannerText } from './helpers';
 import css from './scanner.module.css';
 
 /** The reconnecting note (D-T8.10), the one sentence every view prints while the bus is away. */
@@ -83,9 +84,14 @@ export const ErrorBlock: Component<{
   </div>
 );
 
-export const ReconnectNote: Component = () => (
+/**
+ * The reconnecting note. Without `valuesAgeMs` it is the shared sentence; the Jobs tab passes the
+ * age of its values (or `null` before the first list) and gets D15's banner, `Bus disconnected ·
+ * showing values from 0:42 ago · reconnecting…` (`linkBannerText`, the Kit's words).
+ */
+export const ReconnectNote: Component<{ valuesAgeMs?: number | null | undefined }> = (props) => (
   <p class={css.note} role="status" data-reconnect>
-    {RECONNECT_NOTE}
+    {props.valuesAgeMs === undefined ? RECONNECT_NOTE : linkBannerText(props.valuesAgeMs)}
   </p>
 );
 

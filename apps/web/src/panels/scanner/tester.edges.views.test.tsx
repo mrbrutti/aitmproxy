@@ -25,6 +25,7 @@ import { SitemapView } from './SitemapView';
 import { scanStore, type ScanStore } from './store';
 import { stubApp } from './testkit';
 import css from './scanner.module.css';
+import jobsCss from './jobs.module.css';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = resolve(here, '../../../../../crates/aitm-scan-model/fixtures');
@@ -127,20 +128,18 @@ describe('tester: keyboard handlers over an empty list (W-17)', () => {
     expect(document.activeElement).toBe(list);
   });
 
-  it('Jobs: nothing is selected; the empty layout has no detail pane, so Enter is a no-op', async () => {
+  it('Jobs: nothing is selected; the empty state is the Kit sentence and Open Profiles, with no listbox, card or wells to key over', async () => {
     const h = mount(() => <JobsView />, { replies: { 'scan.list': { jobs: [] } } });
-    const list = await screen.findByRole('listbox', { name: 'Jobs' });
-    await screen.findByText('No jobs yet: start one from Profiles');
-    list.focus();
-    for (const key of KEYS) {
-      fireEvent.keyDown(list, { key });
-      expect(h.s.selectedJob()).toBeNull();
-    }
-    expect(list.getAttribute('aria-activedescendant')).toBeNull();
-    expect(list.closest(`.${css.layout}`)!.getAttribute('data-empty')).toBe('true');
-    expect(screen.queryByRole('region', { name: 'Job detail' })).toBeNull();
-    fireEvent.keyDown(list, { key: 'Enter' });
-    expect(document.activeElement).toBe(list);
+    h.s.setTab('jobs');
+    await screen.findByText('No jobs yet — pick a profile and Start Scan.');
+    expect(h.s.selectedJob()).toBeNull();
+    expect(screen.queryByRole('listbox', { name: 'Jobs' })).toBeNull();
+    expect(screen.queryByRole('region', { name: 'Selected job' })).toBeNull();
+    expect(document.querySelector(`.${jobsCss.wells}`)).toBeNull();
+    // The one control: Open Profiles switches the tab; the keys have nothing to move.
+    fireEvent.click(screen.getByRole('button', { name: 'Open Profiles' }));
+    expect(h.s.tab()).toBe('profiles');
+    expect(h.s.selectedJob()).toBeNull();
   });
 
   it('Site map: nothing is selected and Enter moves focus to the (empty) detail', async () => {
@@ -252,7 +251,9 @@ const SCOPE = { scope: [{ host: '127.0.0.1' }] };
 const jobsRow = (id: string) => document.querySelector<HTMLElement>(`[role=option][data-job="${id}"]`);
 
 describe('tester: Cancel placement (A3) and error ownership (A8) in the Jobs view', () => {
-  it('rows_have_no_cancel: no row carries a button; exactly two Cancel controls exist, the strip’s and the detail’s', async () => {
+  it('rows_have_no_cancel: no row carries a `Cancel scan <job>` control; exactly two exist, the strip’s (another tab) and the card’s', async () => {
+    // This harness mounts the strip and the view together on the Profiles tab (the shell never
+    // does): the strip and the card are both present, so both Cancels are.
     mount(() => (
       <>
         <JobStrip />
@@ -263,17 +264,20 @@ describe('tester: Cancel placement (A3) and error ownership (A8) in the Jobs vie
     const rows = Array.from(document.querySelectorAll<HTMLElement>('[role=option][data-job]'));
     expect(rows).toHaveLength(2);
     for (const row of rows) {
-      expect(row.querySelectorAll('button')).toHaveLength(0);
-      // The two-line row: state words and the severity bar are there, Cancel is not.
+      expect(row.querySelectorAll('button[aria-label^="Cancel scan"]')).toHaveLength(0);
+      // The Kit cells: the state word and the severity words are there, Cancel is not.
       expect(row.querySelector('[data-field=state]')).not.toBeNull();
-      expect(row.querySelector('[role=img]')).not.toBeNull();
+      expect(row.querySelector('[data-field=issues]')).not.toBeNull();
+      expect(row.querySelector('[role=img]')).toBeNull();
     }
     const cancels = screen.getAllByRole('button', { name: `Cancel scan ${JOB}` });
     expect(cancels).toHaveLength(2);
-    const strip = screen.getByRole('region', { name: 'Selected job' });
-    const detail = screen.getByRole('region', { name: 'Job detail' });
+    const strip = document.querySelector(`.${css.strip}`)!;
+    const card = document.querySelector(`.${jobsCss.card}`)!;
+    expect(strip.getAttribute('aria-label')).toBe('Selected job');
+    expect(card.getAttribute('aria-label')).toBe('Selected job');
     expect(cancels.filter((b) => strip.contains(b))).toHaveLength(1);
-    expect(cancels.filter((b) => detail.contains(b))).toHaveLength(1);
+    expect(cancels.filter((b) => card.contains(b))).toHaveLength(1);
   });
 
   it('a launch refusal never shows in the Jobs view; a refused cancel does, and a later error of another source replaces it', async () => {
@@ -299,7 +303,7 @@ describe('tester: Cancel placement (A3) and error ownership (A8) in the Jobs vie
     const line = await screen.findByText('Not found: scan-1a2b3c4d');
     expect(line.getAttribute('data-error')).toBe('cancel');
     expect(line.getAttribute('role')).toBe('alert');
-    expect(screen.getByRole('region', { name: 'Job detail' }).contains(line)).toBe(true);
+    expect(document.querySelector(`.${jobsCss.card}`)!.contains(line)).toBe(true);
 
     // One error slot (A8): the next launch refusal belongs to the editor, so the cancel line goes.
     await h.s.launch(standard(), 'start');

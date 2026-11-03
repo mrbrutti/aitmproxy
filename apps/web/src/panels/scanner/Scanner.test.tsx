@@ -12,6 +12,7 @@ import { RECONNECT_NOTE } from './primitives';
 import { scanStore, type ScanStore } from './store';
 import { Scanner } from './Scanner';
 import css from './scanner.module.css';
+import jobsCss from './jobs.module.css';
 
 const JOB = 'scan-1a2b3c4d';
 const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
@@ -140,6 +141,29 @@ describe('Scanner shell', () => {
     const option2 = r2.container.querySelector('[role=option][data-issue="issue-4c3b2a19"]');
     expect(option2).not.toBeNull();
     expect(option2!.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('one_selected_job_region_per_tab (AC37): on the Jobs tab the one `Selected job` region is the card; on Issues it is the strip', async () => {
+    const h = mount();
+    await tick();
+    fireEvent.click(h.tab('jobs'));
+    await tick();
+    const section = h.r.getByRole('region', { name: 'Scanner' });
+    const onJobs = h.r.getAllByRole('region', { name: 'Selected job' });
+    expect(onJobs).toHaveLength(1);
+    expect(onJobs[0]!.classList.contains(jobsCss.card!)).toBe(true);
+    expect(onJobs[0]!.getAttribute('data-job')).toBe(JOB);
+    expect(section.querySelector(`.${css.strip}`)).toBeNull();
+    // The live script's selector finds the card here.
+    expect(section.querySelector('[role=region][aria-label="Selected job"]')).toBe(onJobs[0]);
+
+    fireEvent.click(h.tab('issues'));
+    await tick();
+    const onIssues = h.r.getAllByRole('region', { name: 'Selected job' });
+    expect(onIssues).toHaveLength(1);
+    expect(onIssues[0]!.classList.contains(css.strip!)).toBe(true);
+    expect(onIssues[0]!.getAttribute('data-job')).toBe(JOB);
+    expect(section.querySelector(`.${jobsCss.card}`)).toBeNull();
   });
 
   it('reconnecting_note: a note appears and every button in the section is disabled', async () => {
