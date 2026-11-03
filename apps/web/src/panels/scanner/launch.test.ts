@@ -14,9 +14,17 @@ import { describe, expect, it, vi } from 'vitest';
 import type { L4ScopeEntryWire } from '~/panels/l4/model';
 
 import { AGENT_NOTE, CONFIRM_NOTE, L4_HINT } from './helpers';
-import { beginLaunch, confirmLaunch, preflight, type PreflightCtx } from './launch';
-import type { ScanProfile } from './model';
-import { parseScanProfile } from './model';
+import {
+  beginLaunch,
+  beginScanAgain,
+  confirmLaunch,
+  confirmScanAgain,
+  preflight,
+  scanAgainArgs,
+  type PreflightCtx,
+} from './launch';
+import type { JobStatus, ScanProfile } from './model';
+import { parseJobStatus, parseScanProfile } from './model';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = resolve(here, '../../../../../crates/aitm-scan-model/fixtures');
@@ -108,6 +116,75 @@ describe('launch_sends_the_profile_whole', () => {
     expect(outcome.kind).toBe('malformed');
     if (outcome.kind !== 'malformed') throw new Error('expected malformed');
     expect(outcome.message).toBe('scan.start answered with an unexpected shape');
+  });
+});
+
+/** A finished `standard` job against the comp's target (the status the card's Scan Again reads). */
+const finishedStatus = (over: Partial<JobStatus> = {}): JobStatus => {
+  const base = parseJobStatus(fixture('scan.status.json'))!;
+  return { ...base, state: 'done', phase: 'done', targets: ['http://127.0.0.1:8117'], ...over };
+};
+
+describe('scan_again_args_from_the_status', () => {
+  it('builds { profile_name, overrides: { target: { origins } } } from the held status (D13)', () => {
+    expect(scanAgainArgs(finishedStatus())).toEqual({
+      profile_name: 'standard',
+      overrides: { target: { origins: ['http://127.0.0.1:8117'] } },
+    });
+  });
+
+  it('sends an empty profile name verbatim and origins: [] for a pure-L4 job (plan gap 32)', () => {
+    expect(scanAgainArgs(finishedStatus({ profile_name: '', targets: [] }))).toEqual({
+      profile_name: '',
+      overrides: { target: { origins: [] } },
+    });
+  });
+
+  it('copies the targets: a later mutation of the status does not reach the args', () => {
+    const status = finishedStatus();
+    const args = scanAgainArgs(status);
+    status.targets.push('http://127.0.0.1:9');
+    expect(args.overrides.target.origins).toEqual(['http://127.0.0.1:8117']);
+  });
+
+  it('beginScanAgain sends scan.start with exactly the args and surfaces the prompt', async () => {
+    const call = vi.fn().mockResolvedValue({ status: 'needs_confirmation', prompt: PROMPT, confirm_token: 'tok-2' });
+    const args = scanAgainArgs(finishedStatus());
+
+    const outcome = await beginScanAgain(call, args);
+
+    expect(outcome).toEqual({ kind: 'confirm', prompt: PROMPT, token: 'tok-2' });
+    expect(call.mock.calls[0]).toEqual([
+      'scan.start',
+      { profile_name: 'standard', overrides: { target: { origins: ['http://127.0.0.1:8117'] } } },
+    ]);
+    expect(Object.keys(call.mock.calls[0]![1] as Record<string, unknown>)).toEqual(['profile_name', 'overrides']);
+  });
+
+  it('confirmScanAgain re-sends the identical args plus _confirm and classifies the start result', async () => {
+    const call = vi.fn().mockResolvedValue(fixture('scan.start.json'));
+    const args = scanAgainArgs(finishedStatus());
+
+    const outcome = await confirmScanAgain(call, args, 'tok-2');
+
+    expect(call.mock.calls[0]).toEqual([
+      'scan.start',
+      { profile_name: 'standard', overrides: { target: { origins: ['http://127.0.0.1:8117'] } }, _confirm: 'tok-2' },
+    ]);
+    expect(outcome.kind).toBe('started');
+  });
+
+  it('classifies a Scan Again refusal like any launch (invalid_profile inline)', async () => {
+    const call = vi.fn().mockRejectedValue(new Error('scan: invalid_profile: no profile named'));
+
+    const outcome = await beginScanAgain(call, scanAgainArgs(finishedStatus({ profile_name: '' })));
+
+    expect(outcome).toEqual({
+      kind: 'refused',
+      code: 'invalid_profile',
+      detail: 'no profile named',
+      message: 'scan: invalid_profile: no profile named',
+    });
   });
 });
 

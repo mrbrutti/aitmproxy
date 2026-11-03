@@ -3,9 +3,12 @@
 // Two rules this module exists to keep:
 //
 //   1. **What you see is what runs.** `scan.start` / `scan.map` carry `{ profile }` — the draft,
-//      whole and inline — and nothing else. The UI never sends `profile_name`, `target` or
+//      whole and inline — and nothing else. The editor never sends `profile_name`, `target` or
 //      `overrides`, so there are no partial-merge semantics to get wrong and an unsaved tweak runs
-//      exactly as it reads in the editor.
+//      exactly as it reads in the editor. The one other sender is Scan Again (Jobs view D13): a
+//      finished job's status names its profile and targets, so it re-runs as
+//      `scan.start { profile_name, overrides: { target: { origins } } }` — the engine resolves the
+//      name and merges the override; the status carries no profile body to send whole.
 //   2. **The core is the guard.** The confirm handshake is `beginGuarded`/`confirmGuarded` from
 //      `panels/l4/inject.ts`: this module surfaces what the core returns (a `needs_confirmation`
 //      prompt verbatim, a refusal classified but never softened, or the start result) and
@@ -26,7 +29,7 @@ import {
   originHost,
   profileHasL4,
 } from './helpers';
-import type { ScanErrorCode, ScanProfile, StartResult } from './model';
+import type { JobStatus, ScanErrorCode, ScanProfile, StartResult } from './model';
 import { parseScanError, parseStartResult } from './model';
 
 export type Call = <T = unknown>(tool: string, params?: Record<string, unknown>) => Promise<T>;
@@ -81,6 +84,34 @@ export async function confirmLaunch(
 ): Promise<LaunchOutcome> {
   const verb = LAUNCH_VERB[mode];
   return classify(verb, await confirmGuarded(call, verb, { profile }, token));
+}
+
+/* ------------------------------------------------------------------ Scan Again (Jobs view D13) */
+
+/** What Scan Again sends: the job's profile by name, run again against the job's own origins. */
+export interface ScanAgainArgs {
+  profile_name: string;
+  overrides: { target: { origins: string[] } };
+}
+
+/**
+ * `scan.start { profile_name, overrides: { target: { origins } } }` from a job's status. The
+ * name goes out verbatim (an empty one is the engine's `invalid_profile` to refuse, not ours to
+ * guess at) and `origins: []` is what a pure-L4 job sends (plan gap 32). Whether the job is
+ * finished is the caller's gate (`store.scanAgain`), as it is the Kit's.
+ */
+export function scanAgainArgs(st: JobStatus): ScanAgainArgs {
+  return { profile_name: st.profile_name, overrides: { target: { origins: [...st.targets] } } };
+}
+
+/** First phase of Scan Again: `scan.start` without `_confirm`, classified like any launch. */
+export async function beginScanAgain(call: Call, args: ScanAgainArgs): Promise<LaunchOutcome> {
+  return classify('scan.start', await beginGuarded(call, 'scan.start', { ...args }));
+}
+
+/** Second phase: the identical arguments carrying the reserved `_confirm` token. */
+export async function confirmScanAgain(call: Call, args: ScanAgainArgs, token: string): Promise<LaunchOutcome> {
+  return classify('scan.start', await confirmGuarded(call, 'scan.start', { ...args }, token));
 }
 
 /* ------------------------------------------------------------------ pre-flight (courtesy only) */

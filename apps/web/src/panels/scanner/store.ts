@@ -9,6 +9,8 @@
 //
 //   1. **What you see is what runs** (D-T8.5, W-12): `scan.start` / `scan.map` carry `{ profile }`
 //      and `scan.profile.save` carries the whole profile. There is no name/overrides merge here.
+//      The one exception is Scan Again (Jobs view D13): a finished job's status is re-run as
+//      `scan.start { profile_name, overrides: { target: { origins } } }`, built by `launch.ts`.
 //   2. **The core is the guard** (D-T8.6, W-15): a refusal is classified for its text and shown,
 //      never softened and never second-guessed. Nothing in this file decides whether a scan may
 //      run; `preflight` (launch.ts) only explains a dimmed button.
@@ -21,13 +23,17 @@ import type { AppStore } from '~/state/app';
 import { findingsState } from '~/panels/findings/state';
 import type { L4ScopeEntryWire } from '~/panels/l4/model';
 
-import { EMPTY_FILTER, emptyRecord, own, scanErrorText, type IssueFilter } from './helpers';
+import { EMPTY_FILTER, emptyRecord, isTerminal, own, scanErrorText, type IssueFilter } from './helpers';
 import {
   beginLaunch,
+  beginScanAgain,
   confirmLaunch as confirmLaunchCall,
+  confirmScanAgain,
+  scanAgainArgs,
   type Call,
   type LaunchMode,
   type LaunchOutcome,
+  type ScanAgainArgs,
 } from './launch';
 import { createLiveModel, type CancelResult, type LiveModel } from './live';
 import {
@@ -75,12 +81,19 @@ export interface ScanError {
   text: string;
 }
 
+/**
+ * Where a launch came from, held so the confirmed call re-sends the identical arguments: the
+ * editor's whole profile under `scan.start` / `scan.map`, or Scan Again's name + origins (D13).
+ */
+export type PendingConfirmSource =
+  | { kind: 'profile'; profile: ScanProfile; mode: LaunchMode }
+  | { kind: 'again'; args: ScanAgainArgs };
+
 /** The core's confirmation prompt, held with exactly what is needed to re-issue the launch. */
 export interface PendingConfirm {
   prompt: string;
   token: string;
-  mode: LaunchMode;
-  profile: ScanProfile;
+  source: PendingConfirmSource;
 }
 
 export interface ScanStore extends LiveModel {
@@ -151,6 +164,12 @@ export interface ScanStore extends LiveModel {
   ensureJobs(): Promise<void>;
   previewSession(origin: string): Promise<SessionProfile | null>;
   launch(profile: ScanProfile, mode: LaunchMode): Promise<LaunchOutcome>;
+  /**
+   * Scan Again (D13): `scan.start { profile_name, overrides: { target: { origins } } }` from the
+   * held status of `job`. Refused here, through `report('launch', …)`, only when no terminal
+   * status is held (`Select a finished job.`); everything else is the core's to refuse.
+   */
+  scanAgain(job: string): Promise<LaunchOutcome>;
   confirmLaunch(): Promise<LaunchOutcome>;
   cancelConfirm(): void;
   cancel(job: string): Promise<CancelResult>;
@@ -491,10 +510,10 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     setTabSignal('jobs');
   }
 
-  async function handle(outcome: LaunchOutcome, mode: LaunchMode, profile: ScanProfile): Promise<LaunchOutcome> {
+  async function handle(outcome: LaunchOutcome, source: PendingConfirmSource): Promise<LaunchOutcome> {
     switch (outcome.kind) {
       case 'confirm':
-        setPendingConfirm({ prompt: outcome.prompt, token: outcome.token, mode, profile });
+        setPendingConfirm({ prompt: outcome.prompt, token: outcome.token, source });
         return outcome;
       case 'started':
         await afterStart(outcome.result);
@@ -516,8 +535,36 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
 
   const call: Call = <T,>(tool: string, params?: Record<string, unknown>): Promise<T> => app.call<T>(tool, params);
 
+  /** The first call of either launch, from its source. */
+  const begin = (source: PendingConfirmSource): Promise<LaunchOutcome> =>
+    source.kind === 'again' ? beginScanAgain(call, source.args) : beginLaunch(call, source.mode, source.profile);
+
+  /** The confirming call: the same arguments `begin` sent, plus the token. */
+  const confirm = (source: PendingConfirmSource, token: string): Promise<LaunchOutcome> =>
+    source.kind === 'again'
+      ? confirmScanAgain(call, source.args, token)
+      : confirmLaunchCall(call, source.mode, source.profile, token);
+
   async function launch(profile: ScanProfile, mode: LaunchMode): Promise<LaunchOutcome> {
-    return guarded(async () => handle(await beginLaunch(call, mode, profile), mode, profile));
+    const source: PendingConfirmSource = { kind: 'profile', profile, mode };
+    return guarded(async () => handle(await begin(source), source));
+  }
+
+  /**
+   * Scan Again's one local gate is the Kit's: a status must be held and terminal. The refusal
+   * takes the same path as a core refusal (`report('launch', …)`), so the toast and `lastError`
+   * read `Select a finished job.`; nothing is sent. Scope, the tool and the L4 hint are the view's
+   * courtesy (`title`) and the core's guard, never second-guessed here.
+   */
+  async function scanAgain(job: string): Promise<LaunchOutcome> {
+    const held = live.status(job);
+    if (held === null || !isTerminal(held.state)) {
+      const message = 'Select a finished job.';
+      report('launch', message);
+      return { kind: 'refused', code: null, detail: message, message };
+    }
+    const source: PendingConfirmSource = { kind: 'again', args: scanAgainArgs(held) };
+    return guarded(async () => handle(await begin(source), source));
   }
 
   /**
@@ -531,12 +578,12 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     if (!pending) return { kind: 'malformed', message: 'no confirmation is pending' };
     setPendingConfirm(null);
     return guarded(async () => {
-      const outcome = await confirmLaunchCall(call, pending.mode, pending.profile, pending.token);
+      const outcome = await confirm(pending.source, pending.token);
       if (outcome.kind === 'refused' && outcome.code === 'confirm_required') {
         report('launch', outcome.message);
-        return handle(await beginLaunch(call, pending.mode, pending.profile), pending.mode, pending.profile);
+        return handle(await begin(pending.source), pending.source);
       }
-      return handle(outcome, pending.mode, pending.profile);
+      return handle(outcome, pending.source);
     });
   }
 
@@ -711,6 +758,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     ensureJobs,
     previewSession,
     launch,
+    scanAgain,
     confirmLaunch,
     cancelConfirm,
     loadIssue,
