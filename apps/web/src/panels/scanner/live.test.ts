@@ -295,6 +295,18 @@ describe('createLiveModel: failures', () => {
     expect(h.argsOf('scan.cancel')[0]).toEqual({ job: JOB });
   });
 
+  it('cancel_result_is_not_rewritten_by_a_later_read: the answer is a value, not a view of the store', async () => {
+    const h = harness();
+    const result = await h.m.cancel(JOB);
+    expect(result.ok && result.status.state).toBe('cancelling');
+
+    // A read that lands afterwards (the poll, a list-driven re-read) updates the held status only.
+    h.reply('scan.status', { ...raw('scan.status.json'), state: 'running', elapsed_ms: 43000 });
+    await h.m.refreshStatus(JOB);
+    expect(h.m.status(JOB)!.elapsed_ms).toBe(43000);
+    expect(result.ok && result.status.state).toBe('cancelling');
+  });
+
   it('cancel answers the refusal text instead of throwing when the verb refuses (A1)', async () => {
     const h = harness();
     h.fail('scan.cancel', 'scan: not_found: scan-1a2b3c4d');

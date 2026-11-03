@@ -226,11 +226,15 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
    * Monotonic (D-T8.3): a running job's reply that is older than what we hold is dropped whole —
    * not merged — because two reads in flight at once can land out of order. A terminal reply is the
    * last word and is always taken.
+   *
+   * The store keeps its own copy: Solid merges a later write into the object already held, so
+   * storing `next` itself would let a later read rewrite a reply the caller still holds (`cancel`
+   * answers with the parsed `cancelling` status).
    */
   function applyStatus(next: JobStatus): void {
     const held = own(statuses, next.job);
     if (held && isStale(held, next)) return;
-    setStatuses(next.job, next);
+    setStatuses(next.job, { ...next });
   }
 
   /**
