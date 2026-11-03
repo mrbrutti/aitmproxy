@@ -121,6 +121,69 @@ root, rustfmt the leaf file only if needed): (a) tests only, (b) production.
   ruling). Report "NNN ready <sha>" to the orchestrator; no self-merge.
 - **Done when:** no open Critical or Important finding; Minor fixed or accepted by Matt in the Review log.
 
+### Task 5: merge coherence with #308 and #313 (Amendment 2)
+
+- **Satisfies:** AC2 (amended), AC8, AC9 (AC9's proof is Task 6)
+- **Depends on:** the merge commit `76b99fa6` (origin/main `09553120`, which carries #308 and #313, merged into
+  the branch); one fresh Coder, one sitting
+- **Files:** `apps/mac/Sources/AitmproxyKit/EmbeddedCoreLaunch.swift` (modify: `harnessAuditLogFile` ~179, the
+  `// MARK: - Core pointer isolation` extension ~443),
+  `apps/mac/Sources/Aitmproxy/Bus/EmbeddedCore.swift` (modify: `spawn`, the `Config(...)` comment ~208 and the
+  env block ~228-240),
+  `apps/mac/Tests/AitmproxyKitTests/EmbeddedCoreLaunchTests.swift` (modify, append to `// MARK: Harness audit log`)
+- **Change:** exactly spec Amendment 2, nothing else:
+  - Design 2: `harnessAuditLogFile` takes its store branch from `SettingsDomain.overriddenStoreURL(environment:)`
+    (`store.appending(path: "audit.jsonl")`), no longer reading `APP_STORE` itself; the `APP_LIVE` non-empty
+    branch and the nil branch are unchanged.
+  - Design 5: in the core-pointer-isolation extension, `public static let auditLogEnvironmentKey = "AITM_AUDIT_LOG"`
+    beside `runDirEnvironmentKey`, and `public static func childEnvironment(_ environment: [String: String],
+    harnessAuditLogFile: URL?) -> [String: String]`: returns `environment` unchanged when the file is nil,
+    otherwise the same dictionary with `auditLogEnvironmentKey` removed. Doc comment says why (the core's
+    `env.rs` precedence; #313's goal, a different mechanism) and names AC8.
+  - Design 3 + 5 in `spawn`: bind `let harnessAuditLog = EmbeddedCoreLaunch.harnessAuditLogFile(environment:
+    ProcessInfo.processInfo.environment, workDir: workDir)` once, pass it as `auditLogFile:` (the `Config(...)`
+    argument stays where it is), and after the `AITM_RUN_DIR` block and before `process.environment = environment`
+    call `environment = EmbeddedCoreLaunch.childEnvironment(environment, harnessAuditLogFile: harnessAuditLog)`.
+    One comment block above the env block names the three store-following rules (settings suite =
+    `SettingsDomain.select`; run dir = `AITM_RUN_DIR = isolatedRunDir`, #308 unchanged, explicit non-empty
+    `AITM_RUN_DIR` still wins; audit log = `auditLogFile = harnessAuditLogFile` + the `AITM_AUDIT_LOG` removal)
+    and says both helpers hang off `overriddenStoreURL`. No other app-target change; no Rust change.
+- **Test:** Swift, in the `// MARK: Harness audit log` section:
+  - `child_environment_drops_an_inherited_audit_log_override_only_in_a_harness_run` (AC8): with
+    `let file = URL(fileURLWithPath: "/tmp/s/audit.jsonl")` and `let base = ["PATH": "/usr/bin", "RUST_LOG": "info"]`,
+    for each `v` in `["on", "off", "/x/audit.jsonl"]`: `childEnvironment(base.merging(["AITM_AUDIT_LOG": v]) { $1 },
+    harnessAuditLogFile: file) == base` (key gone, other keys identical); and
+    `childEnvironment(base.merging(["AITM_AUDIT_LOG": "on"]) { $1 }, harnessAuditLogFile: nil) ==
+    base.merging(["AITM_AUDIT_LOG": "on"]) { $1 }` (identical dictionary, key kept); `childEnvironment(base,
+    harnessAuditLogFile: file) == base` (nothing to drop); `EmbeddedCoreLaunch.auditLogEnvironmentKey == "AITM_AUDIT_LOG"`.
+  - `harness_audit_log_file_follows_the_harness_variables` (line ~909) keeps every expectation unchanged: it already
+    pins the store cases (`/tmp/Aitmproxy-dev-state-x/audit.jsonl`, store wins over `APP_LIVE`), so it is the AC2
+    regression guard across the `overriddenStoreURL` switch; the Coder adds no case to it.
+- **Red/green of record:** as Task 1: the Coder's sandbox Kit probe or app-target typecheck (the Overview recipe)
+  exits 0; the orchestrator's Terminal `cd WT/apps/mac && swift test --scratch-path
+  ~/Library/Developer/Aitmproxy/test-build --filter EmbeddedCoreLaunchTests` is the gate of record, red on the
+  tests-only commit (a), green on the production commit (b). Two commits by explicit path (`git add <file>`),
+  never `git add -A`.
+- **Done when:** both commits are on the branch, the Coder's report quotes the typecheck exit code, the
+  orchestrator's filtered `swift test` is green, the mac gate items of Task 2 are re-run green on the new head,
+  and the Task 4 panel has reviewed the Task 5 diff (its findings go in the Review log as `5`).
+
+### Task 6: live proof (AC9), orchestrator in the Terminal, not a Coder
+
+- **Satisfies:** AC9
+- **Depends on:** Task 5 (the Kit and app changes in the built bundle)
+- **Files:** none in the repo; evidence goes in the PR body
+- **Change (recipe):** the Task 3 recipe on the merged head with two additions: the proof script exports
+  `AITM_AUDIT_LOG=on` before `snap-dev.sh` (so the dev bundle's child would inherit it); after the core is up it
+  records the child's environment (`ps -E -p <core pid>` or `ps eww -p <core pid>`, filtered to
+  `AITM_AUDIT_LOG`/`AITM_RUN_DIR` only, never the whole line: the token must not be printed) showing no
+  `AITM_AUDIT_LOG` and `AITM_RUN_DIR=/tmp/Aitmproxy-dev-state-<tag>/run/cores`; `ls -la` of
+  `<store>/audit.jsonl`, `<store>/audit.agent.jsonl`, `<store>/audit.reads.jsonl` and of `<store>/run/cores/`
+  (one pointer file, the dev core's); `stat -f '%z %m'` of the real `audit.jsonl` identical before and after.
+  Stop and clean up as in Task 3.
+- **Done when:** the PR body shows the exported variable, the filtered child-env lines, the three store streams,
+  the `run/cores` listing, the identical before/after `stat` lines, and no token anywhere in the evidence.
+
 ## Review log
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
