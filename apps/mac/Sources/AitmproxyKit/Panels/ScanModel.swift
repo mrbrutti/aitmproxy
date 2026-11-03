@@ -642,7 +642,9 @@ struct ScanWire {
     // or a newline never reaches a row), then the text is cut to its field's cap, and a
     // sampled list is cut to the engine's own cap.
 
-    /// The engine's cap on `error_samples`, `skipped_samples`, `checks.running` and `targets`.
+    /// The engine's cap on `error_samples`, `skipped_samples`, `checks.running` and `targets`;
+    /// also held against `lanes.skipped`, `clamped` and the keys of `probes.by_lane`, which
+    /// the Jobs view draws one row per entry (fix 2.12a).
     static let listMax = 8
     /// The cap on an unknown vocabulary token, a profile name and a job id.
     static let tokenMax = 64
@@ -797,10 +799,16 @@ struct ScanWire {
         return value
     }
 
-    /// An object of whole numbers (`by_lane`); absent reads as empty.
+    /// An object of whole numbers (`by_lane`); absent reads as empty. Every value is
+    /// type-checked, then the first `listMax` keys in sorted order are kept (the parsed
+    /// object is a dictionary, so the wire order is gone; sorting makes the cut deterministic).
     func counts(_ key: String) throws -> [String: Int] {
         guard let value = try optionalObject(key)?.objectValue else { return [:] }
-        return try value.mapValues { try whole($0, key, "an object of whole numbers") }
+        let all = try value.mapValues { try whole($0, key, "an object of whole numbers") }
+        guard all.count > Self.listMax else { return all }
+        var kept: [String: Int] = [:]
+        for name in all.keys.sorted().prefix(Self.listMax) { kept[name] = all[name] }
+        return kept
     }
 
     func vocab<V: ScanVocabulary>(_ key: String) throws -> V {
@@ -1092,7 +1100,7 @@ extension ScanLaneReport {
         let wire = try ScanWire(json, as: "ScanLaneReport")
         requested = try wire.vocabs("requested")
         run = try wire.vocabs("run")
-        skipped = try wire.array("skipped").map { try ScanSkippedLane(json: $0) }
+        skipped = try wire.boundedArray("skipped").map { try ScanSkippedLane(json: $0) }
     }
 }
 
@@ -1218,7 +1226,7 @@ extension ScanJobStatus {
         l4 = try wire.optionalObject("l4").map { try ScanL4Counters(json: $0) }
         session = try wire.optionalObject("session").map { try ScanSessionStatus(json: $0) }
         lanes = try ScanLaneReport(json: wire.object("lanes"))
-        clamped = try wire.array("clamped").map { try ScanClamped(json: $0) }
+        clamped = try wire.boundedArray("clamped").map { try ScanClamped(json: $0) }
         error = try wire.optionalBoundedString("error", max: ScanWire.detailMax)
     }
 }
@@ -1238,7 +1246,7 @@ extension ScanStartResult {
         let wire = try ScanWire(json, as: "ScanStartResult")
         job = try wire.string("job")
         status = try ScanJobStatus(json: wire.object("status"))
-        clamped = try wire.array("clamped").map { try ScanClamped(json: $0) }
+        clamped = try wire.boundedArray("clamped").map { try ScanClamped(json: $0) }
         lanes = try ScanLaneReport(json: wire.object("lanes"))
         dryRun = try wire.optionalBool("dry_run")
     }

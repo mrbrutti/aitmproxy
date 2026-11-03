@@ -333,4 +333,46 @@ import Testing
         #expect(ScanFormat.jobsCaption(total: 1, running: 1) == "1 job · 1 running")
         #expect(ScanFormat.jobsCaption(total: 1200, running: 1000) == "1,200 jobs · 1,000 running")
     }
+
+    /// Fix 2.12a (PR 2 security Important): `paceEstimate` stays in `Double` until the
+    /// seconds-to-go are known to fit under the decoder's 2^53 ms ceiling and gives up
+    /// the estimate rather than trap, so a `scan.status` with in-range but enormous
+    /// counters (`done 1, scheduled 2^53, elapsed_ms 2^53`: a quotient past `Int.max`;
+    /// `done 1, scheduled 1e12, elapsed_ms 1e7`: seconds that fit but whose `× 1000`
+    /// overflows) renders every other counter word and no estimate. The tester's
+    /// ceiling case (`elapsedMs: 1`, `secondsToGo` 9,007,199,254,741) still renders.
+    @Test func paceEstimateGivesUpBeforeItWouldTrap() throws {
+        let ceiling = 9_007_199_254_740_992  // 2^53, `ScanWire.wholeNumberRange`'s top
+
+        // The quotient 8.1e28 is past `Int.max`: no pace, and the progress still says
+        // what it can.
+        #expect(ScanFormat.paceEstimate(done: 1, scheduled: ceiling, elapsedMs: ceiling) == nil)
+        let vast = ScanJobProgress(try F.progressFacts(
+            state: .running, phase: .auditing, elapsedMs: ceiling, edits: F.checks(done: 1, scheduled: ceiling)))
+        #expect(vast.estimateText == nil)
+        #expect(vast.estimateHelp == nil)
+        #expect(vast.checksToGoText == "9,007,199,254,740,991 checks to go")
+        #expect(vast.phaseLine == "1 of 9,007,199,254,740,992 checks")
+        #expect(vast.percentText == "0\u{00A0}%")
+
+        // 9.99e15 seconds fit an `Int`, but `× 1000` would overflow: no pace either.
+        #expect(ScanFormat.paceEstimate(done: 1, scheduled: 1_000_000_000_000, elapsedMs: 10_000_000) == nil)
+        let tall = ScanJobProgress(try F.progressFacts(
+            state: .running, phase: .auditing, elapsedMs: 10_000_000, edits: F.checks(done: 1, scheduled: 1_000_000_000_000)))
+        #expect(tall.estimateText == nil)
+        #expect(tall.estimateHelp == nil)
+        #expect(tall.checksToGoText == "999,999,999,999 checks to go")
+
+        // The tester's ceiling case still renders: the raw quotient is under the bound,
+        // the rounded-up second lands at 2^53 + 8 ms, inside `Int` and `elapsed(ms:)`.
+        let edge = try #require(ScanFormat.paceEstimate(done: 1, scheduled: ceiling, elapsedMs: 1))
+        #expect(edge.secondsToGo == 9_007_199_254_741)
+        #expect(ScanFormat.estimateText(edge) == "at this pace, about 2501999792:59:01 to go")
+        // One check per millisecond less: the same bound from below, as a progress.
+        let edgeProgress = ScanJobProgress(try F.progressFacts(
+            state: .running, phase: .auditing, elapsedMs: 1, edits: F.checks(done: 1, scheduled: ceiling)))
+        #expect(edgeProgress.estimateText == "at this pace, about 2501999792:59:01 to go")
+        #expect(edgeProgress.estimateHelp == "Derived from the counters: 1 check done in 0:00, "
+                + "about 1,000 checks per second, 9,007,199,254,740,991 to go.")
+    }
 }

@@ -991,7 +991,10 @@ final class ScanPanelState {
     /// non-terminal to terminal since it was last seen, post the one VoiceOver
     /// announcement (`ScanFormat.endAnnouncement`) and write one `announce:` line to
     /// the unified log, the observable the live proof counts (AC29; the app has no
-    /// command recorder). A job first seen already finished is never announced.
+    /// command recorder). The line carries the job id as public, which is what the
+    /// proof counts, and the announcement text as private: it names the engagement's
+    /// target host, which must not land in `log show` or a sysdiagnose (fix 2.12a).
+    /// A job first seen already finished is never announced.
     private func announceIfEnded() {
         guard let job = surface.selectedJob, let facts = surface.facts(for: job) else { return }
         let state = facts.summary.state
@@ -1003,7 +1006,7 @@ final class ScanPanelState {
             element: NSApp as Any,
             notification: .announcementRequested,
             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
-        Self.scanLog.info("announce: \(text, privacy: .public)")
+        Self.scanLog.info("announce: \(facts.job, privacy: .public) \(text, privacy: .private)")
     }
 
     /// Takes a status line down after a while, and only while it is still the line

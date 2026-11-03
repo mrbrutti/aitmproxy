@@ -1219,4 +1219,53 @@ extension ScanModelTests {
         members.removeValue(forKey: "job")
         #expect(throws: BusError.self) { try ScanJobStatus(json: .object(members)) }
     }
+
+    /// Fix 2.12a (PR 2 security minor): `lanes.skipped`, `clamped` (on a status and on a
+    /// start result) and `probes.by_lane` are cut to the engine's cap of 8 at decode like
+    /// every other list (`ScanWire.listMax`), so a hostile core cannot draw ten thousand
+    /// notice rows or run the Notices de-dup over them. `by_lane` keeps its first eight
+    /// keys in sorted order: the parser's object is a Swift dictionary, so wire order is
+    /// not available. The Notices list still de-duplicates against the launch's notices.
+    @Test func skippedClampedAndByLaneAreBoundedAtDecode() throws {
+        let nineSkipped = JSONValue.array((0..<9).map { i in .object(["lane": "ws", "reason": .string("r\(i)")]) })
+        let nineClamped = JSONValue.array((0..<9).map { i in
+            .object(["field": .string("f\(i)"), "requested": 9, "applied": .number(Double(i))])
+        })
+        var nineLanes: [String: JSONValue] = [:]
+        for i in 0..<9 { nineLanes["lane\(i)"] = .number(Double(i)) }
+
+        var status = try ScanPack.load("scan.status.json")
+        status = ScanPack.edited(status, path: ["lanes", "skipped"], to: nineSkipped)
+        status = ScanPack.edited(status, path: ["clamped"], to: nineClamped)
+        status = ScanPack.edited(status, path: ["probes", "by_lane"], to: .object(nineLanes))
+        let decoded = try ScanJobStatus(json: status)
+        #expect(decoded.lanes.skipped.count == 8)
+        #expect(decoded.lanes.skipped.first == ScanSkippedLane(lane: .ws, reason: "r0"))
+        #expect(decoded.lanes.skipped.last == ScanSkippedLane(lane: .ws, reason: "r7"))
+        #expect(decoded.clamped.count == 8)
+        #expect(decoded.clamped.last == ScanClamped(field: "f7", requested: 9, applied: 7))
+        #expect(decoded.probes.byLane.count == 8)
+        #expect(decoded.probes.byLane.keys.sorted() == (0..<8).map { "lane\($0)" })
+        #expect(decoded.probes.byLane["lane7"] == 7)
+        #expect(decoded.probes.byLane["lane8"] == nil)
+
+        var start = try ScanPack.load("scan.start.json")
+        start = ScanPack.edited(start, path: ["clamped"], to: nineClamped)
+        start = ScanPack.edited(start, path: ["lanes", "skipped"], to: nineSkipped)
+        let started = try ScanStartResult(json: start)
+        #expect(started.clamped.count == 8)
+        #expect(started.clamped.last == ScanClamped(field: "f7", requested: 9, applied: 7))
+        #expect(started.lanes.skipped.count == 8)
+
+        // Eight clamped and eight skipped lines, two of them already spelled out by the
+        // launch: sixteen lines, the launch's first, nothing twice.
+        let notices = ScanEndText.notices(decoded, launchNotices: ["Clamped f0 9 → 0", "Skipped ws: r3"])
+        #expect(notices.count == 16)
+        #expect(notices[0] == "Clamped f0 9 → 0")
+        #expect(notices[1] == "Skipped ws: r3")
+        #expect(notices[2] == "Clamped f1 9 → 1")
+        #expect(notices[9] == "Skipped ws: r0")
+        #expect(notices.last == "Skipped ws: r7")
+        #expect(Set(notices).count == 16)
+    }
 }

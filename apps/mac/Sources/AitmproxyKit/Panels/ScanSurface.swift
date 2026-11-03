@@ -867,12 +867,19 @@ public struct ScanJobProgress: Equatable, Sendable {
 extension ScanFormat {
     /// `checks.done` over the elapsed time (Jobs view D8 amendment); nil when no rate can
     /// be derived: `elapsedMs <= 0`, `done <= 0` (rate 0), `scheduled <= 0` or
-    /// `done >= scheduled`. The caller limits it to a running audit.
+    /// `done >= scheduled`, and nil when the seconds to go would not fit under the
+    /// decoder's 2^53 ms ceiling (`ScanWire.wholeNumberRange`): the arithmetic stays in
+    /// `Double` until the value is known to fit, and gives up the estimate rather than
+    /// trap on `Int(Double)` or on `secondsToGo * 1000` (fix 2.12a). The bound is
+    /// checked on the raw quotient, so the rounded-up second is at most 2^53 + 1000 ms,
+    /// inside `Int` and inside what `elapsed(ms:)` prints. The caller limits it to a
+    /// running audit.
     public static func paceEstimate(done: Int, scheduled: Int, elapsedMs: Int) -> ScanPace? {
         guard elapsedMs > 0, done > 0, scheduled > 0, done < scheduled else { return nil }
         let checksPerSecond = Double(done) / (Double(elapsedMs) / 1000)
-        let secondsToGo = Int((Double(scheduled - done) / checksPerSecond).rounded(.up))
-        return ScanPace(secondsToGo: secondsToGo, checksPerSecond: checksPerSecond)
+        let seconds = Double(scheduled - done) / checksPerSecond
+        guard seconds <= Double(ScanWire.wholeNumberRange.upperBound) / 1000 else { return nil }
+        return ScanPace(secondsToGo: Int(seconds.rounded(.up)), checksPerSecond: checksPerSecond)
     }
 
     /// `3,232 checks to go` / `1 check to go`; nil when nothing is scheduled or nothing is left.
