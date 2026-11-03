@@ -229,18 +229,20 @@ import Testing
         let ceiling = 9_007_199_254_740_992  // 2^53, `ScanWire.wholeNumberRange`'s top
 
         // done past scheduled: nothing to go and no pace, as the guards say; the fraction
-        // follows the counters past 1.
+        // is clamped at 1 (D8 types it 0…1), so the ring and the percent never overshoot
+        // while the phase line still quotes the counters as sent (fix 2.11b).
         let over = ScanJobProgress(try F.progressFacts(
             state: .running, phase: .auditing, edits: F.checks(done: 7000, scheduled: 6468)))
         #expect(over.checksToGoText == nil)
         #expect(over.estimateText == nil)
         #expect(over.phaseLine == "7,000 of 6,468 checks")
-        withKnownIssue(
-            "Jobs view Task 2.11 finding (Minor): D8 types `fraction` as 0…1 and says `percentText` reads `100 %` only when done == scheduled; a core reporting done > scheduled is not clamped (fraction 1.08, `108 %`). Architect to rule: clamp in the Kit, or amend D8."
-        ) {
-            #expect(over.fraction.map { $0 <= 1 } == true, "fraction \(over.fraction ?? -1)")
-            #expect(over.percentText == "100\u{00A0}%", "percent \(over.percentText ?? "nil")")
-        }
+        #expect(over.fraction == 1, "fraction \(over.fraction ?? -1)")
+        #expect(over.percentText == "100\u{00A0}%", "percent \(over.percentText ?? "nil")")
+        #expect(over.ring == .determinate(1))
+        // The same counters on a finished job: the dimmed ring is full, not past full.
+        let overDone = ScanJobProgress(try F.progressFacts(
+            state: .done, phase: .done, edits: F.checks(done: 7000, scheduled: 6468)))
+        #expect(overDone.ring == .finished(1))
 
         // The ceiling, end to end: grouped, no overflow, no crash.
         let huge = try F.progressFacts(

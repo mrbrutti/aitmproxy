@@ -2361,6 +2361,13 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.estimateText(pace) == "at this pace, about 1:04 to go")
         #expect(ScanFormat.estimateHelp(done: 3236, elapsedMs: 64_000, pace: pace, toGo: 3232)
                 == "Derived from the counters: 3,236 checks done in 1:04, about 51 checks per second, 3,232 to go.")
+        // A fast engine: the rate is grouped like every other number in the sentence (fix 2.11b).
+        let fast = try #require(ScanFormat.paceEstimate(done: 500_000, scheduled: 600_000, elapsedMs: 100_000))
+        #expect(abs(fast.checksPerSecond - 5000) < 0.001)
+        #expect(fast.secondsToGo == 20)
+        #expect(ScanFormat.estimateText(fast) == "at this pace, about 0:20 to go")
+        #expect(ScanFormat.estimateHelp(done: 500_000, elapsedMs: 100_000, pace: fast, toGo: 100_000)
+                == "Derived from the counters: 500,000 checks done in 1:40, about 5,000 checks per second, 100,000 to go.")
 
         #expect(ScanFormat.paceEstimate(done: 0, scheduled: 6468, elapsedMs: 10_000) == nil, "rate 0")
         #expect(ScanFormat.paceEstimate(done: 3236, scheduled: 6468, elapsedMs: 0) == nil, "no elapsed time")

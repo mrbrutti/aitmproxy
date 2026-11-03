@@ -845,10 +845,12 @@ public struct ScanJobProgress: Equatable, Sendable {
         ScanFormat.grouped(checks.done) + " of " + ScanFormat.plural(checks.scheduled, "check", grouped: true)
     }
 
-    /// `done / total` when `total > 0`; nil otherwise.
+    /// `done / total` when `total > 0`, clamped at 1 so a core reporting `done` past
+    /// `scheduled` never overshoots the ring, the lane or `percentText` (D8 types the
+    /// fraction 0…1); nil otherwise. The phase line still quotes the counters as sent.
     private static func fraction(of done: Int, over total: Int) -> Double? {
         guard total > 0 else { return nil }
-        return Double(done) / Double(total)
+        return min(1, Double(done) / Double(total))
     }
 
     private static func nowLine(_ running: [String]) -> String? {
@@ -889,7 +891,8 @@ extension ScanFormat {
     /// check per second` when it rounds to 0.
     public static func estimateHelp(done: Int, elapsedMs: Int, pace: ScanPace, toGo: Int) -> String {
         let rate = Int(pace.checksPerSecond.rounded())
-        let rateWords = rate == 0 ? "fewer than 1 check per second" : "about \(plural(rate, "check")) per second"
+        let rateWords =
+            rate == 0 ? "fewer than 1 check per second" : "about \(plural(rate, "check", grouped: true)) per second"
         return "Derived from the counters: \(plural(done, "check", grouped: true)) done in \(elapsed(ms: elapsedMs)), "
             + "\(rateWords), \(grouped(toGo)) to go."
     }
