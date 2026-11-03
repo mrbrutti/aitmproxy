@@ -2843,8 +2843,8 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.WellKey.certainFirmTentative == "Certain · Firm · Tentative")
         #expect(ScanFormat.WellKey.probeErrors == "Probe errors · timeouts · rate waits")
         #expect(ScanFormat.WellKey.checks == "Checks scheduled · done · errors · skipped")
-        #expect(ScanFormat.WellKey.all.count == 18)
-        #expect(Set(ScanFormat.WellKey.all).count == 18, "every key is distinct")
+        #expect(ScanFormat.WellKey.all.count == 23)
+        #expect(Set(ScanFormat.WellKey.all).count == 23, "every key is distinct")
         #expect(ScanFormat.pointSkipWords(ScanPointCounters.Skipped(ignored: 6, frequent: 722, limit: 0))
                 == ["722 skipped as repetitive", "6 skipped by rule", "0 skipped at the per-request cap"])
         #expect(ScanFormat.pointSkipWords(ScanPointCounters.Skipped(ignored: 1200, frequent: 0, limit: 3))
@@ -2855,6 +2855,55 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.scanAgainHelpGeneric == "Start a new job with this job's profile and target")
         #expect(ScanFormat.showIssuesHelp == "Open the Issues tab filtered to this job")
         #expect(ScanFormat.showSiteMapHelp == "Open the Site map tab for this job")
+    }
+
+    /// Jobs view D11 *Wells* (plan gap 34g): the Crawl well's conditional rows have
+    /// their words in the Kit. One key per L4 counter (rows the view shows only when the
+    /// status carries `l4`); the session canary word (`ok` for a flow canary, `off` for
+    /// none, so `reused · lost · canary · browser partial` reads `yes · no · ok · no` for
+    /// the fixture); and the skipped-lane row (`Lane skipped` → `WebSocket: lane not
+    /// available on this build`, the lane's word rather than the notice's raw `ws`).
+    /// Totalising choices (Task 2.9): four L4 rows rather than one compound row; `off`
+    /// as the canary's negative (the Kit's `Auth-lost detection off`); `: ` between the
+    /// lane word and the engine's reason; the Part 2 panel confirms or amends.
+    @Test func wellWordsForSkippedLanesSessionAndL4() throws {
+        typealias Key = ScanFormat.WellKey
+        #expect(Key.laneSkipped == "Lane skipped")
+        #expect(Key.l4Cases == "L4 cases")
+        #expect(Key.l4Crashes == "L4 crashes")
+        #expect(Key.l4LivenessFailures == "L4 liveness failures")
+        #expect(Key.l4RetiredElements == "L4 retired elements")
+        // The wells' order: the skipped-lane row follows Lanes; the L4 rows close the Crawl well.
+        #expect(Key.all == [
+            Key.pagesFetched, Key.pagesWaiting, Key.depth, Key.formsSubmitted, Key.formsNotSubmitted, Key.crawlErrors,
+            Key.pointsFound, Key.waitingForAudit, Key.audited, Key.lanes, Key.laneSkipped, Key.probesByLane, Key.session,
+            Key.l4Cases, Key.l4Crashes, Key.l4LivenessFailures, Key.l4RetiredElements,
+            Key.criticalHighMedium, Key.low, Key.info, Key.certainFirmTentative, Key.probeErrors, Key.checks,
+        ])
+
+        #expect(ScanFormat.canaryWord(.flow(method: "GET", path: "/account", expectedStatus: 200)) == "ok")
+        #expect(ScanFormat.canaryWord(.flow(method: "HEAD", path: "/me", expectedStatus: nil)) == "ok")
+        #expect(ScanFormat.canaryWord(.none) == "off")
+        let status = try ScanJobStatus(json: Self.load("scan.status.json"))
+        let session = try #require(status.session)
+        let sessionCells = [ScanFormat.yesNo(session.reused), ScanFormat.yesNo(session.lost),
+                            ScanFormat.canaryWord(session.canary), ScanFormat.yesNo(session.browserPartial)]
+        #expect(sessionCells == ["yes", "no", "ok", "no"])
+
+        let skipped = ScanSkippedLane(lane: .ws, reason: "lane not available on this build")
+        #expect(ScanFormat.skippedLaneWords(skipped) == "WebSocket: lane not available on this build")
+        #expect(ScanFormat.skippedLaneWords(ScanSkippedLane(lane: .l4Stream, reason: "no L4 scope entry")) == "L4 stream: no L4 scope entry")
+        #expect(ScanFormat.skippedLaneWords(ScanSkippedLane(lane: .other("quic"), reason: "x")) == "quic: x")
+        #expect(status.lanes.skipped.map(ScanFormat.skippedLaneWords) == ["WebSocket: lane not available on this build"])
+
+        // The L4 counters are optional on the wire: absent in the fixture, four grouped
+        // values when a status carries them.
+        #expect(status.l4 == nil)
+        let withL4 = try ScanJobStatus(json: ScanPack.edited(
+            Self.load("scan.status.json"), path: ["l4"],
+            to: ["cases": 1024, "crashes": 0, "liveness_failures": 2, "retired_elements": 7]))
+        let l4 = try #require(withL4.l4)
+        #expect([l4.cases, l4.crashes, l4.livenessFailures, l4.retiredElements].map(ScanFormat.grouped) == ["1,024", "0", "2", "7"])
     }
 
     /// AC28 (Jobs view D14): the row's one-sentence label, the lane's value, the
@@ -2946,6 +2995,8 @@ extension ScanSurfaceTests {
             ScanFormat.scaleElapsed(ms: 64_000), ScanFormat.elapsedWords(ms: 3_723_000),
             ScanFormat.severityWords(by: .zero, running: true), ScanFormat.severityWords(by: .zero, running: false),
             ScanFormat.issuesSoFar(by: .zero), scanNoJobsText, scanSelectJobText,
+            ScanFormat.canaryWord(.none), ScanFormat.canaryWord(.flow(method: "GET", path: "/account", expectedStatus: 200)),
+            ScanFormat.skippedLaneWords(ScanSkippedLane(lane: .ws, reason: "lane not available on this build")),
         ] + ScanFormat.pointSkipWords(ScanPointCounters.Skipped(ignored: 6, frequent: 722, limit: 0))
         for reason in [ScanStoppedReason.budget, .time, .cancelled, .sessionLost, .errors, .policy, .guardRefused, .failed, .other("paused")] {
             strings.append(ScanEndText.stoppedReason(reason, state: .done, probesBudget: 2000, error: nil) ?? "")

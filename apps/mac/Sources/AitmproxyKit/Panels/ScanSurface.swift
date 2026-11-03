@@ -1587,6 +1587,12 @@ public enum ScanFormat {
         "Skipped \(skipped.lane.rawValue): \(skipped.reason)"
     }
 
+    /// `WebSocket: lane not available on this build`: the Crawl well's `Lane skipped`
+    /// row (Jobs view D11), the lane's word before the engine's reason.
+    public static func skippedLaneWords(_ skipped: ScanSkippedLane) -> String {
+        "\(skipped.lane.word): \(skipped.reason)"
+    }
+
     /// A timing-evidence double: up to three fraction digits, no grouping, `.` as the
     /// decimal mark whatever the locale (`0.857`, `2`).
     public static func number(_ value: Double) -> String {
@@ -1764,6 +1770,15 @@ public enum ScanFormat {
         }
     }
 
+    /// `ok` when a canary flow guards the session, `off` when there is none: the
+    /// Crawl well's Session cell (`reused · lost · canary · browser partial`, Jobs view D11).
+    public static func canaryWord(_ canary: ScanCanary) -> String {
+        switch canary {
+        case .flow: "ok"
+        case .none: "off"
+        }
+    }
+
     /// `1 endpoint` / `3 endpoints`; with `grouped`, `6,468 checks` (the end-state
     /// sentences, Jobs view D4). The one singular rule.
     public static func plural(_ n: Int, _ noun: String, grouped: Bool = false) -> String {
@@ -1868,8 +1883,15 @@ extension ScanFormat {
         public static let waitingForAudit = "Waiting for audit"
         public static let audited = "Audited"
         public static let lanes = "Lanes"
+        /// One row per `lanes.skipped` entry, valued by `skippedLaneWords`.
+        public static let laneSkipped = "Lane skipped"
         public static let probesByLane = "Probes by lane"
         public static let session = "Session"
+        /// The L4 lanes' own counters, one row each; shown only when the status carries `l4`.
+        public static let l4Cases = "L4 cases"
+        public static let l4Crashes = "L4 crashes"
+        public static let l4LivenessFailures = "L4 liveness failures"
+        public static let l4RetiredElements = "L4 retired elements"
         public static let criticalHighMedium = "Critical · High · Medium"
         public static let low = "Low"
         public static let info = "Info"
@@ -1880,8 +1902,9 @@ extension ScanFormat {
         /// Every key, in the wells' order.
         public static let all = [
             pagesFetched, pagesWaiting, depth, formsSubmitted, formsNotSubmitted, crawlErrors, pointsFound,
-            waitingForAudit, audited, lanes, probesByLane, session, criticalHighMedium, low, info,
-            certainFirmTentative, probeErrors, checks,
+            waitingForAudit, audited, lanes, laneSkipped, probesByLane, session, l4Cases, l4Crashes,
+            l4LivenessFailures, l4RetiredElements, criticalHighMedium, low, info, certainFirmTentative,
+            probeErrors, checks,
         ]
     }
 
