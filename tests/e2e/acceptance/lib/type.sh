@@ -12,13 +12,15 @@
 #        type.sh --probe               keystroke a single "1" (focus probe; no Return) — read it
 #                                      back with ax_texts.sh, then clear it with --clear
 #        type.sh --clear               ⌘A then Delete in the focused field
+#        type.sh --escape              one Escape (closes an attached sheet; an attached sheet makes
+#                                      AppKit refuse the app's quit — -128 "User canceled")
 # Refuses when the app is not running, when more than one Aitmproxy process exists (a dev bundle),
 # or when ACCEPT_WINDOW=1 (the orchestrator's display-lock window) is not set.
 set -euo pipefail
 mode="${1:-}"
 with_return=1
 if [ "$mode" = --no-return ]; then with_return=0; mode="${2:-}"; fi
-[ -n "$mode" ] || { echo "usage: type.sh \"<text>\" | --no-return \"<text>\" | --probe | --clear" >&2; exit 2; }
+[ -n "$mode" ] || { echo "usage: type.sh \"<text>\" | --no-return \"<text>\" | --probe | --clear | --escape" >&2; exit 2; }
 pgrep -f '^/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy' >/dev/null || { echo "refused: the installed Aitmproxy is not running" >&2; exit 3; }
 [ "$(pgrep -f 'Aitmproxy.app/Contents/MacOS/Aitmproxy' | wc -l | tr -d ' ')" = 1 ] || { echo "refused: more than one Aitmproxy process (a dev bundle is running)" >&2; exit 3; }
 [ "${ACCEPT_WINDOW:-0}" = 1 ] || { echo "refused: ACCEPT_WINDOW=1 (the orchestrator's display-lock window) is not set" >&2; exit 3; }
@@ -38,6 +40,11 @@ case "$mode" in
     front
     osascript -e 'tell application "System Events" to keystroke "a" using command down' -e 'tell application "System Events" to key code 51'
     echo "cleared the field"
+    ;;
+  --escape)
+    front
+    osascript -e 'tell application "System Events" to key code 53'
+    echo "pressed Escape"
     ;;
   *)
     saved="$(pbpaste 2>/dev/null || true)"

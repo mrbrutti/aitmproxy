@@ -66,7 +66,7 @@ WINDOW = window_open()
 HOSTS = ("example.com:80", "httpbin.org:443")
 N1_HOST = "acceptance-n1.invalid:443"
 EXPECTED_STEPS = (
-    "MAC-0", "MAC-1", "MAC-2", "MAC-3", "MAC-4", "MAC-5", "MAC-6", "MAC-7", "MAC-8", "MAC-9a", "MAC-9b",
+    "MAC-0", "MAC-1", "MAC-2", "MAC-3", "MAC-4", "MAC-5", "MAC-5b", "MAC-6", "MAC-7", "MAC-8", "MAC-9a", "MAC-9b",
     "MAC-10", "MAC-11", "MAC-12", "MAC-13", "MAC-14", "MAC-15", "MAC-16",
     "N1-MAC", "N2-MAC", "N3-MAC", "N4-MAC", "N5-MAC",
 )
@@ -154,6 +154,18 @@ def open_scope_sheet() -> bool:
         if has_text_field(dump, SCOPE_FIELD_ID):
             return True
     return False
+
+
+def dismiss_scope_sheet() -> bool:
+    """Close the Edit Scope sheet if it is up (gated `type.sh --escape`, twice at most) and confirm the
+    sheet field `scope-add-host` is gone. Why: an attached sheet makes AppKit refuse the app's quit
+    (spec Review log 2026-11-03); adds apply over the bus as typed, so nothing is lost."""
+    for _ in range(2):
+        if not has_text_field(ax(), SCOPE_FIELD_ID):
+            return True
+        sh("bash", os.path.join(LIB, "type.sh"), "--escape")
+        time.sleep(0.8)
+    return not has_text_field(ax(), SCOPE_FIELD_ID)
 
 
 def click_scope_field() -> bool:
@@ -311,6 +323,15 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         rows = [r for r in audit_tail(200) if r.get("command") == "scope.add" and r.get("result") == "ok" and r.get("at", 0) >= t0]
         ok5 = len(listed) == len(targets) and len(shown) == len(targets) and not pend and not err
         step("MAC-5", "PASS" if ok5 else "FAIL", f"typed {targets}" + (f" (already in Scope before: {pre})" if pre else "") + f"; rows shown {shown}; pending words {pend}; status-bar error {err}", f"scope.list now {sc2}; audit scope.add ok since start: {len(rows)}")
+    sheet_opened = WINDOW and "MAC-5" in YES and has_text_field(ax(), SCOPE_FIELD_ID) if WINDOW else False
+    if sheet_opened and not dismiss_scope_sheet():
+        step("MAC-5b", "FAIL", "the Edit Scope sheet is still attached after Escape (scope-add-host present); a quit would be refused (-128)", explains="card task_15c30fb3 (quit ends open sheets)")
+    elif sheet_opened:
+        step("MAC-5b", "PASS", "Escape closed the Edit Scope sheet (scope-add-host gone); the adds stay listed", f"scope.list {bus.call('scope.list', {})}")
+    elif WINDOW:
+        step("MAC-5b", "SKIP", "no Edit Scope sheet was open after MAC-5")
+    else:
+        step("MAC-5b", "SKIP", "needs the window (MAC-5 did not open the sheet)")
 
     before_sc, before_svc = scutil(), service_state()
     set_by_us = False
@@ -573,6 +594,14 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                     for h in added:
                         if h not in done:
                             append_leftover(OUT, h, f"failed ({type(e).__name__}: {str(e)[:60]})", "mac")
+        # Last UI action of the run: the Scope cleanup (Proxy ▸ Scope… on the Scope page opens the
+        # sheet since #322) and N1-MAC may have left the Edit Scope sheet attached; never end with one.
+        if WINDOW:
+            try:
+                if not dismiss_scope_sheet():
+                    step("SHEET", "FAIL", "the Edit Scope sheet is still attached at the end of the run; the app's quit would be refused (-128)", explains="card task_15c30fb3 (quit ends open sheets)")
+            except Exception:  # noqa: BLE001 — the report must still finish
+                pass
         if set_by_us:
             print("== restore trap: MAC-6 set the system proxy and MAC-15 did not restore it; Restore via the app, then replay the recorded state", flush=True)
             try:
