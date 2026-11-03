@@ -43,6 +43,18 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+/// What a masked value is replaced by, everywhere in this module.
+///
+/// Readers of scrubbed text key on this exact spelling. The one outside this
+/// crate is `scripts/bundled/active/check-nosqli-json.rhai`, which refuses to
+/// rebuild a JSON document that holds the mask where a value should be; Rhai
+/// cannot read a Rust constant, so that spelling is pinned instead by
+/// `crates/aitm-scan-checks-http/tests/rhai_new_scripts.rs` and
+/// `crates/aitm/tests/rhai_nosqli_production_parser.rs`, which build their
+/// examples by running [`scrub_text_wide`] over a plain body. Reword this and
+/// those go red.
+pub const MASK: &str = "[redacted]";
+
 /// Substrings that mark an argument *key* as carrying a secret (matched
 /// case-insensitively, as a substring, so `X-Api-Key`, `access_token`,
 /// `set-cookie`, `JSESSIONID`, and `ASP.NET_SessionId` are all caught). These are
@@ -571,7 +583,7 @@ fn mask_secret_pairs(text: &str, reading: Reading) -> String {
         // `value_end` is a quote, a delimiter, a whitespace char, or the end of the
         // text, so both are char boundaries.
         out.push_str(&text[copied..value_start]);
-        out.push_str("[redacted]");
+        out.push_str(MASK);
         copied = value_end;
         masked_to = value_end + usize::from(closer.is_some());
         // Resume inside the masked value, so a secret pair that begins there is
@@ -596,6 +608,35 @@ mod tests {
                 (actual != expected).then_some((input, expected, actual))
             })
             .collect()
+    }
+
+    /// One spelling of the mask, in one place. The `key=value` pass writes
+    /// [`MASK`] itself; a regex replacement template cannot interpolate a
+    /// constant, so the two literals in [`patterns`] are checked against it
+    /// here instead. Everything downstream that reads scrubbed text keys on
+    /// this exact string — including the bundled
+    /// `check-nosqli-json.rhai`, which refuses a JSON body that holds the mask
+    /// where a value should be.
+    #[test]
+    fn every_pass_masks_with_the_one_token() {
+        assert_eq!(MASK, "[redacted]");
+        for (pattern, template) in patterns() {
+            assert!(
+                template.ends_with(MASK),
+                "`{}` replaces with `{template}`, not `{MASK}`",
+                pattern.as_str()
+            );
+        }
+        assert_eq!(
+            scrub_text(r#"{"password":"hunter2"}"#),
+            format!(r#"{{"password":"{MASK}"}}"#)
+        );
+        // The shape the script's bare-mask guard exists for: a secret-named
+        // field whose value was not quoted loses the quotes with the value.
+        assert_eq!(
+            scrub_text_wide(r#"{"user":"a","api_key":12345}"#),
+            format!(r#"{{"user":"a","api_key":{MASK}}}"#)
+        );
     }
 
     #[test]
