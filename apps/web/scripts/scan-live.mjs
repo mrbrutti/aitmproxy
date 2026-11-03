@@ -655,6 +655,11 @@ async function run() {
       const after = await status(jobId);
       return { label, before: before.probes?.sent ?? null, rendered, after: after.probes?.sent ?? null };
     };
+    // The crawl sends no probes, and under `--latency-ms 400` it outlasts the 2 s between the
+    // brackets (runs 2-3 read 0 -> 0 with the witness at 0 as well): wait for the witness's first
+    // probe, then bracket.
+    const probing = await soft(async () => (((await status(jobId)).probes?.sent ?? 0) > 0 ? true : null), 60000);
+    if (!probing) note('03 probes', 'the witness sent no probe within 60 s; the brackets read the crawl');
     const a = await bracket('a');
     await sleep(2000);
     const b = await bracket('b');
@@ -828,7 +833,8 @@ async function run() {
     // The cancel is proven on a SECOND standard job against the same origin, so the first must be
     // over: the engine admits one job per origin (`scan: busy`), and a debug-build core takes
     // ~30 s for a standard scan of the test target.
-    // With `--latency-ms 400` on the target a standard job runs ~2 min (the mac driver's measure).
+    // With `--latency-ms 400` on the target a standard job runs ~11 min on this harness (see
+    // FIRST_JOB_WAIT_MS); the mac driver measured ~2 min against its own target.
     const settledAt = Date.now();
     const first = await soft(async () => (TERMINAL.has((await status(jobId)).state) ? true : null), FIRST_JOB_WAIT_MS);
     if (!first) {
@@ -1268,7 +1274,10 @@ const RUN_DIR = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'aitm-scan-live
 const FINDINGS_DIR = join(RUN_DIR, 'findings');
 mkdirSync(FINDINGS_DIR, { recursive: true });
 /** Step 05's wait for the first standard job: ~2 min with the 400 ms target latency. */
-const FIRST_JOB_WAIT_MS = TARGET_LATENCY_MS > 0 ? 300000 : 120000;
+// With `--latency-ms 400` the release core sends ~3 probes/s against the standard budget of 2,000
+// (step 03's NOTE: 59 probes ~20 s into the audit), so a standard job runs ~11 min here; runs 2-3
+// were still `running` at the old 300 s.
+const FIRST_JOB_WAIT_MS = TARGET_LATENCY_MS > 0 ? 900000 : 120000;
 /** The dead port of step 11: picked free (in the try below), never listened on, in scope from the start (AC58 (c)). */
 let DEAD_PORT = null;
 let DEAD_HOST = null;
