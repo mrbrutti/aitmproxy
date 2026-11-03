@@ -54,12 +54,13 @@ import Testing
         // Spec Constraints: the Apple event handler is registered inside `applicationDidFinishLaunching`
         // (after AppKit installed its own, before `setActivationPolicy`); registered earlier, AppKit's
         // later installation would replace it and the Apple event route would silently go back to a
-        // refused quit. `applicationWillFinishLaunching` is named in a comment, so pin the `func`.
+        // refused quit. The handler is registered exactly once, so the one `kAEQuitApplication` pinned
+        // between those two offsets is the only registration and none can reappear elsewhere.
         let didFinish = try Self.offset(of: "func applicationDidFinishLaunching(", in: app)
         let registration = try Self.offset(of: "kAEQuitApplication", in: app)
         let activation = try Self.offset(of: "NSApp.setActivationPolicy(.regular)", in: app)
         #expect(didFinish < registration && registration < activation)
-        #expect(!app.contains("func applicationWillFinishLaunching"))
+        #expect(Self.count(of: "kAEQuitApplication", in: app) == 1)
     }
 
     @Test func thePrincipalClassDetourIsGone() throws {
