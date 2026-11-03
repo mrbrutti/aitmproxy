@@ -1,19 +1,26 @@
-// Web live-harness audit-log isolation (spec 2026-11-02-web-harness-audit-log-isolation, AC1–AC4):
+// Web live-harness audit-log isolation (spec 2026-11-02-web-harness-audit-log-isolation, AC1–AC5):
 // `renderConfig` gains `auditLogDir`, which points the core's general audit log and CA audit log
-// into the run's own dir, and `assertAuditLogIsolated` refuses a written config that does not
-// carry both lines. The script is loaded by file URL exactly as `tester.live-env.test.ts` does.
-import { mkdtempSync, writeFileSync } from 'node:fs';
+// into the run's own dir, `assertAuditLogIsolated` refuses a written config that does not carry
+// both lines, and `startAitm` wires both in and fails closed on an inherited `AITM_AUDIT_LOG`.
+// The script is loaded by file URL exactly as `tester.live-env.test.ts` does.
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// `@types/node` is deliberately absent from apps/web (see `types-node-test.d.ts`); the AC5 test
+// sets and restores the inherited variable, so `process` is declared locally as `args.test.ts` does.
+declare const process: { env: Record<string, string | undefined> };
 
 const here = dirname(fileURLToPath(import.meta.url));
-const LIVE_ENV = `file://${resolve(here, '../../../scripts/live-env.mjs')}`;
+const LIVE_ENV_PATH = resolve(here, '../../../scripts/live-env.mjs');
+const LIVE_ENV = `file://${LIVE_ENV_PATH}`;
 
 interface LiveEnv {
   renderConfig(opts: Record<string, unknown>): string;
   assertAuditLogIsolated(cfgPath: string, runDir: string): void;
+  startAitm(opts: Record<string, unknown>): Promise<unknown>;
 }
 
 const liveEnv = async (): Promise<LiveEnv> => (await import(/* @vite-ignore */ LIVE_ENV)) as LiveEnv;
@@ -77,5 +84,68 @@ describe('live-env assertAuditLogIsolated (AC4)', () => {
     expect(() => assertAuditLogIsolated(writeDoc(wrongBlock), '/r/run')).toThrow(
       /missing: mcp\.audit_log, ca\.audit_log$/,
     );
+  });
+});
+
+describe('live-env startAitm wiring (AC5)', () => {
+  const BOGUS = { aitmBin: '/nonexistent/aitm' };
+  const NOT_FOUND = 'aitm binary not found at /nonexistent/aitm';
+
+  it('startAitm wires the guard before the spawn and no longer forces the audit log off', () => {
+    const src = readFileSync(LIVE_ENV_PATH, 'utf8');
+    const start = src.indexOf('export async function startAitm(');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = src.indexOf('\nexport ', start + 1);
+    expect(end).toBeGreaterThan(start);
+    const body = src.slice(start, end);
+
+    const guard = body.indexOf('assertAuditLogIsolated(cfg, dir)');
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeLessThan(body.indexOf('spawn(aitmBin'));
+    expect(body).toContain('auditLogDir: dir');
+    expect(body).not.toContain("AITM_AUDIT_LOG: process.env.AITM_AUDIT_LOG ?? 'off'");
+    expect(body).toContain(
+      'live-env: AITM_AUDIT_LOG=off is set in this environment; this core writes no general audit log (mcp.audit_log in ',
+    );
+    expect(body).toContain(
+      "live-env: AITM_AUDIT_LOG is set to a value other than off in this environment; it would override mcp.audit_log and send this core's general audit log outside ",
+    );
+  });
+
+  it('startAitm refuses an inherited AITM_AUDIT_LOG other than off before writing anything', async () => {
+    const { startAitm } = await liveEnv();
+    const saved = process.env.AITM_AUDIT_LOG;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // Any value other than `off` aborts ahead of the binary check (so ahead of every port, dir
+      // and file), with the fixed abort message and without echoing the value.
+      process.env.AITM_AUDIT_LOG = 'on';
+      await expect(startAitm(BOGUS)).rejects.toThrow(
+        /^live-env: AITM_AUDIT_LOG is set to a value other than off in this environment; it would override mcp\.audit_log and send this core's general audit log outside .+\. Unset it \(env -u AITM_AUDIT_LOG\) and retry\.$/,
+      );
+      expect(errorSpy).not.toHaveBeenCalled();
+      process.env.AITM_AUDIT_LOG = '/elsewhere/sneaky-audit.jsonl';
+      await expect(startAitm(BOGUS)).rejects.toThrow(/^live-env: AITM_AUDIT_LOG is set to a value other than off/);
+      await expect(startAitm(BOGUS)).rejects.not.toThrow(/sneaky/);
+      expect(errorSpy).not.toHaveBeenCalled();
+
+      // `off` is tolerated: one warning on console.error, then the run goes on to the binary check.
+      process.env.AITM_AUDIT_LOG = 'off';
+      await expect(startAitm(BOGUS)).rejects.toThrow(NOT_FOUND);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(String(errorSpy.mock.calls[0]?.[0])).toMatch(
+        /^live-env: AITM_AUDIT_LOG=off is set in this environment; this core writes no general audit log \(mcp\.audit_log in .+ is overridden\)$/,
+      );
+
+      // Unset is the normal case: silent, straight to the binary check.
+      errorSpy.mockClear();
+      delete process.env.AITM_AUDIT_LOG;
+      await expect(startAitm(BOGUS)).rejects.toThrow(NOT_FOUND);
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      if (saved === undefined) delete process.env.AITM_AUDIT_LOG;
+      else process.env.AITM_AUDIT_LOG = saved;
+      errorSpy.mockRestore();
+    }
   });
 });

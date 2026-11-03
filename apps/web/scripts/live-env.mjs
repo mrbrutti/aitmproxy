@@ -308,6 +308,16 @@ export function parseOperatorUrl(stdout) {
 /**
  * Spawns `aitm web` with its own config (all ports free, scope widening on, PoC dirs set).
  * Resolves once the bridge is up. `env.stop()` kills it.
+ *
+ * Both of the core's audit logs live in the run's own `aitm-live-*` dir: `mcp.audit_log` at
+ * `<dir>/audit.jsonl` and `ca.audit_log` at `<dir>/ca-audit.jsonl` (`renderConfig`'s
+ * `auditLogDir`), and the written config is checked with `assertAuditLogIsolated` before the spawn,
+ * so every proof script gets the isolation with no edit. The spawn env no longer defaults
+ * `AITM_AUDIT_LOG`; in the core an inherited value wins over the file, so the variable is inspected
+ * first: unset is the normal case; exactly `off` is tolerated with one warning on stderr (the core
+ * then writes no general log, so a proof's own audit assertions fail); any other value aborts before
+ * any port, dir or file is touched, because it could send the log outside the run dir and no check
+ * of the config file can see that. The value itself is never echoed.
  */
 export async function startAitm({
   scope = [],
@@ -317,6 +327,19 @@ export async function startAitm({
   aitmBin = process.env.AITM_BIN ?? join(REPO, 'target/debug/aitm'),
   log = () => {},
 } = {}) {
+  // The inherited-env check precedes the binary check and the mkdtemp below, so nothing exists on
+  // disk when it aborts; the messages therefore name where the run dir would be made.
+  const inheritedAuditLog = process.env.AITM_AUDIT_LOG;
+  if (inheritedAuditLog !== undefined) {
+    const runDir = join(tmpdir(), 'aitm-live-*');
+    if (inheritedAuditLog === 'off') {
+      console.error(`live-env: AITM_AUDIT_LOG=off is set in this environment; this core writes no general audit log (mcp.audit_log in ${runDir} is overridden)`);
+    } else {
+      throw new Error(
+        `live-env: AITM_AUDIT_LOG is set to a value other than off in this environment; it would override mcp.audit_log and send this core's general audit log outside ${runDir}. Unset it (env -u AITM_AUDIT_LOG) and retry.`,
+      );
+    }
+  }
   if (!existsSync(aitmBin)) throw new Error(`aitm binary not found at ${aitmBin} — run: cargo build -p aitm (after npm run build in apps/web)`);
   const [proxyPort, browserProxyPort, webPort] = await Promise.all([freePort(), freePort(), freePort()]);
   const dir = mkdtempSync(join(tmpdir(), 'aitm-live-'));
@@ -333,11 +356,13 @@ export async function startAitm({
   const pocDir = join(dir, 'poc');
   const pocOut = join(dir, 'poc-out');
   const cfg = join(dir, 'config.yaml');
-  writeFileSync(cfg, renderConfig({ proxyPort, browserProxyPort, pocDir, pocOut, operatorSecret, token, scope, l4, findingsDir, scanner }));
+  writeFileSync(cfg, renderConfig({ proxyPort, browserProxyPort, pocDir, pocOut, operatorSecret, token, scope, l4, findingsDir, scanner, auditLogDir: dir }));
+  // Checks the bytes the core will read, not the rendered string: both audit logs must name `dir`.
+  assertAuditLogIsolated(cfg, dir);
   for (const d of [pocDir, pocOut]) if (!existsSync(d)) spawn('mkdir', ['-p', d]);
   const child = spawn(aitmBin, ['--config', cfg, 'web', '--listen', `127.0.0.1:${webPort}`, '--token', token], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info', AITM_AUDIT_LOG: process.env.AITM_AUDIT_LOG ?? 'off' },
+    env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info' },
   });
   let stderr = '';
   let out = '';
