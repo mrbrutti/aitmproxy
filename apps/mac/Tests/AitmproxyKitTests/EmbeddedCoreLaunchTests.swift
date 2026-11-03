@@ -937,6 +937,27 @@ import Testing
         let browser = try #require(yaml.range(of: "browser:\n"))
         #expect(audit.upperBound <= browser.lowerBound)
     }
+
+    @Test func child_environment_drops_an_inherited_audit_log_override_only_in_a_harness_run() {
+        // AC8 (Amendment 2, Design 5): the core's `env.rs` lets `AITM_AUDIT_LOG` in the child's
+        // environment win over the file's `mcp.audit_log` (`on` means the DEFAULT file, the
+        // operator's real `audit.jsonl`), and the child inherits the app's environment. In a
+        // harness run (a non-nil file) the key is removed so the config stays authoritative and
+        // the store isolation cannot be defeated from outside; every other key is untouched.
+        // With no harness file the dictionary passes through unchanged, the key included (the
+        // installed app keeps the core's own rule). #313's goal, by a different mechanism.
+        let file = URL(fileURLWithPath: "/tmp/s/audit.jsonl")
+        let base = ["PATH": "/usr/bin", "RUST_LOG": "info"]
+        for value in ["on", "off", "/x/audit.jsonl"] {
+            let inherited = base.merging(["AITM_AUDIT_LOG": value]) { $1 }
+            #expect(EmbeddedCoreLaunch.childEnvironment(inherited, harnessAuditLogFile: file) == base,
+                    "AITM_AUDIT_LOG=\(value) must be dropped from a harness child")
+        }
+        let kept = base.merging(["AITM_AUDIT_LOG": "on"]) { $1 }
+        #expect(EmbeddedCoreLaunch.childEnvironment(kept, harnessAuditLogFile: nil) == kept)
+        #expect(EmbeddedCoreLaunch.childEnvironment(base, harnessAuditLogFile: file) == base)
+        #expect(EmbeddedCoreLaunch.auditLogEnvironmentKey == "AITM_AUDIT_LOG")
+    }
 }
 
 /// A minimal real listener that holds a TCP port for the duration of a test, so
