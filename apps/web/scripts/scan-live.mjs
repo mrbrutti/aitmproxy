@@ -21,30 +21,65 @@
 // judge the words against the witness. Guard (gap 57): the written config must point `mcp.audit_log`
 // and `ca.audit_log` into the run directory or the run exits 2 before any step
 // (`config-audit-lines.txt`), and Matt's real `audit.jsonl` / `ca-audit.jsonl` are hashed before the
-// first step and after the last (`audit-before-after.txt`). `--selfcheck` pins the pure matchers and
-// exits without touching anything (gap 56: the W2 words `Auditing`, `287 of 2,000`).
+// first step and after the last (`audit-before-after.txt`). The pure matchers (gap 56: the W2 words
+// `Auditing`, `287 of 2,000`) live in `scan-live-matchers.mjs`, pinned under vitest by
+// `src/panels/scanner/tester.scan-live-matchers.test.ts` (Task 3.12 C). The operator URL is printed
+// with its token redacted; the dead port of step 11 is checked distinct from every port of the run and
+// refused on connect after each `startAitm`, or the run FAILs and stops.
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { connect as tcpConnect } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectBus, freePort, REPO, sleep, startAitm, startTestTarget, waitFor } from './live-env.mjs';
 import { launchChrome, makeDriver } from './cua-driver.mjs';
+import {
+  ATTENTION_ERRORS,
+  CANCEL_WORDS,
+  CANCELLED_SENTENCE,
+  CANCELLED_WORD,
+  PERCENT_TEXT,
+  RAW_ERRORS_LINE,
+  ROW_PROGRESS_AUDITING,
+  STOPPED_ERRORS_SENTENCE,
+  TERMINAL,
+  auditLogLines,
+  auditLogPath,
+  cancelLinesFor,
+  elapsedSeconds,
+  fmtElapsed,
+  grouped,
+  insideDir,
+  listenPortsIn,
+  parseProbesText,
+  phaseWord,
+  portClashes,
+  redactOperatorUrl,
+  sameDigests,
+  shellQuote,
+  strayErrorsTokens,
+  terminalWord,
+  ungroup,
+} from './scan-live-matchers.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SHOTS = resolve(here, '../.cua-shots/scan');
 const TRANSCRIPT = join(SHOTS, 'bus-transcript.jsonl');
 const KEEP = process.argv.includes('--keep');
 const JSON_MODE = process.argv.includes('--json');
-const SELFCHECK = process.argv.includes('--selfcheck');
 const W = 1600;
 const H = 1000;
 /** The AC59 stills of steps 09–11 are taken at the comp's size (`committed-1440.jpg`). */
 const JOBS_VIEWPORT = { width: 1440, height: 900 };
 /** AC58's target: `aitm-testtarget-serve --latency-ms 400`; `SCAN_LIVE_TARGET_LATENCY_MS=0` runs it unslowed. */
 const TARGET_LATENCY_MS = Number(process.env.SCAN_LIVE_TARGET_LATENCY_MS ?? 400);
-/** The profile step 11 runs against the dead port (the Task 3.11 dispatch; the plan text says `standard`). */
-const DEAD_PROFILE = process.env.SCAN_LIVE_DEAD_PROFILE ?? 'light-http';
+/**
+ * The profile step 11 runs against the dead port: the plan's `standard` (Task 3.12 C). Against a refused
+ * port it ends `done` with `stopped_reason: errors` in about 30 s; run 1's `light-http` ended at four
+ * errors without a `stopped_reason`, which step 11 reports as a GAP.
+ */
+const DEAD_PROFILE = process.env.SCAN_LIVE_DEAD_PROFILE ?? 'standard';
 /** Matt's real store: the two files AC59 requires unchanged. `audit.reads.jsonl` is never read. */
 const OPERATOR_STORE = join(homedir(), 'Library', 'Application Support', 'aitmproxy');
 const OPERATOR_AUDIT_FILES = ['audit.jsonl', 'ca-audit.jsonl'];
@@ -74,213 +109,20 @@ const TOAST = '[role=alert]';
 // The D-T8.9 fallback the store shows when `poc_ref` is not in the Findings list (scanner/store.ts openPoc).
 const POC_FALLBACK = 'is not in the Findings list';
 
-const TERMINAL = new Set(['done', 'cancelled', 'failed']); // JobState, crates/aitm-scan-model/src/job.rs
 // The store polls scan.status every 1000 ms (D10), so a witness read taken this long before the DOM
 // read is guaranteed to precede the poll the rendered number came from: that is what makes the
 // bracket `status_before.sent <= rendered <= status_after.sent` a sound assertion and not a race.
 const BRACKET_LEAD_MS = 1300;
+// Step 09's now tag alone takes one more witness read this long before the DOM read (Task 3.12 C):
+// the running check ids rotate faster than BRACKET_LEAD_MS (run 1 saw `xxe` between `xss-reflected`
+// and `crlf`), so the tag is judged against the union of three reads.
+const NOW_TAG_LEAD_MS = 2000;
 
-// ------------------------------------------------------------------------------------------
-// Pure matchers (gap 56: the W2 glossary words) — pinned by `--selfcheck`, which runs them and exits
-// before anything on disk is touched, so the matchers are tested where the live run cannot be.
-// ------------------------------------------------------------------------------------------
-/** `287 of 2,000` (the W2 row and KPI) or `418/2000` (the older row) -> `{ sent, budget }`; null otherwise. */
-function parseProbesText(text) {
-  if (typeof text !== 'string') return null;
-  const m = text.match(/(\d[\d,]*)\s*(?:\/|of)\s*(\d[\d,]*)/);
-  return m ? { sent: ungroup(m[1]), budget: ungroup(m[2]) } : null;
-}
-/** The witness-comparable word of a rendered state cell, lowercased: `Auditing` -> `auditing`, legacy `running · crawling` -> `crawling`. */
-function phaseWord(words) {
-  if (typeof words !== 'string' || words.trim() === '') return null;
-  return (words.includes('·') ? words.split('·').pop() : words).trim().toLowerCase();
-}
-/** The lowercased word when it is a terminal JobState (`Done` -> `done`), else null. */
-function terminalWord(words) {
-  const w = phaseWord(words);
-  return w !== null && TERMINAL.has(w) ? w : null;
-}
-const CANCEL_WORDS = /cancelling|cancelled/i;
-const CANCELLED_WORD = /^cancelled$/i;
-/** The row's auditing text (helpers.ts `rowText`): `50 % · 3,236 of 6,468` with U+00A0 before `%`. */
-const ROW_PROGRESS_AUDITING = /^(\d+)\u00a0% · ([\d,]+) of ([\d,]+)$/;
-/** The KPI Progress numeral (`percentText`): `50 %` with U+00A0. */
-const PERCENT_TEXT = /^(\d+)\u00a0%$/;
-/** D4's cancelled sentence with its three numbers captured. */
-const CANCELLED_SENTENCE = /^Cancelled after (\d+:\d{2}(?::\d{2})?); ([\d,]+) of ([\d,]+) checks? had run\. What it found stays\.$/;
-/** D9's check-error attention line. */
-const ATTENTION_ERRORS = /^([\d,]+) checks? could not run$/;
-const STOPPED_ERRORS_SENTENCE = 'Stopped early: too many errors from the target.';
-const RAW_ERRORS_LINE = 'stopped_reason: errors';
-
-const GROUPED = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
-/** `6,468` (helpers.ts `grouped`). */
-const grouped = (n) => GROUPED.format(Math.trunc(n));
-/** `6,468` -> 6468. */
-const ungroup = (text) => Number(String(text).replace(/,/g, ''));
-/** `m:ss` / `h:mm:ss` (helpers.ts `fmtElapsed`). */
-function fmtElapsed(ms) {
-  const total = Number.isFinite(ms) && ms > 0 ? Math.floor(ms / 1000) : 0;
-  const sec = total % 60;
-  const min = Math.floor(total / 60) % 60;
-  const h = Math.floor(total / 3600);
-  const two = (n) => String(n).padStart(2, '0');
-  return h > 0 ? `${h}:${two(min)}:${two(sec)}` : `${min}:${two(sec)}`;
-}
-/** `1:55` -> 115 seconds. */
-const elapsedSeconds = (text) => String(text).split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
-
-/**
- * The lines of a JSONL audit log that record `scan.cancel` for `job`: `command` is `scan.cancel`
- * and `args` (the bounded args summary, `aitm_ca::audit::entry_to_jsonl`) names the job. A line
- * that is not JSON is judged on its text.
- */
-function cancelLinesFor(text, job) {
-  const hits = [];
-  for (const line of String(text ?? '').split('\n')) {
-    if (line.trim() === '') continue;
-    let command = null;
-    let args = null;
-    try {
-      const o = JSON.parse(line);
-      command = typeof o.command === 'string' ? o.command : null;
-      args = typeof o.args === 'string' ? o.args : j(o.args ?? null);
-    } catch {
-      command = line.includes('scan.cancel') ? 'scan.cancel' : null;
-      args = line;
-    }
-    if (command === 'scan.cancel' && args.includes(job)) hits.push(line);
-  }
-  return hits;
-}
-/** The first `audit_log:` line under the top-level `mcp:` and `ca:` keys of a rendered config (null when a block has none). */
-function auditLogLines(configText) {
-  let block = null;
-  const found = { mcp: null, ca: null };
-  for (const line of String(configText).split('\n')) {
-    if (line.length && !line.startsWith(' ')) block = line.replace(/:\s*$/, '');
-    else if ((block === 'mcp' || block === 'ca') && /^\s+audit_log:\s/.test(line) && found[block] === null) found[block] = line;
-  }
-  return found;
-}
-/** The path an `  audit_log: "<path>"` line names (JSON-quoted or bare); null when none. */
-function auditLogPath(line) {
-  if (typeof line !== 'string') return null;
-  const v = line.replace(/^\s*audit_log:\s*/, '').trim();
-  if (v.startsWith('"')) {
-    try {
-      return JSON.parse(v);
-    } catch {
-      return null;
-    }
-  }
-  return v === '' ? null : v;
-}
-/** Whether `path` lies inside `dir` (a path-segment prefix, so `/tmp/run2` is not inside `/tmp/run`). */
-const insideDir = (path, dir) => typeof path === 'string' && (path === dir || path.startsWith(dir.endsWith('/') ? dir : `${dir}/`));
-/**
- * AC58 (c)'s "the only `errors` token inside the card": the count of the word `errors` in the card's
- * text once D4's sentence (`too many errors from the target`) and the crawl-trouble clause
- * (`hit 2 errors`) are set aside; exactly 1 means the data-face line is the only raw token.
- */
-function strayErrorsTokens(cardText) {
-  const stripped = String(cardText).split(STOPPED_ERRORS_SENTENCE).join(' ').replace(/hit [\d,]+ errors?/g, ' ');
-  return (stripped.match(/\berrors\b/g) ?? []).length;
-}
 /** Size and sha256 of a file; `absent` for a file that does not exist. */
 function fileDigest(path) {
   if (!existsSync(path)) return { size: 'absent', sha256: 'absent' };
   const buf = readFileSync(path);
   return { size: buf.length, sha256: createHash('sha256').update(buf).digest('hex') };
-}
-/** Whether two `{ file: { size, sha256 } }` maps agree on every file. */
-const sameDigests = (a, b) => {
-  const names = new Set([...Object.keys(a), ...Object.keys(b)]);
-  return [...names].every((n) => a[n]?.size === b[n]?.size && a[n]?.sha256 === b[n]?.sha256);
-};
-/** A POSIX single-quoted word. */
-const shellQuote = (text) => `'${String(text).replace(/'/g, `'\\''`)}'`;
-
-if (SELFCHECK) {
-  const AUDIT_FIXTURE = [
-    '{"at":1,"origin":"operator","client_label":null,"connection_id":"c1","command":"scan.cancel","args":"{\\"job\\":\\"scan-1a2b3c4d\\"}","result":"ok"}',
-    '{"at":2,"origin":"operator","client_label":null,"connection_id":"c1","command":"scan.status","args":"{\\"job\\":\\"scan-1a2b3c4d\\"}","result":"ok"}',
-    '{"at":3,"origin":"operator","client_label":null,"connection_id":"c1","command":"scan.cancel","args":"{\\"job\\":\\"scan-ffffffff\\"}","result":"ok"}',
-    'not json at all scan.cancel scan-1a2b3c4d',
-    '',
-  ].join('\n');
-  const CONFIG_FIXTURE = [
-    'listen: 127.0.0.1:1',
-    'ca:',
-    '  audit_log: "/tmp/run/ca-audit.jsonl"',
-    'mcp:',
-    '  operator_token: x',
-    '  audit_log: "/tmp/run/audit.jsonl"',
-    '  transport:',
-    '    loopback_tcp:',
-    '      port: 0',
-    '',
-  ].join('\n');
-  const CARD_FIXTURE =
-    'Done Stopped early: too many errors from the target. 7 checks could not run The crawl fetched 0 pages and hit 2 errors stopped_reason: errors crawl.last_error: connect_refused';
-  const checks = [
-    ['parseProbesText W2 `287 of 2,000`', j(parseProbesText('287 of 2,000')), j({ sent: 287, budget: 2000 })],
-    ['parseProbesText legacy `418/2000`', j(parseProbesText('418/2000')), j({ sent: 418, budget: 2000 })],
-    ['parseProbesText no budget', j(parseProbesText('287 probes')), 'null'],
-    ['parseProbesText non-string', j(parseProbesText(null)), 'null'],
-    ['phaseWord `Auditing`', phaseWord('Auditing'), 'auditing'],
-    ['phaseWord `Done`', phaseWord('Done'), 'done'],
-    ['phaseWord legacy `running · crawling`', phaseWord('running · crawling'), 'crawling'],
-    ['phaseWord empty', phaseWord(''), null],
-    ['terminalWord `Done`', terminalWord('Done'), 'done'],
-    ['terminalWord `Cancelled`', terminalWord('Cancelled'), 'cancelled'],
-    ['terminalWord `Auditing`', terminalWord('Auditing'), null],
-    ['CANCEL_WORDS `Cancelling`', CANCEL_WORDS.test('Cancelling'), true],
-    ['CANCEL_WORDS `Cancelled`', CANCEL_WORDS.test('Cancelled'), true],
-    ['CANCELLED_WORD `Cancelled`', CANCELLED_WORD.test('Cancelled'), true],
-    ['CANCELLED_WORD rejects `Cancelling`', CANCELLED_WORD.test('Cancelling'), false],
-    ['ROW_PROGRESS_AUDITING with U+00A0', j(ROW_PROGRESS_AUDITING.exec('50\u00a0% · 3,236 of 6,468')?.slice(1)), j(['50', '3,236', '6,468'])],
-    ['ROW_PROGRESS_AUDITING rejects a plain space', ROW_PROGRESS_AUDITING.test('50 % · 3,236 of 6,468'), false],
-    ['PERCENT_TEXT `50 %`', PERCENT_TEXT.exec('50\u00a0%')?.[1], '50'],
-    ['CANCELLED_SENTENCE', j(CANCELLED_SENTENCE.exec('Cancelled after 1:55; 3,236 of 6,468 checks had run. What it found stays.')?.slice(1)), j(['1:55', '3,236', '6,468'])],
-    ['CANCELLED_SENTENCE singular', j(CANCELLED_SENTENCE.exec('Cancelled after 0:03; 0 of 1 check had run. What it found stays.')?.slice(1)), j(['0:03', '0', '1'])],
-    ['CANCELLED_SENTENCE rejects Done', CANCELLED_SENTENCE.test('Done in 1:09 · 1,020 points · 6,468 checks.'), false],
-    ['ATTENTION_ERRORS', ATTENTION_ERRORS.exec('7 checks could not run')?.[1], '7'],
-    ['ATTENTION_ERRORS singular', ATTENTION_ERRORS.exec('1 check could not run')?.[1], '1'],
-    ['ATTENTION_ERRORS rejects skipped', ATTENTION_ERRORS.test('3 checks were skipped'), false],
-    ['ungroup', ungroup('6,468'), 6468],
-    ['grouped', grouped(6468), '6,468'],
-    ['fmtElapsed 1:55', fmtElapsed(115000), '1:55'],
-    ['fmtElapsed 0:03', fmtElapsed(3999), '0:03'],
-    ['elapsedSeconds', elapsedSeconds('1:55'), 115],
-    ['cancelLinesFor: the JSON line and the unparsable text line naming the job', cancelLinesFor(AUDIT_FIXTURE, 'scan-1a2b3c4d').length, 2],
-    ['cancelLinesFor: a clean log counts one', cancelLinesFor(AUDIT_FIXTURE.split('\n').slice(0, 3).join('\n'), 'scan-1a2b3c4d').length, 1],
-    ['cancelLinesFor another job', cancelLinesFor(AUDIT_FIXTURE, 'scan-ffffffff').length, 1],
-    ['cancelLinesFor unknown job', cancelLinesFor(AUDIT_FIXTURE, 'scan-00000000').length, 0],
-    ['auditLogLines mcp', auditLogLines(CONFIG_FIXTURE).mcp, '  audit_log: "/tmp/run/audit.jsonl"'],
-    ['auditLogLines ca', auditLogLines(CONFIG_FIXTURE).ca, '  audit_log: "/tmp/run/ca-audit.jsonl"'],
-    ['auditLogLines missing', j(auditLogLines('mcp:\n  operator_token: x\n')), j({ mcp: null, ca: null })],
-    ['auditLogPath quoted', auditLogPath('  audit_log: "/tmp/run/audit.jsonl"'), '/tmp/run/audit.jsonl'],
-    ['auditLogPath bare', auditLogPath('  audit_log: /tmp/run/audit.jsonl'), '/tmp/run/audit.jsonl'],
-    ['auditLogPath null', auditLogPath(null), null],
-    ['insideDir yes', insideDir('/tmp/run/audit.jsonl', '/tmp/run'), true],
-    ['insideDir sibling prefix', insideDir('/tmp/run2/audit.jsonl', '/tmp/run'), false],
-    ['insideDir null', insideDir(null, '/tmp/run'), false],
-    ['strayErrorsTokens: the raw token alone', strayErrorsTokens(CARD_FIXTURE), 1],
-    ['strayErrorsTokens: a second raw token', strayErrorsTokens(CARD_FIXTURE + ' errors'), 2],
-    ['strayErrorsTokens: prose only', strayErrorsTokens('Stopped early: too many errors from the target. hit 1 error'), 0],
-    ['sameDigests equal', sameDigests({ a: { size: 1, sha256: 'x' } }, { a: { size: 1, sha256: 'x' } }), true],
-    ['sameDigests differ', sameDigests({ a: { size: 1, sha256: 'x' } }, { a: { size: 2, sha256: 'y' } }), false],
-    ['shellQuote', shellQuote("/a b/it's"), "'/a b/it'\\''s'"],
-  ];
-  let bad = 0;
-  for (const [name, got, want] of checks) {
-    const ok = got === want;
-    if (!ok) bad++;
-    console.log(`${ok ? 'ok  ' : 'FAIL'} ${name}: got ${j(got)}${ok ? '' : ` want ${j(want)}`}`);
-  }
-  console.log(`selfcheck: ${checks.length - bad} ok · ${bad} failed`);
-  process.exit(bad ? 1 : 0);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -365,6 +207,50 @@ let engineOk = false;
 function requireOperator(where) {
   if (env?.operatorUiUrl && env.operatorToken) return true;
   fail('00 operator URL', `the core printed no Operator line (${where}); this run would be an agent session`);
+  return false;
+}
+
+/** Whether a TCP connect to 127.0.0.1:`port` is refused within `timeoutMs`: null when it is, else the reason it was not. */
+const connectNotRefused = (port, timeoutMs = 1000) =>
+  new Promise((res) => {
+    const s = tcpConnect({ host: '127.0.0.1', port });
+    const t = setTimeout(() => {
+      s.destroy();
+      res(`no answer within ${timeoutMs} ms`);
+    }, timeoutMs);
+    s.once('connect', () => {
+      clearTimeout(t);
+      s.destroy();
+      res('something accepted the connection');
+    });
+    s.once('error', (e) => {
+      clearTimeout(t);
+      res(e.code === 'ECONNREFUSED' ? null : (e.code ?? e.message));
+    });
+  });
+
+/**
+ * Task 3.12 C: step 11's dead port must be no port of this run (the proxy, the web UI, the target, and
+ * the `listen` / `browser.proxy_addr` ports of the written config, since `startAitm` does not return
+ * the browser proxy port) and a TCP connect to it must be refused within 1 s. `freePort` picks by
+ * bind-and-close, so the OS may hand the same number to `startAitm`'s own picks a moment later; a
+ * clash would aim the dead-target job at a live service. A miss FAILs under `00 dead port` and the
+ * caller stops the run. Run after each `startAitm` (startup and the 08b restart).
+ */
+async function requireDeadPortIsolated(where) {
+  const named = { proxy: env.proxyPort, web: env.webPort, target: target.port };
+  const configPorts = listenPortsIn(readFileSync(env.cfg, 'utf8'));
+  const problems = [];
+  if (!Number.isInteger(DEAD_PORT) || DEAD_PORT <= 0) problems.push(`is not a port (${j(DEAD_PORT)})`);
+  for (const name of portClashes(DEAD_PORT, named)) problems.push(`equals the ${name} port`);
+  if (configPorts.includes(DEAD_PORT)) problems.push(`is a listen or proxy_addr port of the written config ${j(configPorts)}`);
+  const notRefused = problems.length ? null : await connectNotRefused(DEAD_PORT);
+  if (notRefused) problems.push(`connect to 127.0.0.1:${DEAD_PORT} was not refused: ${notRefused}`);
+  if (problems.length === 0) {
+    note(`00 dead port ${where}`, `${DEAD_PORT} is none of ${j(named)} nor of the config's ${j(configPorts)}, and a connect is refused`);
+    return true;
+  }
+  fail(`00 dead port ${where}`, `dead port ${DEAD_PORT} ${problems.join('; ')}; the run stops here`);
   return false;
 }
 
@@ -1078,6 +964,7 @@ async function run() {
     // The restarted core has a fresh config: the same guard as at startup (gap 57).
     await auditPreflightOrExit('after the 08b restart');
     if (!requireOperator('after the 08b restart')) return;
+    if (!(await requireDeadPortIsolated('after the 08b restart'))) return;
     bus = await witness(env.busUrl, env.operatorToken, 'witness-l4');
     coreReady = true;
     await d.open(env.operatorUiUrl);
@@ -1139,7 +1026,7 @@ async function run() {
   // the comp's 1440 × 900 for the three steps (AC59).
   let job3 = null;
   if (!coreReady) {
-    note('09-11 skipped', 'the 08b restart gave no operator core and witness; the Jobs view cannot be driven');
+    note('09-11 skipped', 'the 08b restart gave no usable core (no Operator line, a dead-port clash, or no witness); the Jobs view cannot be driven');
     return;
   }
   await step('09 Jobs view: auditing with the now mark', async () => {
@@ -1164,7 +1051,11 @@ async function run() {
     }
     // The audit fill and its now tag need the store's status poll (1 s) to have landed.
     await soft(() => d.q('exists', `${card} [data-field=now] [data-role=checkId]`), 5000);
-    // Bracket (03's rule): a witness read BRACKET_LEAD_MS before the DOM reads, one right after.
+    // Bracket (03's rule): a witness read BRACKET_LEAD_MS before the DOM reads, one right after; and
+    // for the now tag alone one more read NOW_TAG_LEAD_MS before them (the ids rotate faster than
+    // the lead), so the tag is judged against the union of the three reads' `checks.running`.
+    const early = await status(job);
+    await sleep(NOW_TAG_LEAD_MS - BRACKET_LEAD_MS);
     const before = await status(job);
     await sleep(BRACKET_LEAD_MS);
     const rendered = {
@@ -1179,7 +1070,7 @@ async function run() {
       rowProbes: await d.q('text', `${rowSel(job)} [data-field=probes]`),
     };
     const after = await status(job);
-    keepStatus('09', { job, before, after, rendered });
+    keepStatus('09', { job, early, before, after, rendered });
     await still('09-jobs-auditing.png');
     const liveBoth = [before, after].every((st) => st.state === 'running' && st.phase === 'auditing');
     if (!liveBoth) {
@@ -1188,13 +1079,19 @@ async function run() {
     }
     expect(rendered.chip === 'Auditing', '09a the card chip reads Auditing while the witness reads running · auditing', `chip ${j(rendered.chip)}`);
     expect(rendered.rowState === 'Auditing', '09a the row state word reads Auditing', `row ${j(rendered.rowState)}`);
-    // The now tag: the ids rotate between polls, so the sound claim is membership in the bracket's
-    // union; whether it equals a bracket read's running[0] is reported beside it.
-    const running = new Set([...(before.checks.running ?? []), ...(after.checks.running ?? [])]);
-    const firsts = [before.checks.running?.[0] ?? null, after.checks.running?.[0] ?? null];
-    expect(rendered.nowId !== null && running.has(rendered.nowId), '09b the now tag names a check the witness had running (bracket)', `now tag ${j(rendered.nowTag)}; witness running before ${j([...(before.checks.running ?? [])])}, after ${j([...(after.checks.running ?? [])])}`);
+    // The now tag: the ids rotate between polls faster than the bracket's lead, so the sound claim is
+    // membership in the union of the three witness reads' `checks.running` (2 s before, 1.3 s before,
+    // right after the DOM read; Task 3.12 C); whether it equals a read's running[0] stays a NOTE.
+    const reads = { early, before, after };
+    const runningOf = (st) => st.checks?.running ?? [];
+    const running = new Set(Object.values(reads).flatMap(runningOf));
+    const firsts = Object.values(reads).map((st) => runningOf(st)[0] ?? null);
+    const witnessRunning = Object.entries(reads)
+      .map(([k, st]) => `${k} ${j(runningOf(st))}`)
+      .join(', ');
+    expect(rendered.nowId !== null && running.has(rendered.nowId), '09b the now tag names a check the witness had running (the union of three reads)', `now tag ${j(rendered.nowTag)}; witness running ${witnessRunning}`);
     expect(typeof rendered.nowTag === 'string' && rendered.nowTag.startsWith(`now · ${rendered.nowId}`), '09b the now tag reads `now · <id>`', `now tag ${j(rendered.nowTag)}`);
-    note('09b now tag vs running[0]', `${j(rendered.nowId)} ${firsts.includes(rendered.nowId) ? 'equals' : 'differs from'} the witness running[0] of the bracket (${j(firsts)})`);
+    note('09b now tag vs running[0]', `${j(rendered.nowId)} ${firsts.includes(rendered.nowId) ? 'equals' : 'differs from'} a witness running[0] of the three reads (${j(firsts)})`);
     const fractions = [doneOver(before), doneOver(after)];
     const lo = Math.min(...fractions) - 0.02;
     const hi = Math.max(...fractions) + 0.02;
@@ -1439,9 +1336,10 @@ try {
   // AC59: Matt's real logs, hashed before the first step; compared after the last (the finally block).
   auditBefore = operatorAuditDigests();
   writeFileSync(join(SHOTS, 'audit-before-after.txt'), [`operator store: ${OPERATOR_STORE}`, `before ${new Date().toISOString()}`, ...digestLines(auditBefore), ''].join('\n'));
-  if (requireOperator('at startup')) {
+  if (requireOperator('at startup') && (await requireDeadPortIsolated('at startup'))) {
     bus = await witness(env.busUrl, env.operatorToken, 'witness');
-    out(`aitm up: proxy ${env.proxyPort}, ui ${env.operatorUiUrl}, target ${target.base} (${target.mode}, latency ${TARGET_LATENCY_MS} ms), dead port ${DEAD_PORT}, findings ${FINDINGS_DIR}`);
+    // The operator URL carries the bridge token: printed redacted, here and under --keep.
+    out(`aitm up: proxy ${env.proxyPort}, ui ${redactOperatorUrl(env.operatorUiUrl)}, target ${target.base} (${target.mode}, latency ${TARGET_LATENCY_MS} ms), dead port ${DEAD_PORT}, findings ${FINDINGS_DIR}`);
     cdp = await launchChrome({ width: W, height: H });
     d = makeDriver(cdp, { log: out, shotsDir: SHOTS });
     await run();
@@ -1465,7 +1363,7 @@ try {
   };
   out(`\n${summary.pass} PASS · ${summary.fail} FAIL · ${summary.gap} GAP · screenshots in ${SHOTS} · transcript ${TRANSCRIPT}`);
   if (KEEP && env) {
-    out(`--keep: aitm and Chrome left running. UI: ${env.operatorUiUrl}  proxy: 127.0.0.1:${env.proxyPort}  target: ${target?.base}`);
+    out(`--keep: aitm and Chrome left running. UI: ${redactOperatorUrl(env.operatorUiUrl)} (token redacted)  proxy: 127.0.0.1:${env.proxyPort}  target: ${target?.base}`);
     console.log(JSON.stringify(summary));
     await new Promise(() => {});
   }
