@@ -22,6 +22,7 @@ import Testing
         let helper = try Self.text("Sources/Aitmproxy/Quit.swift")
         #expect(helper.contains("static func endSheetsAndTerminate()"))
         #expect(helper.contains("NSApp.terminate(nil)"))
+        #expect(helper.contains("preventsApplicationTerminationWhenModal = false"))
         #expect(!helper.contains("exit("))
     }
 
