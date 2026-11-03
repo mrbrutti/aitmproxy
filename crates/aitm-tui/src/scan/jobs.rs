@@ -12,8 +12,8 @@ use aitm_scan_model::{
 };
 
 use super::{
-    is_job_id, lane_token, more, severity_counts, severity_token, ScanError, DETAIL_VALUE_MAX,
-    SEVERITY_ORDER,
+    due, is_job_id, lane_token, more, severity_counts, severity_token, ScanError, DETAIL_VALUE_MAX,
+    NOT_IN_TIME, SEVERITY_ORDER,
 };
 use crate::text::{clean, cut_to, truncate};
 
@@ -65,6 +65,12 @@ pub struct JobsState {
     /// values on screen are while the bus stays silent; `None` until the
     /// first list lands.
     pub listed_ok_at_tick: Option<u64>,
+    /// The tick the `scan.list` now in flight left (Jobs view D19
+    /// amendment, the hung-core detector; stamped by the reducer): `None`
+    /// when no list is in flight, when its reply settled (ok or error),
+    /// when the bus dropped, or once the detector has fired for it, so it
+    /// fires once per request and re-arms when the next list leaves.
+    pub list_sent_at_tick: Option<u64>,
     /// The jobs this TUI started (spec D3): a `StartResult` fold inserts the
     /// id (Task 12), a `scan.list` that carries it removes it, and
     /// [`JobsState::fold_list`] keeps at the front exactly the marked ids a
@@ -83,11 +89,35 @@ pub struct JobsState {
     /// ([`super::ScanState::clear_error`]) or, for a keyed
     /// `scan.status:<job>` / `scan.cancel:<job>` error, until its job turns
     /// terminal or leaves the list ([`super::ScanState::fold_job_status`],
-    /// [`super::ScanState::fold_job_list`]; fix round H, H66).
+    /// [`super::ScanState::fold_job_list`]; fix round H, H66). Its third
+    /// source is the hung-core detector (Jobs view D19 amendment): the
+    /// uncoded `scan.list` error [`NOT_IN_TIME`], set by the reducer when
+    /// the list in flight is [`super::LIST_OVERDUE_TICKS`] overdue and
+    /// cleared by that list's late fold like any other `scan.list` error.
     pub error: Option<ScanError>,
 }
 
+/// Whether the `scan.list` that left on `sent_at` is `limit_ticks` or more
+/// ticks overdue on `now_tick` (Jobs view D19 amendment, the hung-core
+/// detector): [`due`]'s comparison, so no list in flight (`None`) is never
+/// overdue and a tick behind the stamp never underflows.
+pub fn list_overdue(now_tick: u64, sent_at: Option<u64>, limit_ticks: u64) -> bool {
+    due(sent_at, now_tick, limit_ticks)
+}
+
 impl JobsState {
+    /// Whether the Jobs error is the hung-core detector's sentence (Jobs
+    /// view D19 amendment): an uncoded `scan.list` error whose detail is
+    /// [`NOT_IN_TIME`]. While it stands, `x` is refused: a cancel would
+    /// queue behind the hung call and fire unseen when the core wakes. Any
+    /// other `scan.list` error, the same words under a keyed tag, or no
+    /// error at all reads false.
+    pub fn unanswered(&self) -> bool {
+        self.error
+            .as_ref()
+            .is_some_and(|e| e.tag == "scan.list" && e.code.is_none() && e.detail == NOT_IN_TIME)
+    }
+
     /// Fold a `scan.status` / `scan.cancel` reply (spec D10): the full view
     /// replaces `full[job]`, its summary replaces `summaries[job]`, and a job
     /// not yet in `order` goes to the front (newest first). The core's
@@ -2528,5 +2558,35 @@ mod tests {
         let mut none = fixture_status(JobState::Running);
         none.checks.running.clear();
         assert_eq!(of(&none).now_line, None);
+    }
+
+    /// Jobs view AC60 (D19 amendment, the hung-core detector): the
+    /// overdue test counts from the tick the list left with `due`'s
+    /// comparison; no list in flight is never overdue, and a tick behind
+    /// the stamp never underflows.
+    #[test]
+    fn list_overdue_counts_from_the_send() {
+        assert!(!list_overdue(119, Some(40), 80));
+        assert!(list_overdue(120, Some(40), 80));
+        assert!(!list_overdue(500, None, 80));
+        assert!(
+            !list_overdue(10, Some(40), 80),
+            "a tick behind never underflows"
+        );
+    }
+
+    /// Jobs view AC60 (D19 amendment): `unanswered` is true for exactly the
+    /// detector's sentence under `scan.list`, not for another `scan.list`
+    /// error, not for the same words under a keyed tag, not for no error.
+    #[test]
+    fn unanswered_reads_only_the_list_sentence() {
+        let mut jobs = JobsState::default();
+        assert!(!jobs.unanswered());
+        jobs.error = Some(ScanError::uncoded("scan.list", NOT_IN_TIME));
+        assert!(jobs.unanswered());
+        jobs.error = Some(ScanError::uncoded("scan.list", "boom"));
+        assert!(!jobs.unanswered());
+        jobs.error = Some(ScanError::uncoded("scan.status:scan-1a2b3c4d", NOT_IN_TIME));
+        assert!(!jobs.unanswered());
     }
 }

@@ -30,14 +30,15 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    due, fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
-    parse_result, row_gate, scan_host, scroll, state_text, status_token, step, tag_keyed,
-    tag_parts, typed_origin, usable_selector, walk, ConfirmReply, Dir, EditorField, FieldKind,
-    IssueFilterKey, IssuePane, JobPane, Launch, LaunchVerb, MapPane, MapSource, PendingLaunch,
-    ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab, WireConfirm,
-    CLAMPED_FIELD_MAX, CLAMPED_MAX, ERROR_DETAIL_MAX, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
-    MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
-    OTHER_SAVED, SAVED_NAME_MAX, SAVED_PATH_MAX, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
+    due, fold_profile, is_job_id, l4_gate, lane_token, launch_args, list_overdue, out_of_scope,
+    parse_l4_target, parse_result, row_gate, scan_host, scroll, state_text, status_token, step,
+    tag_keyed, tag_parts, typed_origin, usable_selector, walk, ConfirmReply, Dir, EditorField,
+    FieldKind, IssueFilterKey, IssuePane, JobPane, Launch, LaunchVerb, MapPane, MapSource,
+    PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab,
+    WireConfirm, CANCEL_NOT_SENT, CLAMPED_FIELD_MAX, CLAMPED_MAX, ERROR_DETAIL_MAX,
+    ISSUES_POLL_TICKS, LIST_OVERDUE_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NOT_IN_TIME,
+    NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SAVED_NAME_MAX,
+    SAVED_PATH_MAX, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
 use crate::text::{cut_to, truncate};
 use crate::theme::Theme;
@@ -4203,8 +4204,10 @@ impl App {
                 self.forget_inflight();
                 // Nothing tagged before the drop will be answered (D4), and
                 // a launch in flight is lost with the connection, as is the
-                // one `scan.issue` read (D6).
+                // one `scan.issue` read (D6). The list in flight is lost
+                // with them: the hung-core detector has nothing to watch.
                 self.scan.inflight.clear();
+                self.scan.jobs.list_sent_at_tick = None;
                 self.scan.issues.pending_read = None;
                 self.scan.launch.pending = None;
                 // A confirm token is bound to the connection that issued it
@@ -5815,6 +5818,14 @@ impl App {
         let Some(job) = self.scan.jobs.cursor_job().cloned() else {
             return;
         };
+        // The core is not answering (Jobs view D19 amendment, after D6's
+        // rule): the cancel would queue behind the hung call and fire
+        // unseen when the core wakes, so it is not sent. A toast, not a
+        // notice: the error outranks a notice on the banner.
+        if self.scan.jobs.unanswered() {
+            self.toast(Level::Warn, CANCEL_NOT_SENT);
+            return;
+        }
         match self.scan.jobs.state_of(&job) {
             Some(state) if state.is_terminal() => {
                 self.scan.notice = Some(format!("already {}", state_text(state)));
@@ -5848,6 +5859,18 @@ impl App {
     /// [`SITEMAP_POLL_TICKS`] while the Site map is shown and a job it
     /// covers is crawling.
     fn scan_tick(&mut self, t: u64, out: &mut Vec<BusRequest>) {
+        // The hung-core detector (Jobs view D19 amendment): the one
+        // `scan.list` in flight, [`LIST_OVERDUE_TICKS`] after it left with
+        // no reply, puts `NOT_IN_TIME` on the Jobs banner (the age clause
+        // follows it). It fires once per request (the stamp is taken) and
+        // re-arms when the next list leaves; the request is not cancelled,
+        // so the list timer below finds its tag in flight and sends nothing,
+        // and the late reply's fold clears the sentence under its tag.
+        if list_overdue(t, self.scan.jobs.list_sent_at_tick, LIST_OVERDUE_TICKS) {
+            self.scan.jobs.list_sent_at_tick = None;
+            self.scan
+                .set_error(ScanError::uncoded("scan.list", NOT_IN_TIME));
+        }
         if t.is_multiple_of(STATUS_POLL_TICKS) {
             let live = self.scan.jobs.live();
             let attempted = self.request_scan_statuses(&live, out);
@@ -5878,10 +5901,13 @@ impl App {
         }
     }
 
-    /// `scan.list {}` under its single-slot tag, stamping `listed_at_tick`.
+    /// `scan.list {}` under its single-slot tag, stamping `listed_at_tick`
+    /// and arming the hung-core detector (`list_sent_at_tick`; Jobs view
+    /// D19 amendment).
     fn request_scan_list(&mut self, out: &mut Vec<BusRequest>) {
         if self.scan_poll("scan.list".to_string(), "scan.list", json!({}), out) {
             self.scan.jobs.listed_at_tick = self.ticks;
+            self.scan.jobs.list_sent_at_tick = Some(self.ticks);
         }
     }
 
@@ -5975,6 +6001,11 @@ impl App {
     /// (D4). Later tasks add their verbs to this match.
     fn on_scan_ok(&mut self, tag: &str, name: &str, value: Value, out: &mut Vec<BusRequest>) {
         self.scan.inflight.remove(tag);
+        if tag == "scan.list" {
+            // The list is answered, contract match or not: the hung-core
+            // detector stands down (Jobs view D19 amendment).
+            self.scan.jobs.list_sent_at_tick = None;
+        }
         match name {
             "scan.start" | "scan.map" => {
                 // A `needs_confirmation` reply opens the shared overlay with
@@ -6245,6 +6276,10 @@ impl App {
     /// precedence over it (D13), so nothing more is kept for it here.
     fn on_scan_failed(&mut self, tag: &str, message: String, out: &mut Vec<BusRequest>) {
         self.scan.inflight.remove(tag);
+        if tag == "scan.list" {
+            // An error reply settles the list too (Jobs view D19 amendment).
+            self.scan.jobs.list_sent_at_tick = None;
+        }
         let err = ScanError::from_message(tag, &message);
         if err.verb == "scan.issue" {
             self.scan.issues.pending_read = None;

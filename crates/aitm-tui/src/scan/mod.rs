@@ -58,6 +58,13 @@ pub const STATUS_POLL_TICKS: u64 = 4;
 /// shown (spec D6: ten seconds).
 pub const LIST_POLL_TICKS: u64 = 40;
 
+/// How many `Tick`s (20 s) a `scan.list` may stay unanswered before the
+/// Jobs view declares the core not answering (Jobs view spec D19 amendment,
+/// the hung-core detector): two list periods, so a list merely queued behind
+/// one slow call on the sequential bus session is not flagged, while the TUI
+/// still notices before the mac's 30 s client timeout.
+pub const LIST_OVERDUE_TICKS: u64 = 80;
+
 /// How many `scan.status` requests may leave the reducer per `scan.list` fold
 /// and per status-timer firing (spec D6, hostile-core bounds; the Architect's
 /// number). The rest wait for the next firing; the tag dedupe already keeps
@@ -503,6 +510,18 @@ const MISSING_VERB: &str = "is not on this bus";
 /// when its `job` is not the key of the tag it answers (spec D6, hostile-core
 /// bounds): nothing is folded from such a reply.
 pub const OTHER_JOB: &str = "reply named a different job";
+
+/// The detail of the uncoded `scan.list` error the hung-core detector
+/// records when the list in flight is [`LIST_OVERDUE_TICKS`] overdue (Jobs
+/// view spec D19 amendment): the Jobs banner reads `scan.list: the bus did
+/// not reply in time` with the age clause after it.
+pub const NOT_IN_TIME: &str = "the bus did not reply in time";
+
+/// The Warn toast `x` raises while the core is not answering
+/// ([`JobsState::unanswered`]; Jobs view spec D19 amendment, after D6's
+/// rule): the cancel is not sent, since it would queue behind the hung call
+/// and fire unseen whenever the core wakes.
+pub const CANCEL_NOT_SENT: &str = "scan.cancel not sent: the bus did not reply in time";
 
 /// A failed `scan.*` call, coded when the core's message carries a D9 code.
 #[derive(Debug, Clone, PartialEq, Eq)]

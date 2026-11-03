@@ -16,8 +16,8 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::App;
 use aitm_tui::scan::{
     probe_bar, probe_fill, progress_bar, progress_fill, row, severity_bar, severity_runs,
-    JobsState, ReadStatus, ScanTab, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, JOBS_MAX, PROFILE_MAX,
-    TARGETS_MAX,
+    JobsState, ReadStatus, ScanError, ScanTab, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, JOBS_MAX,
+    PROFILE_MAX, TARGETS_MAX,
 };
 use aitm_tui::text::width;
 use common::*;
@@ -1110,4 +1110,92 @@ fn hostile_counters_render_a_clamped_progress() {
         "{strip:?}"
     );
     assert!(!shown.contains("Stopped early"), "{shown}");
+}
+
+/// Jobs view AC60 (D19 amendment, gap 66): a `scan.list` that leaves on the
+/// tick-40 timer and gets no reply sets nothing by tick 119; on tick 120
+/// (`LIST_OVERDUE_TICKS` after the send) the Jobs error reads the
+/// not-answering sentence and the banner carries it with the age clause
+/// counted from the last fold (tick 0); the request is not cancelled (still
+/// in flight, so the tick-120 timer sends no second list); `x` while the
+/// sentence stands sends nothing and toasts the refusal; the late list reply
+/// at tick 121 clears the banner, stamps the fold and `x` is live again.
+#[test]
+fn a_held_list_turns_into_the_not_answering_banner() {
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    app.ticks = 0;
+    app.scan.jobs.listed_ok_at_tick = Some(0);
+
+    let mut reqs = Vec::new();
+    for _ in 0..40 {
+        reqs = app.update(Action::Tick);
+    }
+    assert!(
+        reqs.contains(&tagged("scan.list", "scan.list", json!({}))),
+        "the fortieth tick's list: {reqs:?}"
+    );
+    assert_eq!(app.scan.jobs.list_sent_at_tick, Some(40));
+
+    let mut later = Vec::new();
+    for _ in 0..79 {
+        later.extend(app.update(Action::Tick));
+    }
+    assert_eq!(app.ticks, 119);
+    assert_eq!(app.scan.jobs.error, None, "tick 119: not yet overdue");
+
+    later.extend(app.update(Action::Tick));
+    assert_eq!(app.ticks, 120);
+    assert_eq!(
+        app.scan
+            .jobs
+            .error
+            .as_ref()
+            .map(ScanError::wording)
+            .as_deref(),
+        Some("scan.list: the bus did not reply in time")
+    );
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(
+        strip
+            .trim_end_matches(['│', ' '])
+            .ends_with("scan.list: the bus did not reply in time · showing values from 30s ago"),
+        "{strip:?}"
+    );
+    assert_eq!(
+        app.scan.jobs.list_sent_at_tick, None,
+        "the detector fired once"
+    );
+    assert!(
+        app.scan.inflight.contains("scan.list"),
+        "the request is not cancelled"
+    );
+    assert!(
+        !later.contains(&tagged("scan.list", "scan.list", json!({}))),
+        "no second scan.list left between ticks 41 and 120: {later:?}"
+    );
+    assert!(app.scan.jobs.unanswered());
+
+    let reqs = app.update(Action::ScanCancel);
+    assert_eq!(
+        reqs,
+        Vec::new(),
+        "x sends nothing while the core is not answering"
+    );
+    assert_eq!(
+        toast(&app),
+        "scan.cancel not sent: the bus did not reply in time"
+    );
+
+    let _ = app.update(Action::Tick);
+    assert_eq!(app.ticks, 121);
+    let _ = app.on_bus(list_reply());
+    assert_eq!(
+        app.scan.jobs.error, None,
+        "the late fold clears the sentence"
+    );
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(!strip.contains("showing values"), "{strip:?}");
+    assert_eq!(app.scan.jobs.listed_ok_at_tick, Some(121));
+    assert!(!app.scan.jobs.unanswered());
 }
