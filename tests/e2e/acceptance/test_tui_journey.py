@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # e2e: tier=manual surface=acceptance
-"""Release acceptance, journey TUI (spec §D4, negatives §D7): the INSTALLED `aitm tui` on the
-operator's real HOME, driven by keystrokes in a pty, observed through the screen grid, the real
-client and the durable audit (aitm tui serves no loopback bus on 0.5.10: results read
-"bus truth: audit only").
+"""Release acceptance, journey TUI (spec §D4, negatives §D7, amended 2026-11-03): the INSTALLED
+`aitm tui` on the operator's real HOME, driven by keystrokes in a pty, observed through the screen
+grid, the real client and the loopback operator bus `aitm tui` serves since cli-oneshot-live-core:
+the one-shot CLI on the operator's default config (`aitm scope list`, `aitm proxy status`) is the
+bus truth while the TUI runs. The TUI's in-process operator server is unaudited by design
+(durable-audit spec, named follow-up), so audit.jsonl is read only for the system-proxy verbs.
 
 Preconditions: the default ports are free (the app quit) — else SKIP naming the holder.
 `yes` steps (TUI-3 set, TUI-7 restore the system proxy) run only when ACCEPT_YES lists them and
@@ -57,9 +59,19 @@ YES = yes_set()
 AITM = os.environ.get("AITM", INSTALLED_CLI)
 HOST = "example.com"
 EXPECTED_STEPS = ("TUI-1", "TUI-2", "TUI-3", "TUI-4", "TUI-5a", "TUI-5b", "TUI-6", "TUI-7", "TUI-8", "TUI-9", "TUI-10", "N1-TUI", "N2-TUI", "N3-TUI")
-NO_FLOWS = "No flows yet — point a client at 127.0.0.1:8080 or open the browser."
-NO_FLOWS_GENERIC = "No flows yet — point a client at the proxy or open the browser."
-TOAST_LOG = ("embedded proxy · set RUST_LOG to write a log file", "embedded proxy · log: ")
+NO_FLOWS = "No flows yet: point a client at 127.0.0.1:8080 or open the browser."
+NO_FLOWS_GENERIC = "No flows yet: point a client at the proxy or open the browser."
+# crates/aitm/src/tui.rs TuiLog: the startup toast's three shapes (plan Literals table).
+TOAST_LOG = ("embedded proxy · log: ", "embedded proxy · log location not reported", "embedded proxy · logging disabled: could not open ")
+TOAST_LOG_RX = "|".join(re.escape(t) for t in TOAST_LOG)
+SUBSCRIBE_REGRESSION = "flow.subscribe failed"  # #255: the in-process transport must never call flow.subscribe
+ANSI_RX = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")  # CSI sequences: a style change mid-toast must not split a substring
+SCOPE_HINT = "host · host:port · *.wildcard (a human action)"
+SCOPE_EMPTY = "Scope is empty: every flow is dimmed and read-only. Press a to add a host."
+SIDEBAR_SCOPE_RX = re.compile(r"^\s*Scope\s+(\d+)", re.M)  # the host count; the status bar's ` · N in scope` counts flows
+ARMED_BAR_RX = r"Intercept armed: every request pauses here"
+ARMED_PILL = " · intercept armed"  # the toolbar pill's word while armed (`… · CA trusted · intercept armed`)
+CA_HINT = "y runs it · n / Esc cancels"
 PAUSE_HINT = "[a Resume] [A Resume all] [d Kill · abort mode: reset (429/503 need F3)] [e Edit] [i Disarm]"
 
 w = StepWriter(os.path.join(OUT, "tui-steps.tsv"), EXPECTED_STEPS)
@@ -78,8 +90,37 @@ def pgrep_lines(pattern: str) -> str:
     return f"[pgrep error {r.returncode}: {r.stderr.strip()[:80]}]"
 
 
+def plain_raw(term: Terminal) -> str:
+    """Everything the TUI ever wrote, CSI styling stripped: a substring search here catches a toast
+    even after it cleared, and even when a style change was emitted in the middle of its words."""
+    return ANSI_RX.sub("", bytes(term.raw).decode("utf-8", "replace"))
+
+
+def armed_flag(st: object) -> bool | None:
+    """`intercept_armed` from an `aitm proxy status` object; None when the verb gave no object."""
+    return st.get("intercept_armed") if isinstance(st, dict) else None
+
+
 def audit_since(t0_ms: int) -> list[dict]:
     return [r for r in audit_tail(400) if r.get("at", 0) >= t0_ms]
+
+
+def oneshot_json(*args: str) -> tuple[object | None, str]:
+    """`aitm <args>` as a one-shot verb on the operator's default config while `aitm tui` serves the
+    loopback bus: (parsed stdout JSON, note). The value is None on a non-zero exit, a timeout or
+    unparsable stdout; the note carries the exit and the first 120 chars of stderr (never stdout,
+    which could carry a token) so the step detail says why."""
+    try:
+        r = subprocess.run([AITM, *args], capture_output=True, text=True, timeout=40, check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"aitm {' '.join(args)}: timeout 40s"
+    err = r.stderr.strip().replace("\n", " ")[:120]
+    if r.returncode != 0:
+        return None, f"aitm {' '.join(args)}: exit {r.returncode} {err}".strip()
+    try:
+        return json.loads(r.stdout), f"aitm {' '.join(args)}: exit 0"
+    except ValueError:
+        return None, f"aitm {' '.join(args)}: exit 0, stdout not JSON ({len(r.stdout)} bytes) {err}".strip()
 
 
 def save(name: str, text: str) -> None:
@@ -138,50 +179,63 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
 
     try:
         # TUI-1 — the screen, the pill, the status bar, the toast, the empty state (verbatim).
-        ok = term.wait_for(r"aitmproxy", 30)
+        # The startup checklist card prints `aitmproxy` 0.26 s in, before ratatui draws: wait
+        # for the frame (the flows pane's empty state), then the status bar, then the toast.
+        ok = term.wait_for(r"No flows yet", 30)
+        busbar = term.wait_for(r"bus \S.*? · operator", 5)
+        toast = term.wait_for(TOAST_LOG_RX, 6)
         screen = term.text()
+        regression = SUBSCRIBE_REGRESSION in plain_raw(term)
         pill = next((ln for ln in screen.splitlines() if "aitmproxy" in ln and ("listening" in ln or "bus" in ln)), "")
         want = ["listening 127.0.0.1:8080", "sys-proxy", "CA trusted"]
         miss = [x for x in want if x not in screen]
         exact = NO_FLOWS in screen
         generic = NO_FLOWS_GENERIC in screen
-        busbar = re.search(r"bus \S.*? · operator", screen) is not None
-        toast = any(t in screen for t in TOAST_LOG)
         save("TUI-1.txt", screen)
-        if ok and not miss and exact and busbar and toast:
-            step("TUI-1", "PASS", f"pill: {pill.strip()[:120]}; empty state verbatim; status bar `bus … · operator`; startup toast present", "bus truth: audit only; proxy.status SKIP (no loopback bus on 0.5.10)", "claude/cli-oneshot-live-core")
+        if ok and not miss and exact and busbar and toast and not regression:
+            step("TUI-1", "PASS", f"pill: {pill.strip()[:120]}; empty state verbatim; status bar `bus … · operator`; startup toast present; no `{SUBSCRIBE_REGRESSION}`", "bus truth: one-shot CLI (TUI-2, TUI-5a read it)", "claude/cli-oneshot-live-core")
         else:
             obs_line = next((ln.strip() for ln in screen.splitlines() if "No flows yet" in ln), "(no 'No flows yet' line)")
-            step("TUI-1", "FAIL", f"missing {miss}; no-flows line exact {exact}" + (f" — TUI prints the generic sentence: `{obs_line}` (spec AC2 gap)" if generic else f" — observed `{obs_line[:120]}`") + f"; status bar `bus … · operator` {busbar}; startup toast {toast}; screen head: {screen.splitlines()[0][:100] if screen else '(blank: 0x0 pty?)'}")
+            step("TUI-1", "FAIL", f"frame {ok}; missing {miss}; no-flows line exact {exact}" + (f" — TUI prints the generic sentence: `{obs_line}` (spec AC2 gap)" if generic else f" — observed `{obs_line[:120]}`") + f"; status bar `bus … · operator` {busbar}; startup toast {toast}" + (f"; `{SUBSCRIBE_REGRESSION}` drawn: the in-process transport called flow.subscribe (#255 regression, plan 2026-11-03 Task 1)" if regression else "") + f"; screen head: {screen.splitlines()[0][:100] if screen else '(blank: 0x0 pty?)'}")
 
-        # TUI-2 — Scope add (words, toast, count, audit).
+        # TUI-2 — Scope add (words, toast, sidebar count, one-shot `aitm scope list`).
         term.press("S", 0.5)
         panel = term.text()
-        scope_empty = "Scope is empty — every flow is dimmed and read-only. Press a to add a host." in panel
+        scope_empty = SCOPE_EMPTY in panel
         on_panel = re.search(r"(^|\s)" + re.escape(HOST) + r"(\s|$)", panel, re.M) is not None
         pre_existing = HOST in config_scope or on_panel   # config OR surface: never remove his own host
         term.press("a", 0.3)
         prompt = term.wait_for(r"scope add:", 3)
-        hint = "host · host:port · *.wildcard — a human action" in term.text()
+        hint = SCOPE_HINT in term.text()
         term.press(HOST + "\r", 0.8)
         toast = term.wait_for(r"Scope \+ " + re.escape(HOST), 5)
         added = toast and not pre_existing
-        count = re.search(r" · (\d+) in scope", term.text())
-        rows = audit_since(t0)
-        ok_rows = [r for r in rows if r.get("command") == "scope.add" and HOST in json.dumps(r.get("args", "")) and r.get("result") == "ok"]
         listed = re.search(r"(^|\s)" + re.escape(HOST) + r"(\s|$)", term.text(), re.M) is not None
         save("TUI-2.txt", term.text())
-        if prompt and hint and toast and ok_rows and listed and count:
-            step("TUI-2", "PASS", f"prompt + hint shown, toast `Scope + {HOST}`, panel lists it, status bar ` · {count.group(1)} in scope`; Scope-empty words before: {scope_empty}" + (f"; the host was ALREADY in Scope before the run (config.yaml {HOST in config_scope}, panel {on_panel}; not removed at the end)" if pre_existing else ""), f"audit scope.add ok at {ok_rows[-1]['at']} (origin {ok_rows[-1].get('origin')}); bus truth: audit only")
-        else:
-            step("TUI-2", "FAIL", f"prompt {prompt}, hint {hint}, toast {toast}, listed {listed}, in-scope count {count.group(0) if count else None}, audit scope.add ok {len(ok_rows)}", json.dumps(rows[-3:])[:200])
+        # No audit grep: the TUI's in-process operator server is unaudited by design (durable-audit
+        # spec, "stays unaudited (Architect's call)", named follow-up); the one-shot CLI is the truth.
+        scope_list, scope_note = oneshot_json("scope", "list")
+        on_bus = isinstance(scope_list, list) and HOST in scope_list
+        # The status bar's ` · N in scope` counts flows, not hosts; it is hidden under the toast for
+        # ~4 s and only recorded. The host count is the sidebar's `Scope N` row.
         term.press("\x1b", 0.4)
+        term.wait_for(r" · \d+ in scope", 8)
+        after = term.text()
+        count = re.search(r" · (\d+) in scope", after)
+        side = SIDEBAR_SCOPE_RX.search(after)
+        side_n = int(side.group(1)) if side else 0
+        # A fresh scope reads `Scope 1`; a pre-existing host (his own entry) legitimately raises it.
+        side_ok = side_n == 1 or (pre_existing and side_n >= 1)
+        if prompt and hint and toast and listed and on_bus and side_ok:
+            step("TUI-2", "PASS", f"prompt + hint shown, toast `Scope + {HOST}`, panel lists it, sidebar `Scope {side_n}`, status bar ` · {count.group(1) if count else '?'} in scope` (flows; recorded); Scope-empty words before: {scope_empty}" + (f"; the host was ALREADY in Scope before the run (config.yaml {HOST in config_scope}, panel {on_panel}; not removed at the end)" if pre_existing else ""), f"aitm scope list contains {HOST} ({len(scope_list)} hosts); bus truth: one-shot CLI")
+        else:
+            step("TUI-2", "FAIL", f"prompt {prompt}, hint {hint}, toast {toast}, listed {listed}, sidebar `Scope {side_n}` (row {side.group(0).strip() if side else None}; want 1, or >= 1 for a pre-existing host), status bar {count.group(0) if count else None}, aitm scope list has host {on_bus}", scope_note[:200])
         term.press("\x1b", 0.4)
 
         # N2 — a host in Scope, no route: the pill word and the empty pane are what is judged.
         screen = term.text()
         if "sys-proxy off" in screen and (NO_FLOWS in screen or NO_FLOWS_GENERIC in screen):
-            step("N2-TUI", "PASS", "pill `· sys-proxy off`; flows pane empty state while a host is in Scope (zero rows is correct here)", "bus truth: audit only")
+            step("N2-TUI", "PASS", "pill `· sys-proxy off`; flows pane empty state while a host is in Scope (zero rows is correct here)", "bus truth: one-shot CLI (TUI-2's aitm scope list)")
         elif "sys-proxy off" not in screen:
             pill_word = re.search(r"sys-proxy [^·\n]*", screen)
             step("N2-TUI", "SKIP", f"not the N2 state: pill shows `{pill_word.group(0).strip() if pill_word else '(no sys-proxy word)'}`")
@@ -229,7 +283,11 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
 
         # TUI-5a — arm / disarm; TUI-5b — park / resume (needs a route and a hand).
         term.press("i", 0.5)
-        armed = term.wait_for(r"Intercept armed — every request pauses here", 5)
+        armed = term.wait_for(ARMED_BAR_RX, 5)
+        pill_armed = ARMED_PILL in term.text()
+        save("TUI-5a-armed.txt", term.text())
+        st_armed, note_armed = oneshot_json("proxy", "status")
+        bus_armed = armed_flag(st_armed) is True
         if w.results.get("TUI-4") == "PASS" and is_manual():
             pause("Reload http://example.com/ in Safari, then press Enter here")
             parked = term.wait_for(r"1 paused\s+GET http://example\.com/", 15)
@@ -242,21 +300,32 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             step("TUI-5b", "BLOCKED", "TUI-3" if w.results.get("TUI-3") != "PASS" else "TUI-4", "no route / no hand: park and resume cannot be judged")
         term.press("i", 0.5)
         disarmed = term.wait_for(r"Intercept disarmed", 5)
-        step("TUI-5a", "PASS" if armed and disarmed else "FAIL", f"armed bar {armed}; toast `Intercept disarmed` {disarmed}", "bus truth: audit only")
+        st_off, note_off = oneshot_json("proxy", "status")
+        bus_disarmed = armed_flag(st_off) is False
+        ok_5a = armed and pill_armed and disarmed and bus_armed and bus_disarmed
+        detail_5a = (
+            f"armed bar {armed}; pill `{ARMED_PILL.strip()}` {pill_armed}; toast `Intercept disarmed` {disarmed}; "
+            f"aitm proxy status intercept_armed after arm {armed_flag(st_armed)}, after disarm {armed_flag(st_off)}"
+        )
+        step("TUI-5a", "PASS" if ok_5a else "FAIL", detail_5a, f"bus truth: one-shot CLI ({note_armed}; {note_off})")
 
         # TUI-6 — local confirm: CA panel, i, then n.
         term.press(":", 0.3)
         term.press("ca\r", 0.6)
         term.press("i", 0.5)
         prompt = term.wait_for(r"confirm: ca\.install", 5)
-        hint = "y runs it · n / Esc cancels" in term.text()
+        # The hint is observed, not asserted: ca.install's long description pushes `[y/N]` and the
+        # hint off a 180-column prompt row (bars.rs::prompt drops the hint when it does not fit).
+        hint = CA_HINT in term.text()
         term.press("n", 0.5)
-        cancelled = term.wait_for(r"CA trust cancelled", 5)
+        # The local `n` toasts `<call> cancelled` (app.rs answer_confirm); `CA trust cancelled` is
+        # the toast for a `ca.install cancelled` error from the OS dialog (system-proxy spec D17.11).
+        cancelled = term.wait_for(r"ca\.install cancelled", 5)
         ca_rows = [r for r in audit_tail(50, "ca-audit.jsonl") if r.get("at", 0) >= t0 and "install" in json.dumps(r)]
-        if prompt and hint and cancelled and not ca_rows:
-            step("TUI-6", "PASS", "confirm prompt + hint shown; n → `CA trust cancelled`", "ca-audit.jsonl: no ca.install from this run", "PR #263 (over-the-wire _confirm) not pinned here")
+        if prompt and cancelled and not ca_rows:
+            step("TUI-6", "PASS", f"confirm prompt `confirm: ca.install` shown; hint `{CA_HINT}` visible {hint} (not required: clipped at 180 cols); n → `ca.install cancelled`", "ca-audit.jsonl: no ca.install from this run", "PR #263 (over-the-wire _confirm) not pinned here")
         else:
-            step("TUI-6", "FAIL", f"prompt {prompt}, hint {hint}, cancelled {cancelled}, ca-audit rows {len(ca_rows)}")
+            step("TUI-6", "FAIL", f"prompt {prompt}, hint {hint} (not required), cancelled {cancelled}, ca-audit rows {len(ca_rows)}")
         term.press("\x1b", 0.4)
         term.press("\x1b", 0.4)
 

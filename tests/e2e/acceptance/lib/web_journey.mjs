@@ -45,7 +45,17 @@ const ask = async (kind, text) => { console.log(`${kind}\t${text}`); return read
 const chrome = await launchChrome({ width: 1500, height: 950 });
 if (typeof chrome.close !== 'function') { console.error('cua-driver changed: launchChrome() has no close(); refusing to run without a scoped cleanup'); process.exit(2); }
 const d = makeDriver(chrome, { log, shotsDir: outdir });
-const status = () => d.ev(`document.querySelector('[role=status]')?.textContent||''`);
+// The intercept bar (apps/web/src/shell/InterceptBar.tsx) is NOT the first `[role=status]`: the
+// toolbar pill span (Toolbar.tsx) and the operator banner are `[role=status]` too, and the pill
+// reads `… · CA trusted · intercept armed` when armed. Pick the bar by its own words (armed:
+// `Intercept armed — …`; paused: `N paused …`); '' when it is not drawn, so WEB-6d's "bar gone"
+// and WEB-6b's `/1 paused/` poll both read the bar and nothing else. innerText keeps the spaces
+// between the text and the buttons that textContent drops.
+const status = () => d.ev(`[...document.querySelectorAll('[role=status]')].map(e=>e.innerText.replace(/\\s+/g,' ').trim()).find(t=>t.startsWith('Intercept armed')||/^\\d+ paused/.test(t))||''`);
+// A button's label from its text nodes only: `Button` (apps/web/src/components/Button.tsx) renders
+// `{children}<kbd>{kbd}</kbd>`, so `Disarm`'s textContent is `Disarmi` and `Resume`'s is `Resume⌘⏎`.
+// Page-side arrow-function source, interpolated into d.ev() expressions as `(${btnLabel})(b)`.
+const btnLabel = `(b=>[...b.childNodes].filter(n=>n.nodeType===3).map(n=>n.textContent).join('').trim())`;
 const pillWord = () => d.ev(`document.body.innerText.match(/sys-proxy [^·\\n]+/)?.[0]||''`);
 const gridRows = () => d.ev(`[...document.querySelectorAll('[role=grid][aria-label="Flows"] [role=row]')].map(r=>r.textContent.replace(/\\s+/g,' ').trim())`);
 const openPillMenu = () => d.click({ role: 'button', text: 'aitmproxy · listening' }).catch(async () => d.click({ sel: 'button[aria-haspopup="menu"]' }));
@@ -148,15 +158,17 @@ try {
   await d.key('i');
   await sleep(600);
   const armedText = await status();
-  const btnDisarm = await d.ev(`[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='Disarm')`);
-  const btnRules = await d.ev(`[...document.querySelectorAll('button')].some(b=>b.textContent.trim().startsWith('Rules'))`);
+  // btnLabel: text nodes only, the <kbd> shortcut inside the button is not part of the label.
+  const btnDisarm = await d.ev(`[...document.querySelectorAll('button')].some(b=>(${btnLabel})(b)==='Disarm')`);
+  const btnRules = await d.ev(`[...document.querySelectorAll('button')].some(b=>(${btnLabel})(b).startsWith('Rules'))`);
   step('WEB-6a', armedText.includes('Intercept armed — every request pauses here') && btnDisarm && btnRules ? 'PASS' : 'FAIL', `status bar "${armedText.trim().slice(0, 120)}"; Disarm ${btnDisarm}; Rules… ${btnRules}`);
   if (isManual && routeOpen && setByUs) {
     await ask('PAUSE', 'Reload http://example.com/ in Safari, then press Enter in the wrapper');
     let paused = '';
     for (let i = 0; i < 30 && !/\d+ paused/.test(paused); i++) { await sleep(500); paused = await status(); }
     const rowPaused = await d.ev(`document.body.innerText.includes('Paused')`);
-    const resumeOn = await d.ev(`[...document.querySelectorAll('button')].some(b=>/^(Resume|Apply & Resume)$/.test(b.textContent.trim())&&!b.disabled)`);
+    // btnLabel: `Resume` carries kbd="⌘⏎", so its textContent never matches the anchored regex.
+    const resumeOn = await d.ev(`[...document.querySelectorAll('button')].some(b=>/^(Resume|Apply & Resume)$/.test((${btnLabel})(b))&&!b.disabled)`);
     step('WEB-6b', /1 paused/.test(paused) && rowPaused && resumeOn ? 'PASS' : 'FAIL', `status "${paused.trim().slice(0, 80)}"; row Paused ${rowPaused}; Resume enabled ${resumeOn}`);
     await d.click({ role: 'button', text: 'Resume' });
     await sleep(1500);
