@@ -20,7 +20,7 @@ import { batch, createEffect, createSignal, untrack, type Accessor } from 'solid
 import { createStore } from 'solid-js/store';
 import type { AppStore } from '~/state/app';
 import type { BusState } from '~/bus/types';
-import { emptyRecord, isLive, isStale, own } from './helpers';
+import { emptyRecord, isLive, isStale, needsStatusRead, own } from './helpers';
 import {
   ISSUES_LIMIT,
   JOB_NOTIFICATION_METHOD,
@@ -153,6 +153,8 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
   const lastSeq = new Map<string, number>();
   const statusTriggers = new Map<string, ReturnType<typeof setTimeout>>();
   const issueTriggers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Jobs whose list-driven `scan.status` read has not answered yet (the re-read rule's dedupe). */
+  const listReads = new Set<string>();
   let statusPoll: ReturnType<typeof setInterval> | null = null;
   let listPoll: ReturnType<typeof setInterval> | null = null;
   let issuesPoll: ReturnType<typeof setInterval> | null = null;
@@ -194,6 +196,7 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
         setJobsLoadedAt(Date.now());
         setLiveCount(parsed.jobs.filter((j) => isLive(j.state)).length);
       });
+      rereadTurnedTerminal(parsed.jobs);
     } catch (e) {
       batch(() => {
         setJobsLoaded(true);
@@ -201,6 +204,22 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
       });
     }
     syncPolls();
+  }
+
+  /**
+   * The re-read rule (Jobs view D18 W1, the web's C1/C2 shape): a listed job with nothing held, or
+   * one the list calls terminal while the held status is still live, owes one `scan.status` read.
+   * Without a push line the 1 Hz poll stops the moment the list turns terminal, which would leave
+   * the held status at its last running read for ever; with push the terminal line already
+   * triggered a read, so this is the fallback. One read per job is in flight at a time: a second
+   * list reply landing before the first read answered does not send another.
+   */
+  function rereadTurnedTerminal(listed: JobSummary[]): void {
+    for (const j of listed) {
+      if (listReads.has(j.job) || !needsStatusRead(j, own(statuses, j.job) ?? null)) continue;
+      listReads.add(j.job);
+      void refreshStatus(j.job).finally(() => listReads.delete(j.job));
+    }
   }
 
   /**

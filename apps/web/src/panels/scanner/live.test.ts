@@ -19,6 +19,15 @@ const sub = (o: Raw, key: string): Raw => o[key] as Raw;
 const JOB = 'scan-1a2b3c4d';
 const OTHER = 'scan-55667788';
 const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
+/**
+ * A `scan.status` answer for the job asked about: the fixture is JOB's running status; OTHER is the
+ * list fixture's finished job. (The bare fixture names JOB whatever the argument, which would leave
+ * OTHER with nothing held and so re-read on every list under W1's rule.)
+ */
+const statusFor = (args: Record<string, unknown>): Raw =>
+  args['job'] === OTHER
+    ? { ...raw('scan.status.json'), job: OTHER, state: 'done', phase: 'done' }
+    : raw('scan.status.json');
 
 let close: (() => void) | null = null;
 
@@ -133,18 +142,22 @@ describe('createLiveModel: poll is truth', () => {
 
   it('polls_while_live: 1 Hz status and 5 s list while a job is live, and stops when none is', async () => {
     const h = harness();
+    h.reply('scan.status', statusFor);
     expect(h.m.liveCount()).toBeNull();
     await h.m.refreshJobs();
     expect(h.m.liveCount()).toBe(1);
     expect(h.m.jobs().length).toBe(2);
     expect(h.m.jobsLoaded()).toBe(true);
+    // The first list seeds one read per job it named (W1's re-read rule: nothing was held yet).
+    expect(h.argsOf('scan.status').map((a) => a['job'])).toEqual([JOB, OTHER]);
+    const seeded = h.count('scan.status');
 
     await tick(5000);
-    expect(h.count('scan.status')).toBeGreaterThanOrEqual(5);
-    expect(h.count('scan.status')).toBeLessThanOrEqual(6);
+    expect(h.count('scan.status') - seeded).toBeGreaterThanOrEqual(5);
+    expect(h.count('scan.status') - seeded).toBeLessThanOrEqual(6);
     expect(h.count('scan.list')).toBe(2);
     // Only the live job is polled.
-    expect(h.argsOf('scan.status').every((a) => a['job'] === JOB)).toBe(true);
+    expect(h.argsOf('scan.status').slice(seeded).every((a) => a['job'] === JOB)).toBe(true);
 
     const list = raw('scan.list.json');
     const jobs = list['jobs'] as Raw[];
@@ -162,7 +175,11 @@ describe('createLiveModel: poll is truth', () => {
 
   it('nothing_while_not_open: a bus that is not open is never called, and a re-open resyncs', async () => {
     const h = harness();
+    h.reply('scan.status', statusFor);
     await h.m.refreshJobs();
+    // One read per listed job (W1's re-read rule), then nothing more while the bus is away.
+    const seeded = h.count('scan.status');
+    expect(seeded).toBe(2);
     h.setBusState('reconnecting');
     const before = h.calls.length;
 
@@ -177,8 +194,8 @@ describe('createLiveModel: poll is truth', () => {
     h.setBusState('open');
     await tick(50);
     expect(h.count('scan.list')).toBe(2);
-    expect(h.count('scan.status')).toBe(2);
-    expect(h.argsOf('scan.status').map((a) => a['job'])).toEqual([JOB, OTHER]);
+    expect(h.count('scan.status')).toBe(seeded + 2);
+    expect(h.argsOf('scan.status').slice(seeded).map((a) => a['job'])).toEqual([JOB, OTHER]);
   });
 
   it('issues_heartbeat: the mounted Issues view re-reads every 5 s while its job is live', async () => {
@@ -352,5 +369,67 @@ describe('createLiveModel: failures', () => {
     expect(h.m.jobsError()).toBe('bus closed');
     expect(h.m.jobsLoaded()).toBe(true);
     expect(h.m.liveCount()).toBeNull();
+  });
+});
+
+// Jobs view W1 (D18, AC34): the web's C1/C2 shape of the re-read rule. Without a push line the
+// 1 Hz poll stops the moment the list turns terminal, which would leave the held status at its
+// last running read for ever; so a list reply that calls a job terminal while the held status is
+// still live costs exactly one `scan.status` read (`needsStatusRead`), de-duplicated while a read
+// for that job is already in flight.
+describe('createLiveModel: the re-read rule (W1)', () => {
+  const listOf = (...jobs: Raw[]): Raw => ({ jobs });
+  const jobRow = (patch: Raw = {}): Raw => ({ ...(raw('scan.list.json')['jobs'] as Raw[])[0]!, ...patch });
+
+  it('terminal_list_rereads_a_running_status: list done over a held running status is one read', async () => {
+    const h = harness();
+    await h.m.refreshStatus(JOB);
+    expect(h.m.status(JOB)!.state).toBe('running');
+
+    h.reply('scan.list', listOf(jobRow({ state: 'done', phase: 'done' })));
+    const before = h.count('scan.status');
+    await h.m.refreshJobs();
+    expect(h.count('scan.status')).toBe(before + 1);
+    expect(h.argsOf('scan.status').at(-1)).toEqual({ job: JOB });
+
+    // The held status is already terminal: the list has nothing new to say, so no read follows.
+    h.reply('scan.status', { ...raw('scan.status.json'), state: 'done', elapsed_ms: 50000 });
+    await h.m.refreshStatus(JOB);
+    expect(h.m.status(JOB)!.state).toBe('done');
+    const settled = h.count('scan.status');
+    await h.m.refreshJobs();
+    expect(h.count('scan.status')).toBe(settled);
+  });
+
+  it('a listed job with no held status is read once, and a live job with a live held status is not', async () => {
+    const h = harness();
+    h.reply('scan.list', listOf(jobRow()));
+    await h.m.refreshJobs();
+    expect(h.argsOf('scan.status')).toEqual([{ job: JOB }]);
+    await tick(0);
+    expect(h.m.status(JOB)!.state).toBe('running');
+
+    await h.m.refreshJobs();
+    expect(h.count('scan.status')).toBe(1);
+  });
+
+  it('inflight_dedupe: two list replies before the status answers cost one read', async () => {
+    const h = harness();
+    await h.m.refreshStatus(JOB);
+    let release!: (value: unknown) => void;
+    h.reply('scan.status', () => new Promise<unknown>((r) => (release = r)));
+    h.reply('scan.list', listOf(jobRow({ state: 'done', phase: 'done' })));
+    const before = h.count('scan.status');
+
+    await h.m.refreshJobs();
+    await h.m.refreshJobs();
+    expect(h.count('scan.status')).toBe(before + 1);
+
+    // The answer lands, the slot frees, and the held status is now terminal: a third list says nothing.
+    release({ ...raw('scan.status.json'), state: 'done', elapsed_ms: 50000 });
+    await tick(0);
+    expect(h.m.status(JOB)!.state).toBe('done');
+    await h.m.refreshJobs();
+    expect(h.count('scan.status')).toBe(before + 1);
   });
 });
