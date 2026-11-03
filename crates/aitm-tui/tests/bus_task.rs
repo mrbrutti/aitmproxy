@@ -9,8 +9,10 @@
 //! line it sends: the handshake subscribes once when the bus offers
 //! `flow.subscribe` and a refused subscribe is a warning, not a session
 //! loss; `prune()` keeps the reserved `_confirm` key; a `CallTagged` answers
-//! under its tag. The live counterpart against the real server is
-//! `crates/aitm/tests/tui_live_bus.rs`.
+//! under its tag. The 0.5.16 acceptance (T7 D5 as amended 2026-11-03) adds:
+//! on a transport with no push sink (`aitm tui`'s in-process server) the
+//! handshake never calls `flow.subscribe` and raises no toast. The live
+//! counterpart against the real server is `crates/aitm/tests/tui_live_bus.rs`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -209,10 +211,12 @@ struct Running {
     task: JoinHandle<()>,
 }
 
-fn start(connect: Connector, poll: Duration) -> Running {
+/// The task on a transport that can (`push == true`, the TCP bus) or cannot
+/// (`push == false`, the in-process server) deliver server pushes.
+fn start(connect: Connector, poll: Duration, push: bool) -> Running {
     let (req_tx, req_rx) = mpsc::channel(32);
     let (ev_tx, ev_rx) = mpsc::channel(256);
-    let task = tokio::spawn(bus::run(connect, req_rx, ev_tx, poll));
+    let task = tokio::spawn(bus::run(connect, req_rx, ev_tx, poll, push));
     Running {
         req_tx,
         ev_rx,
@@ -235,8 +239,12 @@ fn scripted(answer: fn(&str, &Value) -> Value, attempts: Arc<AtomicUsize>) -> Co
 }
 
 /// The task against a recording [`Scripted`] bus offering [`SCAN_TOOLS`],
-/// and the lines it sends.
-fn start_recording(answer: fn(&str, &Value) -> Value, poll: Duration) -> (Running, Lines) {
+/// and the lines it sends. `push` as for [`start`].
+fn start_recording(
+    answer: fn(&str, &Value) -> Value,
+    poll: Duration,
+    push: bool,
+) -> (Running, Lines) {
     let lines: Lines = Arc::new(Mutex::new(Vec::new()));
     let recorded = lines.clone();
     let connect: Connector = Arc::new(move || {
@@ -251,7 +259,7 @@ fn start_recording(answer: fn(&str, &Value) -> Value, poll: Duration) -> (Runnin
             })))
         })
     });
-    (start(connect, poll), lines)
+    (start(connect, poll, push), lines)
 }
 
 async fn next_where(
@@ -294,7 +302,7 @@ async fn a_refused_token_during_the_handshake_is_reported_once_and_not_retried()
         counter.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(BusClient::new(Box::new(Refusing))) })
     });
-    let mut r = start(connect, Duration::from_millis(20));
+    let mut r = start(connect, Duration::from_millis(20), true);
     let first = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
     assert_eq!(first, BusEvent::Disconnected(bus::REFUSED.into()));
     // The task ends on its own: no second connect, no back-off loop. Both
@@ -331,7 +339,7 @@ async fn a_failed_connect_reports_disconnected_then_retries_with_backoff() {
         })
     });
     let started = Instant::now();
-    let mut r = start(connect, Duration::from_millis(50));
+    let mut r = start(connect, Duration::from_millis(50), true);
     let first = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
     assert_eq!(
         first,
@@ -370,6 +378,7 @@ async fn a_malformed_flow_detail_reply_is_a_warn_toast_and_a_detail_failed_event
     let mut r = start(
         scripted(garbage_detail, attempts.clone()),
         Duration::from_millis(50),
+        true,
     );
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
     r.req_tx
@@ -394,7 +403,7 @@ async fn a_malformed_flow_detail_reply_is_a_warn_toast_and_a_detail_failed_event
 /// reach it as pushes. It follows `proxy.status` and precedes the first poll.
 #[tokio::test]
 async fn the_handshake_subscribes_once_when_the_bus_offers_flow_subscribe() {
-    let (mut r, lines) = start_recording(scan_bus, Duration::from_millis(50));
+    let (mut r, lines) = start_recording(scan_bus, Duration::from_millis(50), true);
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
     let wire = sent(&lines);
     // initialize, notifications/initialized, tools/list, then the reads.
@@ -420,7 +429,7 @@ async fn the_handshake_subscribes_once_when_the_bus_offers_flow_subscribe() {
 /// poll; it is never a `Disconnected`.
 #[tokio::test]
 async fn a_failed_subscribe_is_a_warn_toast_not_a_session_loss() {
-    let (mut r, _lines) = start_recording(refusing_subscribe, Duration::from_millis(50));
+    let (mut r, _lines) = start_recording(refusing_subscribe, Duration::from_millis(50), true);
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
     let mut toasts = Vec::new();
     let flows = loop {
@@ -446,12 +455,53 @@ async fn a_failed_subscribe_is_a_warn_toast_not_a_session_loss() {
     finish(r).await;
 }
 
+/// T7 spec D5 as amended 2026-11-03 (0.5.16 acceptance, TUI-1): `aitm tui`
+/// talks to its embedded core over an in-process transport that has no push
+/// sink, so the server refuses `flow.subscribe` by design and the poll is
+/// the truth. With `push == false` the handshake never puts `flow.subscribe`
+/// on the wire and raises no toast, even against a bus that offers the tool
+/// and would refuse it; the session still reaches its first poll. Before
+/// the fix every `aitm tui` start toasted `flow.subscribe failed: …`, which
+/// hid the startup log note.
+#[tokio::test]
+async fn the_in_process_handshake_never_subscribes() {
+    let (mut r, lines) = start_recording(refusing_subscribe, Duration::from_millis(50), false);
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    let mut toasts = Vec::new();
+    loop {
+        let ev = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
+        match ev {
+            BusEvent::Flows(_) => break,
+            BusEvent::Toast(level, text) => toasts.push((level, text)),
+            BusEvent::Disconnected(why) => panic!("the handshake lost the session: {why}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        toasts,
+        Vec::new(),
+        "no toast between Connected and the first poll"
+    );
+    let wire = sent(&lines);
+    assert_eq!(
+        wire.iter()
+            .filter(|w| tool_name(w) == "flow.subscribe")
+            .count(),
+        0,
+        "flow.subscribe never reaches the wire on the in-process transport: {wire:?}"
+    );
+    // The handshake is otherwise unchanged: proxy.status, then the poll.
+    assert_eq!(wire[3]["params"]["name"], "proxy.status");
+    assert_eq!(wire[4]["params"]["name"], "flow.list");
+    finish(r).await;
+}
+
 /// Scanner v2 T7, Constraints finding and T7-15: `prune()` keeps the reserved
 /// `_confirm` key although no tool schema declares it (the server strips it
 /// itself); every other undeclared key is still dropped.
 #[tokio::test]
 async fn prune_keeps_the_reserved_confirm_key() {
-    let (mut r, lines) = start_recording(scan_bus, Duration::from_millis(50));
+    let (mut r, lines) = start_recording(scan_bus, Duration::from_millis(50), true);
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
     let before = sent(&lines).len();
     r.req_tx
@@ -490,7 +540,7 @@ async fn prune_keeps_the_reserved_confirm_key() {
 /// stays verb-agnostic: the tag is opaque to it.
 #[tokio::test]
 async fn a_tagged_call_answers_with_the_same_tag() {
-    let (mut r, lines) = start_recording(scan_bus, Duration::from_millis(50));
+    let (mut r, lines) = start_recording(scan_bus, Duration::from_millis(50), true);
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
 
     r.req_tx
@@ -559,4 +609,160 @@ async fn a_tagged_call_answers_with_the_same_tag() {
         }
     );
     finish(r).await;
+}
+
+/// Tester, 0.5.16 acceptance Task 1: the flag `bus::run` reads comes from
+/// `lib::connector`, so the fix is only as good as that wiring. The TCP choice
+/// reports pushes (`true`), the in-process choice reports none (`false`),
+/// beside the labels the status bar shows. Neither connector is invoked, so
+/// no socket is opened and the handler is never called.
+#[test]
+fn the_connector_reports_pushes_for_tcp_and_none_for_in_process() {
+    use aitm_bus_client::InProcessHandler;
+    use aitm_tui::{connector, TransportChoice};
+
+    let handler: InProcessHandler = Arc::new(|_line: &str| -> Option<String> {
+        panic!("the connector must not call the handler while being built")
+    });
+    let (_connect, label, push) =
+        connector(TransportChoice::InProcess(handler)).expect("build the in-process connector");
+    assert_eq!(label, "in-process");
+    assert!(
+        !push,
+        "the in-process server has no push sink: the bus task must not subscribe on it"
+    );
+
+    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let (_connect, label, push) = connector(TransportChoice::Tcp {
+        addr,
+        token: "t".into(),
+    })
+    .expect("build the TCP connector");
+    assert_eq!(label, addr.to_string());
+    assert!(push, "the loopback TCP bus carries server pushes");
+}
+
+/// [`Recording`] whose connection dies at its first `flow.list` when `dies`
+/// is set: from then on every send fails the way a reset socket does.
+struct Dropping {
+    inner: Recording,
+    dies: bool,
+    dead: std::sync::atomic::AtomicBool,
+}
+
+impl BusTransport for Dropping {
+    fn send(&self, line: String) -> BoxFuture<'_, anyhow::Result<Option<String>>> {
+        if self.dies {
+            let req: Value = serde_json::from_str(&line).expect("the client sends JSON");
+            if tool_name(&req) == "flow.list" || self.dead.load(Ordering::SeqCst) {
+                self.dead.store(true, Ordering::SeqCst);
+                self.inner.lines.lock().unwrap().push(line);
+                return Box::pin(async { Err(anyhow::anyhow!("connection reset by peer")) });
+            }
+        }
+        self.inner.send(line)
+    }
+}
+
+/// The task against a bus that refuses `flow.subscribe`, whose first
+/// connection drops mid-stream (at the first poll) and whose second one is
+/// healthy. Returns every line sent over both connections, the toasts seen,
+/// and the connect attempts.
+async fn drop_then_reconnect(push: bool) -> (Vec<Value>, Vec<(Level, String)>, usize) {
+    let lines: Lines = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let recorded = lines.clone();
+    let counter = attempts.clone();
+    let connect: Connector = Arc::new(move || {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        let lines = recorded.clone();
+        Box::pin(async move {
+            Ok(BusClient::new(Box::new(Dropping {
+                inner: Recording {
+                    inner: Scripted {
+                        answer: refusing_subscribe,
+                        tools: SCAN_TOOLS,
+                    },
+                    lines,
+                },
+                dies: n == 0,
+                dead: std::sync::atomic::AtomicBool::new(false),
+            })))
+        })
+    });
+    let mut r = start(connect, Duration::from_millis(50), push);
+    let mut toasts = Vec::new();
+    let mut connected = 0;
+    let mut lost = 0;
+    // Connected, (toast), Disconnected, Connected, (toast), Flows.
+    let deadline = Instant::now() + WAIT * 2;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let ev = timeout(left, r.ev_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the reconnect completes within {:?}", WAIT * 2))
+            .expect("the bus task is alive");
+        match ev {
+            BusEvent::Connected { .. } => connected += 1,
+            BusEvent::Disconnected(_) => lost += 1,
+            BusEvent::Toast(level, text) => toasts.push((level, text)),
+            BusEvent::Flows(_) if connected == 2 => break,
+            _ => {}
+        }
+    }
+    assert_eq!((connected, lost), (2, 1), "one drop, one reconnect");
+    finish(r).await;
+    (sent(&lines), toasts, attempts.load(Ordering::SeqCst))
+}
+
+/// Tester: a connection that dies mid-stream is `Disconnected`, backed off
+/// and reconnected (`bus::run`'s `Outcome::Lost` arm). On the TCP transport
+/// every connection subscribes once more: two connections, two
+/// `flow.subscribe` lines, two refusal toasts.
+#[tokio::test]
+async fn a_dropped_push_connection_subscribes_again_on_reconnect() {
+    let (wire, toasts, attempts) = drop_then_reconnect(true).await;
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        wire.iter()
+            .filter(|w| tool_name(w) == "flow.subscribe")
+            .count(),
+        2,
+        "once per connection: {wire:?}"
+    );
+    assert_eq!(
+        toasts.len(),
+        2,
+        "one refusal toast per connection: {toasts:?}"
+    );
+    assert!(toasts
+        .iter()
+        .all(|(l, t)| *l == Level::Warn && t.starts_with("flow.subscribe failed")));
+}
+
+/// Tester, T7 D5 as amended 2026-11-03: the in-process flag survives a drop.
+/// The second connection is a fresh `Session`, built from `bus::run`'s own
+/// `push`, so it must not start subscribing (or toasting) after a reconnect
+/// either: zero `flow.subscribe` lines and zero toasts over both connections.
+#[tokio::test]
+async fn a_dropped_in_process_connection_still_never_subscribes() {
+    let (wire, toasts, attempts) = drop_then_reconnect(false).await;
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        wire.iter()
+            .filter(|w| tool_name(w) == "flow.subscribe")
+            .count(),
+        0,
+        "flow.subscribe never reaches the wire on either connection: {wire:?}"
+    );
+    assert_eq!(
+        toasts,
+        Vec::new(),
+        "no toast over the drop and the reconnect"
+    );
+    // Both connections completed their handshake: two `initialize` lines.
+    assert_eq!(
+        wire.iter().filter(|w| w["method"] == "initialize").count(),
+        2
+    );
 }

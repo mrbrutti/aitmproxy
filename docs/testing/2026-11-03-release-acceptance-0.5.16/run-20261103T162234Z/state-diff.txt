@@ -1,0 +1,32 @@
+23c23
+< <pid> /Applications/Aitmproxy.app/Contents/Resources/core/obscura serve --host 127.0.0.1 --port 52588 --proxy http://127.0.0.1:<port> --ca-cert /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt --ready-file /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-obscura-52405-70a720fe3828ba1817f553ca759f53d0/ready-70a720fe3828ba1817f553ca759f53d0.ready
+---
+> <pid> /Applications/Aitmproxy.app/Contents/Resources/core/obscura serve --host 127.0.0.1 --port 51287 --proxy http://127.0.0.1:<port> --ca-cert /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt --ready-file /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-obscura-76513-202df2c39fc1c6c7848e1420a21dcee4/ready-202df2c39fc1c6c7848e1420a21dcee4.ready
+29c29
+< aitm    52405 matt   13u  IPv4 0x6c32a265bdfdbbc9      0t0  TCP 127.0.0.1:<port> (LISTEN)
+---
+> aitm    76513 matt   13u  IPv4 0x4c160d8f57af7744      0t0  TCP 127.0.0.1:<port> (LISTEN)
+121c121
+< <ls> 52405.json
+---
+> <ls> 76513.json
+125,129c125,129
+< {"at":<ms>,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_ad34ba4a477a74aa-4","command":"scope.add","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+< {"at":<ms>,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_ad34ba4a477a74aa-6","command":"scope.remove","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+< {"at":<ms>,"marker":"start","pid":58991,"schema":1,"stream":"control","version":"0.5.16"}
+< {"at":<ms>,"marker":"start","pid":59279,"schema":1,"stream":"control","version":"0.5.16"}
+< {"at":<ms>,"marker":"start","pid":59285,"schema":1,"stream":"control","version":"0.5.16"}
+---
+> {"at":<ms>,"origin":"operator","client_label":"aitm-cli","connection_id":"conn_ad34ba4a477a74aa-18","command":"scope.remove","args":"{\"host\":\"acceptance-cli5.invalid\"}","result":"ok"}
+> {"at":<ms>,"marker":"start","pid":76166,"schema":1,"stream":"control","version":"0.5.16"}
+> {"at":<ms>,"marker":"start","pid":76513,"schema":1,"stream":"control","version":"0.5.16"}
+> {"at":<ms>,"marker":"start","pid":76562,"schema":1,"stream":"control","version":"0.5.16"}
+> {"at":<ms>,"marker":"start","pid":76567,"schema":1,"stream":"control","version":"0.5.16"}
+152a153
+> <ls> 33C687F3-A22E-481B-947A-1BC0B908B4FA
+201d201
+< <ls> ECEB3A32-56A0-43E6-B6A1-DB32F0D1FE08
+212a213
+> /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/<uuid>/  bus.endpoint=127.0.0.1:<port>  listen="127.0.0.1:<port>"
+261d261
+< /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T//aitm-embedded-core/<uuid>/  bus.endpoint=127.0.0.1:<port>  listen="127.0.0.1:<port>"

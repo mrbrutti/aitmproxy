@@ -45,6 +45,13 @@ use crate::app::App;
 use crate::caps::TermCaps;
 use crate::theme::Theme;
 
+/// The period of one `Tick` in milliseconds: the unit the Jobs banner's
+/// age clause counts in (`ui::scan::values_age_text`).
+pub const TICK_MS: u64 = 250;
+/// The period of one `Tick`: the runtime's interval, [`TICK_MS`] as a
+/// `Duration`.
+pub const TICK: Duration = Duration::from_millis(TICK_MS);
+
 /// Where the UI gets its bus.
 pub enum TransportChoice {
     /// A running proxy's loopback TCP transport.
@@ -92,8 +99,11 @@ impl Drop for TerminalGuard {
 }
 
 /// Build the connector for a transport choice, plus the address label the
-/// status bar shows.
-pub fn connector(choice: TransportChoice) -> anyhow::Result<(bus::Connector, String)> {
+/// status bar shows and whether the transport carries server pushes
+/// (`bus::run`'s `push`): the TCP bus does; the in-process server of
+/// `aitm tui` has no push sink by design, so the bus task must not try
+/// `flow.subscribe` on it and the poll is the truth (T7 spec D5).
+pub fn connector(choice: TransportChoice) -> anyhow::Result<(bus::Connector, String, bool)> {
     Ok(match choice {
         TransportChoice::Tcp { addr, token } => {
             let token = Arc::new(token);
@@ -104,14 +114,14 @@ pub fn connector(choice: TransportChoice) -> anyhow::Result<(bus::Connector, Str
                     Ok(BusClient::new(Box::new(t)))
                 })
             });
-            (c, addr.to_string())
+            (c, addr.to_string(), true)
         }
         TransportChoice::InProcess(handler) => {
             let c: bus::Connector = Arc::new(move || {
                 let h = handler.clone();
                 Box::pin(async move { Ok(BusClient::new(Box::new(InProcessTransport::new(h)))) })
             });
-            (c, "in-process".to_string())
+            (c, "in-process".to_string(), false)
         }
     })
 }
@@ -120,12 +130,12 @@ pub fn connector(choice: TransportChoice) -> anyhow::Result<(bus::Connector, Str
 pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let caps = opts.caps.unwrap_or_else(TermCaps::detect);
     let theme = Theme::new(caps.truecolor);
-    let (connect, label) = connector(opts.transport)?;
+    let (connect, label, push) = connector(opts.transport)?;
     let mut app = App::new(caps, label);
 
     let (req_tx, req_rx) = mpsc::channel(128);
     let (ev_tx, mut ev_rx) = mpsc::channel(512);
-    let bus_task = tokio::spawn(bus::run(connect, req_rx, ev_tx, opts.poll));
+    let bus_task = tokio::spawn(bus::run(connect, req_rx, ev_tx, opts.poll, push));
     if let Some(note) = opts.startup_note {
         app.toast(Level::Info, note);
     }
@@ -140,7 +150,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let size = terminal.size()?;
     let _ = app.update(Action::Resize(size.width, size.height));
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut tick = tokio::time::interval(TICK);
 
     let result: anyhow::Result<()> = loop {
         if let Err(e) = terminal.draw(|f| ui::view(&app, &theme, f)) {

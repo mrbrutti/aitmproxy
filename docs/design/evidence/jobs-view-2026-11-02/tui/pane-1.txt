@@ -1,0 +1,50 @@
+ ›•‹ aitmproxy  ● rec  ✎ compose  ⌫ clear                       ● aitmproxy · listening 127.0.0.1:18180 · sys-proxy off                        [⚙ Agent ● auto · 3/min]  : palette  ▄▄ below  b sidebar
+  All 1 │ HTTP2 HTTPS3 WebSocket4 │ TCP5 UDP6 L47 │ h18 h29 │ JSON0 Form XML JS CSS GraphQL Document Media Other                                                                             ⌕ / filter
+ ›•‹ aitmproxy             │        # URL                                                                                 Client   Method  Status Time         Duration  Request Response SSL Ed Origin
+                           │
+ Working                   │
+  Pinned                   │
+  Saved                 F10│
+                           │
+ All                       │
+  All flows               0│
+  Apps                    0│
+  Domains                 0│
+                           │
+ aitmproxy                 │
+  Scope                   2│
+  Findings                0│
+  Browser                 —│
+  Scripts                M3│
+  Agent               3/min│  No flows yet: point a client at 127.0.0.1:18180 or open the browser.
+  Scan                    -│
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+                           │
+ [ ] move  b hide          │
+ ? help  i intercept  e edit  r replay  n compose  P poc  : palette  t Auto-select ○                      – / 0 rows · 0 in scope                      — ↑ — ↓ — (F4)  ● bus 127.0.0.1:19190 · operator

@@ -1,0 +1,1 @@
+FAIL: 52 ok, 1 noted, 3 failed; aitm-tui Scan surface on bus 127.0.0.1:53721: jobs ['scan-21142f91', 'scan-7e4a7341', 'scan-f4dd0c4a']; target latency 300 ms; failed: ["T7-17: `⏎` on the first probe flow opened the inspector (Request/Resp

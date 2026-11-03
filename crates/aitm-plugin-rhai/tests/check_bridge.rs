@@ -735,6 +735,15 @@ impl ProbeHost for ModeRecordingHost {
     fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
         Some(Arc::new(aitm_scan_model::testing::NullClient))
     }
+    /// The recorder answers every probe itself; no captured flow built it.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+    /// Affordable up to `budget_left`, debiting nothing: this host counts
+    /// probes, not units.
+    fn charge(&self, units: u32) -> bool {
+        self.budget_left() >= units
+    }
 }
 
 /// T3: `probe.send` takes the map form too, so a check can append to the value

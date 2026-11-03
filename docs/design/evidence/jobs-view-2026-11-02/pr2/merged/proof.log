@@ -1,0 +1,52 @@
+[06:39:09] == pass M: merged head 4cbd5294 (4cbd5294 Merge remote-tracking branch 'origin/main' into feat/scan-jobs-view-red); app + core from the bundle tree dc3992bb = merged head + #310 (origin/claude/serene-villani-38530e; #310 is not on main yet)
+[06:39:09] real audit before: d85c0495ea7cd38b 94273  ; ca-audit: ed14b58f15856db8 20889 
+share
+app pid 50336
+core pid 50346 proxy port 52412 bus 127.0.0.1:52417
+[06:39:42] core config /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/8E7FE2ED-B52C-4F6E-8E04-DD542C3E79BA/config.yaml
+1:listen: "127.0.0.1:52412"
+9:  audit_log: "/tmp/Aitmproxy-dev-state-jobsux/audit.jsonl"
+[06:39:42] #310 PASS: every audit_log line under the isolated store (/tmp/Aitmproxy-dev-state-jobsux/audit.jsonl)
+pressed AXButton '' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[06:40:04] frame M0-empty
+[06:40:04] == M1 running·auditing: standard on 8117, wait for auditing with a check running, select the row
+[06:40:05] standard job scan-d3156689
+left-clicked 885 -800 in pid 50336 via HID tap
+selected now: scan-job-scan-d3156689 (wanted scan-job-scan-d3156689)
+[06:40:36] frame M1-running
+witness running auditing checks 3057 -> 3060 of 6457 running ['xss-reflected'] -> ['xss-reflected'] probes 72 -> 76
+AX has   Auditing
+AX has   now ·
+AX LACKS checks to go
+AX LACKS probe budget
+AX has   Progress
+AX has   Cancel Scan
+AX LACKS at this pace
+now tag id standard in witness running ids ['xss-reflected'] -> False
+rendered percents ['47'] floor(100*done/scheduled) bracket [47, 47] -> True
+[06:40:37] == M2 cancelled by one press; one scan.cancel for the job in the store's audit log
+pressed AXButton '' -> 0
+witness cancelled cancelled elapsed_ms 33353 checks 3066 of 6457
+[06:40:44] frame M2-cancelled
+AXStaticText		Cancelled	
+AXButton			Scan Again
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 33 seconds.
+[06:40:44] audit scan.cancel for scan-d3156689: before=0
+0 after=1 (expect after-before == 1)
+[06:40:44] == M3 dead target 8121 (never listens): wait for done, select, D4 sentence + raw token
+[06:40:44] dead-target job scan-5765d365
+witness done errors checks errors 7 crawl None
+left-clicked 885 -734 in pid 50336 via HID tap
+selected now: scan-job-scan-5765d365 (wanted scan-job-scan-5765d365)
+[06:41:23] frame M3-dead-target
+22:AXStaticText		Done
+26:AXStaticText		Stopped early: too many errors from the target.
+33:AXStaticText		The crawl fetched 1 page and hit 1 error
+34:AXStaticText		stopped_reason: errors
+[06:41:24] raw token count in AX: 1 (expect 1)
+[06:41:24] real audit after: ab0b96d33c2129ab 94372 ; ca-audit: ed14b58f15856db8 20889 
+[06:41:24] #310 FAIL: a real audit log changed
+[06:41:24] == evidence copy

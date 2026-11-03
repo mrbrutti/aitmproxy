@@ -1,0 +1,4 @@
+N5-CLI	N/A	the one-shot refusal is CLI-6's row (no separate step on this surface)		
+N5-TUI	SKIP	the app's embedded core is not running (8080 not held by it)		
+N4-TUI	SKIP	the app's embedded core is not running (8080 not held by it)		
+N4-WEB	SKIP	the app's embedded core is not running (8080 not held by it)		

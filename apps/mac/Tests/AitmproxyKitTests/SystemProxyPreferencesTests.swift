@@ -77,6 +77,29 @@ import Testing
         #expect(SystemProxyPreferences.bypassField(defaults) == "corp.test")
     }
 
+    /// Release acceptance MAC-6/15: seeding writes the recommended list only when the store holds
+    /// nothing for the key, so `defaults read` carries what the app will pass before Settings is ever
+    /// opened, and an operator's own value — empty, a string, or something stored under another type by
+    /// hand — is never overwritten. The returned-value behaviour stays with the test above.
+    @Test func seedingWritesOnlyIntoAnEmptyKey() {
+        let suite = "com.mrbrutti.aitmproxy.tests.sysproxy-prefs-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        #expect(defaults.object(forKey: SystemProxyPreferences.bypassKey) == nil)
+        SystemProxyPreferences.seedBypassDefaultIfUnset(defaults)
+        #expect(defaults.string(forKey: SystemProxyPreferences.bypassKey) == SystemProxyPreferences.defaultBypassField)
+        defaults.set("", forKey: SystemProxyPreferences.bypassKey)
+        SystemProxyPreferences.seedBypassDefaultIfUnset(defaults)
+        #expect(defaults.string(forKey: SystemProxyPreferences.bypassKey) == "", "a cleared field is not re-filled")
+        defaults.set("corp.test", forKey: SystemProxyPreferences.bypassKey)
+        SystemProxyPreferences.seedBypassDefaultIfUnset(defaults)
+        #expect(defaults.string(forKey: SystemProxyPreferences.bypassKey) == "corp.test")
+        defaults.set(["corp.test"], forKey: SystemProxyPreferences.bypassKey)
+        SystemProxyPreferences.seedBypassDefaultIfUnset(defaults)
+        #expect(defaults.array(forKey: SystemProxyPreferences.bypassKey) as? [String] == ["corp.test"],
+                "a value stored under another type by hand is left alone")
+    }
+
     // MARK: Edges a bus client must survive (tester, stage 5)
 
     /// Tabs and CRLF are whitespace like any other; a pasted Windows line ending is not a host.
