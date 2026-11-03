@@ -581,6 +581,35 @@ async function still(file) {
   out(`  still ${path}`);
   return path;
 }
+/**
+ * AC59's stills: the lower region grown to the Shell's keyboard maximum (ArrowUp on the
+ * `Resize inspector` separator, 0.02 a press, clamped at 0.85) so the card fills the 1440 x 900
+ * viewport instead of the flow table; real key input, the split persists in `aitm.split.h`.
+ */
+const SPLITTER = '[role=separator][aria-label="Resize inspector"]';
+async function growLowerRegion() {
+  const before = await d.ev(`localStorage.getItem('aitm.split.h')`);
+  await d.ev(`document.querySelector(${j(SPLITTER)})?.focus()`);
+  for (let i = 0; i < 40; i++) {
+    const v = Number(await d.ev(`localStorage.getItem('aitm.split.h')`));
+    if (Number.isFinite(v) && v >= 0.85) break;
+    await d.key('ArrowUp');
+  }
+  const after = await d.ev(`localStorage.getItem('aitm.split.h')`);
+  note('09 lower region', `aitm.split.h ${j(before)} -> ${j(after)} (ArrowUp on the separator)`);
+  await sleep(300);
+}
+/** Scroll `sel` to the top of its scroll container, settle, and keep a still. */
+async function stillOf(sel, file) {
+  await d.ev(`document.querySelector(${j(sel)})?.scrollIntoView({ block: 'start' })`);
+  await sleep(350);
+  return still(file);
+}
+/** The three AC59 views of one state: the card from its top, then the table with the wells below it. */
+async function jobsStills(name, card) {
+  await stillOf(card, `${name}.png`);
+  await stillOf(JOBS, `${name}-table.png`);
+}
 /** The witness JSON kept beside a still. */
 const keepStatus = (name, payload) => writeFileSync(join(SHOTS, `status-${name}.json`), JSON.stringify(payload, null, 2) + '\n');
 const doneOver = (st) => (st?.checks?.scheduled > 0 ? st.checks.done / st.checks.scheduled : null);
@@ -1040,6 +1069,7 @@ async function run() {
     return;
   }
   await step('09 Jobs view: auditing with the now mark', async () => {
+    await growLowerRegion();
     await setViewport(JOBS_VIEWPORT);
     await waitForQuietEngine('09', 90000);
     job3 = await launchStandard('09', [], { failTitle: '09 a standard job starts for the Jobs view' });
@@ -1081,7 +1111,7 @@ async function run() {
     };
     const after = await status(job);
     keepStatus('09', { job, early, before, after, rendered });
-    await still('09-jobs-auditing.png');
+    await jobsStills('09-jobs-auditing', cardSel(job));
     const liveBoth = [before, after].every((st) => st.state === 'running' && st.phase === 'auditing');
     if (!liveBoth) {
       gap('09 bracket', `the job left auditing during the capture (${before.state} · ${before.phase} -> ${after.state} · ${after.phase}); the still and status-09.json stand, the numbers are not judged`);
@@ -1163,7 +1193,7 @@ async function run() {
     };
     const final = await status(job);
     keepStatus('10', { job, cancelled, final, rendered });
-    await still('10-jobs-cancelled.png');
+    await jobsStills('10-jobs-cancelled', card);
     expect(rendered.chip === 'Cancelled', '10a the card chip reads Cancelled after the witness read cancelled', `chip ${j(rendered.chip)}`);
     expect(rendered.rowState === 'Cancelled', '10a the row state word reads Cancelled', `row ${j(rendered.rowState)}`);
     const m = CANCELLED_SENTENCE.exec(end ?? '');
@@ -1251,7 +1281,8 @@ async function run() {
     };
     const final = await status(job);
     keepStatus('11', { job, terminal, final, rendered });
-    await still('11-jobs-dead.png');
+    await stillOf(`${card} [data-field=attention]`, '11-jobs-dead-attention.png');
+    await jobsStills('11-jobs-dead', card);
     expect(rendered.stopped === STOPPED_ERRORS_SENTENCE, '11a [data-field=stopped] reads the D4 sentence for stopped_reason errors', `stopped ${j(rendered.stopped)}`);
     expect(rendered.stoppedRaw === RAW_ERRORS_LINE, '11b [data-field="stopped-raw"] reads the raw token line', `stopped-raw ${j(rendered.stoppedRaw)}`);
     const n = attentionLine === null ? null : ungroup(ATTENTION_ERRORS.exec(attentionLine)[1]);
