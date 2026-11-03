@@ -961,7 +961,7 @@ per cell.
 #### D11. The job card and the wells (locked comp)
 
 The job card replaces the inspector. `ScanJobCard(facts:progress:link:…)` in
-`ScanJobCard.swift` is composed of small views: `ScanJobTitleRow`, `ScanLane`,
+`ScanJobCard.swift` is composed of small views: `ScanJobTitleRow`, `ScanJobLane`,
 `ScanIssueLedger`, `ScanProbeGauge`, `ScanKPIStrip`, `ScanAttentionBlock`;
 the wells are `ScanJobWells` in `ScanJobWells.swift`. The card's **tone** is
 a Kit value, `ScanFormat.tone(facts) -> ScanJobTone` (`.progress` while
@@ -1021,7 +1021,7 @@ horizontal, a 3 pt left edge in the tone's colour clipped to the radius,
    `.focused(inspectorFocused)`; `.onExitCommand` returns focus to the table
    and clears `scanAgainError`. `Unable to scan again: <display>` renders
    under the title row (D13).
-2. **Scan lane** (`ScanLane(progress:facts:reduceMotion:)`): a 64 pt track
+2. **Scan lane** (`ScanJobLane(progress:facts:reduceMotion:)`; `ScanLane` is the Kit's lane enum, Task 2.6): a 64 pt track
    (`Tok.Size.Row.card`) on `Tok.Ground.raised`, `Tok.Radius.panel`, with a
    1 pt top highlight at 3 % of `Tok.Ink.primary`. While auditing, reporting
    or terminal with `scheduled > 0`: a **crawl cap** in `Tok.Accent.deep` as
@@ -1142,7 +1142,7 @@ sizes `Tok.Size.badge / controlLg / Row.card`; spacing `Space.*`. The comp's
 geometric constants that are not tokens (edge 3, now mark 2, overshoot 10,
 dot 10 and 6, halo 3, gauge 3, mark 8 × 16 radius 2, ring stroke 2.5, crawl
 cap 80, row pitch 44, header 32, action column 84, halo opacity 0.12,
-breathing floor 0.4) live once in `private enum CardMetrics` in
+breathing floor 0.4) live once in `enum CardMetrics` in
 `ScanJobCard.swift` with a comment naming the comp's CSS rule; no colour,
 radius or duration literal appears in `ScanPanel+Jobs.swift`,
 `ScanJobCard.swift`, `ScanJobWells.swift` or `ScanProgressViews.swift`
@@ -2027,6 +2027,6 @@ autonomous mode; Matt may overrule any of them at the PR 2 review:
    in the comp notes); it collides with the glossary's *Lane* (a protocol a
    job scans over). The word never appears on screen (the element's
    accessibility label is `Progress`; its segments read `crawl` / `audit`),
-   so the glossary is untouched; the view type is `ScanLane`.
+   so the glossary is untouched; the view type is `ScanJobLane` (`ScanLane` is the Kit's lane enum).
 7. Web W2 is re-cut to the comp before Part 3 opens (D18 amendment); the
    TUI keeps its own layout and gains only the derived words.
