@@ -761,7 +761,8 @@ public struct ScanJobProgress: Equatable, Sendable {
     /// `3,232 checks to go`; while running in auditing or reporting with something
     /// scheduled and left; nil otherwise and when terminal.
     public var checksToGoText: String?
-    /// `now · xss-reflected and 3 more`: the lane's spelling of `nowLine`; nil with it.
+    /// `now · xss-reflected and 3 more`: the lane's spelling of `nowLine`, `nowTagParts`
+    /// joined; nil with it.
     public var nowTag: String?
     /// `nowTag` in parts (Jobs view D21): `now · ` (plain), the first running id
     /// (`.checkId`) and, for more than one, ` and 3 more` (plain); joined, they are
@@ -790,12 +791,12 @@ public struct ScanJobProgress: Equatable, Sendable {
         let running = checks?.running ?? []
 
         nowLine = Self.nowLine(running)
-        nowTag = running.first.map { "now · " + Self.nowIds(running, first: $0) }
         nowTagParts = running.first.map { first in
             var parts = [ScanFindingLine.Part(text: "now · ", role: .plain), .init(text: first, role: .checkId)]
             if running.count > 1 { parts.append(.init(text: " and \(running.count - 1) more", role: .plain)) }
             return parts
         }
+        nowTag = nowTagParts.map { $0.map(\.text).joined() }
 
         let checksFraction: Double? = checks.flatMap { Self.fraction(of: $0.done, over: $0.scheduled) }
         let pagesFraction: Double? = crawl.flatMap { Self.fraction(of: $0.pages, over: $0.pages + $0.queued) }
@@ -921,7 +922,7 @@ public struct ScanJobProgress: Equatable, Sendable {
         return "Now: " + nowIds(running, first: first)
     }
 
-    /// `xss-reflected` / `xss-reflected and 3 more`.
+    /// `xss-reflected` / `xss-reflected and 3 more`; `nowLine`'s ids (`nowTag` is its parts joined).
     private static func nowIds(_ running: [String], first: String) -> String {
         running.count > 1 ? "\(first) and \(running.count - 1) more" : first
     }
@@ -2014,7 +2015,7 @@ extension ScanFormat {
     public static func severityWords(by: BySeverity, running: Bool) -> String {
         let parts = severityWordParts(by: by)
         guard !parts.isEmpty else { return running ? "no issues yet" : "no issues" }
-        return parts.map(\.word).joined(separator: ", ")
+        return parts.map(\.word).joined(separator: severityWordSeparator)
     }
 
     /// `[(.high, "1 high"), (.low, "3 low")]`, critical → info, zero counts omitted: the
@@ -2197,7 +2198,7 @@ extension ScanFormat {
     public static func issuesTileHelp(by: BySeverity) -> String {
         let parts = severityWordParts(by: by)
         guard !parts.isEmpty else { return "no issues" }
-        return "\(plural(by.total, "issue", grouped: true)): \(parts.map(\.word).joined(separator: ", "))"
+        return "\(plural(by.total, "issue", grouped: true)): \(parts.map(\.word).joined(separator: severityWordSeparator))"
     }
 
     /// `of 6,468`: the unit after a KPI or cell numeral.
@@ -2229,6 +2230,10 @@ extension ScanFormat {
 
     /// Between a row's cells: `0 · 1 · 0`.
     public static let wellCellSeparator = " · "
+    /// Between the severity words: `1 high, 3 low`. `severityWords`, `issuesTileHelp` and
+    /// the app's one severity-words builder read it, so the words and their inked `Text`
+    /// cannot drift apart.
+    public static let severityWordSeparator = ", "
 
     /// The two wells' rows in D11's order (Jobs view D21), every key a `WellKey`, every
     /// number `grouped`, `—` for a status-only value until the status lands. Crawl and

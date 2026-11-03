@@ -2973,17 +2973,7 @@ extension ScanSurfaceTests {
     /// the two allowances (the Cancel helps' `Stop this job; …` and D4's session-lost
     /// sentence) are excepted by name and must stay in the sweep.
     @Test func jobsWordsAvoidTheBannedTerms() throws {
-        let fourIds = ["xss-reflected", "sqli-error", "open-redirect", "ssrf"]
-        var facts: [ScanJobFacts] = []
-        for state in [ScanJobState.queued, .running, .cancelling, .done, .cancelled, .failed, .other("paused")] {
-            for phase in [ScanPhase.queued, .crawling, .passive, .auditing, .reporting, .done] {
-                facts.append(try Self.progressFacts(
-                    state: state, phase: phase,
-                    edits: Self.checks(done: 3236, scheduled: 6468, running: fourIds) + Self.compJob + Self.issues(high: 1, low: 4)
-                        + [(["checks", "errors"], 7), (["checks", "skipped"], 3), (["crawl", "errors"], 1), (["error"], "boom")]))
-            }
-        }
-        facts.append(ScanJobFacts(summary: try Self.progressRow(state: .running, phase: .auditing), status: nil))
+        let facts = try Self.ac32Sweep()
 
         var strings: [String] = ScanFormat.tableHeaders + ScanFormat.kpiLabels + ScanFormat.WellKey.all + [
             ScanFormat.gaugeLabel, ScanFormat.laneCrawlLabel, ScanFormat.laneAuditLabel, ScanFormat.missingValue,
@@ -3190,8 +3180,8 @@ extension ScanSurfaceTests {
 extension ScanSurfaceTests {
     /// The AC32 sweep's 43 facts: 7 states × 6 phases over `scan.status.json` with the
     /// comp's job, 1 high / 4 low, check and crawl errors and an error text, plus one
-    /// running row whose status has not landed. `jobsWordsAvoidTheBannedTerms` builds the
-    /// same set; the D21 pins walk it so every state × phase is compared, not sampled.
+    /// running row whose status has not landed. `jobsWordsAvoidTheBannedTerms` and the D21
+    /// pins walk it so every state × phase is compared, not sampled.
     static func ac32Sweep() throws -> [ScanJobFacts] {
         let fourIds = ["xss-reflected", "sqli-error", "open-redirect", "ssrf"]
         var facts: [ScanJobFacts] = []
@@ -3359,7 +3349,16 @@ extension ScanSurfaceTests {
         let sessionRow = try #require(rows.crawl.first { $0.key == Key.session })
         #expect(sessionRow.cells.map(\.text) == ["yes", "no", "ok", "no"])
         #expect(ScanFormat.wellCellSeparator == " · ")
+        #expect(ScanFormat.severityWordSeparator == ", ")
         #expect(rows.crawl.first { $0.key == Key.lanes }?.cells.count == 1)
+
+        // Fix 3.0a: the Lanes row is `lanes.run` joined, and the decoder cuts that list to
+        // eight distinct lanes, so a hundred-lane status reads as eight words, never more.
+        let hundred = JSONValue.array((0..<100).map { .string("lane\($0)") })
+        let crowded = ScanFormat.wellRows(try Self.wellFacts(shared: shared, statusOnly: [(["lanes", "run"], hundred)]))
+        let lanesRow = try #require(crowded.crawl.first { $0.key == Key.lanes })
+        #expect(lanesRow.text == (0..<8).map { "lane\($0)" }.joined(separator: ", "))
+        #expect(lanesRow.text.components(separatedBy: ", ").count == 8)
 
         #expect(rows.issues.map { "\($0.key) = \($0.text)" } == [
             "\(Key.criticalHighMedium) = 0 · 1 · 0", "\(Key.low) = 4", "\(Key.info) = 0",

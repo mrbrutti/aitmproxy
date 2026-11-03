@@ -41,16 +41,16 @@ enum ScanToneColors {
 // MARK: - Severity words
 
 /// The one builder for the severity words (D21): `1 high, 2 low` as one interpolated
-/// `Text`, each word in `ScanToneColors.severity(_:)`, the `, ` between words in
-/// `Tok.Ink.secondary`, all in `font`. The table's Issues cell (data face) and the KPI
-/// Issues cell (UI face) both read it; being one `Text`, a long cell truncates at its
-/// tail as one line.
+/// `Text`, each word in `ScanToneColors.severity(_:)`, `ScanFormat.severityWordSeparator`
+/// between words in `Tok.Ink.secondary`, all in `font`. The table's Issues cell (data
+/// face) and the KPI Issues cell (UI face) both read it; being one `Text`, a long cell
+/// truncates at its tail as one line.
 enum ScanSeverityWordsText {
     static func text(_ parts: [(severity: ScanSeverity, word: String)], font: Font) -> Text {
         var text = Text(verbatim: "")
         for (index, part) in parts.enumerated() {
             if index > 0 {
-                text = Text("\(text)\(Text(verbatim: ", ").foregroundStyle(Tok.Ink.secondary.color))")
+                text = Text("\(text)\(Text(verbatim: ScanFormat.severityWordSeparator).foregroundStyle(Tok.Ink.secondary.color))")
             }
             text = Text("\(text)\(Text(verbatim: part.word).foregroundStyle(ScanToneColors.severity(part.severity)))")
         }
