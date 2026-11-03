@@ -687,7 +687,12 @@ async function run() {
     // The crawl sends no probes, and under `--latency-ms 400` it outlasts the 2 s between the
     // brackets (runs 2-3 read 0 -> 0 with the witness at 0 as well): wait for the witness's first
     // probe, then bracket.
-    const probing = await soft(async () => (((await status(jobId)).probes?.sent ?? 0) > 0 ? true : null), 60000);
+    // Each wait read samples the rendered words too, so a phase the witness passes through here
+    // (`passive`, run 5) is in the rendered set 03c judges.
+    const probing = await soft(async () => {
+      await renderedState(jobId);
+      return ((await status(jobId)).probes?.sent ?? 0) > 0 ? true : null;
+    }, 60000);
     if (!probing) note('03 probes', 'the witness sent no probe within 60 s; the brackets read the crawl');
     const a = await bracket('a');
     await sleep(2000);
