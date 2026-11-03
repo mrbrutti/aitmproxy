@@ -8,7 +8,7 @@ use std::ops::Deref;
 use aitm_scan_model::{
     BySeverity, Canary, CanaryMethod, CheckCounters, CheckErrorSample, CrawlCounters,
     CrawlErrorKind, JobId, JobState, JobStatus, JobSummary, LaneKind, ListResult, Phase,
-    StoppedReason,
+    SkippedPoints, StoppedReason,
 };
 
 use super::{
@@ -946,8 +946,10 @@ const DETAIL_FIXED_LINES: usize = 7;
 /// running check ids, the [`attention_lines`] (empty labels), and the
 /// `label value` lines: lanes requested/run/skipped with reasons, who
 /// started it, the probe, crawl (with `· errors n (<last error words>)`
-/// when the crawl hit any; Jobs view D4), point and check counters (with
-/// `· errors n · skipped n` when non-zero), the session, then `clamped`,
+/// when the crawl hit any; Jobs view D4), point counters (the skip clause
+/// is the Kit's three skip words; Jobs view D21, plan gap 62), check
+/// counters (with `· errors n · skipped n` when non-zero), the session,
+/// then `clamped`,
 /// `error` and `l4` only when present; a list the fold cut ends in `+n`
 /// (fix round G, G11). Plain text; the view styles the label. Read through
 /// [`JobsState::detail_text`], the one public reading of the pane (fix
@@ -1031,13 +1033,11 @@ fn detail_lines(read: &ReadStatus) -> Vec<(&'static str, String)> {
     lines.push((
         "points",
         format!(
-            "found {} · queued {} · audited {} · skipped ignored {}, frequent {}, limit {}",
-            pt.found,
-            pt.queued,
-            pt.audited,
-            pt.skipped.ignored,
-            pt.skipped.frequent,
-            pt.skipped.limit
+            "found {} · queued {} · audited {} · {}",
+            grouped(pt.found),
+            grouped(pt.queued),
+            grouped(pt.audited),
+            point_skip_words(&pt.skipped).join(" · ")
         ),
     ));
 
@@ -1254,6 +1254,18 @@ fn elapsed_clock(ms: u64) -> String {
 fn plural(n: u64, noun: &str) -> String {
     let s = if n == 1 { "" } else { "s" };
     format!("{} {noun}{s}", grouped(n))
+}
+
+/// The Kit's `ScanFormat.pointSkipWords` (Jobs view D21, plan gap 62): one
+/// `<grouped count> <words>` text per skip counter in the Kit's order
+/// (frequent, ignored, limit), zeros included: `722 skipped as repetitive`,
+/// `6 skipped by rule`, `0 skipped at the per-request cap`.
+fn point_skip_words(skipped: &SkippedPoints) -> [String; 3] {
+    [
+        format!("{} skipped as repetitive", grouped(skipped.frequent)),
+        format!("{} skipped by rule", grouped(skipped.ignored)),
+        format!("{} skipped at the per-request cap", grouped(skipped.limit)),
+    ]
 }
 
 /// A count with a `,` every three digits (`6,468`, `1,234,567`) whatever
@@ -2277,6 +2289,45 @@ mod tests {
         assert_eq!(
             lines_of(&queued)[0],
             ("", "Waiting for the engine to start this job.".to_string())
+        );
+    }
+
+    /// Jobs view D21, plan gap 62 (Task 4.4a): the `points` line's skip
+    /// clause is the Kit's three `ScanPointSkipWords.text` in the Kit's
+    /// order (frequent, ignored, limit), each count grouped, zeros kept, so
+    /// the skip rows read the same on the three surfaces; the line count
+    /// does not move.
+    #[test]
+    fn points_line_reads_the_kit_skip_words() {
+        let points_line = |status: &JobStatus| -> String {
+            let read = ReadStatus::new(status.clone());
+            let lines = detail_lines(&read);
+            assert_eq!(detail_line_count(&read.status), lines.len(), "{lines:?}");
+            let (_, value) = lines
+                .iter()
+                .find(|(label, _)| *label == "points")
+                .expect("a points line");
+            value.clone()
+        };
+
+        let mut status = fixture_status(JobState::Running);
+        status.points.found = 1020;
+        status.points.queued = 923;
+        status.points.audited = 97;
+        status.points.skipped.frequent = 722;
+        status.points.skipped.ignored = 6;
+        status.points.skipped.limit = 0;
+        assert_eq!(
+            points_line(&status),
+            "found 1,020 · queued 923 · audited 97 · 722 skipped as repetitive · 6 skipped by rule · 0 skipped at the per-request cap"
+        );
+
+        status.points.skipped.frequent = 0;
+        status.points.skipped.ignored = 1200;
+        status.points.skipped.limit = 3;
+        assert_eq!(
+            points_line(&status),
+            "found 1,020 · queued 923 · audited 97 · 0 skipped as repetitive · 1,200 skipped by rule · 3 skipped at the per-request cap"
         );
     }
 
