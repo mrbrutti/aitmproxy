@@ -1,0 +1,958 @@
+[17:06:12] == PR 2 pass A: app from 7fe457f6 (feat/scan-jobs-view-redesign), core from bundle tree b7f603f7
+share
+app pid 86313
+core pid 86345 proxy port 49969 bus 127.0.0.1:49973
+[17:06:40] core 86345; audit log 
+pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[17:06:46] frame 00-empty
+[17:06:46] == saved profile tiny-budget (standard with budget.probes 50) over the bus
+{"content": [{"type": "text", "text": "scan: invalid_profile: `findings.dir` is not set, so there is nowhere to save a profile"}], "isError": true}
+[17:06:47] == crawling / auditing frames (AC14, AC18, AC21, AC46 progress, AC47)
+[17:06:47] standard job scan-2aefd3f7
+[17:06:53] frame 10-crawling
+[17:07:29] frame 11-auditing
+AC14 status running auditing 3096 6464 fraction 0.479 probes 100 2000
+AXStaticText		Auditing		true
+AXButton			Cancel Scan	true
+AXUnknown			Progress	true
+AXStaticText		Progress, 47 %		true
+AXDisclosureTriangle		false	11 checks could not run	true
+AXButton			Auditing, standard, 127.0.0.1:8117, 47 percent, 3,099 of 6,464 checks, 4 issues: 4 low, 42 seconds.	true
+[17:07:29] == hover on/off the running row (AC19), context menu of the row (AC19)
+[17:09:59] == PR 2 pass A: app and core from the bundle tree 38b31b15 = feat/scan-jobs-view-redesign 7fe457f6 + #310
+[17:09:59] real audit log size before: 94174
+share
+app pid 87810
+core pid 87819 proxy port 50885 bus 127.0.0.1:50890
+[17:10:25] core 87819; audit log /tmp/Aitmproxy-dev-state-jobsux/audit.jsonl
+[17:10:25] #310 PASS: audit log under the isolated store
+pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[17:10:31] frame 00-empty
+[17:10:31] == tiny-budget: the dev core has no findings.dir, so scan.profile.save is refused; the budget job starts with an INLINE profile (standard + budget.probes 50, name tiny-budget) instead of a saved one (deviation from Task 2.13, recorded)
+inline profile prepared: tiny-budget {'check_timeout_s': 60, 'max_issues': 1024, 'per_host_errors': {'consecutive': 10, 'ratio': 0.5}, 'probes': 50, 'time_s': 600}
+[17:10:31] == crawling / auditing frames (AC14, AC18, AC21, AC46 progress, AC47)
+[17:10:31] standard job scan-67c2e058
+[17:10:38] frame 10-crawling
+[17:11:13] frame 11-auditing
+AC14 status running auditing 3105 6482 fraction 0.479 probes 100 2000
+AXStaticText		Auditing		true
+AXButton			Cancel Scan	true
+AXUnknown			Progress	true
+AXStaticText		Progress, 47 %		true
+AXDisclosureTriangle		false	11 checks could not run	true
+AXButton			Auditing, standard, 127.0.0.1:8117, 47 percent, 3,108 of 6,482 checks, 4 issues: 4 low, 42 seconds.	true
+[17:11:14] == hover on/off the running row (AC19), context menu of the row (AC19)
+[17:11:14] row centre: 3285 -557
+hover 3285 -557
+[17:11:16] frame 12-hover-on
+hover 700 60
+[17:11:18] frame 12-hover-off
+AXShowMenu on scan-job-scan-67c2e058 -> -25204
+[17:11:21] frame 13-context-menu
+posted key 53 flags 0 to 87810
+[17:11:22] == light-http on 8120 (ledger, AC48) and tiny-budget on 8118 (gauge, AC49) started; standard cancel (AC46 cancelling/cancelled)
+[17:11:22] light-http job scan-a7a2f359
+pressed AXButton '' -> 0
+[17:11:30] frame 20-cancelled
+AXStaticText		Cancelled		true
+AXButton			Scan Again	true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 53 seconds.	true
+[17:11:30] tiny-budget job scan-726d32e0 (inline profile)
+[17:11:30] == dead target 8121 (AC16): wait, select, open the attention disclosure
+[17:11:30] dead-target job {'content': [{'type': 'text', 'text': 'scan: busy: 2 scan jobs are already running'}], 'isError': True}
+[17:12:14] frame 30-dead-target
+pressed AXDisclosureTriangle '18 checks could not run' -> 0
+no AXButton starting with 'checks could not run' (0 matched, walked 127)
+[17:12:17] frame 31-dead-target-attention
+[17:12:17] AC16 'errors' tokens in the dump: 2
+48:AXDisclosureTriangle		true	18 checks could not run
+92:AXStaticText		Probe errors · timeouts · rate waits, 0 · 0 · 0	
+93:AXStaticText		Checks scheduled · done · errors · skipped, 6,482 · 3,130 · 18 · 0	
+[17:12:17] == tiny-budget past 40 probes (AC49 gauge amber), then ended
+[17:12:19] frame 40-tiny-budget-gauge
+AXUnknown			probe budget	true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.	true
+[17:12:20] tiny-budget ended: done
+[17:12:24] frame 41-tiny-budget-ended
+AC49 status done budget 50 50
+AXUnknown			probe budget
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.
+[17:12:24] == four jobs: table AX label and tab title (AC31)
+AXButton			Jobs 3
+AXGroup			3 jobs · 1 running
+AXButton			Jobs 3
+AXGroup			3 jobs · 1 running
+1 scan-726d32e0 done
+2 scan-a7a2f359 running
+3 scan-67c2e058 cancelled
+[17:12:24] == AC30: core stopped 10 s (no banner) and 35 s (banner), Reconnect Bus while stopped, CONT recovery
+[17:12:26] core stopped
+[17:12:37] frame 50-stopped-10s
+0
+[17:13:29] == PR 2 pass A: app and core from the bundle tree 38b31b15 = feat/scan-jobs-view-redesign 7fe457f6 + #310
+[17:13:29] real audit log size before: 94174
+share
+app pid 89475
+core pid 89496 proxy port 51593 bus 127.0.0.1:51597
+[17:13:45] core 89496; audit log /tmp/Aitmproxy-dev-state-jobsux/audit.jsonl
+[17:13:45] #310 PASS: audit log under the isolated store
+pressed AXButton '' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[17:13:52] frame 00-empty
+[17:13:52] == tiny-budget: the dev core has no findings.dir, so scan.profile.save is refused; the budget job starts with an INLINE profile (standard + budget.probes 50, name tiny-budget) instead of a saved one (deviation from Task 2.13, recorded)
+inline profile prepared: tiny-budget {'check_timeout_s': 60, 'max_issues': 1024, 'per_host_errors': {'consecutive': 10, 'ratio': 0.5}, 'probes': 50, 'time_s': 600}
+[17:13:52] == crawling / auditing frames (AC14, AC18, AC21, AC46 progress, AC47)
+[17:13:52] standard job scan-2a22e1e3
+[17:13:59] frame 10-crawling
+[17:14:34] frame 11-auditing
+AC14 status running auditing 3116 6496 fraction 0.4797 probes 103 2000
+AXStaticText		Auditing		true
+AXButton			Cancel Scan	true
+AXUnknown			Progress	true
+AXStaticText		Progress, 47 %		true
+AXDisclosureTriangle		false	11 checks could not run	true
+AXButton			Auditing, standard, 127.0.0.1:8117, 47 percent, 3,117 of 6,496 checks, 4 issues: 4 low, 42 seconds.	true
+[17:14:35] == hover on/off the running row (AC19), context menu of the row (AC19)
+[17:14:36] row centre (global): 3285 -557; window: 2453 -1192 1440 900
+hover 3285 -557
+[17:14:37] frame 12-hover-on
+hover 700 60
+[17:14:39] frame 12-hover-off
+right-clicked 3285 -557 in pid 89475
+[17:14:41] frame 13-context-menu
+posted key 53 flags 0 to 89475
+[17:14:42] == standard cancel (AC46 cancelling/cancelled); engine max_jobs is 2, so the other jobs are sequenced: dead target + light-http, then tiny-budget
+pressed AXButton 'Cancel Scan' -> 0
+[17:14:50] frame 20-cancelled
+AXStaticText		Cancelled		true
+AXButton			Scan Again	true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 52 seconds.	true
+[17:14:50] == dead target 8121 (AC16) and light-http 8120 (AC48) started; wait for the dead target, select it, open the attention disclosure
+[17:14:51] dead-target job scan-5ba7107a
+[17:14:51] light-http job scan-87cf6a3c
+[17:15:34] frame 30-dead-target
+pressed AXDisclosureTriangle '19 checks could not run' -> 0
+no AXButton starting with 'checks could not run' (0 matched, walked 127)
+[17:15:37] frame 31-dead-target-attention
+[17:15:37] AC16 'errors' tokens in the dump: 2
+48:AXDisclosureTriangle		true	19 checks could not run
+92:AXStaticText		Probe errors · timeouts · rate waits, 0 · 0 · 0	
+93:AXStaticText		Checks scheduled · done · errors · skipped, 6,496 · 3,138 · 19 · 0	
+[17:15:37] dead-target state: done (slot freed)
+[17:15:37] tiny-budget job scan-d4f20d1b (inline profile)
+[17:15:37] == tiny-budget past 40 probes (AC49 gauge amber), then ended
+[17:15:58] frame 40-tiny-budget-gauge
+AXUnknown			probe budget	true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 2 issues: 2 low, 20 seconds.	true
+[17:15:59] tiny-budget ended: done
+[17:16:03] frame 41-tiny-budget-ended
+AC49 status done budget 50 50
+AXUnknown			probe budget
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 2 issues: 2 low, 20 seconds.
+[17:16:03] == four jobs: table AX label and tab title (AC31)
+AXButton			Jobs 4
+AXButton			Jobs 4
+AXGroup			4 jobs
+1 scan-d4f20d1b done
+2 scan-87cf6a3c done
+3 scan-5ba7107a done
+4 scan-2a22e1e3 cancelled
+[17:16:03] == AC30: core stopped 10 s (no banner) and 35 s (banner), Reconnect Bus while stopped, CONT recovery
+[17:16:05] core stopped
+[17:16:15] frame 50-stopped-10s
+0
+[17:16:42] frame 51-stopped-35s
+AXStaticText		The core is not answering · showing values from 0:37 ago · retrying every 2 s		true
+AXUnknown			Error: Unable to list jobs: the bus did not reply in time. Showing values from 0:37 ago; retrying every 2 s.	true
+AXButton			Scan Again	false
+pressed Proxy > Reconnect Bus -> 0
+[17:16:46] frame 52-reconnecting
+AXStaticText		Bus disconnected · showing values from 0:41 ago · reconnecting…	
+[17:16:47] core continued
+[17:16:54] frame 53-recovered
+[17:16:54] == AC48: wait for light-http scan-87cf6a3c, select, ledger + end sentence
+[17:16:54] light-http ended: done
+AC48 status done {'by_confidence': {'certain': 1, 'firm': 0, 'tentative': 0}, 'by_severity': {'critical': 0, 'high': 0, 'info': 0, 'low': 1, 'medium': 0}, 'total': 1}
+[17:16:57] frame 60-light-http-done
+AXButton			Flows, 96	true
+AXButton			Scan Again	true
+AXUnknown			4 issues: 4 low	true
+AXStaticText		Issues, 4, 4 low		true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 2 issues: 2 low, 20 seconds.	true
+AXButton			Done, light-http, 127.0.0.1:8120, 1 issue: 1 low, 34 seconds.	true
+AXButton			Done, standard, 127.0.0.1:8121, no issues, 30 seconds.	true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 52 seconds.	true
+[17:16:58] == AC26: Scan Again on the Done light-http row; second press while running; deleted profile
+pressed AXButton 'Scan Again' -> 0
+[17:17:02] frame 70-scan-again-started
+[17:17:03] AC26 audit scan.start before=4 after=5
+{"at":1793668618935,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_b41a7a42bb3c34da-25","command":"scan.start","args":"{\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:8117\"]}},\"profile_name\":\"standard\"}","result":"ok"}
+1 scan-0103a122 running 
+2 scan-d4f20d1b done 
+3 scan-87cf6a3c done 
+4 scan-5ba7107a done 
+5 scan-2a22e1e3 cancelled 
+scan-job-scan-0103a122	AXButton	selected=true	focused=false
+scan-job-scan-d4f20d1b	AXButton	selected=nil	focused=false
+scan-job-scan-87cf6a3c	AXButton	selected=nil	focused=false
+scan-job-scan-5ba7107a	AXButton	selected=nil	focused=false
+scan-job-scan-2a22e1e3	AXButton	selected=nil	focused=false
+rows: 5
+no AXButton starting with 'Scan Again' (0 matched, walked 120)
+[17:17:08] frame 71-scan-again-refused
+[17:17:08] AC26 third clause: the tiny-budget job ran from an inline profile, so no saved profile of that name exists; Scan Again sends profile_name tiny-budget and the engine answers invalid_profile (same path as a deleted saved profile)
+no AXButton starting with 'Scan Again' (0 matched, walked 120)
+[17:17:13] frame 72-scan-again-invalid-profile
+[17:17:14] AC27 (L4 Scan Again): not run on this rig (BPF is root-only; no L4 profile can finish) - recorded as not reproducible
+[17:17:14] == AC29: AX shapes, announce log line, Return/Escape focus
+AXButton	Done, tiny-budget, 127.0.0.1:8118, 2 issues: 2 low, 20 seconds.
+AXButton	Done, light-http, 127.0.0.1:8120, 1 issue: 1 low, 34 seconds.
+AXButton	Done, standard, 127.0.0.1:8121, no issues, 30 seconds.
+AXButton	Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 52 seconds.
+AXHeading			SCAN
+AXHeading			127.0.0.1:8117
+AXButton			Done, light-http, 127.0.0.1:8120, 1 issue: 1 low, 34 seconds.
+AXHeading			Crawl and points, what the job found to test
+AXUnknown			Progress	
+AXStaticText		Progress, —		
+[17:17:14] show --last 20m --predicate category == "scan" --style compact
+posted key 36 flags 0 to 89475
+[17:37:10] == PR 2 pass A: app and core from the bundle tree 456d6764 = feat/scan-jobs-view-redesign 28416ab6 + #310
+[17:37:10] real audit log size before: 94174
+share
+app pid 97911
+core pid 97917 proxy port 56274 bus 127.0.0.1:56280
+[17:37:33] core 97917; audit log /tmp/Aitmproxy-dev-state-jobsux/audit.jsonl
+[17:37:33] #310 PASS: audit log under the isolated store
+pressed AXButton '' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[17:37:40] frame 00-empty
+[17:37:40] == tiny-budget: the dev core has no findings.dir, so scan.profile.save is refused; the budget job starts with an INLINE profile (standard + budget.probes 50, name tiny-budget) instead of a saved one (deviation from Task 2.13, recorded)
+inline profile prepared: tiny-budget {'check_timeout_s': 60, 'max_issues': 1024, 'per_host_errors': {'consecutive': 10, 'ratio': 0.5}, 'probes': 50, 'time_s': 600}
+[17:37:40] == crawling / auditing frames (AC14, AC18, AC21, AC46 progress, AC47)
+[17:37:40] standard job scan-9f210992
+[17:37:47] frame 10-crawling
+[17:38:22] frame 11-auditing
+AC14 status running auditing 3096 6464 fraction 0.479 probes 100 2000
+AXStaticText		Auditing		true
+AXButton			Cancel Scan	true
+AXUnknown			Progress	true
+AXStaticText		Progress, 47 %		true
+AXDisclosureTriangle		false	11 checks could not run	true
+AXButton			Auditing, standard, 127.0.0.1:8117, 47 percent, 3,099 of 6,464 checks, 4 issues: 4 low, 42 seconds.	true
+[17:38:24] AC14 pixel runs at y=520: fill(#60A5FA)=[0 0 0] cap(#3B82F6)=[0 0 0]; track row y=575 (#2C2C2F)=[500 1391 892] -> fill / (track - cap) is computed in the README from these runs against the status fraction
+[17:38:25] AC46 running edge sample: 534 420 #232326
+534 600 #1B1B1D
+534 800 #232326 (expect #60A5FA within 4)
+[17:38:25] == hover on/off the running row (AC19), context menu of the row (AC19)
+[17:38:26] row centre (global): 3285 -557; window: 2453 -1192 1440 900
+hover 3285 -557
+[17:38:27] frame 12-hover-on
+hover 700 60
+[17:38:29] frame 12-hover-off
+1299.29 (0.00100254)[17:38:29] AC19 hover diff heatmap -> 12-hover-diff.png (changed pixels must lie in the action column only); AE=1299.29 (0.00100254)
+right-clicked 3285 -557 in pid 97911 via HID tap
+[17:38:31] frame 13-context-menu
+posted key 53 flags 0 to 97911
+[17:38:32] == standard cancel (AC46 cancelling/cancelled); engine max_jobs is 2, so the other jobs are sequenced: dead target + light-http, then tiny-budget
+pressed AXButton '' -> 0
+[17:38:41] frame 20-cancelled
+AXStaticText		Cancelled		true
+AXButton			Scan Again	true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 55 seconds.	true
+[17:38:42] AC46 cancel loop f03 edge: 534 420 #232326
+534 800 #232326 (cancelling expects #F5A524 within 4)
+[17:38:42] AC46 cancel loop f05 edge: 534 420 #232326
+534 800 #232326 (cancelling expects #F5A524 within 4)
+[17:38:43] AC46 cancel loop f08 edge: 534 420 #232326
+534 800 #232326 (cancelling expects #F5A524 within 4)
+[17:38:43] AC46 cancelled edge: 534 420 #232326
+534 800 #232326 (neutral #B4B4B8 within 4)
+[17:38:43] == dead target 8121 (AC16) and light-http 8120 (AC48) started; wait for the dead target, select it, open the attention disclosure
+[17:38:43] dead-target job scan-399920d0
+[17:38:43] light-http job scan-1e607fef
+[17:38:43] D20 queued-or-busy: a third start while two run -> {"content": [{"type": "text", "text": "scan: busy: 2 scan jobs are already running"}], "isError": true}
+[17:38:44] frame 14-two-running
+[17:39:28] frame 30-dead-target
+pressed AXDisclosureTriangle '21 checks could not run' -> 0
+no AXButton starting with 'checks could not run' (0 matched, walked 127)
+[17:39:31] frame 31-dead-target-attention
+[17:39:32] AC16 whole-word errors tokens in the dump: 2 (the well keys Probe errors / Checks ... errors are labels; the raw line is stopped_reason: errors)
+48:AXDisclosureTriangle		true	21 checks could not run
+92:AXStaticText		Probe errors · timeouts · rate waits, 0 · 0 · 0	
+93:AXStaticText		Checks scheduled · done · errors · skipped, 6,464 · 3,126 · 21 · 0	
+[17:39:32] AC46 done edge: 534 420 #232326
+534 800 #1E1E20 (success #86EFAC within 4)
+[17:39:32] AC21 wells positive: 3 lines; negative (expect 0): 0
+[17:39:32] dead-target state: done (slot freed)
+[17:39:32] tiny-budget job scan-4237938e (inline profile)
+[17:39:32] == tiny-budget past 40 probes (AC49 gauge amber), then ended
+[17:39:57] frame 40-tiny-budget-gauge
+AXUnknown			Probe budget, 139 of 2,000	true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.	true
+[17:39:58] tiny-budget ended: done (polled at 1 s; frame at once, AC47 end frame within 3 s)
+[17:39:58] frame 41-tiny-budget-ended
+AC49 status done budget 50 50
+AXUnknown			Probe budget, 139 of 2,000
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.
+[17:39:59] AC49 raw stopped_reason tokens in the dump: 1 (expect 1, the raw line)
+[17:39:59] == four jobs: table AX label and tab title (AC31)
+AXButton			Jobs 4
+AXButton			Jobs 4
+AXGroup			4 jobs
+1 scan-4237938e done
+2 scan-1e607fef done
+3 scan-399920d0 done
+4 scan-9f210992 cancelled
+[17:39:59] == AC30: core stopped 10 s (no banner) and 35 s (banner), Reconnect Bus while stopped, CONT recovery
+[17:40:02] frame 49-before-stop
+[17:40:02] core stopped
+[17:40:13] frame 50-stopped-10s
+[17:40:13] AC30 10 s: banner/error lines = 0 (expect 0); rows diff vs pre-stop AE=0 (0) (elapsed digits and the breathing dot may differ)
+[17:42:14] == PR 2 pass A: app and core from the bundle tree 456d6764 = feat/scan-jobs-view-redesign 28416ab6 + #310
+[17:42:14] real audit log size before: 94174
+share
+app pid 641
+core pid 648 proxy port 57050 bus 127.0.0.1:57057
+[17:42:29] core 648; audit log /tmp/Aitmproxy-dev-state-jobsux/audit.jsonl
+[17:42:29] #310 PASS: audit log under the isolated store
+pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[17:42:36] frame 00-empty
+[17:42:36] == tiny-budget: the dev core has no findings.dir, so scan.profile.save is refused; the budget job starts with an INLINE profile (standard + budget.probes 50, name tiny-budget) instead of a saved one (deviation from Task 2.13, recorded)
+inline profile prepared: tiny-budget {'check_timeout_s': 60, 'max_issues': 1024, 'per_host_errors': {'consecutive': 10, 'ratio': 0.5}, 'probes': 50, 'time_s': 600}
+[17:42:36] == crawling / auditing frames (AC14, AC18, AC21, AC46 progress, AC47)
+[17:42:36] standard job scan-fac5fa41
+[17:42:42] frame 10-crawling
+[17:43:18] frame 11-auditing
+AC14 status running auditing 3087 6454 fraction 0.4783 probes 100 2000
+AXStaticText		Auditing		true
+AXButton			Cancel Scan	true
+AXUnknown			Progress	true
+AXStaticText		Progress, 47 %		true
+AXDisclosureTriangle		false	11 checks could not run	true
+AXButton			Auditing, standard, 127.0.0.1:8117, 47 percent, 3,090 of 6,454 checks, 4 issues: 4 low, 42 seconds.	true
+AC14 lane runs y=262: cap [289, 368, 80] fill [369, 848, 480] rest [854, 1398, 545] -> track 1110 fill/(track-cap) = 0.466
+[17:43:20] AC46 running edge (x=266,267 y=300/500): 266 300 #5FA3F8 267 300 #5FA3F7 266 500 #5FA3F8  (expect #60A5FA within 4 per channel)
+[17:43:20] == hover on/off the running row (AC19), context menu of the row (AC19)
+[17:43:21] row centre (global): 3285 -557; window: 2453 -1192 1440 900
+hover 3285 -557
+[17:43:23] frame 12-hover-on
+hover 700 60
+[17:43:24] frame 12-hover-off
+448.534 (0.000346091)[17:43:24] AC19 hover diff heatmap -> 12-hover-diff.png (changed pixels must lie in the action column only); AE=448.534 (0.000346091)
+right-clicked 3285 -557 in pid 641 via HID tap
+[17:48:54] frame 13-context-menu captured by region while the menu was open (pass A aborted at the bounds read); menu items dumped to 13-menu-ax.tsv; Escape sent
+[17:54:16] == PR 2 pass A: app and core from the bundle tree 24d2d94e = feat/scan-jobs-view-redesign 4ad7e537 + #310
+[17:54:16] real audit log size before: 94174
+share
+app pid 5275
+core pid 5281 proxy port 60212 bus 127.0.0.1:60218
+[17:54:36] core 5281; audit log /tmp/Aitmproxy-dev-state-jobsux/audit.jsonl
+[17:54:36] #310 PASS: audit log under the isolated store
+pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[17:54:43] frame 00-empty
+[17:54:43] == tiny-budget: the dev core has no findings.dir, so scan.profile.save is refused; the budget job starts with an INLINE profile (standard + budget.probes 50, name tiny-budget) instead of a saved one (deviation from Task 2.13, recorded)
+inline profile prepared: tiny-budget {'check_timeout_s': 60, 'max_issues': 1024, 'per_host_errors': {'consecutive': 10, 'ratio': 0.5}, 'probes': 50, 'time_s': 600}
+[17:54:43] == crawling / auditing frames (AC14, AC18, AC21, AC46 progress, AC47)
+[17:54:43] standard job scan-faf8fd3e
+[17:54:50] frame 10-crawling
+[17:55:25] frame 11-auditing
+AC14 status running auditing 3078 6436 fraction 0.4782 probes 100 2000
+AXStaticText		Auditing		true
+AXButton			Cancel Scan	true
+AXUnknown			Progress	true
+AXStaticText		Progress, 47 %		true
+AXDisclosureTriangle		false	11 checks could not run	true
+AXButton			Auditing, standard, 127.0.0.1:8117, 47 percent, 3,081 of 6,436 checks, 4 issues: 4 low, 42 seconds.	true
+AC14 lane runs y=262: cap [289, 368, 80] fill [369, 848, 480] rest [854, 1398, 545] -> track 1110 fill/(track-cap) = 0.466
+[17:55:27] AC46 running edge (x=266,267 y=300/500): 266 300 #5FA3F8 267 300 #5FA3F7 266 500 #5FA3F8  (expect #60A5FA within 4 per channel)
+[17:55:27] == hover on/off the running row (AC19), context menu of the row (AC19)
+[17:55:28] row centre (global): 3285 -557; window: 2453 -1192 1440 900
+hover 3285 -557
+[17:55:30] frame 12-hover-on
+hover 700 60
+[17:55:31] frame 12-hover-off
+1522.82 (0.00117502)[17:55:32] AC19 hover diff heatmap -> 12-hover-diff.png (changed pixels must lie in the action column only); AE=1522.82 (0.00117502)
+right-clicked 3285 -557 in pid 5275 via HID tap
+[17:55:34] frame 13-context-menu (region capture of 2453 -1192 1440 900: the menu is its own window, so a window-id capture would miss it)
+posted key 53 flags 0 to 5275
+[17:55:35] == standard cancel (AC46 cancelling/cancelled); engine max_jobs is 2, so the other jobs are sequenced: dead target + light-http, then tiny-budget
+pressed AXButton '' -> 0
+[17:55:43] frame 20-cancelled
+AXStaticText		Cancelled		true
+AXButton			Scan Again	true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 54 seconds.	true
+[17:55:44] AC46 cancel loop f02 edge: 266 300 #5FA3F8 267 300 #5FA3F7  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[17:55:44] AC46 cancel loop f03 edge: 266 300 #5FA3F8 267 300 #5FA3F7  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[17:55:44] AC46 cancel loop f04 edge: 266 300 #5FA3F8 267 300 #5FA3F7  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[17:55:45] AC46 cancel loop f05 edge: 266 300 #5FA3F8 267 300 #5FA3F7  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[17:55:45] AC46 cancel loop f06 edge: 266 300 #F3A325 267 300 #F2A325  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[17:55:46] AC46 cancel loop f08 edge: 266 300 #B2B2B6 267 300 #B2B2B6  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[17:55:46] AC46 cancel loop f10 edge: 266 300 #B2B2B6 267 300 #B2B2B6  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[17:55:46] AC46 cancel loop f12 edge: 266 300 #B2B2B6 267 300 #B2B2B6  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[17:55:47] AC46 cancelled edge: 266 300 #B2B2B6 267 300 #B2B2B6  (neutral #B4B4B8 within 4)
+[17:55:47] == dead target 8121 (AC16) and light-http 8120 (AC48) started; wait for the dead target, select it, open the attention disclosure
+[17:55:47] dead-target job scan-4e8113ff
+[17:55:47] light-http job scan-39e5ab57
+[17:55:47] D20 queued-or-busy: a third start while two run -> {"content": [{"type": "text", "text": "scan: busy: 2 scan jobs are already running"}], "isError": true}
+[17:55:48] frame 14-two-running
+[17:56:31] frame 30-dead-target
+pressed AXDisclosureTriangle '19 checks could not run' -> 0
+no AXButton starting with 'checks could not run' (0 matched, walked 127)
+[17:56:34] frame 31-dead-target-attention
+[17:56:34] AC16 whole-word errors tokens in the dump: 2 (the well keys Probe errors / Checks ... errors are labels; the raw line is stopped_reason: errors)
+48:AXDisclosureTriangle		true	19 checks could not run
+92:AXStaticText		Probe errors · timeouts · rate waits, 0 · 0 · 0	
+93:AXStaticText		Checks scheduled · done · errors · skipped, 6,436 · 3,106 · 19 · 0	
+[17:56:35] AC46 done edge: 266 300 #B2B2B6 267 300 #B2B2B6  (success #86EFAC within 4)
+[17:56:35] AC21 wells positive: 3 lines; negative (expect 0): 0
+[17:56:35] dead-target state: done (slot freed)
+[17:56:35] tiny-budget job scan-9963cadc (inline profile)
+[17:56:35] == tiny-budget past 40 probes (AC49 gauge amber), then ended
+[17:56:56] frame 40-tiny-budget-gauge
+AXUnknown			Probe budget, 136 of 2,000	true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 2 issues: 2 low, 20 seconds.	true
+[17:56:56] tiny-budget ended: done (polled at 1 s; frame at once, AC47 end frame within 3 s)
+[17:56:57] frame 41-tiny-budget-ended
+AC49 status done budget 50 50
+AXUnknown			Probe budget, 136 of 2,000
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 2 issues: 2 low, 20 seconds.
+[17:56:58] AC49 raw stopped_reason tokens in the dump: 1 (expect 1, the raw line)
+[17:56:58] == four jobs: table AX label and tab title (AC31)
+AXButton			Jobs 4
+AXButton			Jobs 4
+AXGroup			4 jobs
+1 scan-9963cadc done
+2 scan-39e5ab57 done
+3 scan-4e8113ff done
+4 scan-faf8fd3e cancelled
+[17:56:58] == AC30: core stopped 10 s (no banner) and 35 s (banner), Reconnect Bus while stopped, CONT recovery
+[17:57:00] frame 49-before-stop
+[17:57:00] core stopped
+[17:57:11] frame 50-stopped-10s
+[17:57:11] AC30 10 s: banner/error lines = 0 (expect 0); rows diff vs pre-stop AE=0 (0) (elapsed digits and the breathing dot may differ)
+[17:57:37] frame 51-stopped-35s
+AXStaticText		The core is not answering · showing values from 0:37 ago · retrying every 2 s		true
+AXUnknown			Error: Unable to list jobs: the bus did not reply in time. Showing values from 0:37 ago; retrying every 2 s.	true
+AXButton			Scan Again	false
+pressed Proxy > Reconnect Bus -> 0
+[17:57:42] frame 52-reconnecting
+AXStaticText		Bus disconnected · showing values from 0:41 ago · reconnecting…	
+[17:57:42] core continued
+[17:57:48] frame 53-recovered
+[17:57:49] == AC48: wait for light-http scan-39e5ab57, select, ledger + end sentence
+[17:57:49] light-http ended: done
+AC48 status done {'by_confidence': {'certain': 1, 'firm': 0, 'tentative': 0}, 'by_severity': {'critical': 0, 'high': 0, 'info': 0, 'low': 1, 'medium': 0}, 'total': 1}
+[17:57:52] frame 60-light-http-done
+AXButton			Flows, 96	true
+AXButton			Scan Again	true
+AXUnknown			4 issues: 4 low	true
+AXStaticText		Issues, 4, 4 low		true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 2 issues: 2 low, 20 seconds.	true
+AXButton			Done, light-http, 127.0.0.1:8120, 1 issue: 1 low, 34 seconds.	true
+AXButton			Done, standard, 127.0.0.1:8121, no issues, 30 seconds.	true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 54 seconds.	true
+[17:57:53] == AC26: Scan Again on the Done light-http row; second press while running; deleted profile
+pressed AXButton 'Scan Again' -> 0
+[17:57:57] frame 70-scan-again-started
+[17:57:58] AC26 audit scan.start before=5 after=6
+{"at":1793671073776,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_a61cb87a0f32c27e-26","command":"scan.start","args":"{\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:8117\"]}},\"profile_name\":\"standard\"}","result":"ok"}
+1 scan-7e56205b running 
+2 scan-9963cadc done 
+3 scan-39e5ab57 done 
+4 scan-4e8113ff done 
+5 scan-faf8fd3e cancelled 
+scan-job-scan-7e56205b	AXButton	selected=true	focused=false
+scan-job-scan-9963cadc	AXButton	selected=nil	focused=false
+scan-job-scan-39e5ab57	AXButton	selected=nil	focused=false
+scan-job-scan-4e8113ff	AXButton	selected=nil	focused=false
+scan-job-scan-faf8fd3e	AXButton	selected=nil	focused=false
+rows: 5
+no AXButton starting with 'Scan Again' (0 matched, walked 111)
+[17:58:02] AC26 second press: scan.start count before=6 after=6 (a refused start is still one audited scan.start with an error result)
+{"at":1793671073776,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_a61cb87a0f32c27e-26","command":"scan.start","args":"{\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:8117\"]}},\"profile_name\":\"standard\"}","result":"ok"}
+[17:58:03] frame 71-scan-again-refused
+[17:58:03] AC26 third clause: the tiny-budget job ran from an inline profile, so no saved profile of that name exists; Scan Again sends profile_name tiny-budget and the engine answers invalid_profile (same path as a deleted saved profile)
+no AXButton starting with 'Scan Again' (0 matched, walked 111)
+[17:58:08] frame 72-scan-again-invalid-profile
+[17:58:09] AC27 (L4 Scan Again): not run on this rig (BPF is root-only; no L4 profile can finish) - recorded as not reproducible
+[17:58:09] == AC29: AX shapes, announce log line, Return/Escape focus
+AXButton	Done, tiny-budget, 127.0.0.1:8118, 2 issues: 2 low, 20 seconds.
+AXButton	Done, light-http, 127.0.0.1:8120, 1 issue: 1 low, 34 seconds.
+AXButton	Done, standard, 127.0.0.1:8121, no issues, 30 seconds.
+AXButton	Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 54 seconds.
+AXHeading			SCAN
+AXHeading			127.0.0.1:8117
+AXButton			Done, light-http, 127.0.0.1:8120, 1 issue: 1 low, 34 seconds.
+AXHeading			Crawl and points, what the job found to test
+AXUnknown			Progress	
+AXStaticText		Progress, —		
+[17:58:09] show --last 20m --predicate category == "scan" --style compact
+posted key 36 flags 0 to 5275
+scan-job-scan-7e56205b	AXButton	selected=true	focused=false
+scan-job-scan-9963cadc	AXButton	selected=nil	focused=false
+scan-job-scan-39e5ab57	AXButton	selected=nil	focused=false
+scan-job-scan-4e8113ff	AXButton	selected=nil	focused=false
+scan-job-scan-faf8fd3e	AXButton	selected=nil	focused=false
+rows: 5
+posted key 53 flags 0 to 5275
+scan-job-scan-7e56205b	AXButton	selected=true	focused=false
+scan-job-scan-9963cadc	AXButton	selected=nil	focused=false
+scan-job-scan-39e5ab57	AXButton	selected=nil	focused=false
+scan-job-scan-4e8113ff	AXButton	selected=nil	focused=false
+scan-job-scan-faf8fd3e	AXButton	selected=nil	focused=false
+rows: 5
+[17:58:14] real audit log size after: 94174 (before 94174)
+[17:58:14] #310 PASS: real audit log untouched
+[17:58:14] == evidence copy
+[17:58:15] == done pass A (app left running for pass B)
+[18:02:32] == PR 2 pass A: app and core from the bundle tree 24d2d94e = feat/scan-jobs-view-redesign c043ff05 + #310
+[18:02:32] real audit log size before: 94174
+share
+app pid 9300
+core pid 9306 proxy port 62190 bus 127.0.0.1:62195
+[18:02:48] core 9306; audit log /tmp/Aitmproxy-dev-state-jobsux/audit.jsonl
+[18:02:48] #310 PASS: audit log under the isolated store
+pressed AXButton '' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[18:02:55] frame 00-empty
+[18:02:55] == tiny-budget: the dev core has no findings.dir, so scan.profile.save is refused; the budget job starts with an INLINE profile (standard + budget.probes 50, name tiny-budget) instead of a saved one (deviation from Task 2.13, recorded)
+inline profile prepared: tiny-budget {'check_timeout_s': 60, 'max_issues': 1024, 'per_host_errors': {'consecutive': 10, 'ratio': 0.5}, 'probes': 50, 'time_s': 600}
+[18:02:55] == crawling / auditing frames (AC14, AC18, AC21, AC46 progress, AC47)
+[18:02:55] standard job scan-8094e0c0
+[18:03:01] frame 10-crawling
+[18:03:37] frame 11-auditing
+AC14 status running auditing 3087 6446 fraction 0.4789 probes 100 2000
+AXStaticText		Auditing		true
+AXButton			Cancel Scan	true
+AXUnknown			Progress	true
+AXStaticText		Progress, 47 %		true
+AXDisclosureTriangle		false	11 checks could not run	true
+AXButton			Auditing, standard, 127.0.0.1:8117, 47 percent, 3,089 of 6,446 checks, 4 issues: 4 low, 41 seconds.	true
+AC14 lane runs y=262: cap [289, 368, 80] fill [369, 849, 481] rest [855, 1398, 544] -> track 1110 fill/(track-cap) = 0.467
+[18:03:39] AC46 running edge (x=266,267 y=300/500): 266 300 #5FA3F8 267 300 #5FA3F7 266 500 #5FA3F8  (expect #60A5FA within 4 per channel)
+[18:03:39] == hover on/off the running row (AC19), context menu of the row (AC19)
+[18:03:40] row centre (global): 3285 -557; window: 2453 -1192 1440 900
+hover 3285 -557
+[18:03:42] frame 12-hover-on
+hover 700 60
+[18:03:43] frame 12-hover-off
+1745.37 (0.00134674)[18:03:43] AC19 hover diff heatmap -> 12-hover-diff.png (changed pixels must lie in the action column only); AE=1745.37 (0.00134674)
+right-clicked 3285 -557 in pid 9300 via HID tap
+[18:03:45] frame 13-context-menu (region capture of 2453 -1192 1440 900: the menu is its own window, so a window-id capture would miss it)
+posted key 53 flags 0 to 9300
+[18:03:46] == standard cancel (AC46 cancelling/cancelled); engine max_jobs is 2, so the other jobs are sequenced: dead target + light-http, then tiny-budget
+left-clicked 3285 -558 in pid 9300 via HID tap
+pressed AXButton '' -> 0
+[18:03:55] frame 20-cancelled
+AXStaticText		Cancelled		true
+AXButton			Scan Again	true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 55 seconds.	true
+[18:03:56] AC46 cancel loop f02 edge: 266 300 #5FA3F8 267 300 #5FA3F7  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[18:03:56] AC46 cancel loop f03 edge: 266 300 #5FA3F8 267 300 #5FA3F7  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[18:03:57] AC46 cancel loop f04 edge: 266 300 #5FA3F8 267 300 #5FA3F7  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[18:03:57] AC46 cancel loop f05 edge: 266 300 #5FA3F8 267 300 #5FA3F7  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[18:03:58] AC46 cancel loop f06 edge: 266 300 #F0A434 267 300 #EFA434  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[18:03:58] AC46 cancel loop f08 edge: 266 300 #F3A324 267 300 #F2A324  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[18:03:58] AC46 cancel loop f10 edge: 266 300 #C6AF98 267 300 #C6AF98  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[18:03:59] AC46 cancel loop f12 edge: 266 300 #B2B2B6 267 300 #B2B2B6  (cancelling expects #F5A524 within 4; a 1440x900 1x frame)
+[18:03:59] AC46 cancelled edge: 266 300 #B2B2B6 267 300 #B2B2B6  (neutral #B4B4B8 within 4)
+[18:03:59] == dead target 8121 (AC16) alone (a concurrent crawl of another origin broke while a dead-target job ran: light-http ended with 1 page, 1 crawl error, 4 checks — recorded for the engine lane); then light-http alone
+[18:03:59] dead-target job scan-b5e32649
+left-clicked 3285 -519 in pid 9300 via HID tap
+[18:04:43] frame 30-dead-target
+pressed AXDisclosureTriangle '7 checks could not run' -> 0
+no AXButton starting with 'checks could not run' (0 matched, walked 123)
+[18:04:46] frame 31-dead-target-attention
+[18:04:47] AC16 whole-word errors tokens in the dump: 5 (the well keys Probe errors / Checks ... errors are labels; the raw line is stopped_reason: errors)
+39:AXStaticText		Stopped early: too many errors from the target.	
+49:AXDisclosureTriangle		true	7 checks could not run
+51:AXStaticText		error: check-security-headers:49 — hook 'anon$d24fa5f6b588a735' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)  help: the flow was forwarded 
+55:AXStaticText		error: check-header-reflection:63 — hook 'anon$18afc689587f65ad' failed: probe.send failed: scan: probe failed: Connection refused (os error 61)  help: the flow was forwarded unchan
+57:AXStaticText		every one of the 3 reflection probes was refused	
+61:AXStaticText		stopped_reason: errors	
+72:AXStaticText		Crawl errors, 1	
+88:AXStaticText		Probe errors · timeouts · rate waits, 10 · 0 · 0	
+89:AXStaticText		Checks scheduled · done · errors · skipped, 135 · 49 · 7 · 0	
+[18:04:47] AC46 done edge: 266 300 #85ECAA 267 300 #84ECAA  (success #86EFAC within 4)
+[18:04:47] AC21 wells positive: 3 lines; negative (expect 0): 0
+[18:04:47] dead-target state: done (slot freed)
+[18:04:48] light-http job scan-ca4cd51f (alone for its crawl)
+[18:05:33] tiny-budget job scan-ff39b41e (inline profile)
+[18:05:33] D20 queued-or-busy: a third start while two run -> {"content": [{"type": "text", "text": "scan: busy: 2 scan jobs are already running"}], "isError": true}
+[18:05:33] frame 14-two-running
+[18:05:33] == tiny-budget past 40 probes (AC49 gauge amber), then ended
+left-clicked 3285 -319 in pid 9300 via HID tap
+[18:05:55] frame 40-tiny-budget-gauge
+AXUnknown			Probe budget, 1 of 2,000	true
+AXButton			Crawling, tiny-budget, 127.0.0.1:8118, no issues yet, 21 seconds.	true
+[18:05:57] tiny-budget ended: done (polled at 1 s; frame at once, AC47 end frame within 3 s)
+[18:05:57] frame 41-tiny-budget-ended
+AC49 status done budget 50 50
+AXStaticText		Stopped early: too many errors from the target.	
+AXUnknown			Probe budget, 1 of 2,000
+AXButton			Auditing, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.
+[18:05:58] AC49 raw stopped_reason tokens in the dump: 1 (expect 1, the raw line)
+[18:05:58] == four jobs: table AX label and tab title (AC31)
+AXButton			Jobs 4
+AXGroup			4 jobs · 2 running
+AXButton			Jobs 4
+AXGroup			4 jobs · 2 running
+1 scan-ff39b41e done
+2 scan-ca4cd51f running
+3 scan-b5e32649 done
+4 scan-8094e0c0 cancelled
+[18:05:58] == AC30: core stopped 10 s (no banner) and 35 s (banner), Reconnect Bus while stopped, CONT recovery
+another window is under the point; no click
+[18:06:01] frame 49-before-stop
+[18:06:04] D15 now-dot pair 369 (x=734): A[usage: pixel.swift <png> <x> <y> ... ] B[usage: pixel.swift <png> <x> <y> ... ] -> IDENTICAL
+[18:06:04] core stopped
+[18:06:16] D15 now-dot pair 369 (x=734): A[usage: pixel.swift <png> <x> <y> ... ] B[usage: pixel.swift <png> <x> <y> ... ] -> IDENTICAL
+[18:06:17] frame 50-stopped-10s
+[18:06:17] AC30 10 s: banner/error lines = 0 (expect 0); rows diff vs pre-stop AE=0 (0) (elapsed digits and the breathing dot may differ)
+[18:06:44] D15 now-dot pair 0 (x=1): A[usage: pixel.swift <png> <x> <y> ... ] B[usage: pixel.swift <png> <x> <y> ... ] -> IDENTICAL
+[18:06:45] frame 51-stopped-35s
+AXStaticText		The core is not answering · showing values from 0:42 ago · retrying every 2 s		true
+AXUnknown			Error: Unable to list jobs: the bus did not reply in time. Showing values from 0:42 ago; retrying every 2 s.	true
+AXButton			Scan Again	false
+pressed Proxy > Reconnect Bus -> 0
+[18:06:49] frame 52-reconnecting
+AXStaticText		Bus disconnected · showing values from 0:47 ago · reconnecting…	
+[18:06:50] core continued
+[18:06:56] frame 53-recovered
+[18:06:56] == AC48: wait for light-http scan-ca4cd51f, select, ledger + end sentence
+[18:14:48] light-http ended: done
+AC48 status done {'by_confidence': {'certain': 2, 'firm': 2, 'tentative': 1}, 'by_severity': {'critical': 0, 'high': 1, 'info': 0, 'low': 4, 'medium': 0}, 'total': 5}
+another window is under the point; no click
+[18:14:53] frame 60-light-http-done
+AXButton			Flows, 257	true
+AXStaticText		Done		true
+AXButton			Scan Again	true
+AXUnknown			no issues	true
+AXStaticText		Issues, 0, no issues		true
+AXStaticText		error: check-security-headers:49 — hook 'anon$d24fa5f6b588a735' failed: probe.baseline failed: scan: baseline failed: Connection refused (os error 61)  help: the flow was forwarded unchanged. Fix the 		tr
+AXStaticText		error: check-header-reflection:63 — hook 'anon$18afc689587f65ad' failed: probe.send failed: scan: probe failed: Connection refused (os error 61)  help: the flow was forwarded unchanged. Fix the hook a		tr
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.	true
+AXButton			Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes.	true
+AXButton			Done, standard, 127.0.0.1:8121, no issues, 30 seconds.	true
+[18:14:54] == AC26: Scan Again on the Done light-http row; second press while running; deleted profile
+pressed AXButton 'Scan Again' -> 0
+[18:14:58] frame 70-scan-again-started
+[18:14:59] AC26 audit scan.start before=5 after=6
+{"at":1793672094708,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_b16ed9b1bae9eff4-27","command":"scan.start","args":"{\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:8121\"]}},\"profile_name\":\"standard\"}","result":"ok"}
+1 scan-50e0ecb5 running 
+2 scan-ff39b41e done 
+3 scan-ca4cd51f done 
+4 scan-b5e32649 done 
+5 scan-8094e0c0 cancelled 
+scan-job-scan-50e0ecb5	AXButton	selected=true	focused=true
+scan-job-scan-ff39b41e	AXButton	selected=nil	focused=true
+scan-job-scan-ca4cd51f	AXButton	selected=nil	focused=true
+scan-job-scan-b5e32649	AXButton	selected=nil	focused=true
+scan-job-scan-8094e0c0	AXButton	selected=nil	focused=true
+rows: 5
+pressed AXButton 'Scan Again' -> 0
+[18:15:04] AC26 second press: scan.start count before=6 after=7 (a refused start is still one audited scan.start with an error result)
+{"at":1793672102346,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_b16ed9b1bae9eff4-27","command":"scan.start","args":"{\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:8120\"]}},\"profile_name\":\"light-http\"}","result":"ok"}
+[18:15:05] frame 71-scan-again-refused
+[18:15:05] AC26 third clause: the tiny-budget job ran from an inline profile, so no saved profile of that name exists; Scan Again sends profile_name tiny-budget and the engine answers invalid_profile (same path as a deleted saved profile)
+left-clicked 3285 -495 in pid 9300 via HID tap
+pressed AXButton 'Scan Again' -> 0
+[18:15:11] frame 72-scan-again-invalid-profile
+AXStaticText		Stopped early: the probe budget of 50 was spent. Raise it in the profile to go further.	
+AXStaticText		Unable to scan again: profile `tiny-budget`	
+[18:15:12] AC46 failed tone: not reproducible on this rig (no profile or target ends a job in state failed; a dead target ends done + stopped_reason errors) - recorded, as AC46 allows
+[18:15:12] AC27 (L4 Scan Again): not run on this rig (BPF is root-only; no L4 profile can finish) - recorded as not reproducible
+[18:15:12] == AC29: AX shapes, announce log line, Return/Escape focus
+AXButton	Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.
+AXButton	Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes.
+AXButton	Done, standard, 127.0.0.1:8121, no issues, 30 seconds.
+AXButton	Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 55 seconds.
+AXHeading			SCAN
+AXHeading			127.0.0.1:8121
+AXButton			Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes.
+AXHeading			Crawl and points, what the job found to test
+AXUnknown			Progress	
+AXStaticText		Progress, —		
+left-clicked 3285 -340 in pid 9300 via HID tap
+[18:15:17] focused before Return: AXButton |  | Crawling, light-http, 127.0.0.1:8120, no issues yet, 14 seconds. | scan-job-scan-17127866
+posted key 36 flags 0 to 9300
+[18:15:18] focused after Return: AXButton |  | Crawling, light-http, 127.0.0.1:8120, no issues yet, 14 seconds. | scan-job-scan-17127866 (AC29: the card's first enabled verb)
+posted key 53 flags 0 to 9300
+[18:15:20] focused after Escape: AXButton |  | Crawling, light-http, 127.0.0.1:8120, no issues yet, 16 seconds. | scan-job-scan-17127866 (AC29: back to the table)
+scan-job-scan-17127866	AXButton	selected=nil	focused=true
+scan-job-scan-50e0ecb5	AXButton	selected=nil	focused=true
+scan-job-scan-ff39b41e	AXButton	selected=nil	focused=true
+scan-job-scan-ca4cd51f	AXButton	selected=true	focused=true
+scan-job-scan-b5e32649	AXButton	selected=nil	focused=true
+scan-job-scan-8094e0c0	AXButton	selected=nil	focused=true
+rows: 6
+[18:15:21] real audit log size after: 94174 (before 94174)
+[18:15:21] #310 PASS: real audit log untouched
+[18:15:21] == evidence copy
+[18:15:22] == done pass A (app left running for pass B)
+[18:18:42] == pass A4 on the running app; PR 2 head c043ff05, bundle 24d2d94e
+1 scan-17127866 running 
+2 scan-50e0ecb5 done 
+3 scan-ff39b41e done 
+4 scan-ca4cd51f done 
+5 scan-b5e32649 done 
+6 scan-8094e0c0 cancelled 
+[18:18:42] done light-http: ; running light-http: 
+[18:18:42] == AC49 + AC29 announce: tiny-budget selected while it runs and ends (gauge amber past 40 of 50, end sentence, one announce line)
+[18:18:42] tiny-budget job scan-705d8772
+left-clicked 3285 -530 in pid 9300 via HID tap
+selection is [scan-job-scan-705d8772], retrying once
+[18:19:02] tiny-budget probes sent now: 41
+[18:19:03] frame 42-tiny-budget-gauge-amber
+AXStaticText		no issues so far · tiny-budget · started 18:18 by anim-verify		true
+AXUnknown			Probe budget, 44 of 50	true
+AXStaticText		Probes, 44, of 50		true
+AXButton			Crawling, tiny-budget, 127.0.0.1:8118, no issues yet, 20 seconds.	true
+[18:19:04] AC49 gauge fill sample (y=403, x 380..440): 385 403 #F5A525 400 403 #F5A525 420 403 #F5A525  (amber #F5A524 expected on the fill)
+[18:19:06] tiny-budget ended: done
+[18:19:07] frame 43-tiny-budget-ended
+AXButton			Scan Again	true
+AXStaticText		Stopped early: the probe budget of 50 was spent. Raise it in the profile to go further.		true
+AXStaticText		tiny-budget · started 18:18 by anim-verify · finished 18:19		true
+AXUnknown			Probe budget, 50 of 50	true
+AXStaticText		stopped_reason: budget		true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 1 issue: 1 low, 23 seconds.	true
+[18:19:12] AC29 announce lines in the last 3 min: 0 (expect 1 for scan-705d8772)
+[18:19:12] == AC48: the done light-http card (ledger with two severities, end sentence)
+[18:19:15] frame 61-light-http-card
+AXButton			Flows, 435	true
+AXStaticText		Done		true
+AXButton			Scan Again	true
+AXUnknown			1 issue: 1 low	true
+AXStaticText		Issues, 1, 1 low		true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 1 issue: 1 low, 23 seconds.	true
+AXButton			Auditing, light-http, 127.0.0.1:8120, 4 issues: 4 low, 4 minutes 12 seconds.	true
+AXButton			Done, standard, 127.0.0.1:8121, no issues, 30 seconds.	true
+AXButton			Done, tiny-budget, 127.0.0.1:8118, 4 issues: 4 low, 23 seconds.	true
+AXButton			Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes.	true
+[18:19:15] == AC26 second clause: Scan Again on the done light-http while a light-http job runs on the same origin
+[18:19:15] started a light-http job on 8120 for the refusal: {'content': [{'type': 'text', 'text': 'scan: busy: a scan is already running against http://127.0.0.1:8120'}], 'isError': True}
+pressed AXButton 'Scan Again' -> 0
+[18:19:22] frame 73-scan-again-already-running
+AXStaticText		Unable to scan again: profile `tiny-budget`	
+[18:19:23] AC26 refused press: scan.start count before=10 after=11
+{"at":1793672359989,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_b16ed9b1bae9eff4-27","command":"scan.start","args":"{\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:8118\"]}},\"profile_name\":\"tiny-budget\"}","result":{"error":"scan: not_found: profile `tiny-budge
+[18:19:23] == AC29: Return moves focus to the card's first verb, Escape returns it to the table (HID key events)
+[18:19:24] focused before Return: AXButton |  | Done, tiny-budget, 127.0.0.1:8118, 1 issue: 1 low, 23 seconds. | scan-job-scan-705d8772
+hid key 36 flags 0 to pid 9300
+[18:19:26] focused after Return: AXButton |  | Done, tiny-budget, 127.0.0.1:8118, 1 issue: 1 low, 23 seconds. | scan-job-scan-705d8772
+hid key 53 flags 0 to pid 9300
+[18:19:28] focused after Escape: AXButton |  | Done, tiny-budget, 127.0.0.1:8118, 1 issue: 1 low, 23 seconds. | scan-job-scan-705d8772
+[18:19:28] == D15 / AC30 now-dot pairs: a standard job on 8117 (the earlier one is cancelled), selected while auditing
+[18:19:29] standard job scan-742dc84e
+left-clicked 3285 -507 in pid 9300 via HID tap
+selection is [scan-job-scan-742dc84e], retrying once
+[18:20:18] D15 now-dot pair 80-dot-live (x=1): A[1 220 #1E1E20 1 223 #1E1E20 1 226 #1E1E20 ] B[1 220 #1E1E20 1 223 #1E1E20 1 226 #1E1E20 ] -> IDENTICAL
+[18:20:18] core stopped
+[18:20:30] D15 now-dot pair 81-dot-10s (x=1): A[1 220 #1E1E20 1 223 #1E1E20 1 226 #1E1E20 ] B[1 220 #1E1E20 1 223 #1E1E20 1 226 #1E1E20 ] -> IDENTICAL
+[18:20:57] D15 now-dot pair 82-dot-35s (x=1): A[1 220 #1E1E20 1 223 #1E1E20 1 226 #1E1E20 ] B[1 220 #1E1E20 1 223 #1E1E20 1 226 #1E1E20 ] -> IDENTICAL
+[18:20:57] frame 82-stopped-35s
+AXStaticText		The core is not answering · showing values from 0:40 ago · retrying every 2 s		true
+AXButton			Cancel Scan	false
+[18:20:58] core continued
+[18:21:06] D15 now-dot pair 83-dot-recovered (x=1): A[1 220 #1E1E20 1 223 #1E1E20 1 226 #1E1E20 ] B[1 220 #1E1E20 1 223 #1E1E20 1 226 #1E1E20 ] -> IDENTICAL
+[18:21:06] standard job scan-742dc84e left running for pass B (which records it, then cancels it)
+[18:21:06] == evidence copy
+[18:21:07] == done pass A4 (app left running for pass B)
+[18:21:07] == PR 2 pass B: window 2453 -1192 1440 900
+[18:21:07] == AC24: fresh standard job on 8117, wait for auditing, select, record 10 s
+[18:21:07] standard job {'content': [{'type': 'text', 'text': 'scan: busy: 2 scan jobs are already running'}], 'isError': True} (fresh)
+[18:21:47] standard job {'content': [{'type': 'text', 'text': 'scan: busy: 2 scan jobs are already running'}], 'isError': True} (running, from pass A4)
+no row frame for {'content': [{'type': 'text', 'text': 'scan: busy: 2 scan jobs are already running'}], 'isError': True}: []
+captured 569 changed frames in 10.0 s -> /tmp/claude/jobsux-proof/pr2/motion
+[18:22:15] motion frames: 569
+514 changed frames, last change at 10631 ms
+1118.48 (0.000310378)923.816 (0.000256359)[18:24:01] heatmaps: first->last and first->mid (red = changed pixels; expect the digits, the fill, the now mark + dot and the elapsed only)
+[18:24:01] == AC50: entrance on a pointer row click (recording 2 s, click at +0.5 s), stills at +0/100/200/300/400 ms
+[18:24:01] clicking row 
+[18:24:03] click at +527 ms (recording clock)
+captured 142 changed frames in 2.5 s -> /tmp/claude/jobsux-proof/pr2/entrance
+128 changed frames, last change at 3045 ms
+[18:24:36] still +0 ms -> frame t545
+[18:24:36] still +100 ms -> frame t636
+[18:24:36] still +200 ms -> frame t738
+[18:24:36] still +300 ms -> frame t840
+[18:24:36] still +400 ms -> frame t934
+[18:24:36] still +600 ms -> frame t1134
+[18:24:36] == AC50: Down-arrow selection (keyboard: no entrance); first frame after the key must already be opaque
+posted key 125 flags 0 to 9300
+[18:24:39] key at +523 ms
+69 changed frames, last change at 2122 ms
+[18:25:01] still +0 ms -> frame t567
+[18:25:01] still +50 ms -> frame t574
+[18:25:01] still +100 ms -> frame t627
+[18:25:01] still +300 ms -> frame t827
+[18:25:01] Reduce Motion variants: NOT RUN (system setting; needs Matt's yes)
+[18:25:01] standard job cancelled (cleanup)
+[18:25:01] == evidence copy
+[18:25:01] == done pass B; quitting the bundle (quit-when-idle rule)
+down
+[18:25:03] targets stopped
+[18:27:06] == pass A5 (relaunch): app and core from the bundle tree 24d2d94e = feat/scan-jobs-view-redesign c043ff05 + #310
+[18:27:06] real audit log size before: 94174
+share
+app pid 20179
+core pid 20189 proxy port 52913 bus 127.0.0.1:52918
+[18:27:23] #310 PASS: audit log under the isolated store (/tmp/Aitmproxy-dev-state-jobsux/audit.jsonl)
+pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[18:27:29] == light-http on 8120 alone (its crawl must not overlap another job); then standard on 8117
+[18:27:29] light-http job scan-91d7f80c
+[18:28:19] standard job scan-bf7e0f9e
+[18:28:42] standard phase: auditing
+left-clicked 3285 -585 in pid 20179 via HID tap
+selected now: scan-job-scan-bf7e0f9e (wanted scan-job-scan-bf7e0f9e)
+[18:28:46] == D15 / AC30: now-dot pairs around a frozen core (standard auditing, selected)
+[18:28:50] D15 now-dot pair 80-dot-live (fill end x=851): A[851 218 #E5E5E7 851 221 #E6E6E8 851 224 #E6E6E8 851 227 #E6E6E8 ] B[851 218 #7F7F82 851 221 #E6E6E8 851 224 #E6E6E8 851 227 #E6E6E8 ] -> DIFFERENT
+[18:28:50] core stopped
+[18:29:02] D15 now-dot pair 81-dot-10s (fill end x=851): A[851 218 #E5E5E7 851 221 #E6E6E8 851 224 #E6E6E8 851 227 #E6E6E8 ] B[851 218 #89898B 851 221 #E6E6E8 851 224 #E6E6E8 851 227 #E6E6E8 ] -> DIFFERENT
+[18:29:28] D15 now-dot pair 82-dot-35s (fill end x=1): A[1 218 #1E1E20 1 221 #1E1E20 1 224 #1E1E20 1 227 #1E1E20 ] B[1 218 #1E1E20 1 221 #1E1E20 1 224 #1E1E20 1 227 #1E1E20 ] -> IDENTICAL
+[18:29:29] frame 82-stopped-35s
+AXStaticText		The core is not answering · showing values from 0:40 ago · retrying every 2 s		true
+AXButton			Cancel Scan	false
+[18:29:29] core continued
+[18:29:38] D15 now-dot pair 83-dot-recovered (fill end x=853): A[853 218 #838386 853 221 #E6E6E8 853 224 #E6E6E8 853 227 #E6E6E8 ] B[853 218 #E6E6E8 853 221 #E6E6E8 853 224 #E6E6E8 853 227 #E6E6E8 ] -> DIFFERENT
+[18:29:38] == AC50: entrance on a pointer row click (the light-http row), stills at +0/100/200/300/400 ms
+left-clicked 3285 -535 in pid 20179 via HID tap
+selection is [scan-job-scan-bf7e0f9e], retrying once
+left-clicked 3285 -535 in pid 20179 via HID tap
+selected now: scan-job-scan-bf7e0f9e (wanted scan-job-scan-91d7f80c)
+[18:29:44] click at +524 ms (recording clock)
+captured 148 changed frames in 2.5 s -> /tmp/claude/jobsux-proof/pr2/entrance
+101 changed frames, last change at 3105 ms
+[18:30:12] still +0 ms -> frame t535
+[18:30:12] still +100 ms -> frame t640
+[18:30:12] still +200 ms -> frame t730
+[18:30:12] still +300 ms -> frame t834
+[18:30:12] still +400 ms -> frame t928
+[18:30:12] still +600 ms -> frame t1137
+[18:30:12] == AC50: HID Down-arrow (keyboard selection: no entrance); the first frame after the key is already opaque
+left-clicked 3285 -535 in pid 20179 via HID tap
+selection is [scan-job-scan-bf7e0f9e], retrying once
+left-clicked 3285 -535 in pid 20179 via HID tap
+selected now: scan-job-scan-bf7e0f9e (wanted scan-job-scan-91d7f80c)
+hid key 125 flags 0 to pid 20179
+[18:30:20] key at +525 ms
+83 changed frames, last change at 2120 ms
+[18:30:40] still +0 ms -> frame t527
+[18:30:40] still +50 ms -> frame t589
+[18:30:40] still +100 ms -> frame t629
+[18:30:40] still +300 ms -> frame t841
+scan-job-scan-bf7e0f9e	AXButton	selected=nil	focused=true
+scan-job-scan-91d7f80c	AXButton	selected=true	focused=true
+rows: 2
+[18:30:40] AC29 Return/Escape: Full Keyboard Access (AppleKeyboardUIMode) is unset/off; macOS buttons take keyboard focus only with it on, so Return cannot land on the card's verb on this rig without a system-setting change (Matt's yes required) - recorded, not proven
+[18:30:40] standard job cancelled (cleanup; light-http keeps running to its end)
+[18:30:40] == AC48: wait for light-http scan-91d7f80c (alone again), select it: ledger with two severities, end sentence
+[18:37:29] light-http ended: done
+AC48 status done {'critical': 0, 'high': 1, 'info': 0, 'low': 4, 'medium': 0} 3514 of 4624 600005
+left-clicked 3285 -524 in pid 20179 via HID tap
+selection is [scan-job-scan-bf7e0f9e], retrying once
+left-clicked 3285 -513 in pid 20179 via HID tap
+selected now: scan-job-scan-bf7e0f9e (wanted scan-job-scan-91d7f80c)
+[18:37:38] frame 61-light-http-card
+AXButton			Flows, 171	true
+AXButton			Scan Again	true
+AXUnknown			4 issues: 4 low	true
+AXStaticText		Issues, 4, 4 low		true
+AXButton			Cancelled, standard, 127.0.0.1:8117, 4 issues: 4 low, 2 minutes 21 seconds.	true
+AXButton			Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes.	true
+[18:37:39] AC46 done edge on the light-http card: 266 300 #B2B2B6 267 300 #B2B2B6 
+[18:37:39] == AC26 second clause: a second light-http on 8120 runs; Scan Again on the done one is refused
+[18:37:39] second light-http job scan-87413d8b (running)
+left-clicked 3285 -491 in pid 20179 via HID tap
+selection is [scan-job-scan-bf7e0f9e], retrying once
+left-clicked 3285 -491 in pid 20179 via HID tap
+selected now: scan-job-scan-bf7e0f9e (wanted scan-job-scan-91d7f80c)
+pressed AXButton 'Scan Again' -> 0
+[18:37:51] frame 73-scan-again-already-running
+[18:37:52] AC26 refused press: scan.start count before=3 after=4
+{"at":1793673469267,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_0c10014c1b8d054a-1","command":"scan.start","args":"{\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:8117\"]}},\"profile_name\":\"standard\"}","result":"ok"}
+[18:37:52] second light-http cancelled (cleanup)
+2026-11-02 18:37:29.818 I  Aitmproxy-jobsux[20179:a5d3def] [com.mrbrutti.aitmproxy:scan] announce: scan-91d7f80c <private>
+2026-11-02 18:37:34.006 I  Aitmproxy-jobsux[20179:a5d3def] [com.mrbrutti.aitmproxy:scan] announce: scan-bf7e0f9e <private>
+[18:37:55] AC29 announce lines (30 min, --info): 2
+[18:37:55] real audit log size after: 94174 (before 94174) -> #310 PASS
+[18:37:55] == evidence copy
+[18:37:55] == done pass A5; quitting the bundle (quit-when-idle rule)
+down
+[18:37:57] targets stopped
+[18:45:20] == pass A6 (relaunch): app and core from the bundle tree 282cb428 = feat/scan-jobs-view-redesign 46dc0538 + #310
+[18:45:20] real audit log size before: 94174
+share
+app pid 28092
+core pid 28279 proxy port 57151 bus 127.0.0.1:57157
+[18:45:40] #310 PASS: audit log under the isolated store
+pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[18:45:45] == light-http on 8120 alone; a dead-target job on 8121 after its crawl so the table has three rows for the AX-frame check
+[18:45:45] light-http job scan-54c57eae
+[18:46:35] dead-target job scan-4020dada
+[18:46:41] == fix 2.12d check: every scan-job- row reports its own 44 pt frame (x y w h id)
+2718 -607 1134 44 scan-job-scan-4020dada
+2718 -562 1134 44 scan-job-scan-54c57eae
+[18:47:06] dead-target state: done
+left-clicked 3285 -585 in pid 28092 via HID tap
+selected now: scan-job-scan-4020dada (wanted scan-job-scan-4020dada)
+[18:47:11] frame 91-row2-selected
+left-clicked 3285 -429 in pid 28092 via HID tap
+selected now: scan-job-scan-54c57eae (wanted scan-job-scan-54c57eae)
+[18:47:15] frame 92-row1-selected
+2718 -607 1134 44 scan-job-scan-4020dada
+2718 -562 1134 44 scan-job-scan-54c57eae
+[18:47:16] == AC48: wait for light-http scan-54c57eae, select it: ledger with two severities, end sentence
+[18:55:46] light-http ended: done
+AC48 status done time {'critical': 0, 'high': 1, 'info': 0, 'low': 4, 'medium': 0} 3555 of 4624 600007
+left-clicked 3285 -485 in pid 28092 via HID tap
+selected now: scan-job-scan-54c57eae (wanted scan-job-scan-54c57eae)
+[18:55:51] frame 61-light-http-card
+AXButton			Flows, 87	true
+AXStaticText		Done		true
+AXButton			Scan Again	true
+AXStaticText		Stopped early: the time budget ran out.		true
+AXUnknown			5 issues: 1 high, 4 low	true
+AXStaticText		Issues, 5, 1 high, 4 low		true
+AXButton			Done, standard, 127.0.0.1:8121, no issues, 30 seconds.	true
+AXButton			Done, light-http, 127.0.0.1:8120, 5 issues: 1 high, 4 low, 10 minutes.	true
+[18:55:52] AC46 done edge on the light-http card: 266 300 #85ECAA 267 300 #84ECAA 
+[18:55:53] AC48 ledger marks sampled (y=372, x 296..340): 296 372 #232326 312 372 #232326 330 372 #232326  (first group in the high ink, then the low ink)
+[18:55:53] == AC26 second clause: a second light-http on 8120 runs; Scan Again on the done one is refused
+[18:55:53] second light-http job scan-c8a70504 (running)
+left-clicked 3285 -440 in pid 28092 via HID tap
+selected now: scan-job-scan-54c57eae (wanted scan-job-scan-54c57eae)
+pressed AXButton 'Scan Again' -> 0
+[18:56:03] frame 73-scan-again-already-running
+AXStaticText		Unable to scan again: A scan on this origin is already running	
+[18:56:03] AC26 refused press: scan.start count before=3 after=4
+{"at":1793674560375,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_6b5c5b22c0894da1-1","command":"scan.start","args":"{\"overrides\":{\"target\":{\"origins\":[\"http://127.0.0.1:8120\"]}},\"profile_name\":\"light-http\"}","result":{"error":"scan: busy: a scan is already running against http://127.0.0.1:8120"}}
+[18:56:03] second light-http cancelled (cleanup)
+[18:56:03] real audit log size after: 94174 (before 94174) -> #310 PASS
+[18:56:03] == evidence copy
