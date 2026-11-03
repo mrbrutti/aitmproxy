@@ -800,7 +800,8 @@ Rules (the UX section's, made total):
 
 `percentText` is `Int((fraction * 100).rounded(.down))` + ` %` with a
 non-breaking space; it never reads `100 %` for a running job unless
-`done == scheduled`. `nowLine` is `Now: <first id>` for one running check,
+`done >= scheduled` (the derived fraction is clamped at 1, so a core reporting
+`done > scheduled` reads `100 %`; fix 2.11b). `nowLine` is `Now: <first id>` for one running check,
 `Now: <first id> and <n> more` for more (`checks.running` is already capped at
 8 by the engine). The fraction may fall when `scheduled` grows; the model
 reports the new value and D12's motion eases to it.
