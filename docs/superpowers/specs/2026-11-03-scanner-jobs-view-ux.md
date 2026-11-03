@@ -1625,6 +1625,79 @@ pin with a test comment, and P14's unknown crawl error is pinned through
 `Transport` / `Other` (`the connection failed`). A lenient `Other(String)`
 variant in the model crate is an engine-lane follow-up, not Part 4.
 
+**Amendment (2026-11-02, Task 4.6 live proof run 1: the hung core).** T2's
+"the Jobs error banner already carries the last error" is wrong for a core
+that stops answering without closing its socket. After `kill -STOP` of the
+core the TUI showed its stale rows for 75 s with no banner at all. The TUI
+bus client (`crates/aitm-tui/src/bus.rs`) has no per-request timeout (only
+the 500 ms → 10 s reconnect back-off after a transport failure) and its
+session serves one call at a time; the TCP connection stays open, so the
+in-flight `scan.list` never returns, no error reply or transport failure
+happens, `JobsState::error` stays empty and the age clause has nothing to
+attach to. This is the TUI's own C12 (the mac's bus client times a read out
+after 30 s, D6; the web tells an open socket from a closed one). The Jobs
+view therefore gains a **hung-core detector** in the reducer:
+
+- **What it watches: the one `scan.list` in flight** (single-slot tag
+  `scan.list`; Architect's call). `JobsState.list_sent_at_tick: Option<u64>`
+  is the tick that list left, cleared when its reply settles (ok or error)
+  and when the bus drops. `scan.status` / `scan.cancel` are not watched: the
+  session is sequential, so a hung core holds every call and a list is
+  always among them within one list period (10 s while the Scan view is
+  shown); the list is the read the age clause counts from, so the banner's
+  two clauses speak of the same read; and a `scan.list` error is cleared by
+  the very fold that ends the hang, with no new clearing rule (a keyed
+  `scan.status:<job>` error would need H66's rules).
+- **When: `LIST_OVERDUE_TICKS = 80`, 20 s at 250 ms a tick** (Architect's
+  call). `list_overdue(now, list_sent_at_tick, 80)` is `now − sent ≥ 80`,
+  the comparison of the reducer's `due`. Why 20 s: the values on screen are
+  normally 0–10 s old (one list period), so a list outstanding for two whole
+  periods has certainly missed a beat; a shorter limit would flag a list
+  merely queued behind one slow call on the sequential session (a large
+  import, a `poc.run`); the mac's 30 s client timeout is the upper
+  reference, and the TUI should not be the slowest surface to notice. On
+  the steady cadence a list leaves on every fortieth tick, so the banner
+  first appears 20–30 s after the freeze and its first age reads `30s`
+  (`29s` when the last list took a tick to fold): `LIST_POLL_TICKS +
+  LIST_OVERDUE_TICKS` = 120 ticks since the last fold. A list sent off the
+  cadence (opening the view, a `not_found` self-heal) can make the first age
+  as low as `20s`.
+- **What it says.** It records `ScanError::uncoded("scan.list", "the bus did
+  not reply in time")` through `ScanState::set_error` (the Jobs slot and
+  `last_error`), so the existing banner reads `scan.list: the bus did not
+  reply in time · showing values from 30s ago` and the clause keeps
+  counting. The core text is the mac's (`Unable to list jobs: the bus did
+  not reply in time.`); the form is the TUI's `<verb>: <detail>` (D9 of the
+  TUI spec). No toast: the banner stands, and the mac does not toast either
+  (Architect's call).
+- **What it does not do.** The request is not cancelled (the client has no
+  cancel, and the tag dedupe keeps a second list from leaving while one is
+  held). The detector fires once per request: it takes `list_sent_at_tick`
+  when it fires and re-arms when the next list leaves. A late reply folds as
+  today: `scan_reply` clears the `scan.list` error, `listed_ok_at_tick` is
+  stamped, and the banner and its clause go. A late error reply replaces the
+  sentence with its own text.
+- **`x` while the core is not answering: refused** (Architect's call, after
+  D6's rule that the mac disables Cancel while `!link.verbsEnabled`).
+  `JobsState::unanswered()` is true while the Jobs error is this sentence
+  under `scan.list`; `x` then sends nothing and toasts `scan.cancel not
+  sent: the bus did not reply in time` (Warn). The session is sequential, so
+  a cancel pressed now would queue behind the hung call and fire whenever
+  the core wakes, unseen; the banner cannot carry a notice here (the error
+  outranks the notice), hence the toast. `x` works again once a list folds.
+
+A client-side timeout in `bus.rs` is not this fix: it belongs to the shared
+bus client and every TUI call, not the Jobs view, and is a follow-up. AC43's
+live literal and AC60 follow this amendment (plan Task 4.5a, gap 66).
+
+**Note (2026-11-02, Part 4 panel round 1).** The `points` detail line groups
+every count it carries (`found 1,020 · queued 12 · audited 1,008 · 722
+skipped as repetitive · 6 skipped by rule · 0 skipped at the per-request
+cap`), like the Kit's Points rows: the skip words are grouped by the Kit
+text, so an ungrouped `found 1020` beside `1,200 skipped by rule` would be
+the inconsistency. The sibling label-value lines (`crawl`, `checks`, …) keep
+their plain numbers (coordinator ruling; plan gap 68).
+
 ### Part D: testing
 
 #### D20. Tests per surface and the live proof
@@ -2329,8 +2402,35 @@ Live web criteria (numbered after AC57 so no reference moves):
     through a `standard` job shows the progress column rising, the detail's
     `now` line, `x` producing `cancelling` then `cancelled`, and the
     detail's first line `Cancelled after …; … of … checks had run. What it
-    found stays.`; the Jobs banner after `kill -STOP` carries `showing values
-    from 4xs ago`.
+    found stays.`. After `kill -STOP` of the core, within 31 s a frame shows
+    the Jobs banner `scan.list: the bus did not reply in time · showing
+    values from <N>s ago` with N from 20 to 30 on its first frame (`29` or
+    `30` on the steady list cadence, D19 amendment), and a frame 5 s later
+    reads N + 5 (± 1); after `kill -CONT`, within 5 s a frame shows neither
+    `did not reply` nor `showing values`. (Amended 2026-11-02: the first
+    draft's `4xs` assumed an error the TUI never produced; plan gap 66.)
+60. **AC60 (T2, D19 amendment; unit).** `list_overdue(119, Some(40), 80) ==
+    false`, `list_overdue(120, Some(40), 80) == true`, `list_overdue(500,
+    None, 80) == false`, `list_overdue(10, Some(40), 80) == false`. Through
+    the app: a `scan.list` that leaves at tick 40 and gets no reply sets no
+    Jobs error by tick 119; at tick 120 the Jobs error reads `scan.list: the
+    bus did not reply in time`, the banner row ends `scan.list: the bus did
+    not reply in time · showing values from 30s ago` (last fold at tick 0),
+    `scan.list` is still in flight and no second `scan.list` left between
+    ticks 41 and 120; `x` on the running job then sends nothing and toasts
+    `scan.cancel not sent: the bus did not reply in time`; the late list
+    reply at tick 121 clears the banner (no `showing values`), stamps
+    `listed_ok_at_tick == Some(121)` and `unanswered()` reads false.
+61. **AC61 (T2, D19, D20; acceptance cell).** `python3 -I
+    tests/e2e/tui/test_tui_scan_live.py --selftest` exits 0 with its Jobs
+    fixture drawn with the header `job  profile  targets  state  progress
+    budget  points  issues  el.`; `row_state` reads `crawling`, `auditing`
+    and `cancelled` off the new rows and returns `None` for an old-shape
+    cell (`running/crawl`, `running/audit`, `cancelled/done`: the negative
+    control); `row_probes` reads the budget cell (`418/2000` → `(418,
+    2000)`), not the progress cell, also when the progress cell is `...`;
+    one Terminal run of the cell against the real core exits 0 (plan Task
+    4.6).
 
 ### Kit rows and parts (mac PR 3)
 
@@ -2394,8 +2494,10 @@ Live web criteria (numbered after AC57 so no reference moves):
     `failed` + error `"boom\nsecond"` → nil / `boom`; `failed`, no reason,
     error `"\nboom"` → nil / `boom`; `failed`, no reason, error `""` → nil /
     nil; `cancelled` + `cancelled` → nil / nil; `running` + `errors` → nil /
-    nil; `done` without a status → nil / nil. Over the AC32 sweep
-    `findingLine(f, timeZone:).reason == reasonLine(f)`.
+    nil; `done` without a status → nil / nil (the two newline cases are
+    built on the decoded status; the wire decoder strips newlines, plan gap
+    70). Over the AC32 sweep `findingLine(f, timeZone:).reason ==
+    reasonLine(f)`.
 56. **AC56 (P3, D21; unit).** `nowTagParts` for four running ids is
     `[("now · ", .plain), ("xss-reflected", .checkId), (" and 3 more",
     .plain)]`, for one id `[("now · ", .plain), ("xss-reflected",
@@ -2473,3 +2575,13 @@ autonomous mode; Matt may overrule any of them at the PR 2 review:
    Cancel is pointer-only and the web has no row context menu; the table
    cell's severity words become one `Text` on the mac (D21); PR 3 proves
    "behaviour unchanged" by its pins and one short live check.
+9. The Part 4 hung-core amendment (2026-11-02, D19) added these calls: the
+   TUI watches the one `scan.list` in flight, not `scan.status` /
+   `scan.cancel`; it declares the core not answering after 80 ticks (20 s);
+   it says `scan.list: the bus did not reply in time` through the existing
+   Jobs banner and age clause, with no toast; the request is not cancelled
+   and a late reply clears the banner; `x` is refused with the toast
+   `scan.cancel not sent: the bus did not reply in time` while the sentence
+   stands; a client timeout in the TUI's bus client is a follow-up. The
+   acceptance cell's evidence keeps its JSON key names
+   (`screen_state_phase`, `screen_sent`) across the row re-pin.
