@@ -93,10 +93,14 @@ enum Store {
     /// harness run (`APP_STORE` / `APP_LIVE`; `SettingsDomain`), so stale Settings ▸ Bus
     /// residue never steers a test and a test never overwrites it. `UserDefaults` is
     /// thread-safe but not marked `Sendable`, hence `unsafe`; the embedded core reads
-    /// it off the main actor.
+    /// it off the main actor (and the one seed write below happens inside this initialiser).
     nonisolated(unsafe) static let defaults: UserDefaults = {
         let env = ProcessInfo.processInfo.environment
-        return SettingsDomain.select(environment: env).makeDefaults(registering: SettingsDomain.registration(environment: env))
+        let defaults = SettingsDomain.select(environment: env).makeDefaults(registering: SettingsDomain.registration(environment: env))
+        // The one write at build time: the recommended bypass list becomes readable from the store
+        // before any reader (core spawn, Settings, the live set) and never races one (MAC-6/15).
+        SystemProxyPreferences.seedBypassDefaultIfUnset(defaults)
+        return defaults
     }()
 
     static var url: URL {
