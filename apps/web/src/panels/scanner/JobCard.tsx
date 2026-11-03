@@ -43,6 +43,7 @@ import {
   rawCrawlErrorLine,
   rawReasonLine,
   reasonLine,
+  sampleRowText,
   SCAN_AGAIN_ERROR_PREFIX,
   SCAN_AGAIN_HELP_GENERIC,
   scaleElapsed,
@@ -100,7 +101,17 @@ export const JobCard: Component<JobCardProps> = (props) => {
   const [againLaunched, setAgainLaunched] = createSignal(false);
   const launchError = s.errorFor(['launch']);
   const scanAgainError = () => (againLaunched() ? launchError() : null);
-  createEffect(on(job, () => setAgainLaunched(false), { defer: true }));
+  // A new job on the card: the refusal and the cancel in flight were the last job's (gap 79).
+  createEffect(
+    on(
+      job,
+      () => {
+        setAgainLaunched(false);
+        setCancelInFlight(false);
+      },
+      { defer: true },
+    ),
+  );
   const scanAgainTitle = () => {
     const refusal = scanAgainError();
     if (refusal !== null) return refusal.text;
@@ -110,11 +121,13 @@ export const JobCard: Component<JobCardProps> = (props) => {
   const cancelError = s.errorFor(['cancel']);
 
   const onCancel = async (): Promise<void> => {
+    const id = job();
     setCancelInFlight(true);
     try {
-      await s.cancel(job());
+      await s.cancel(id);
     } finally {
-      setCancelInFlight(false);
+      // The reply is this job's: a late one must not clear a cancel the next job has in flight.
+      if (job() === id) setCancelInFlight(false);
     }
   };
   const onScanAgain = async (): Promise<void> => {
@@ -485,9 +498,7 @@ export const JobCard: Component<JobCardProps> = (props) => {
                     <ul class={css.notices}>
                       <For each={line.samples}>
                         {(sample) => (
-                          <li class={css.unit}>
-                            {sample.check} · {sample.detail}
-                          </li>
+                          <li class={css.unit}>{sampleRowText(sample)}</li>
                         )}
                       </For>
                     </ul>

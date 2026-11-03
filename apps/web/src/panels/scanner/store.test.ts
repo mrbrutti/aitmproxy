@@ -337,8 +337,6 @@ describe('scanStore: launch (D-T8.6)', () => {
     expect(h.s.tab()).toBe('jobs');
     expect(h.s.startNotice()!.clamped[0]!.applied).toBe(20000);
     expect(h.notice).toHaveBeenCalledWith('scan-1a2b3c4d started');
-    h.s.dismissStartNotice();
-    expect(h.s.startNotice()).toBeNull();
   });
 
   it('confirm_flow: the dialog is the core prompt, cancel sends nothing, confirm carries the token (W-9)', async () => {

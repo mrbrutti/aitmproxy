@@ -465,6 +465,30 @@ describe('JobsView: keyboard and the entrance (W-17, D12)', () => {
     expect(h.region().getAttribute('data-generation')).toBe('3');
     expect(h.region().getAttribute('data-entrance')).toBe('play');
   });
+
+  it('wells_remount_on_the_generation (gap 79): two pointer clicks each give a new `.wells` element, an arrow key keeps it', async () => {
+    const h = mount();
+    await tick();
+    const wells = () => h.r.container.querySelector(`.${jobsCss.wells}`)!;
+    const first = wells();
+    expect(first).not.toBeNull();
+    fireEvent.click(h.row(DONE));
+    await tick();
+    const second = wells();
+    expect(second).not.toBe(first);
+    expect(second.getAttribute('data-entrance')).toBe('play');
+    fireEvent.click(h.row(JOB));
+    await tick();
+    const third = wells();
+    expect(third).not.toBe(second);
+    expect(h.region().getAttribute('data-generation')).toBe('3');
+    // The keyboard changes the job and keeps the generation: the same wells element, nothing plays.
+    fireEvent.keyDown(h.r.getByRole('listbox', { name: 'Jobs' }), { key: 'ArrowDown' });
+    await tick();
+    expect(h.region().getAttribute('data-job')).toBe(DONE);
+    expect(wells()).toBe(third);
+    expect(wells().getAttribute('data-entrance')).toBe('none');
+  });
 });
 
 describe('JobsView: states (W-16, D15)', () => {

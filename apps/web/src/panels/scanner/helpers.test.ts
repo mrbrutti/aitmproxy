@@ -6,7 +6,7 @@
 // pack's README demands: nothing here is evidence that a scan found, reported or reproduced
 // anything. T8's acceptance is the live run, never this suite.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { L4ScopeEntryWire } from '~/panels/l4/model';
 
@@ -73,6 +73,7 @@ import {
   jobHeadingHelp,
   jobProgress,
   jobsCaption,
+  jobsCaptionFor,
   laneChecksDone,
   lanePages,
   ledgerGroups,
@@ -103,6 +104,7 @@ import {
   rawReasonLine,
   reasonLine,
   rowSubLine,
+  sampleRowText,
   scaleElapsed,
   scaleStarted,
   scanAgainHelp,
@@ -1137,6 +1139,20 @@ describe('startedByWords / agentOriginated / clock (D11; gap 48)', () => {
     expect(scaleStarted('11:32')).toBe('started 11:32');
     expect(scaleElapsed(64_000)).toBe('elapsed 1:04');
   });
+
+  it('clock builds one Intl.DateTimeFormat per zone and reuses it (gap 79)', () => {
+    const spy = vi.spyOn(Intl, 'DateTimeFormat');
+    try {
+      // A zone no earlier test touched, so the cache cannot already hold it.
+      expect(clock(STARTED_AT_1132, 'Pacific/Auckland')).toBe('22:32');
+      expect(clock(STARTED_AT_1132 + 60_000, 'Pacific/Auckland')).toBe('22:33');
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(clock(STARTED_AT_1132, 'America/New_York')).toBe('06:32');
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 describe('issuesSoFar / nowClause / findingLine (D11, AC36)', () => {
@@ -1623,6 +1639,21 @@ describe('jobsCaption / elapsedWords (D10, D14)', () => {
     expect(jobsCaption(1, 0)).toBe('1 job');
     expect(jobsCaption(3, 0)).toBe('3 jobs');
     expect(jobsCaption(2, 2)).toBe('2 jobs · 2 running');
+  });
+
+  it('jobsCaptionFor counts the rows and the `running` ones only; queued and cancelling are not running (gap 79)', () => {
+    expect(jobsCaptionFor([])).toBe('0 jobs');
+    expect(jobsCaptionFor([facts('running', 'auditing')])).toBe('1 job · 1 running');
+    expect(jobsCaptionFor([facts('running', 'auditing'), facts('queued', 'queued'), facts('cancelling', 'auditing'), facts('done', 'done')])).toBe(
+      '4 jobs · 1 running',
+    );
+    expect(jobsCaptionFor([facts('done', 'done'), facts('cancelled', 'done'), facts('failed', 'done')])).toBe('3 jobs');
+    expect(jobsCaptionFor([unread('running', 'crawling'), facts('running', 'crawling')])).toBe('2 jobs · 2 running');
+  });
+
+  it('sampleRowText is the check id and the detail joined with ` · ` (gap 79)', () => {
+    expect(sampleRowText({ check: 'xss-reflected', point: 'GET /login', detail: 'connection refused' })).toBe('xss-reflected · connection refused');
+    expect(sampleRowText({ check: 'sqli-error', point: '', detail: '' })).toBe('sqli-error · ');
   });
 
   it('spells the elapsed time in words, zero components left out', () => {

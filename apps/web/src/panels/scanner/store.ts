@@ -158,7 +158,6 @@ export interface ScanStore extends LiveModel {
   /** `lastError()` when its `source` is one of `sources`, else `null`. */
   errorFor(sources: readonly ScanErrorSource[]): Accessor<ScanError | null>;
   startNotice: Accessor<StartResult | null>;
-  dismissStartNotice(): void;
   pendingConfirm: Accessor<PendingConfirm | null>;
 
   /** `load*` always reads (Retry); `ensure*` joins a read in flight and is a no-op once loaded. */
@@ -760,7 +759,6 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     lastError,
     errorFor,
     startNotice,
-    dismissStartNotice: () => setStartNotice(null),
     pendingConfirm,
 
     loadProfiles,

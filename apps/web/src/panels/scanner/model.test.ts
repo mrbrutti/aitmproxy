@@ -11,9 +11,11 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_SAMPLES,
   SCAN_ERROR_CODES,
+  STAMP_MAX,
   STR_MAX,
   TARGET_MAX,
   TOKEN_MAX,
+  boundedStr,
   parseCheckMeta,
   parseChecksResult,
   parseInsertionPoint,
@@ -219,6 +221,17 @@ describe('parseJobStatus', () => {
     expect(same.lanes.skipped).toEqual([{ lane: 'ws', reason: 'lane not available on this build' }]);
     expect(same.clamped).toEqual([]);
     expect(same.error).toBeNull();
+  });
+
+  it('boundedStr and STAMP_MAX are the one cleaning rule the helpers share (gap 79)', () => {
+    expect(STAMP_MAX).toBe(8.64e15);
+    // Control, format, line and paragraph separators go; the cut is in code points, so an astral scalar is never split.
+    expect(boundedStr('a\u0000b\tc\u202Ed\u2028e', 10)).toBe('abcde');
+    expect(boundedStr('\u{1F600}\u{1F600}\u{1F600}', 2)).toBe('\u{1F600}\u{1F600}');
+    expect(boundedStr('abcdef', 3)).toBe('abc');
+    expect(boundedStr('abc', 3)).toBe('abc');
+    expect(boundedStr(5, 3)).toBe('');
+    expect(boundedStr(null, 3)).toBe('');
   });
 
   it('bounds targets to 200 chars and 8 entries and rejects a stamp no date holds', () => {

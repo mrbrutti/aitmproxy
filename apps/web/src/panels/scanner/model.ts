@@ -692,7 +692,7 @@ export const TARGET_MAX = 200;
 /** The engine's cap on `error_samples`, `skipped_samples` and `checks.running`; held against `lanes.skipped`, `clamped` and `targets` too. */
 export const MAX_SAMPLES = 8;
 /** The largest millisecond stamp a `Date` can hold (±8.64e15; the wire's stamps are epoch ms, so only the positive side). */
-const STAMP_MAX = 8.64e15;
+export const STAMP_MAX = 8.64e15;
 
 /** Control, format, line and paragraph separator scalars: none of them belongs in a row. */
 const UNPRINTABLE = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
@@ -700,9 +700,9 @@ const UNPRINTABLE = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
 /**
  * `v` as a string with `UNPRINTABLE` scalars dropped and cut to `max` code points (not UTF-16
  * units, so an astral scalar is never split); `''` for a non-string. The strings of a status that a
- * Jobs row prints go through here, never `str`.
+ * Jobs row prints go through here, never `str`; `helpers.ts` cleans its own labels with it too (gap 79).
  */
-function boundedStr(v: unknown, max: number): string {
+export function boundedStr(v: unknown, max: number): string {
   if (typeof v !== 'string') return '';
   const clean = v.replace(UNPRINTABLE, '');
   let end = 0;

@@ -163,41 +163,9 @@
 .strip > button:last-child {
   margin-left: auto;
 }
-
-/* Severity stacked bar: hue only here and on chips. */
-.bar {
-  display: flex;
-  flex: none;
-  gap: 1px;
-  width: 120px;
-  height: 6px;
-  overflow: hidden;
-  border-radius: var(--radius-pill);
-  background: var(--color-ground-raised);
-}
-.bar[data-empty='true'] {
-  background: var(--color-ground-raised);
-}
-.barSeg {
-  display: block;
-  height: 100%;
-  min-width: 2px;
-  background: var(--color-text-tertiary);
-}
-.barSeg[data-severity='critical'] {
-  background: var(--color-severity-critical-fg);
-}
-.barSeg[data-severity='high'] {
-  background: var(--color-severity-high-fg);
-}
-.barSeg[data-severity='medium'] {
-  background: var(--color-severity-medium-fg);
-}
-.barSeg[data-severity='low'] {
-  background: var(--color-severity-low-fg);
-}
-.barSeg[data-severity='info'] {
-  background: var(--color-severity-info-fg);
+/* The strip's empty severity words (`no issues yet`): the Jobs view's muted ink, whose rule is scoped to `.jobs`. */
+.strip [data-ink='muted'] {
+  color: var(--color-text-tertiary);
 }
 
 /* ---------- list + detail grid (as findings.module.css) ---------- */
@@ -399,21 +367,6 @@
   color: var(--color-text-tertiary);
   white-space: nowrap;
 }
-/* Jobs rows: line 1 is state + elapsed, line 2 is id/counters + a short severity bar. The strip
-   keeps its 120px bar; the row's is scoped here so the 320px list never crowds the state words. */
-.jobRow .rowSecondary {
-  grid-row: 1;
-  align-self: end;
-  line-height: 18px;
-}
-.jobRow .bar {
-  grid-column: 2;
-  grid-row: 2;
-  align-self: start;
-  justify-self: end;
-  width: 56px;
-  margin-top: 5px;
-}
 .tag {
   display: inline-block;
   flex: none;
@@ -442,16 +395,6 @@
 .body {
   max-width: 920px;
   padding: var(--space-5) var(--space-6) var(--space-8);
-}
-.detailHead {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-}
-.detailHead > h2 {
-  min-width: 0;
-  overflow-wrap: anywhere;
 }
 .body h2 {
   margin: 0;
@@ -896,8 +839,7 @@
   .strip > button:last-child {
     margin-left: 0;
   }
-  .rowSecondary,
-  .jobRow .bar {
+  .rowSecondary {
     display: none;
   }
   .row {

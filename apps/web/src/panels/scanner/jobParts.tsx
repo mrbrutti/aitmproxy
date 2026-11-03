@@ -9,8 +9,11 @@ import { For, Show, type Component } from 'solid-js';
 import { AGENT_DOT_HELP, type Part, type Ring as RingValue, type SeverityPart, type Tone } from './helpers';
 import css from './jobs.module.css';
 
-/** How a job became selected; the entrance plays for every cause but `keyboard` (D12). */
-export type SelectCause = 'pointer' | 'keyboard' | 'start' | 'list';
+/**
+ * How the table selected a job: the entrance plays for the pointer and never for the keyboard
+ * (D12). A selection the view did not make (a start, the first list) has no cause and plays.
+ */
+export type SelectCause = 'pointer' | 'keyboard';
 
 const classes = (...names: (string | undefined)[]): string => names.filter((n) => n !== undefined && n !== '').join(' ');
 

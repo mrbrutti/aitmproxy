@@ -4,10 +4,12 @@
 // file only draws them. A row is `.kv[data-key]`: the key span, then `[data-field=value]` holding
 // one span per cell (`data-ink="value"` / `data-ink="muted"`, or `.sev[data-severity]`) with
 // `WELL_CELL_SEPARATOR` as bare text between them, so the row's text reads `0 · 1 · 0` and the
-// stylesheet paints each cell by its hook. The block is the entrance's fourth (`--jobs-i: 3`) and
-// follows the card's `data-entrance`. No timer, no store read, no literal word.
+// stylesheet paints each cell by its hook. The block is the entrance's fourth (`--jobs-i: 3`): keyed
+// on the generation like the card's blocks, so a pointer selection, a start or the first list
+// remounts it and `jobsEnter` plays once more, while a keyboard selection keeps the generation and
+// the element (D12); it follows the card's `data-entrance`. No timer, no store read, no literal word.
 
-import { Index, Show, type Component } from 'solid-js';
+import { createMemo, Index, Show, type Component } from 'solid-js';
 import {
   WELL_CELL_SEPARATOR,
   WELL_CRAWL_SUBTITLE,
@@ -68,11 +70,13 @@ const Well: Component<{ title: string; subtitle: string; rows: WellRow[] }> = (p
 );
 
 export const JobWells: Component<JobWellsProps> = (props) => {
-  const rows = () => wellRows(props.facts);
+  const rows = createMemo(() => wellRows(props.facts));
   return (
-    <div class={`${css.wells} ${css.enter}`} style={{ '--jobs-i': 3 }} data-entrance={props.play ? 'play' : 'none'}>
-      <Well title={WELL_CRAWL_TITLE} subtitle={WELL_CRAWL_SUBTITLE} rows={rows().crawl} />
-      <Well title={WELL_ISSUES_TITLE} subtitle={WELL_ISSUES_SUBTITLE} rows={rows().issues} />
-    </div>
+    <Show keyed when={String(props.generation)}>
+      <div class={`${css.wells} ${css.enter}`} style={{ '--jobs-i': 3 }} data-entrance={props.play ? 'play' : 'none'}>
+        <Well title={WELL_CRAWL_TITLE} subtitle={WELL_CRAWL_SUBTITLE} rows={rows().crawl} />
+        <Well title={WELL_ISSUES_TITLE} subtitle={WELL_ISSUES_SUBTITLE} rows={rows().issues} />
+      </div>
+    </Show>
   );
 };

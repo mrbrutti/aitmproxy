@@ -25,7 +25,7 @@ import {
   isTerminal,
   jobAccessibilityLabel,
   jobProgress,
-  jobsCaption,
+  jobsCaptionFor,
   ofText,
   probeBudgetText,
   profileText,
@@ -37,7 +37,7 @@ import {
   tone,
   type JobFacts,
 } from './helpers';
-import { AgentDot, JobDot, Ring, SeverityWords, Tick } from './jobParts';
+import { AgentDot, JobDot, Ring, SeverityWords, Tick, type SelectCause } from './jobParts';
 import { listboxKeys } from './primitives';
 import { scanStore, type ScanStore } from './store';
 import css from './jobs.module.css';
@@ -46,14 +46,16 @@ export interface JobsTableProps {
   /** One facts per job, in display order; the rows are keyed by `summary.job`. */
   rows: JobFacts[];
   selected: string | null;
-  onSelect: (job: string, cause: 'pointer' | 'keyboard') => void;
-  /** Enter and →: move focus to the card's first enabled verb (D14). */
+  onSelect: (job: string, cause: SelectCause) => void;
+  /**
+   * Enter and →: move focus to the card's primary verb (`Cancel scan <job>` / `Scan again <job>`)
+   * when enabled, else its first enabled verb (D14 as gap 77 amends it).
+   */
   onFocusCard: () => void;
   /** Whether the current generation's entrance plays. */
   play: boolean;
   /** `generation <= 1`: the table enters with the card on the tab's first selection only. */
   first: boolean;
-  generation: number;
 }
 
 const domId = (job: string): string => `job-${job}`;
@@ -64,7 +66,7 @@ export const JobsTable: Component<JobsTableProps> = (props) => {
   /** The facts by job id; the rows render from this so a job's row finds its facts by key, not by index. */
   const byId = createMemo(() => new Map(props.rows.map((f) => [f.summary.job, f])));
   const ids = createMemo(() => props.rows.map((f) => f.summary.job));
-  const caption = () => jobsCaption(props.rows.length, props.rows.filter((f) => f.summary.state === 'running').length);
+  const caption = () => jobsCaptionFor(props.rows);
 
   const keys = listboxKeys({
     ids,
@@ -118,7 +120,7 @@ interface JobRowProps {
   facts: JobFacts;
   selected: boolean;
   store: ScanStore;
-  onSelect: (cause: 'pointer' | 'keyboard') => void;
+  onSelect: (cause: SelectCause) => void;
 }
 
 /** One row: the nine cells of D18 W2 and the action column, every word from `helpers.ts`. */

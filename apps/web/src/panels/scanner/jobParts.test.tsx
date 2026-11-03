@@ -47,7 +47,7 @@ describe('Ring', () => {
     expect(svg.getAttribute('aria-hidden')).toBe('true');
     expect(svg.getAttribute('data-fraction')).toBe('0.5003');
     expect(svg.getAttribute('data-indeterminate')).toBeNull();
-    expect(svg.style.getPropertyValue('--jobs-f')).toBe(String(3236 / 6468));
+    expect(svg.style.getPropertyValue('--jobs-f')).toBe('0.5003092145949288');
     const circles = Array.from(svg.querySelectorAll('circle'));
     expect(circles).toHaveLength(2);
     const [track, arc] = circles as [SVGCircleElement, SVGCircleElement];

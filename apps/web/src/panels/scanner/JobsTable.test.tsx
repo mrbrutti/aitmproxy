@@ -187,7 +187,7 @@ function mount(initialRows: JobFacts[], selected: string | null, opts: { first?:
   const onFocusCard = vi.fn();
   const r = render(() => (
     <AppProvider store={stub.app}>
-      <JobsTable rows={rows()} selected={sel()} onSelect={onSelect} onFocusCard={onFocusCard} play={play()} first={first()} generation={1} />
+      <JobsTable rows={rows()} selected={sel()} onSelect={onSelect} onFocusCard={onFocusCard} play={play()} first={first()} />
     </AppProvider>
   ));
   const list = () => r.getByRole('listbox', { name: 'Jobs' });
@@ -243,7 +243,7 @@ describe('JobsTable: the comp rows (AC37)', () => {
     expect(h.field(crawl, 'elapsed')).toBe('0:05');
     const crawlRing = crawl.querySelector(`svg.${css.ring}`)!;
     expect(crawlRing).not.toBeNull();
-    expect(crawlRing.getAttribute('data-fraction')).toBe((46 / 58).toFixed(4));
+    expect(crawlRing.getAttribute('data-fraction')).toBe('0.7931');
     expect(crawl.querySelector(`.${css.dot}`)).toBeNull();
     expect(crawl.querySelector(`.${css.agentDot}`)).toBeNull();
 

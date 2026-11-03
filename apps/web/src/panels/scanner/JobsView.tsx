@@ -7,11 +7,11 @@
 // while the bus is away (every control disabled, the data kept).
 //
 // The entrance (D12): `{ generation, play }`. A pointer selection, a start or the first list bump
-// the generation and play; a keyboard selection changes the job and plays nothing. The view
-// decides by the cause it was given (`selectJob`) or, for a selection it did not make (the store's
-// after-start pick, the first list), by an effect on the store's selection. No timer lives here:
-// the banner's age is the store's 1 s clock against `jobsLoadedAt` (D16), the counters come from
-// the poll (AC32).
+// the generation and play; a keyboard selection changes the job and plays nothing. A selection the
+// view makes (`selectJob`) decides by its cause before it reaches the store; a selection it did not
+// make (the store's after-start pick, the first list, another client's job) is caught by an effect
+// on the store's selection and plays. No timer lives here: the banner's age is the store's 1 s
+// clock against `jobsLoadedAt` (D16), the counters come from the poll (AC32).
 
 import { createEffect, createMemo, createSignal, Match, on, Show, Switch, type Component } from 'solid-js';
 import { Button } from '~/components';
@@ -71,8 +71,6 @@ export const JobsView: Component = () => {
 
   /* ---- the entrance */
   const [entrance, setEntrance] = createSignal<Entrance>({ generation: 0, play: false });
-  /** The cause of the selection change the view is making; `null` while a change is not ours. */
-  let cause: SelectCause | null = null;
   const bump = (): void => {
     setEntrance((e) => ({ generation: e.generation + 1, play: true }));
   };
@@ -80,17 +78,22 @@ export const JobsView: Component = () => {
     setEntrance((e) => ({ generation: e.generation, play: false }));
   };
 
-  const selectJob = (job: string, c: SelectCause): void => {
-    cause = c;
+  /** The job the view is selecting itself, while the store takes it; `null` otherwise. */
+  let own: string | null = null;
+  /** The table's selection: the cause decides the entrance here; a click on the selected row changes nothing. */
+  const selectJob = (job: string, cause: SelectCause): void => {
+    if (job === selectedId()) return;
+    if (cause === 'keyboard') hold();
+    else bump();
+    own = job;
     s.setSelectedJob(job);
-    cause = null;
+    own = null;
   };
-  // The store's selection changed: by us (the cause says how) or by a start / the first list.
+  // A selection the view did not make (a start, the first list, another client's job) plays.
   createEffect(
     on(selectedId, (id) => {
-      if (id === null) return;
-      if (cause === 'keyboard') hold();
-      else bump();
+      if (id === null || id === own) return;
+      bump();
     }),
   );
 
@@ -144,7 +147,6 @@ export const JobsView: Component = () => {
             onFocusCard={focusCard}
             play={entrance().play}
             first={entrance().generation <= 1}
-            generation={entrance().generation}
           />
           <Show when={selected()}>{(f) => <JobWells facts={f()} generation={entrance().generation} play={entrance().play} />}</Show>
         </Match>

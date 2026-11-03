@@ -27,6 +27,8 @@ import { JobCard } from './JobCard';
 import css from './jobs.module.css';
 
 const JOB = 'scan-c0ffee01';
+/** A second job the card is handed without a remount (the selection moved). */
+const OTHER = 'scan-0ddba11e';
 /** 11:32 UTC; the finding line and the scale row print it in the test's own zone. */
 const STARTED_AT = Date.UTC(2026, 10, 2, 11, 32, 0);
 const zone = (): string => Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -197,7 +199,7 @@ describe('JobCard: the comp', () => {
     expect(lane.getAttribute('aria-valuetext')).toBe('50 percent');
     expect(lane.getAttribute('data-fraction')).toBe('0.5003');
     expect(lane.getAttribute('title')).toBe("3,236 of 6,468 checks (derived from the engine's counters)");
-    expect(lane.style.getPropertyValue('--jobs-f')).toBe(String(3236 / 6468));
+    expect(lane.style.getPropertyValue('--jobs-f')).toBe('0.5003092145949288');
     const track = lane.querySelector(`.${css.track}`)!;
     const crawl = track.querySelector(`.${css.crawl}`)!;
     expect(crawl.querySelector(`.${css.segLabel}`)!.textContent).toBe('crawl');
@@ -459,6 +461,31 @@ describe('JobCard: the comp', () => {
     await tick();
     expect(h.button(`Cancel scan ${JOB}`).disabled).toBe(false);
     expect(h.nowDot()!.classList.contains(css.breathe!)).toBe(true);
+  });
+
+  it('offline_scan_again (AC38, gap 79): Scan again <job> on a done card is off while the bus is reconnecting and on again when it opens', async () => {
+    const h = mount(factsOf(doneStatus()));
+    expect(h.button(`Scan again ${JOB}`).disabled).toBe(false);
+    h.setBusState('reconnecting');
+    await tick();
+    expect(h.button(`Scan again ${JOB}`).disabled).toBe(true);
+    h.setBusState('open');
+    await tick();
+    expect(h.button(`Scan again ${JOB}`).disabled).toBe(false);
+  });
+
+  it('cancel_in_flight_is_per_job (gap 79): a Cancel awaiting its reply reads Cancelling…; a new job on the card gets a fresh, enabled Cancel Scan', async () => {
+    const h = mount(factsOf(compStatus()), {}, { replies: { 'scan.cancel': () => new Promise<never>(() => {}) } });
+    fireEvent.click(h.button(`Cancel scan ${JOB}`));
+    await tick();
+    expect(h.count('scan.cancel')).toBe(1);
+    expect(h.button(`Cancel scan ${JOB}`).disabled).toBe(true);
+    expect(h.button(`Cancel scan ${JOB}`).textContent).toBe('Cancelling…');
+    h.setFacts(factsOf(compStatus({ job: OTHER })));
+    await tick();
+    const cancel = h.button(`Cancel scan ${OTHER}`);
+    expect(cancel.disabled).toBe(false);
+    expect(cancel.textContent).toBe('Cancel Scan');
   });
 
   it('entrance_indices: the title row, the lane block and the KPI strip enter at indices 0, 1, 2; the card says whether it plays', () => {

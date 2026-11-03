@@ -40,6 +40,7 @@
   --jobs-mark-gap: 3px; /* .group gap */
   --jobs-gauge: 3px; /* .gauge height */
   --jobs-ring-stroke: 2.5px; /* .ring circle stroke-width */
+  --jobs-ring-indeterminate: 0.75; /* the indeterminate ring's dash offset: a static quarter arc (gap 79) */
   --jobs-row: 44px; /* td height (CardMetrics row) */
   --jobs-row-sub: 60px; /* a row with a sub-line (CardMetrics rowWithSub) */
   --jobs-header: 32px; /* th height */
@@ -68,10 +69,10 @@
 .banner {
   margin-bottom: var(--space-4);
 }
-[data-ink='muted'] {
+.jobs [data-ink='muted'] {
   color: var(--color-text-tertiary);
 }
-[data-ink='accent'] {
+.jobs [data-ink='accent'] {
   color: var(--color-accent-base);
 }
 /* A number: the data face, tabular (the comp's .num). */
@@ -705,7 +706,7 @@
   transition: stroke-dashoffset var(--motion-progress) var(--motion-ease-out);
 }
 .ring[data-indeterminate='true'] .ringArc {
-  stroke-dashoffset: var(--jobs-lane-sub-opacity);
+  stroke-dashoffset: var(--jobs-ring-indeterminate);
 }
 /* The tone dot of a row that has no ring; the agent dot beside the state word. */
 .dot {
@@ -750,7 +751,8 @@
   font-size: var(--font-size-sm);
   line-height: var(--line-height-tight);
 }
-/* The hover Cancel in the action column: pointer-only, fades in over the hover duration. */
+/* The hover Cancel in the action column: pointer-only, fades in over the hover duration; while
+   hidden it takes no clicks, so an invisible button never swallows a row click. */
 .hoverCancel {
   color: var(--color-text-secondary);
   background: transparent;
@@ -759,10 +761,12 @@
   font: inherit;
   cursor: default;
   opacity: 0;
+  pointer-events: none;
   transition: opacity var(--motion-hover) var(--motion-ease-out);
 }
 .row:hover .hoverCancel {
   opacity: 1;
+  pointer-events: auto;
 }
 @media (hover: hover) and (pointer: fine) {
   .row:hover {

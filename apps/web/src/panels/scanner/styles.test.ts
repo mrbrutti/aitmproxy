@@ -63,8 +63,6 @@ const REQUIRED = [
   'stateDot',
   'stripWords',
   'stripMetric',
-  'bar',
-  'barSeg',
   'layout',
   'list',
   'listHead',
@@ -105,8 +103,6 @@ const REQUIRED = [
   'footer',
   'kv',
   'table',
-  'jobRow',
-  'detailHead',
   'fieldset',
   'idList',
 ];
@@ -119,23 +115,19 @@ describe('scanner.module.css (W-18 design tokens only)', () => {
     expect(source.length).toBeGreaterThan(1000);
   });
 
-  it('severity_hue_only_on_pill_bar_chip', () => {
+  it('severity_hue_only_on_chip', () => {
+    // The severity bar (`.bar`, `.barSeg`) went with `SeverityBar.tsx` (gap 79): the chips are the one place left.
     const all = blocks(css());
     expect(all.length).toBeGreaterThan(20);
     const offenders = all
       .filter((b) => b.body.includes('--color-severity-'))
-      .filter(
-        (b) =>
-          !b.selector.startsWith('.barSeg[data-severity=') &&
-          !b.selector.startsWith('.chip[data-severity='),
-      )
+      .filter((b) => !b.selector.startsWith('.chip[data-severity='))
       .map((b) => b.selector);
     expect(offenders).toEqual([]);
-    // The rule is not vacuous: every severity level is painted on both the bar and the chips.
+    expect(css()).not.toMatch(/\.bar(Seg)?\b/);
+    // The rule is not vacuous: every severity level is painted on the chips.
     for (const level of ['critical', 'high', 'medium', 'low', 'info']) {
-      const bar = all.find((b) => b.selector === `.barSeg[data-severity='${level}']`);
       const chip = all.find((b) => b.selector === `.chip[data-severity='${level}']`);
-      expect(bar?.body, `barSeg ${level}`).toContain(`--color-severity-${level}-fg`);
       expect(chip?.body, `chip ${level}`).toContain(`--color-severity-${level}-fg`);
     }
   });
@@ -152,12 +144,12 @@ describe('scanner.module.css (W-18 design tokens only)', () => {
     const source = css();
     const missing = REQUIRED.filter((name) => !new RegExp(`\\.${name}(?![\\w-])`).test(source));
     expect(missing).toEqual([]);
-    // The states the plan names explicitly.
+    // The states the plan names explicitly; the dead Jobs classes stay out (gap 79).
+    expect(source).not.toMatch(/\.(jobRow|detailHead)\b/);
     expect(source).toContain(".tab[aria-selected='true']");
     expect(source).toContain(".row[aria-selected='true']");
     expect(source).toContain(".chip[aria-pressed='true']");
     expect(source).toContain(".segment[aria-checked='true']");
-    expect(source).toContain(".bar[data-empty='true']");
     expect(source).toContain(".layout[data-empty='true']");
     expect(source).toContain('container-type: inline-size');
   });
@@ -248,6 +240,8 @@ const JOBS_METRICS: Record<string, string> = {
   '--jobs-mark-gap': '3px',
   '--jobs-gauge': '3px',
   '--jobs-ring-stroke': '2.5px',
+  // Gap 79 (Task 3.12 A): the indeterminate arc's own offset, no longer borrowed from the lane sub-label's opacity.
+  '--jobs-ring-indeterminate': '0.75',
   '--jobs-row': '44px',
   '--jobs-row-sub': '60px',
   '--jobs-header': '32px',
@@ -367,8 +361,8 @@ describe('jobs.module.css (Jobs view D18 W2)', () => {
     const metrics = blocks(jobsCss()).filter((b) => b.selector === '.jobs');
     expect(metrics).toHaveLength(1);
     const decls = declarations(metrics[0]?.body ?? '');
-    // Exactly the 45 names, each once, in the plan's order, with the plan's values; nothing else.
-    expect(Object.keys(JOBS_METRICS)).toHaveLength(45);
+    // Exactly the 46 names, each once, in the plan's order, with the plan's values; nothing else.
+    expect(Object.keys(JOBS_METRICS)).toHaveLength(46);
     expect(decls.map((d) => d.name)).toEqual(Object.keys(JOBS_METRICS));
     for (const d of decls) {
       expect(d.value, d.name).toBe(JOBS_METRICS[d.name]);
@@ -551,8 +545,23 @@ describe('jobs.module.css (Jobs view D18 W2)', () => {
     expect(selected?.body).toContain('background: var(--color-ground-active)');
     expect(selected?.body).toContain('inset var(--jobs-edge) 0 0 var(--color-accent-base)');
     expect(all.find((b) => b.selector === ".gauge[data-warn='true'] .gaugeFill")?.body).toContain('background: var(--color-intercept-base)');
-    expect(all.find((b) => b.selector === "[data-ink='muted']")?.body).toContain('color: var(--color-text-tertiary)');
-    expect(all.find((b) => b.selector === '.row:hover .hoverCancel')?.body).toContain('opacity: 1');
+    // Gap 79: the ink hooks are scoped to the Jobs view; the strip paints its own in scanner.module.css.
+    expect(all.find((b) => b.selector === "[data-ink='muted']")).toBeUndefined();
+    expect(all.find((b) => b.selector === "[data-ink='accent']")).toBeUndefined();
+    expect(all.find((b) => b.selector === ".jobs [data-ink='muted']")?.body).toContain('color: var(--color-text-tertiary)');
+    expect(all.find((b) => b.selector === ".jobs [data-ink='accent']")?.body).toContain('color: var(--color-accent-base)');
+    expect(blocks(css()).find((b) => b.selector === ".strip [data-ink='muted']")?.body).toContain('color: var(--color-text-tertiary)');
+    // Gap 79: the hidden hover Cancel takes no clicks; the indeterminate arc has its own metric.
+    const hoverCancel = all.find((b) => b.selector === '.hoverCancel')?.body ?? '';
+    expect(hoverCancel).toContain('opacity: 0');
+    expect(hoverCancel).toContain('pointer-events: none');
+    const hovered = all.find((b) => b.selector === '.row:hover .hoverCancel')?.body ?? '';
+    expect(hovered).toContain('opacity: 1');
+    expect(hovered).toContain('pointer-events: auto');
+    expect(all.find((b) => b.selector === ".ring[data-indeterminate='true'] .ringArc")?.body).toContain(
+      'stroke-dashoffset: var(--jobs-ring-indeterminate)',
+    );
+    expect(source).not.toContain('stroke-dashoffset: var(--jobs-lane-sub-opacity)');
     // Gap 77: the well key in the secondary ink (the comp's `.kv span:first-child{color:var(--muted)}`); the
     // phase line centred inside the empty track in the secondary ink (D11 §2), moved right of the cap when
     // the scheduling variant draws one.

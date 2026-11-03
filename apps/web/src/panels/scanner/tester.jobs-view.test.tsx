@@ -123,7 +123,7 @@ function mountParts(initial: JobFacts, opts: Parameters<typeof stubApp>[0] = {})
     <AppProvider store={stub.app}>
       <div>
         <JobCard facts={facts()} generation={1} play={false} launchNotices={[]} />
-        <JobsTable rows={[facts()]} selected={facts().summary.job} onSelect={() => {}} onFocusCard={() => {}} play={false} first={false} generation={1} />
+        <JobsTable rows={[facts()]} selected={facts().summary.job} onSelect={() => {}} onFocusCard={() => {}} play={false} first={false} />
         <JobWells facts={facts()} generation={1} play={false} />
       </div>
     </AppProvider>
@@ -281,8 +281,7 @@ describe('tester: a hostile status through the model, the helpers and the compon
     const target = h.field(h.row(), 'target');
     expect(target.textContent).toBe(cut);
     expect(target.getAttribute('title')).toBe(cut);
-    expect(h.row().getAttribute('aria-label')).toBe(jobAccessibilityLabel(f));
-    expect(jobAccessibilityLabel(f).startsWith(`Auditing, standard, ${cut}, 50 percent, `)).toBe(true);
+    expect(h.row().getAttribute('aria-label')!.startsWith(`Auditing, standard, ${cut}, 50 percent, `)).toBe(true);
     expect(UNPRINTABLE.test(h.row().getAttribute('aria-label')!)).toBe(false);
     // The rest of the row is intact.
     expect(h.text(h.row(), 'state')).toBe('Auditing');

@@ -37,7 +37,7 @@ import type {
   StartedBy,
   StoppedReason,
 } from './model';
-import { LANES, SEVERITY_ORDER } from './model';
+import { boundedStr, LANES, SEVERITY_ORDER, STAMP_MAX } from './model';
 
 /* ------------------------------------------------------------------ wire-keyed records */
 
@@ -499,22 +499,6 @@ function pluralPlain(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }
 
-/** Control, format, line and paragraph separator scalars: none of them belongs in a line (the Kit's `ScanWire.cleaned`). */
-const UNPRINTABLE = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
-
-/** `text` without `UNPRINTABLE` scalars, cut to `max` code points. */
-function cleaned(text: string, max: number): string {
-  const clean = text.replace(UNPRINTABLE, '');
-  let end = 0;
-  let n = 0;
-  for (const ch of clean) {
-    if (n === max) break;
-    end += ch.length;
-    n += 1;
-  }
-  return end === clean.length ? clean : clean.slice(0, end);
-}
-
 const LANE_WORDS: Record<Lane, string> = {
   http: 'HTTP',
   ws: 'WebSocket',
@@ -869,6 +853,11 @@ export function attention(f: JobFacts): AttentionLine[] {
   return lines;
 }
 
+/** One sample row under an attention line's disclosure: the check id and the detail, `xss-reflected · connection refused`. */
+export function sampleRowText(sample: CheckErrorSample): string {
+  return `${sample.check} · ${sample.detail}`;
+}
+
 /**
  * The **Notices** list: the launch's notices (the `scan.start` result's `clamped` and
  * `lanes.skipped`) first, then the status's clamp rows and skipped lanes the notices did not
@@ -905,6 +894,11 @@ export function jobsCaption(total: number, running: number): string {
   return running > 0 ? `${jobs} · ${grouped(running)} running` : jobs;
 }
 
+/** `jobsCaption` over the table's rows: every row counts; a row is running when its merged state is `running` (not queued, not cancelling). */
+export function jobsCaptionFor(rows: JobFacts[]): string {
+  return jobsCaption(rows.length, rows.filter((f) => f.summary.state === 'running').length);
+}
+
 /* ---- the card's heading and finding line (ScanFormat; D11) */
 
 /** Whether an MCP or agent frontend started the job. */
@@ -918,7 +912,7 @@ export function agentOriginated(by: StartedBy): boolean {
  * (control and format scalars stripped, cut to 40 characters), else `the operator`.
  */
 export function startedByWords(by: StartedBy, ownLabel: string | null = null): string {
-  const label = by.client_label === null ? '' : cleaned(by.client_label, STARTED_BY_LABEL_MAX);
+  const label = by.client_label === null ? '' : boundedStr(by.client_label, STARTED_BY_LABEL_MAX);
   if (ownLabel !== null && label === ownLabel) return 'this app';
   if (by.frontend === 'cli') return 'the CLI';
   if (agentOriginated(by)) return 'an agent';
@@ -926,15 +920,22 @@ export function startedByWords(by: StartedBy, ownLabel: string | null = null): s
   return 'the operator';
 }
 
-/** The widest stamp `Date` represents (±8.64e15 ms). */
-const DATE_RANGE_MS = 8.64e15;
+/** One `Intl.DateTimeFormat` per time zone: building one is the costly part, and the card asks on every beat. */
+const CLOCK_FORMATS = new Map<string, Intl.DateTimeFormat>();
 
-/** `HH:mm`, 24-hour, of an epoch-millisecond stamp in the given zone; `00:00` for a stamp no date holds. */
+function clockFormat(timeZone: string): Intl.DateTimeFormat {
+  let format = CLOCK_FORMATS.get(timeZone);
+  if (format === undefined) {
+    format = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone });
+    CLOCK_FORMATS.set(timeZone, format);
+  }
+  return format;
+}
+
+/** `HH:mm`, 24-hour, of an epoch-millisecond stamp in the given zone; `00:00` for a stamp no date holds (`STAMP_MAX`). */
 export function clock(ms: number, timeZone: string): string {
-  if (!Number.isFinite(ms) || Math.abs(ms) > DATE_RANGE_MS) return '00:00';
-  return new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone }).format(
-    new Date(ms),
-  );
+  if (!Number.isFinite(ms) || Math.abs(ms) > STAMP_MAX) return '00:00';
+  return clockFormat(timeZone).format(new Date(ms));
 }
 
 const plain = (text: string): Part => ({ text, role: 'plain' });
