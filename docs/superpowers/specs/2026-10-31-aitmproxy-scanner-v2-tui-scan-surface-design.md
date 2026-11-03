@@ -94,7 +94,7 @@ Within v2, each control is gated by its own verb (`has_tool`): Issues needs `sca
 
 ### D5. Bus task: subscribe, route, prune (decided)
 
-- After the handshake (every reconnect), when the bus offers `flow.subscribe`, `bus.rs` calls `flow.subscribe {}` once; a tool error is a `Toast(Warn, "flow.subscribe failed: <msg>; scan progress will poll only")`, not a session loss. The in-process server in `aitm tui` has no push sink (research §3.2); the poll cadence of D6 is the truth there.
+- After the handshake (every reconnect), when the bus offers `flow.subscribe`, `bus.rs` calls `flow.subscribe {}` once; a tool error is a `Toast(Warn, "flow.subscribe failed: <msg>; scan progress will poll only")`, not a session loss. The in-process server in `aitm tui` has no push sink (research §3.2); the poll cadence of D6 is the truth there. (amended 2026-11-03, plan 2026-11-03-acceptance-0.5.16-tui-web-cells: on the in-process transport the TUI does not attempt `flow.subscribe` and shows no toast; the first live run of the acceptance TUI cell on 0.5.16 found the Warn toast hiding the startup note at every `aitm tui` start)
 - The reducer routes `BusEvent::Notification(v)` by `v["method"]`: `notifications/aitm/job` with `params.kind == "scan"` is parsed as `JobNotification` and handled by D6; an unparseable job line is ignored. Any other method sets `flows_dirty = true`, and `Action::Tick` issues at most one `Refresh` per tick for it **(Architect's call**, because subscribing newly brings flow lines the TUI never received; coalescing to the 250 ms tick keeps the sweep bounded; the timer poll is unchanged).
 - `prune()` keeps `_confirm` in addition to the declared properties (Constraints finding).
 
