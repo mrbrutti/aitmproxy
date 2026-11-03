@@ -2959,8 +2959,10 @@ extension ScanSurfaceTests {
     }
 
     /// AC32 (Jobs view D17): none of `stop`, `abort`, `finding`, `task` as a whole word
-    /// in any Jobs string, in-process over a sample facts set; the Cancel Scan help's
-    /// `Stop this job` is the one allowed verb use (and PR 1's `cancelHelpText` the same).
+    /// in any Jobs string, in-process over a sample facts set and every fixed string the
+    /// Jobs views render (table, card, wells, banners, raw lines, Scan Again, notices);
+    /// the two allowances (the Cancel helps' `Stop this job; …` and D4's session-lost
+    /// sentence) are excepted by name and must stay in the sweep.
     @Test func jobsWordsAvoidTheBannedTerms() throws {
         let fourIds = ["xss-reflected", "sqli-error", "open-redirect", "ssrf"]
         var facts: [ScanJobFacts] = []
@@ -2994,7 +2996,43 @@ extension ScanSurfaceTests {
         }
         for kind in [ScanCrawlErrorKind.connectRefused, .tls, .timeout, .h2NotNegotiated, .transport, .other, .unknown("x")] {
             strings.append(ScanEndText.crawlErrorWords(kind))
+            strings.append(ScanEndText.rawCrawlErrorLine(kind))
         }
+        // Task 2.11: the Jobs strings the first sweep did not reach: the raw-token lines, D15's
+        // banners, the Scan Again gate and help (D13), the confirm summary, the Cancel helps (both
+        // allowed, below), the notices' words and the inline list error (D6).
+        for reason in [ScanStoppedReason.budget, .time, .cancelled, .sessionLost, .errors, .policy, .guardRefused, .failed, .other("paused")] {
+            strings.append(ScanEndText.rawReasonLine(reason))
+        }
+        strings += [
+            ScanJobsLink.make(bus: .connecting("…"), readFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000).bannerText ?? "",
+            ScanJobsLink.make(bus: .connected("…"), readFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000).bannerText ?? "",
+            ScanJobsLink.make(bus: .connected("…"), readFailedAt: 5_000, jobsLoadedAt: nil, now: 43_000).bannerText ?? "",
+            ScanJobsLink.make(bus: .disconnected, readFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000).bannerText ?? "",
+            ScanJobsLink.make(bus: .disconnected, readFailedAt: nil, jobsLoadedAt: nil, now: 43_000).bannerText ?? "",
+            scanL4Hint, ScanFormat.outOfScopeText(origin: "http://127.0.0.1:8117"),
+            ScanFormat.cancelScanHelp, ScanFormat.cancelHelpText,
+            ScanFormat.clampedText(ScanClamped(field: "budget.probes", requested: 50000, applied: 20000)),
+            ScanFormat.skippedLaneText(ScanSkippedLane(lane: .ws, reason: "lane not available on this build")),
+            ScanFormat.yesNo(true), ScanFormat.yesNo(false),
+        ]
+        var model = ScanSurfaceModel()
+        let doneJob = try Self.progressFacts(state: .done, phase: .done, edits: Self.compJob + [(["job"], "scan-done")])
+        model.applyStatus(try #require(doneJob.status))
+        strings += [
+            model.scanAgainRefusal(for: "scan-done", scopeHosts: [], tools: Self.toolsWithStart) ?? "",
+            model.scanAgainRefusal(for: "scan-done", scopeHosts: ["127.0.0.1:8117"], tools: Self.legacyTools) ?? "",
+            model.scanAgainRefusal(for: "scan-none", scopeHosts: ["127.0.0.1:8117"], tools: Self.toolsWithStart) ?? "",
+            ScanSurfaceModel.scanAgainHelp(try #require(doneJob.status)),
+        ]
+        let againArgs = try #require(model.scanAgainArguments(for: "scan-done"))
+        let request = try #require(L4ConfirmRequest(json: [
+            "structuredContent": ["status": "needs_confirmation", "prompt": "Really?", "confirm_token": "t"],
+        ]))
+        strings.append(ScanConfirm(tool: againArgs.tool, arguments: againArgs.args, request: request).summaryLine)
+        model.noteReadFailure(text: "Unable to list jobs: the bus did not reply in time", now: 43_000)
+        strings += [model.inlineJobsError(ageMs: 42_000) ?? "", model.inlineJobsError(ageMs: nil) ?? ""]
+        #expect(strings.filter(\.isEmpty).count < strings.count / 4, "the sweep is mostly real strings, not nil fallbacks")
         for f in facts {
             let progress = ScanJobProgress(f)
             strings += [
@@ -3012,17 +3050,28 @@ extension ScanSurfaceTests {
             if let status = f.status { strings += ScanEndText.notices(status, launchNotices: []) }
         }
         let banned = try Regex("(?i)\\b(stop|abort|finding|task)\\b")
-        // D4's session-lost sentence is pinned by the spec with the verb in it ("the profile
-        // says stop when that happens"), which AC32 forbids: a spec contradiction reported
-        // with Task 2.3, excepted here by name so the test neither hides nor rewords it.
+        // AC32's two allowances, excepted by name: the Cancel help's `Stop this job; …` (the
+        // card's `cancelScanHelp` and the row's PR 1 `cancelHelpText` share that opening), and
+        // D4's session-lost sentence, kept as shipped with the verb in it (gap 29, second
+        // allowance). Each exception must still be in the sweep and still trip the matcher, so a
+        // reworded string drops out of the list instead of being silently excused.
         let sessionLost = try #require(ScanEndText.stoppedReason(.sessionLost, state: .done, probesBudget: 0, error: nil))
-        #expect(sessionLost.contains(banned), "the exception is live; drop it when the spec settles the wording")
-        let offenders = strings.filter { $0 != sessionLost && $0.contains(banned) }
+        #expect(sessionLost == "Stopped early: the session was lost and the profile says stop when that happens.")
+        let allowed = [ScanFormat.cancelScanHelp, ScanFormat.cancelHelpText, sessionLost]
+        for text in allowed {
+            #expect(text.hasPrefix("Stop"), "the allowances are the two `Stop` sentences, nothing else: \(text)")
+            #expect(strings.contains(text), "the exception is live, in the sweep: \(text)")
+            #expect(text.contains(banned), "the exception trips the matcher; drop it when the wording settles: \(text)")
+        }
+        let offenders = strings.filter { !allowed.contains($0) && $0.contains(banned) }
         #expect(offenders.isEmpty, "\(offenders)")
-        // The negative control: the matcher does catch the one allowed verb use.
-        #expect(ScanFormat.cancelScanHelp.contains(banned))
-        #expect(ScanFormat.cancelHelpText.contains(banned))
+        // The matcher's own edges: whole words only, any case, inside a sentence.
         #expect("Stopped early: the time budget ran out.".contains(banned) == false, "`Stopped` is not the whole word `stop`")
+        #expect("multitasking".contains(banned) == false)
+        #expect("Findings so far".contains(banned) == false, "`Findings` is not the whole word `finding`")
+        #expect("one finding, two".contains(banned))
+        #expect("ABORT now".contains(banned))
+        #expect("a task".contains(banned))
     }
 
     /// AC25 (Jobs view D13): Scan Again is client-side only. The arguments are the
