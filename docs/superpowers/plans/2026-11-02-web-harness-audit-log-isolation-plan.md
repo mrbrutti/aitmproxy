@@ -96,7 +96,7 @@ never `git add -A`. The gate for this branch is `npm run build && npm test` from
 - **Files:** `apps/web/live-proof/harness-audit-log-2026-11-02/` (create: `proof.sh`, `real-before.txt`,
   `real-after.txt`, `scan-live.log`, `run-dirs.txt`, `README.md`)
 - **Change (recipe):** build once in the Terminal: `cd "$WT/apps/web" && npm ci && npm run build`, then
-  `cd "$WT" && cargo build -p aitm && cargo build -p aitm-testtarget --bin aitm-testtarget-serve`. Write
+  `cd "$WT" && cargo build --release -p aitm && cargo build --release -p aitm-testtarget --bin aitm-testtarget-serve`. Write
   this to `$WT/apps/web/live-proof/harness-audit-log-2026-11-02/proof.sh` (a file, because the Terminal
   hook mangles `#`, parentheses and long compound lines; never edit it while it runs) and run
   `bash <that path>`:
@@ -162,6 +162,7 @@ never `git add -A`. The gate for this branch is `npm run build && npm test` from
 ## Review log
 
 - 2026-11-02, live proof (Task 4): the first run passed 27/0/0 with `audit.jsonl`, `audit.agent.jsonl`, `ca-audit.jsonl` and `system-proxy-state.json` byte-identical, but `audit.reads.jsonl` grew (7978037 → 8258225 bytes) during the five minutes: the installed app's core (one `aitm` process holding the real files, pid in `reads-writers.txt`) writes the reads stream on every bus read. AC7 amended to judge the reads stream by writer attribution, as #310's proof did; the harness cores' own reads streams are in their run dirs (119,827 and 3,931 bytes).
+- 2026-11-02, panel (security PASS with one minor, quality PASS with seven minors, spec PASS with four minors): Design 3's `<dir>` is rendered as the run-dir pattern `<tmpdir>/aitm-live-*` (the check precedes `mkdtemp`; spec amended); Design 2's block rule tolerates blank lines (spec amended); the plan's build line now says `--release` (the proof used release binaries); README secrets row reworded to the grep actually run; attribution row reworded to rest on the run dirs' own reads streams with the post-run `lsof` as corroboration. Code minors fixed in a follow-up commit by one coder (Task 5a): the security minor (refuse C0/U+0085/U+2028/U+2029 in `auditLogDir`, AC3 extended), `runDir` placeholder renamed `runDirPattern`, the test file's temp dirs created once and removed in `afterAll` (`rmSync` on the shim), the duplicated `startAitm` slice and env/spy scaffolding folded into helpers, the two implementation-mirroring pins (exact spawn-env literal, `=== 'off'` text) dropped in favour of the behaviour tests.
 - 2026-11-02, Task 1 coder gap: `npm run build` type-checks test files against `src/types-node-test.d.ts`, which lacked `mkdtempSync`, `writeFileSync` and `node:os`; the shim is added to Task 1's files (above). Prettier is not installed in `apps/web` and the repo has no config, so the coder rule "prettier --write" does not apply here; style is hand-matched to `tester.live-env.test.ts`.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
