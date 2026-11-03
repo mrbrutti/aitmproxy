@@ -170,6 +170,17 @@ impl ProbeHost for H2Host {
         self.peer
     }
 
+    /// Whatever the scripted inner host answers (`None`: it never sends).
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        self.inner.client()
+    }
+
+    /// Whatever the scripted inner host answers (`None`: its points come
+    /// from a table, not a captured flow).
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        self.inner.captured()
+    }
+
     fn charge(&self, units: u32) -> bool {
         self.charges
             .lock()

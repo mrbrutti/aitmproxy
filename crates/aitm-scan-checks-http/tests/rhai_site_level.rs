@@ -166,6 +166,17 @@ impl ProbeHost for RawLog {
     fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
         Some(Arc::new(aitm_scan_model::testing::NullClient))
     }
+
+    /// The log answers every probe itself; no captured flow built it.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+
+    /// Affordable up to `budget_left`, debiting nothing: the log holds no
+    /// budget of its own.
+    fn charge(&self, units: u32) -> bool {
+        self.budget_left() >= units
+    }
 }
 
 /// Run `check` against the origin point with every raw request logged.

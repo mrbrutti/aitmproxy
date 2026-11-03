@@ -117,9 +117,11 @@ impl JobCtx for NullJob {
 
 /// A [`ProbeHost`] whose every I/O method errors. Budget 3, marker `aitm7f3a`.
 ///
-/// It inherits the default bodies of [`ProbeHost::client`],
-/// [`ProbeHost::shared`] and [`ProbeHost::captured`], which is what makes it the
-/// stub those defaults are tested through.
+/// It inherits the default bodies of [`ProbeHost::shared`] and
+/// [`ProbeHost::baseline_peer_addr`], which is what makes it the stub those
+/// defaults are tested through; [`ProbeHost::client`], [`ProbeHost::captured`] and
+/// [`ProbeHost::charge`] are required since amendment 72b, so it spells out the
+/// answers the defaults used to give (`None`, `None`, `budget_left() >= units`).
 pub struct NullHost {
     profile: ScanProfile,
 }
@@ -166,6 +168,19 @@ impl ProbeHost for NullHost {
     }
     fn held_flows(&self) -> Vec<aitm_core::Flow> {
         Vec::new()
+    }
+    /// None to lend: a check driven by the null host cannot send at all.
+    fn client(&self) -> Option<Arc<dyn ProxyClient>> {
+        None
+    }
+    /// The null host is built from no flow.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+    /// Affordable up to [`ProbeHost::budget_left`], and nothing is debited:
+    /// the null host has no budget to debit.
+    fn charge(&self, units: u32) -> bool {
+        self.budget_left() >= units
     }
 }
 
@@ -523,6 +538,12 @@ impl ProbeHost for RecordingHost {
         self.peer
     }
 
+    /// The recorder answers every probe itself; it was built from no captured
+    /// flow.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+
     /// The recorder charges for real, so a test can see a bypassing stimulus
     /// spend budget. A charge the budget cannot cover is refused and spends
     /// nothing, so the count never wraps.
@@ -755,8 +776,8 @@ mod tests {
     /// Wave-2/3 security review: a script check must only ever send through
     /// the host's budgeted client. The recorder therefore lends one — inert, so
     /// a closure's `http.send` is refused rather than reaching the network —
-    /// instead of the trait default `None`, which the bridge is to treat as a
-    /// wiring error.
+    /// rather than the `None` of a clientless host, which the bridge is to
+    /// treat as a wiring error (`client` is required since amendment 72b).
     #[test]
     fn recording_host_lends_an_inert_client() {
         let host = RecordingHost::new(200, "ok");
