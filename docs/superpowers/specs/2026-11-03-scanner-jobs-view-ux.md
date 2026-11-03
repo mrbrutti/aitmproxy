@@ -760,9 +760,11 @@ the probe rule and every existing string except the *Stopped* section's. It
 adds no motion, no new layout and no Scan Again. It is reviewable as a
 behaviour fix plus a decoder extension, and it is the base PR 2 is cut from.
 
-**Amendment (2026-11-02, PR 1 panel).** The Cancel help text stays PR 1's
-words, `Stop this job; its issues stay (⌥⌘.)`, now one Kit constant (PR 2, fix 2.12b: the row's hover Cancel reads `cancelScanHelp` as well and `cancelHelpText` is deleted; one Cancel help on screen.)
-(`ScanFormat.cancelHelpText`); the hover-help wording of the UX section is
+**Amendment (2026-11-02, PR 1 panel).** PR 1 kept its own Cancel help,
+`Stop this job; its issues stay (⌥⌘.)` (`ScanFormat.cancelHelpText`). From PR 2
+fix 2.12b the row's hover Cancel and the card's Cancel Scan both read
+`cancelScanHelp` and `cancelHelpText` is deleted: one Cancel help on screen,
+the hover-help wording of the UX section, which is
 PR 2's (D11). The Stopped section shows only for a terminal job (D4
 amendment); a live job with crawl errors shows nothing there in PR 1.
 
@@ -836,7 +838,7 @@ extension ScanJobProgress {
 }
 ```
 
-`paceEstimate`: `checksPerSecond = done / (elapsedMs / 1000)`;
+`paceEstimate` (nil, never a trap, when the seconds-to-go quotient exceeds 2^53 / 1000 — the decoder's ceiling leaves the arithmetic finite; fix 2.12a): `checksPerSecond = done / (elapsedMs / 1000)`;
 `secondsToGo = ceil((scheduled - done) / checksPerSecond)`; nil while
 crawling, passive, reporting, queued, cancelling or terminal, when
 `elapsedMs == 0`, `done == 0` (rate 0), `scheduled == 0` or `done >=
@@ -1121,7 +1123,7 @@ Pages fetched · Pages waiting · Depth · Forms submitted · Forms not submitte
 · Crawl errors (only when > 0) · Points found · Waiting for audit · Audited ·
 one row per `pointSkipWords` entry (`722 skipped as repetitive`, `6 skipped
 by rule`, `0 skipped at the per-request cap`) · Lanes (`HTTP, WebSocket`;
-skipped lanes with reasons as further rows) · Probes by lane (`HTTP 240 ·
+skipped lanes with reasons as further rows) · Probes by lane (at most 8 lanes, the first 8 keys in sorted order — `counts("by_lane")` is capped like every other list, fix 2.12a; `HTTP 240 ·
 WebSocket 47`) · Session (only when `status.session != nil`: `reused · lost ·
 canary · browser partial` as `no · no · ok · no`) · L4 rows (only when
 present). **Issues** ("by severity and confidence"): `Critical · High ·
@@ -1134,7 +1136,7 @@ and `Skipped frequent` is `skipped as repetitive` (C9). The Session and Lanes
 sections of the old inspector are gone as sections (C9); their facts survive
 as the rows above **(Architect's call)**.
 
-**Tokens** (every colour, radius and duration the card reads; the comp's geometric constants live once in `enum CardMetrics`, 36 values after Tasks 2.6–2.10): grounds `Tok.Ground.surface / card / raised /
+**Tokens** (every colour, radius and duration the card reads; the comp's geometric constants live once in `enum CardMetrics`, 40 values after Tasks 2.6–2.10, pinned by `ScanJobsViewPinsTests`): grounds `Tok.Ground.surface / card / raised /
 active / hover`; lines `Tok.Line.border / rule / control`; inks
 `Tok.Ink.primary / secondary / tertiary / onAccent`; accent `Tok.Accent.base
 / deep / tint`; `Tok.Agent.base / tint`; `Tok.Intercept.base / tint`;
