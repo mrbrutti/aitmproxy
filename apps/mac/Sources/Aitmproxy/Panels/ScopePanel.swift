@@ -15,7 +15,8 @@ struct ScopePanel: View {
     /// not Scope already has hosts (release acceptance MAC-5: on 0.5.14–0.5.16 a sheet over a
     /// populated Scope opened with nothing focused and typed text went nowhere; an `onAppear` focus
     /// alone loses to that clear, which runs a turn later). The page keeps the quieter rule — focus
-    /// only an empty list — so landing on Scope never steals focus.
+    /// only an empty list, or an "open Scope to edit" arrival (`Session.scopeFieldFocusPending`) — so
+    /// a sidebar click never steals focus.
     var focusRequest = 0
 
     @State private var draft = ""
@@ -96,6 +97,10 @@ struct ScopePanel: View {
             if let host = session.scopeSheetHost {
                 draft = host
                 session.scopeSheetHost = nil
+                fieldFocused = true
+            } else if session.scopeFieldFocusPending {
+                // Proxy ▸ Scope… brought the operator here to edit: the page's field takes focus once.
+                session.scopeFieldFocusPending = false
                 fieldFocused = true
             } else if entries.isEmpty {
                 fieldFocused = true

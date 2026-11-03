@@ -357,9 +357,9 @@ struct CaptureSettings: View {
                     Text("\(advice.headline). \(advice.detail)")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                    // Same action as Proxy ▸ Scope…: the Scope page in the main window.
+                    // The same action as Proxy ▸ Scope… (one home: `Session.openScopeForEditing`).
                     Button("Open Scope…") {
-                        if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) }
+                        session.openScopeForEditing()
                     }
                 }
                 if let reason = capability.degradedReason {

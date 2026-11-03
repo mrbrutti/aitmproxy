@@ -377,7 +377,8 @@ struct AppsAttributionBanner: View {
             .accessibilityElement(children: .combine)
             Spacer(minLength: Space.sm)
             if advice.offersScope {
-                SmallButton("Open Scope…") { session.show(.scope) }
+                // Every "Open Scope…" is an intent to edit: one home (`Session.openScopeForEditing`).
+                SmallButton("Open Scope…") { session.openScopeForEditing() }
             } else if advice.offersSettings {
                 SmallButton("Open Settings…") {
                     session.settingsTab = .capture
@@ -413,7 +414,7 @@ struct AppsEmptyState: View {
             Text(advice.detail)
         } actions: {
             if advice.offersScope {
-                Button("Open Scope…") { session.show(.scope) }
+                Button("Open Scope…") { session.openScopeForEditing() }
             } else if advice.offersSettings {
                 Button("Open Settings…") {
                     session.settingsTab = .capture

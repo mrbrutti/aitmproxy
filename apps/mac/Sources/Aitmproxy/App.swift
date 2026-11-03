@@ -211,7 +211,7 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("0", modifiers: .command)
             Button("Breakpoint Rules…") { session.rulesVisible = true }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
-            Button("Scope…") { if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) } }
+            Button("Scope…") { session.openScopeForEditing() }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
             Button("Scan") { session.show(.scan) }
                 .keyboardShortcut("s", modifiers: [.command, .option])
