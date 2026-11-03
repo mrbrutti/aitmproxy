@@ -4,9 +4,9 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createServer as createTcp } from 'node:net';
-import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { request as httpRequest } from 'node:http';
 
@@ -86,6 +86,12 @@ function scannerBlock(s) {
  * own ports, dirs and secrets straight through. Optional sections are omitted entirely when their
  * option is absent, which keeps the file byte-identical to the pre-extraction one for the existing
  * callers (`cua-live.mjs`, `cua-l4.mjs`, `selftest-live.mjs`).
+ *
+ * `auditLogDir` (an absolute directory, normally the run's own `aitm-live-*` dir) points both of
+ * the core's audit logs into it: `ca.audit_log` at `<dir>/ca-audit.jsonl` (a top-level `ca:` block
+ * directly before `mcp:`) and `mcp.audit_log` at `<dir>/audit.jsonl` (directly after
+ * `operator_token`). Without it neither key is emitted and the general log would be silenced or the
+ * CA log would land in the operator's real store, so `startAitm` always passes its dir.
  */
 export function renderConfig({
   proxyPort,
@@ -98,7 +104,11 @@ export function renderConfig({
   l4 = null,
   findingsDir = null,
   scanner = null,
+  auditLogDir = null,
 }) {
+  if (auditLogDir != null && !isAbsolute(auditLogDir)) {
+    throw new Error('live-env: auditLogDir must be an absolute path; got ' + JSON.stringify(auditLogDir));
+  }
   return [
     `listen: 127.0.0.1:${proxyPort}`,
     `browser:`,
@@ -113,8 +123,12 @@ export function renderConfig({
     // per-finding YAML + runs.jsonl, so a scan's findings survive the run and can be asserted.
     ...(findingsDir ? [`findings:`, `  dir: ${findingsDir}`] : []),
     ...(scanner ? scannerBlock(scanner) : []),
+    // The two audit-log paths are JSON-quoted (a YAML double-quoted scalar), so a quote or a
+    // backslash in the dir cannot break the document.
+    ...(auditLogDir ? [`ca:`, `  audit_log: ${JSON.stringify(join(auditLogDir, 'ca-audit.jsonl'))}`] : []),
     `mcp:`,
     `  operator_token: ${operatorSecret}`,
+    ...(auditLogDir ? [`  audit_log: ${JSON.stringify(join(auditLogDir, 'audit.jsonl'))}`] : []),
     `  transport:`,
     `    loopback_tcp:`,
     `      port: 0`,
@@ -122,6 +136,38 @@ export function renderConfig({
     ...(l4 ? l4Block(l4) : []),
     '',
   ].join('\n');
+}
+
+/**
+ * Refuse to hand the core a config whose audit logs do not live in the run dir. Reads the file at
+ * `cfgPath` (the bytes the core will read, not the rendered string) and requires the exact line
+ * `  audit_log: "<runDir>/audit.jsonl"` under `mcp:` and `  audit_log: "<runDir>/ca-audit.jsonl"`
+ * under `ca:`; a line belongs to the nearest preceding unindented key. Throws naming what is
+ * missing; returns nothing when both are present.
+ *
+ * @param {string} cfgPath
+ * @param {string} runDir
+ * @returns {void}
+ */
+export function assertAuditLogIsolated(cfgPath, runDir) {
+  const mcpPath = join(runDir, 'audit.jsonl');
+  const caPath = join(runDir, 'ca-audit.jsonl');
+  const expectedMcp = '  audit_log: ' + JSON.stringify(mcpPath);
+  const expectedCa = '  audit_log: ' + JSON.stringify(caPath);
+  let block = null;
+  let haveMcp = false;
+  let haveCa = false;
+  for (const line of readFileSync(cfgPath, 'utf8').split('\n')) {
+    if (line.length && !line.startsWith(' ')) block = line;
+    else if (block === 'mcp:' && line === expectedMcp) haveMcp = true;
+    else if (block === 'ca:' && line === expectedCa) haveCa = true;
+  }
+  const missing = [...(haveMcp ? [] : ['mcp.audit_log']), ...(haveCa ? [] : ['ca.audit_log'])];
+  if (missing.length) {
+    throw new Error(
+      `live-env: refusing to start aitm: ${cfgPath} must carry mcp.audit_log ${JSON.stringify(mcpPath)} and ca.audit_log ${JSON.stringify(caPath)} so the core's audit logs stay in the run dir; missing: ${missing.join(', ')}`,
+    );
+  }
 }
 
 /** A local target: JSON + cookies, a body/header echo, and a reflecting search page for PoCs. */
