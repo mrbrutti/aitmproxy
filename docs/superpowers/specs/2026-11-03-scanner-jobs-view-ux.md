@@ -2353,7 +2353,7 @@ Live web criteria (numbered after AC57 so no reference moves):
     `scan.cancel` for the job; (c) dead-target done: `[data-field=stopped]`
     reads `Stopped early: too many errors from the target.`, the open
     attention line reads `<n> checks could not run` with `n` = the witness's
-    `checks.errors`, and `stopped_reason: errors` is the only `errors` token
+    `checks.errors`, and `stopped_reason: errors` is the only `errors` token outside D4's sentence and the crawl-trouble clause
     inside the card. Each state's capture follows a poll of the witness's
     `scan.status` *state*, never the rendered word, and its JSON is kept
     beside the still.
