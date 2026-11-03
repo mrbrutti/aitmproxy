@@ -22,8 +22,8 @@ use aitm_scan_model::JobState;
 
 use crate::app::App;
 use crate::scan::{
-    severity_runs, JobPane, JobRow, LegacyRun, ScanOffer, BAR_EMPTY, BAR_FILLED, PROBE_BAR_CELLS,
-    PROFILE_MAX, SEVERITY_BAR_CELLS, TARGETS_MAX,
+    severity_runs, JobPane, JobRow, LegacyRun, ScanOffer, BAR_EMPTY, BAR_FILLED, PROFILE_MAX,
+    PROGRESS_BAR_CELLS, SEVERITY_BAR_CELLS, TARGETS_MAX,
 };
 use crate::text::{cells, elide_middle, fit, right, truncate, width};
 use crate::theme::Theme;
@@ -78,7 +78,7 @@ struct Columns {
     profile: usize,
     targets: usize,
     state: usize,
-    /// The progress text; the bar sits beside it ([`PROBE_BAR_CELLS`]).
+    /// The progress text; the bar sits beside it ([`PROGRESS_BAR_CELLS`]).
     progress: usize,
     /// The probe budget, a number without a bar (Jobs view D19, T2).
     budget: usize,
@@ -125,7 +125,7 @@ impl Columns {
             + GAP
             + self.progress
             + 1
-            + PROBE_BAR_CELLS
+            + PROGRESS_BAR_CELLS
             + GAP
             + self.budget
             + GAP
@@ -198,7 +198,7 @@ fn header(theme: &Theme, cols: &Columns) -> Line<'static> {
         format!(
             "{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
             fit("state", cols.state),
-            fit("progress", cols.progress + 1 + PROBE_BAR_CELLS),
+            fit("progress", cols.progress + 1 + PROGRESS_BAR_CELLS),
             fit("budget", cols.budget),
             fit("points", cols.points),
             fit("issues", SEVERITY_BAR_CELLS),
@@ -268,11 +268,11 @@ fn row_line(
 /// primary text, the rest empty in tertiary (an indeterminate or unknown
 /// row has a fill of 0; Jobs view D8, D19).
 fn progress_spans(theme: &Theme, row: &JobRow) -> Vec<Span<'static>> {
-    let fill = row.progress_fill.min(PROBE_BAR_CELLS);
+    let fill = row.progress_fill.min(PROGRESS_BAR_CELLS);
     vec![
         Span::styled(BAR_FILLED.repeat(fill), theme.text_primary()),
         Span::styled(
-            BAR_EMPTY.repeat(PROBE_BAR_CELLS - fill),
+            BAR_EMPTY.repeat(PROGRESS_BAR_CELLS - fill),
             theme.text_tertiary(),
         ),
     ]
@@ -344,7 +344,13 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
     let mut lines: Vec<Line<'static>> = vec![Line::from(first)];
     for (label, value) in jobs.detail_text() {
         if label.is_empty() {
-            lines.push(Line::styled(format!(" {value}"), theme.text_tertiary()));
+            // A sentence row (the first line, an attention row): cut to
+            // the pane with the same `…` the labelled lines get (Task
+            // 4.5c, the Part 4 security minor).
+            lines.push(Line::styled(
+                format!(" {}", truncate(&value, w.saturating_sub(1))),
+                theme.text_tertiary(),
+            ));
             continue;
         }
         // `label value`, one space between (the D11 mockup's shape): no

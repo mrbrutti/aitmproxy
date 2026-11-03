@@ -151,20 +151,18 @@ fn banner(app: &App, error: Option<&ScanError>) -> String {
 
 /// How old the Jobs values on screen are (Jobs view D15, D19 T2): the
 /// ticks since the last `scan.list` that folded (`listed_ok_at_tick`,
-/// stamped by the reducer), 250 ms each, as `showing values from 42s ago`
-/// in the row's elapsed shape ([`elapsed_text`]); `None` before the first
-/// list lands. A core that stops answering leaves the banner's error on
-/// screen, and this says the numbers under it are from before it.
+/// stamped by the reducer), [`crate::TICK`] each, as `showing values from
+/// 42s ago` in the row's elapsed shape ([`elapsed_text`]); `None` before
+/// the first list lands. A core that stops answering leaves the banner's
+/// error on screen, and this says the numbers under it are from before it.
 pub fn values_age_text(now_tick: u64, listed_ok_at_tick: Option<u64>) -> Option<String> {
     let since = now_tick.saturating_sub(listed_ok_at_tick?);
+    let ms = u128::from(since).saturating_mul(crate::TICK.as_millis());
     Some(format!(
         "showing values from {} ago",
-        elapsed_text(since.saturating_mul(TICK_MS))
+        elapsed_text(u64::try_from(ms).unwrap_or(u64::MAX))
     ))
 }
-
-/// The period of one `Tick`, in milliseconds (the runtime's interval).
-const TICK_MS: u64 = 250;
 
 /// The active tab's degraded text, when the bus cannot serve it (D2): on a
 /// legacy bus Profiles and Issues name what they need; on a v2 bus a tab
@@ -943,5 +941,17 @@ mod tests {
         assert_eq!(short.list, Rect::new(0, 0, 50, 2));
         assert_eq!(short.rule, None);
         assert_eq!(short.detail, Rect::new(0, 2, 50, 0));
+    }
+
+    /// Jobs view Task 4.5c (5): one tick period. The age clause counts
+    /// [`crate::TICK`] per tick, the runtime's own interval, so 168 ticks
+    /// of 250 ms read `42s`; the constant is the one the runtime polls on.
+    #[test]
+    fn values_age_counts_the_runtime_tick() {
+        assert_eq!(crate::TICK, std::time::Duration::from_millis(250));
+        assert_eq!(
+            values_age_text(168, Some(0)).as_deref(),
+            Some("showing values from 42s ago")
+        );
     }
 }

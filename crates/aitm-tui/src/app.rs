@@ -6051,7 +6051,7 @@ impl App {
             "scan.list" => {
                 if let Some(list) = self.scan_reply::<ListResult>(tag, &value) {
                     let followups = self.scan.fold_job_list(list);
-                    // Jobs view D19, T2: the Jobs banner's age clause reads
+                    // Jobs view D19: the Jobs banner's age clause reads
                     // this tick while the bus stays silent.
                     self.scan.jobs.listed_ok_at_tick = Some(self.ticks);
                     self.request_scan_statuses(&followups, out);

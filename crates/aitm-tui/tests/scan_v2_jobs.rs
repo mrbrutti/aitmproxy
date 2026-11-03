@@ -15,9 +15,8 @@ use aitm_scan_model::{BySeverity, JobStatus, JobSummary, LaneKind};
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::App;
 use aitm_tui::scan::{
-    probe_bar, probe_fill, progress_bar, progress_fill, row, severity_bar, severity_runs,
-    JobsState, ReadStatus, ScanError, ScanTab, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, JOBS_MAX,
-    PROFILE_MAX, TARGETS_MAX,
+    progress_bar, progress_fill, row, severity_bar, severity_runs, JobsState, ReadStatus,
+    ScanError, ScanTab, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, JOBS_MAX, PROFILE_MAX, TARGETS_MAX,
 };
 use aitm_tui::text::width;
 use common::*;
@@ -567,12 +566,12 @@ fn row_reads_dots_until_the_status_is_known() {
     assert_eq!(full.budget, "418/2000");
 }
 
-/// The bars: the probe bar rounds up so any probe shows, a zero budget is
-/// empty; the progress bar (Jobs view D8, D19 T2) floors like its percent,
-/// so it reads full only at 1 and empty while indeterminate; the severity
-/// stack gives every non-zero severity a cell, graver first. The text bars
-/// are composed from the typed fills and `severity_runs` the view styles
-/// (fix round C, C21, C23).
+/// The bars: the progress bar (Jobs view D8, D19 T2) floors like its
+/// percent, so it reads full only at 1 and empty while indeterminate; the
+/// severity stack gives every non-zero severity a cell, graver first. The
+/// text bars are composed from the typed fills and `severity_runs` the
+/// view styles (fix round C, C21, C23). The probe bar is gone (Task 4.5c):
+/// the budget is a number without a bar.
 #[test]
 fn bars_are_box_drawing_cells() {
     assert_eq!(progress_fill(Some(0.5), 6), 3);
@@ -581,16 +580,6 @@ fn bars_are_box_drawing_cells() {
     assert_eq!(progress_bar(Some(0.5), 6), "━━━───");
     assert_eq!(progress_bar(None, 6), "──────");
     assert_eq!(progress_bar(Some(1.0), 6), "━━━━━━");
-
-    assert_eq!(probe_fill(418, 2000, 6), 2);
-    assert_eq!(probe_fill(0, 2000, 6), 0);
-    assert_eq!(probe_fill(5, 0, 4), 0);
-    assert_eq!(probe_fill(3000, 2000, 4), 4);
-    assert_eq!(probe_bar(418, 2000, 6), "━━────");
-    assert_eq!(probe_bar(0, 2000, 6), "──────");
-    assert_eq!(probe_bar(2000, 2000, 6), "━━━━━━");
-    assert_eq!(probe_bar(5, 0, 4), "────");
-    assert_eq!(probe_bar(3000, 2000, 4), "━━━━");
 
     let three = BySeverity {
         high: 1,
@@ -1198,4 +1187,50 @@ fn a_held_list_turns_into_the_not_answering_banner() {
     assert!(!strip.contains("showing values"), "{strip:?}");
     assert_eq!(app.scan.jobs.listed_ok_at_tick, Some(121));
     assert!(!app.scan.jobs.unanswered());
+}
+
+/// Jobs view Task 4.5c (1), the Part 4 security minor: the Detail pane's
+/// empty-label rows (the first line, the attention rows) are cut to the
+/// pane with the same trailing `…` the labelled lines get, so a long
+/// `<check>: <detail>` sample ends in `…` in the pane's last cell instead
+/// of clipping without a mark; at a width that fits, no mark.
+#[test]
+fn detail_empty_label_rows_are_cut_to_the_pane_with_an_ellipsis() {
+    let mut app = app();
+    let mut body = status_in("cancelled", "done");
+    body["elapsed_ms"] = json!(115_000);
+    body["checks"]["done"] = json!(3236);
+    body["checks"]["scheduled"] = json!(6468);
+    body["checks"]["running"] = json!([]);
+    body["checks"]["errors"] = json!(1);
+    body["checks"]["error_samples"] = json!([
+        { "check": "http.sqli-error", "point": "p", "detail": "d".repeat(120) }
+    ]);
+    body["stopped_reason"] = json!("cancelled");
+    let _ = app.on_bus(status_reply(body));
+
+    // 200 columns: the sample row fits whole, no mark.
+    let wide = screen(&app);
+    let sample = line_with(&wide, "http.sqli-error: ").expect("the sample row");
+    assert_eq!(
+        sample,
+        format!(
+            "│ http.sqli-error: {}{}│",
+            "d".repeat(120),
+            " ".repeat(198 - 18 - 120)
+        )
+    );
+
+    // 80 columns (an inner width of 78): the row is cut to 77 cells after
+    // the leading space, the `…` in the pane's last cell.
+    let _ = app.update(Action::Resize(80, 50));
+    let narrow = text_of(&app, 80, 50);
+    let sample = line_with(&narrow, "http.sqli-error: ").expect("the sample row");
+    assert_eq!(sample, format!("│ http.sqli-error: {}…│", "d".repeat(59)));
+
+    // 40 columns: the first line (the end sentence) is cut the same way.
+    let _ = app.update(Action::Resize(40, 50));
+    let tiny = text_of(&app, 40, 50);
+    let first = line_with(&tiny, "Cancelled after").expect("the first line");
+    assert_eq!(first, "│ Cancelled after 1:55; 3,236 of 6,468…│");
 }
