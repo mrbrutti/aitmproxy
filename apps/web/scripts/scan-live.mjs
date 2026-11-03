@@ -315,6 +315,10 @@ const attr = (sel, name) => d.ev(`document.querySelector(${j(sel)})?.getAttribut
 const textsOf = (sel) => d.ev(`Array.from(document.querySelectorAll(${j(sel)})).map((e) => (e.innerText ?? e.textContent ?? '').replace(/\\s+/g, ' ').trim())`);
 /** Unnormalised text: evidence (payload, matched, example) must compare verbatim. */
 const rawText = (sel) => d.ev(`(() => { const e = document.querySelector(${j(sel)}); return e ? (e.textContent ?? null) : null; })()`);
+// Laid-out text (innerText): block siblings separated by whitespace, so a token at the end of one line
+// never runs into the next (`textContent` joins `stopped_reason: errors` + `crawl.last_error: …` as
+// `errorscrawl.last_error`, which no word-boundary match sees).
+const layoutText = (sel) => d.ev(`(() => { const e = document.querySelector(${j(sel)}); return e ? ((e.innerText ?? e.textContent ?? '').replace(/\\s+/g, ' ').trim()) : null; })()`);
 const valueOf = (sel) => d.ev(`document.querySelector(${j(sel)})?.value ?? null`);
 
 // --- real-input interactions -----------------------------------------------------------------
@@ -1237,7 +1241,7 @@ async function run() {
       opened,
       sub: await rawText(`${rowSel(job)} [data-field=sub]`),
       subTitle: await attr(`${rowSel(job)} [data-field=sub]`, 'title'),
-      cardText: await rawText(card),
+      cardText: await layoutText(card),
     };
     const final = await status(job);
     keepStatus('11', { job, terminal, final, rendered });
