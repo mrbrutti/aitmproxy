@@ -51,4 +51,6 @@ uuid = { workspace = true }
 # recording probe host), so the engine's tests exercise `Check`, `Lane` and
 # `ProbeHost` without each module minting its own stub.
 aitm-scan-model = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# `test-util` (dev-only) pauses the clock for the amendment-81 tests in
+# `client`: a probe abandoned at the 30 s ceiling must not cost 30 s of test.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }

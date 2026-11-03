@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aitm_core::{
-    GuardError, HttpFlow, HttpRequest, ProxyClient, RecordPolicy, SendOptions, VersionPolicy,
+    GuardError, HttpFlow, HttpRequest, ProxyClient, RecordPolicy, ScopeRateGuard, SendOptions,
+    VersionPolicy,
 };
 use aitm_scan_model::profile::PerHostErrors;
 use aitm_scan_model::vocab::{HttpVersionPolicy, RecordProbes};
@@ -334,6 +335,15 @@ pub struct JobClient {
     record: RecordPolicy,
     version: VersionPolicy,
     per_host: PerHostErrors,
+    /// The core's own per-host breaker, when the caller handed one down
+    /// ([`JobClient::with_guard`]).
+    ///
+    /// Amendment 81: the sender's own 60 s `RESPONSE_TIMEOUT` would have
+    /// charged the breaker had the probe been awaited; the scanner's 30 s cap
+    /// drops the future first, so the charge is made here. Only the ceiling
+    /// charges it — the job's deadline and its cancellation drop the same
+    /// future and are not the target's fault.
+    breaker: Option<Arc<dyn ScopeRateGuard>>,
 }
 
 impl JobClient {
@@ -359,7 +369,16 @@ impl JobClient {
             },
             version: version.into(),
             per_host,
+            breaker: None,
         }
+    }
+
+    /// Hand the core's guard to this client so a probe abandoned at the 30 s
+    /// ceiling charges its per-host error budget (amendment 81). A client
+    /// built without one keeps the ladder-only behaviour.
+    pub fn with_guard(mut self, guard: Arc<dyn ScopeRateGuard>) -> Self {
+        self.breaker = Some(guard);
+        self
     }
 
     /// The job's shared budget (the worker reads `left`/`spent` for progress).
@@ -418,6 +437,12 @@ impl JobClient {
                 self.meter.timeouts.fetch_add(1, Ordering::SeqCst);
                 self.meter.errors.fetch_add(1, Ordering::SeqCst);
                 self.meter.record(host, false, &self.per_host);
+                // Amendment 81: `host` is already `ladder_key` = `host:port`
+                // with the scheme's default filled, the spelling the core
+                // guard has keyed its error budget on since amendment 74.
+                if let Some(guard) = &self.breaker {
+                    guard.record_error(host);
+                }
                 anyhow::Error::new(ProbeRefused::Timeout {
                     host: host.to_string(),
                     after: MAX_AWAIT,
@@ -600,6 +625,7 @@ mod tests {
         RecordPolicy, SendOptions, VersionPolicy,
     };
     use aitm_core::{ConnInfo, FlowId, FlowMeta};
+    use aitm_core::{LimitConfig, ScopeEntry, ScopeRateGuard, StdGuard};
     use aitm_scan_model::profile::PerHostErrors;
     use aitm_scan_model::vocab::{HttpVersionPolicy, RecordProbes};
 
@@ -1787,5 +1813,301 @@ mod tests {
             CancellationToken::new(),
         );
         assert_eq!(huge.left(), u32::MAX, "`left` saturates for the wire field");
+    }
+
+    /// A guard under amendment 81's shape: `ex.test` in scope, a budget of one
+    /// error, and a rate ceiling high enough that pacing is never the thing
+    /// under test.
+    fn breaker_guard() -> Arc<StdGuard> {
+        let guard = Arc::new(StdGuard::new(LimitConfig {
+            host_error_budget: 1,
+            per_host_rps: 1000,
+            ..LimitConfig::default()
+        }));
+        guard.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        guard
+    }
+
+    /// Amendment 81: the sender's own 60 s `RESPONSE_TIMEOUT` would have
+    /// charged the core breaker had the probe been awaited to its end, but the
+    /// scanner's 30 s ceiling drops the future first — so a tarpit never
+    /// tripped the breaker and the next job walked into it again. The charge is
+    /// made here, under the `host:port` spelling the guard keys on.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_abandoned_at_the_ceiling_charges_the_core_breaker() {
+        let guard = breaker_guard();
+        let meter = Arc::new(ProbeMeter::default());
+        let client = JobClient::new(
+            StubClient::new(vec![Outcome::Sleep(Duration::from_secs(3600))]),
+            "scan-00000001",
+            Arc::new(JobBudget::new(
+                1000,
+                Instant::now() + Duration::from_secs(600),
+                CancellationToken::new(),
+            )),
+            meter.clone(),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors::default(),
+        )
+        .with_guard(guard.clone());
+
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("the tarpit never answers");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Timeout {
+                host: "ex.test:443".to_string(),
+                after: MAX_AWAIT,
+            })
+        );
+        assert!(
+            matches!(
+                guard.check_active("ex.test:443"),
+                Err(GuardError::HostDisabled)
+            ),
+            "the abandoned probe did not charge the core breaker: {:?}",
+            guard.check_active("ex.test:443").err()
+        );
+        assert_eq!(meter.timeouts.load(Ordering::SeqCst), 1);
+        assert_eq!(meter.errors.load(Ordering::SeqCst), 1);
+    }
+
+    /// The exclusion the ruling asks for: the job's own deadline and a
+    /// `scan.cancel` drop the very same future, and neither is the target's
+    /// fault. Only [`AwaitEnd::Timeout`] charges the breaker.
+    #[tokio::test(start_paused = true)]
+    async fn the_job_s_own_deadline_and_cancel_do_not_charge_the_breaker() {
+        let guard = breaker_guard();
+        let deadline_client = JobClient::new(
+            StubClient::new(vec![Outcome::Sleep(Duration::from_secs(3600))]),
+            "scan-00000001",
+            Arc::new(JobBudget::new(
+                1000,
+                Instant::now() + Duration::from_secs(5),
+                CancellationToken::new(),
+            )),
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors::default(),
+        )
+        .with_guard(guard.clone());
+
+        let err = deadline_client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("the deadline is the tighter bound");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Deadline)
+        );
+        assert!(
+            guard.check_active("ex.test:443").is_ok(),
+            "the job's own deadline charged the core breaker"
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_client = JobClient::new(
+            StubClient::new(vec![Outcome::Sleep(Duration::from_secs(3600))]),
+            "scan-00000001",
+            Arc::new(JobBudget::new(
+                1000,
+                Instant::now() + Duration::from_secs(600),
+                cancel.clone(),
+            )),
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors::default(),
+        )
+        .with_guard(guard.clone());
+
+        let sending = tokio::spawn(async move { cancel_client.send(req_to("ex.test")).await });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let err = sending
+            .await
+            .expect("the send task")
+            .expect_err("the job was cancelled");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Cancelled)
+        );
+        assert!(
+            guard.check_active("ex.test:443").is_ok(),
+            "a cancel charged the core breaker"
+        );
+    }
+
+    /// A client built without a guard (every test fake, and any caller that
+    /// does not hand one down) keeps today's behaviour exactly: the timeout is
+    /// a typed refusal on the job's own ladder and nothing is charged
+    /// elsewhere.
+    #[tokio::test(start_paused = true)]
+    async fn a_job_client_without_a_guard_still_counts_the_timeout_on_its_ladder() {
+        let meter = Arc::new(ProbeMeter::default());
+        let client = JobClient::new(
+            StubClient::new(vec![Outcome::Sleep(Duration::from_secs(3600))]),
+            "scan-00000001",
+            Arc::new(JobBudget::new(
+                1000,
+                Instant::now() + Duration::from_secs(600),
+                CancellationToken::new(),
+            )),
+            meter.clone(),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors::default(),
+        );
+
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("the tarpit never answers");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Timeout {
+                host: "ex.test:443".to_string(),
+                after: MAX_AWAIT,
+            })
+        );
+        assert_eq!(meter.timeouts.load(Ordering::SeqCst), 1);
+        assert_eq!(meter.errors.load(Ordering::SeqCst), 1);
+    }
+
+    /// Amendment 74's spelling, pinned from the side that can tell the two
+    /// apart: the charge is keyed on `host:port`, not on the bare host. A
+    /// `record_error("ex.test")` would take the port-0, *host-wide* window of
+    /// [`aitm_core::StdGuard`], which disables every port of that host — so a
+    /// tarpit on `:443` would also stop a job probing `:8443` on the same
+    /// name, and the next `check_active` for any port would refuse. The
+    /// ceiling charge must disable exactly the authority that tarpitted.
+    #[tokio::test(start_paused = true)]
+    async fn the_ceiling_charge_is_keyed_on_host_and_port_not_the_bare_host() {
+        let guard = breaker_guard();
+        let client = JobClient::new(
+            StubClient::new(vec![Outcome::Sleep(Duration::from_secs(3600))]),
+            "scan-00000001",
+            loose_budget(1000),
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors::default(),
+        )
+        .with_guard(guard.clone());
+
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("the tarpit never answers");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Timeout {
+                host: "ex.test:443".to_string(),
+                after: MAX_AWAIT,
+            })
+        );
+
+        // The authority that tarpitted is disabled ...
+        assert!(matches!(
+            guard.check_active("ex.test:443"),
+            Err(GuardError::HostDisabled)
+        ));
+        // ... and no other port of the same host is. A bare-host charge would
+        // have disabled this one too (the port-0 window covers every port).
+        assert!(
+            guard.check_active("ex.test:8443").is_ok(),
+            "another service on the same name was disabled by a probe that \
+             never touched it: {:?}",
+            guard.check_active("ex.test:8443").err()
+        );
+    }
+
+    /// The budget is per authority and the charge is one error per abandoned
+    /// probe: with a budget of two, the first ceiling leaves the host live and
+    /// the second disables it. A charge made twice (or not at all) per
+    /// abandoned probe shows up here and nowhere else.
+    #[tokio::test(start_paused = true)]
+    async fn each_abandoned_probe_charges_the_breaker_exactly_once() {
+        let guard = Arc::new(StdGuard::new(LimitConfig {
+            host_error_budget: 2,
+            per_host_rps: 1000,
+            ..LimitConfig::default()
+        }));
+        guard.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let client = JobClient::new(
+            StubClient::new(vec![
+                Outcome::Sleep(Duration::from_secs(3600)),
+                Outcome::Sleep(Duration::from_secs(3600)),
+            ]),
+            "scan-00000001",
+            loose_budget(1000),
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors::default(),
+        )
+        .with_guard(guard.clone() as Arc<dyn ScopeRateGuard>);
+
+        let _ = client.send(req_to("ex.test")).await.expect_err("tarpit");
+        assert!(
+            guard.check_active("ex.test:443").is_ok(),
+            "one abandoned probe is one error, and the budget here is two"
+        );
+
+        let _ = client.send(req_to("ex.test")).await.expect_err("tarpit");
+        assert!(
+            matches!(
+                guard.check_active("ex.test:443"),
+                Err(GuardError::HostDisabled)
+            ),
+            "the second abandoned probe exhausted the budget"
+        );
+    }
+
+    /// The amendment-81 charge only reaches production if the two places that
+    /// build a [`JobClient`] hand the guard down — the job worker and the
+    /// manual `check.<id>` path. Nothing else in the crate builds one outside
+    /// a test, and no behavioural test in this crate drives the worker through
+    /// a tarpit, so the wiring is pinned here the way `aitm-scan-http` pins its
+    /// log sites: by reading the source. The *behaviour* is pinned by the
+    /// three ceiling tests above.
+    #[test]
+    fn both_production_job_clients_hand_the_core_guard_down() {
+        for (file, source) in [
+            ("worker.rs", include_str!("worker.rs")),
+            ("manual_check.rs", include_str!("manual_check.rs")),
+        ] {
+            let built = source.matches("JobClient::new(").count();
+            assert_eq!(
+                built, 1,
+                "{file} builds {built} job clients; this lint reads exactly one"
+            );
+            // Read only the builder expression — from the one
+            // `JobClient::new(` to the `;` that ends the statement — so a
+            // `.with_guard(` in a comment or on some other builder cannot
+            // satisfy the lint (quality review, PR 3b). The `== 1` count
+            // above makes the slice unambiguous.
+            let start = source
+                .find("JobClient::new(")
+                .expect("the count above found exactly one");
+            let end = source[start..]
+                .find(';')
+                .expect("the JobClient::new(..) statement ends in a `;`");
+            let expression = &source[start..start + end];
+            assert!(
+                expression.contains(".with_guard("),
+                "{file} builds a JobClient without `.with_guard(...)`: a probe \
+                 abandoned at the 30 s ceiling would not charge the core \
+                 breaker there (amendment 81). The builder reads:\n{expression}"
+            );
+        }
     }
 }

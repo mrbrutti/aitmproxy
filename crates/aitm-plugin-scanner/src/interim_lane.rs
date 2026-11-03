@@ -2814,6 +2814,105 @@ mod tests {
         );
     }
 
+    /// Amendment 72a (ruling 72): the runtime contract over the two
+    /// `ProbeHost` implementations the engine itself owns. A lane that takes a
+    /// slot answers every method the interim lane answers, so this pins the
+    /// interim host's four optional answers — and the engine wraps every host
+    /// in [`crate::worker::ArcHost`], the one `shared()` that is `Some`, which
+    /// must forward the other three unchanged.
+    #[tokio::test]
+    async fn the_interim_host_answers_the_four_methods_and_the_engine_s_arc_host_shares_it() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let capture = captured("http", "/search?q=hello");
+        let capture_id = capture.id;
+        store.insert(Flow::Http(capture));
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let discovery = discover_with(&job).await;
+        let point = point_named(&discovery, "q").clone();
+        let host = lane()
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts probes for its own point");
+
+        // `client()` (spec D9.3): the job's own budgeted client, so a script
+        // check's `http.send` keeps scope, rate, marks and the record policy.
+        let lent = host.client().expect("the interim host lends a client");
+        assert!(
+            Arc::ptr_eq(&lent, &job.client()),
+            "the lent client is the job's own, not a second unbudgeted one"
+        );
+
+        // `captured()`: the stored flow this point was discovered from, which
+        // is what the shipped passive checks read instead of sending.
+        assert_eq!(
+            host.captured().map(|f| f.id),
+            Some(capture_id),
+            "the host hands back the point's captured flow"
+        );
+
+        // `shared()`: `None` on the bare host — it is not behind an `Arc`.
+        assert!(
+            host.shared().is_none(),
+            "a host the engine has not wrapped has no owning handle to give"
+        );
+
+        // `charge()`: spends the job's one budget and sends nothing.
+        assert_eq!(job.budget_left(), 1000, "the crawl-off job spent nothing");
+        assert!(host.charge(1), "the job can afford one unit");
+        assert_eq!(
+            job.budget_left(),
+            999,
+            "the charge debited exactly one unit"
+        );
+        assert_eq!(job.charged(), 1);
+        assert_eq!(client.calls(), 0, "a charge sends nothing");
+
+        // The engine's wrapper: `shared()` becomes `Some`, the rest forwards.
+        let arc_host = crate::worker::ArcHost(Arc::from(host));
+        assert!(
+            arc_host.shared().is_some(),
+            "the engine's wrapper is what makes `shared` answer for every host"
+        );
+        let shared_lent = arc_host
+            .client()
+            .expect("the wrapper forwards the lent client");
+        assert!(
+            Arc::ptr_eq(&shared_lent, &job.client()),
+            "the wrapper lends the same job client, not a copy"
+        );
+        assert_eq!(
+            arc_host.captured().map(|f| f.id),
+            Some(capture_id),
+            "the wrapper forwards the captured flow"
+        );
+        assert!(arc_host.charge(1), "the wrapper forwards the charge");
+        assert_eq!(
+            job.budget_left(),
+            998,
+            "the wrapper's charge debited exactly one more unit"
+        );
+        assert_eq!(job.charged(), 2);
+        assert_eq!(client.calls(), 0, "no method under test sent anything");
+
+        // Amendment 38: an origin item carries no capture, so `captured()` is
+        // empty there — but it still lends the job's client.
+        let origin = origin_item(&[ORIGIN], &[]);
+        assert_eq!(origin.id, "origin:http://target.test:80");
+        assert!(origin.flow.is_none(), "an origin item carries no flow");
+        let origin_host = lane()
+            .probe_host_for(&origin, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("an origin item is hosted");
+        assert!(
+            origin_host.captured().is_none(),
+            "a synthesized origin request is not traffic the scan observed"
+        );
+        assert!(
+            origin_host.client().is_some(),
+            "an origin host still lends the job's budgeted client"
+        );
+    }
+
     /// The degenerate origin key: a point with neither a site node nor a
     /// parsable URL gives `point:<id>`, so the origin item's URL is not an
     /// origin at all. It takes the same error path as any other flowless
