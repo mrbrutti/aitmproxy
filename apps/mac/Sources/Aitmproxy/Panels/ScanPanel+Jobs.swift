@@ -98,6 +98,10 @@ struct ScanJobsTab: View {
     /// row and the stored status, reconciled once, so the row and the card never
     /// disagree. Arrow keys walk the selection once the table has focus (D14), with no
     /// animation and no entrance (D12); Return or → hands focus to the card's verbs.
+    /// The accessibility container is declared before `.focusable()`: on macOS a
+    /// focusable view with no element of its own lends its frame to the last element
+    /// directly inside it, which here was the bottom row (fix 2.12d). With the
+    /// container inside, that element is the table's own group, whose frame is right.
     private var table: some View {
         let rows = rows
         return VStack(spacing: 0) {
@@ -124,6 +128,9 @@ struct ScanJobsTab: View {
                 .contextMenu { rowMenu(facts) }
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(
+            ScanFormat.jobsCaption(total: rows.count, running: rows.filter { $0.summary.state == .running }.count))
         .focusable()
         .focused($listFocused)
         .focusEffectDisabled()
@@ -141,9 +148,6 @@ struct ScanJobsTab: View {
             inspectorFocused = true
             return .handled
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(
-            ScanFormat.jobsCaption(total: rows.count, running: rows.filter { $0.summary.state == .running }.count))
         .gridProbe("scan-jobs-table", area: "scan")
     }
 
