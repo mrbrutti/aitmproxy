@@ -657,6 +657,13 @@ Parallel groups: {3.3, 3.4, 3.5, 3.6, 3.7} once their own dependency is met;
 - **Test:** `keyboard` green with the Cancel expectation; a `JobCard.test.tsx` assertion that the scheduling card's phase line carries `.phaseLine`; the styles suite with the two classes.
 - **Done when:** `npm run build` and `npm test` exit 0 on the whole suite.
 
+### Task 3.1c: `targets` and the clock stamps bounded (tester 3.9 Important; gap 78)
+
+- **Depends on:** Task 3.1b. **Files:** `apps/web/src/panels/scanner/model.ts`, `apps/web/src/panels/scanner/model.test.ts`, `apps/web/src/panels/scanner/tester.jobs-view.test.tsx` (flip its `unbounded_target_pins_the_gap` pin to the bounded shape; rename it `bounded_target`).
+- **Change:** `targets: boundedStrList(o.targets, TARGET_MAX)` with `export const TARGET_MAX = 200` (the Kit's `targetMax`), the list cut to `MAX_SAMPLES` (8, the Kit's `listMax`); `started_at`/`finished_at` and every millisecond stamp read through a `stamp()` reader that keeps only finite integers in `0 … 8.64e15` (what `Date` can hold) and gives `0` otherwise, so an out-of-range stamp reads `started —`, not `00:00`.
+- **Test:** `model.test.ts`: a 10,000-char target with U+202E → 200 clean chars; nine targets → 8; `started_at` `1e300`/`-5`/`NaN` → 0, `1_782_901_920_000` kept. `tester.jobs-view.test.tsx`: heading `a0.test and 7 more`, the row's Target cell and `aria-label` bounded, `hostile_started_at` expects `started —` for `1e300`.
+- **Done when:** `npm run build` and `npx vitest run` exit 0.
+
 ### Task 3.9: Tester, whole Part 3
 
 - **Depends on:** Tasks 3.1–3.8c. Map AC33–AC38 to tests; P1–P23 verbatim in `helpers.test.ts`; Task 3.5's table row by row; the no-timer grep; `npm test` and `npm run build` from `apps/web`; quote output. `scan-live.mjs` is not run here (Task 3.11 owns it and its matcher fixes, gap 56).
@@ -892,6 +899,7 @@ Three reviewers on `<kit tip>..<Part 4 tip>` (after Task 4.1's rebase, gap 60).
 74. **The web model has no hostile-core bounds (Task 3.1 coder, 2026-11-02).** `model.ts` reads every string with `str()` (no cleaning, no cut) and every list with `rows()` capped at `MAX_LIST` 1024, so a hostile core can hand the Jobs view 1,024 uncleaned samples; the Kit closed this class in PR 1 (D1 amendment, AC1b) and the TUI in `bound_status`. Task 3.1b adds the web bounds; a web AC1b row is implied by D6 and recorded here rather than renumbering the ACs.
 76. **The web banner age did not count up (Task 3.8 coder, 2026-11-02).** The store exposes no clock, `live.ts` stops its intervals when the bus closes, so the skeleton computed the age once; AC38's `0:42` pin passes but the clause froze. Task 3.8d gives the store a 1 s `nowMs` signal (the mac's D6 amendment). Also from Task 3.8: the `dry_run` start notice and its Dismiss button are gone (the Kit has no `dry_run` word; the comp's card has no Dismiss; `store.startNotice`/`dismissStartNotice` now unused) — for the panel to accept or send back; the card keeps the per-job `ErrorBlock` and the refused-cancel `[data-error=cancel]` line the plan's 3.8a list does not name (pinned behaviour).
 77. **Tasks 3.8a–d findings (2026-11-02).** The comp orders the verbs Show Site Map · Show Issues · primary, so "the first enabled verb takes focus" on Enter landed on Show Site Map; ruled: the primary verb first (Task 3.8e). Stylesheet omissions in Task 3.7's sheet: the well key's secondary ink and the centred phase line (3.8e). Builder's calls accepted: no `Tick` in the wells (the comp has none), the hover Cancel absent (not disabled) on cancelling and terminal rows, the cancelling row's progress reads the Kit's `Scheduling checks` not the comp's illustrative `0 of 0`, the whole `rowText` ticks as one, KPI Probes omit the unit at budget 0, the Scan Again refusal is shown while the card's own launch was the last one, the lane wrapper carries `role=progressbar` with the ledger and gauge beside it.
+78. **`targets` unbounded on the web (tester 3.9, Important).** Gap 74 / Task 3.1b listed the sample lists but not `targets`, which the Kit bounds at `targetMax` 200 and `listMax` 8; a hostile core's 10,000-char host reached the card heading, the row cell, the accessibility label and `scanAgainHelp`. Task 3.1c closes it, with the tester's minor (a finite out-of-range stamp printed `00:00`, now `—`).
 
 ## Review log
 
