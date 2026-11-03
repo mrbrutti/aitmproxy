@@ -2,6 +2,7 @@ import AitmBusClient
 import AitmproxyKit
 import Observation
 import SwiftUI
+import os.log
 
 /// The Scan page's state (scanner-integration Stage 1): the launch form, the last
 /// `scan.discover` result, and the intents. Held by the session as `session.scan`,
@@ -202,6 +203,18 @@ final class ScanPanelState {
 
     var canCancel: Bool { cancelTarget != nil }
 
+    /// Why Scan Again may not be sent for the selected job, nil when it may (Jobs view
+    /// D13): the Kit's gate, Start Scan's, over the live scope and tools, so a scope or
+    /// tools change updates it with no read. With nothing selected the Kit is asked
+    /// about a job it does not hold, so its own "finished job" refusal stands and the
+    /// app carries no copy of the words (D17).
+    var scanAgainRefusal: String? { scanAgainRefusal(for: surface.selectedJob ?? "") }
+
+    /// The same gate for any row (the context menu's Scan Again names its own job).
+    func scanAgainRefusal(for job: String) -> String? {
+        surface.scanAgainRefusal(for: job, scopeHosts: session.scopeHosts, tools: session.tools)
+    }
+
     /// The wall clock in epoch milliseconds, set once a second by `clockTask` so the
     /// link's age clause moves without a render-time clock (Jobs view D6).
     var nowMs = ScanPanelState.clockMs
@@ -323,7 +336,12 @@ final class ScanPanelState {
         do {
             let value = try await session.runCommand("scan.list", [:])
             let result = try ScanListResult(json: value)
+            // D3's list selection (the first list, or a dropped job) is the one list-driven
+            // selection change; it gets the card's entrance (D12, `.list`).
+            let previous = surface.selectedJob
             updateSurface { $0.applyList(result) }
+            noteSelection(previous: previous, cause: .list)
+            announceIfEnded()
             // The freshness stamp is not part of the published model: it moves on every
             // list beat, and a beat that changed nothing must not republish the page (MS-R1).
             jobsLoadedAt = Self.clockMs
@@ -347,6 +365,7 @@ final class ScanPanelState {
             let value = try await session.runCommand("scan.status", ["job": .string(job)])
             let status = try ScanJobStatus(json: value)
             updateSurface { $0.applyStatus(status) }
+            announceIfEnded()
         } catch {
             let text = scanUnableText("read job \(job)", BusService.describe(error))
             let now = Self.clockMs
@@ -600,15 +619,41 @@ final class ScanPanelState {
         guard launchRefusal == nil else { return }
         let call = surface.launchArguments(map: map)
         surface.launchInFlight = true
-        await send(tool: call.tool, args: call.args)
+        confirmSink = .launch
+        await send(tool: call.tool, args: call.args, origins: launchOrigins,
+                   onRefusal: { self.surface.applyLaunchError($0) })
     }
 
-    /// The second half of the handshake: the identical arguments plus `_confirm`.
-    /// A second Start Scan while the first is on the wire sends nothing.
+    /// Scan Again on a finished job (Jobs view D13): `scan.start { profile_name,
+    /// overrides: { target: { origins } } }` from the job's status, through the one
+    /// send path, so a `needs_confirmation` answer opens the same sheet and a start
+    /// result runs through `applyStart`. Sends nothing while the Kit's gate refuses,
+    /// while the link has the verbs gated off, or while a launch or a confirm sheet
+    /// owns the bus. A refusal lands under the card's title row, never in the footer.
+    func scanAgain(job: String) async {
+        guard scanAgainRefusal(for: job) == nil, verbsEnabled, surface.confirm == nil, !surface.launchInFlight,
+              let call = surface.scanAgainArguments(for: job) else { return }
+        surface.launchInFlight = true
+        confirmSink = .scanAgain(job: job)
+        await send(tool: call.tool, args: call.args, origins: scanAgainOrigins(job),
+                   onRefusal: { self.surface.applyScanAgainError($0) })
+    }
+
+    /// The second half of the handshake: the identical arguments plus `_confirm`, on
+    /// the path of whichever verb asked (`confirmSink`), so a refused confirm lands
+    /// where that verb was pressed. A second Start Scan while the first is on the wire
+    /// sends nothing.
     func confirmLaunch() async {
         guard let confirm = surface.confirm, !surface.launchInFlight else { return }
         surface.launchInFlight = true
-        await send(tool: confirm.tool, args: confirm.confirmedArguments)
+        switch confirmSink {
+        case .launch:
+            await send(tool: confirm.tool, args: confirm.confirmedArguments, origins: launchOrigins,
+                       onRefusal: { self.surface.applyLaunchError($0) })
+        case .scanAgain(let job):
+            await send(tool: confirm.tool, args: confirm.confirmedArguments, origins: scanAgainOrigins(job),
+                       onRefusal: { self.surface.applyScanAgainError($0) })
+        }
     }
 
     /// Cancel on the confirm sheet: nothing more is sent. Only the pending confirm
@@ -618,28 +663,52 @@ final class ScanPanelState {
         surface.confirm = nil
     }
 
-    /// One launch call, read as D9 reads it: a `needs_confirmation` answer first,
-    /// then a start result, and a thrown error last.
-    private func send(tool: String, args: [String: JSONValue]) async {
-        let origins = surface.editedProfile?.target.origins ?? []
+    /// Which verb's send a pending confirm belongs to (Jobs view D13): Start Scan's
+    /// refusals go to the Profiles footer, Scan Again's under the card's title row.
+    private enum ConfirmSink {
+        case launch
+        case scanAgain(job: String)
+    }
+
+    /// Set by every first send; `confirmLaunch()` reads it. Not observed: no view reads it.
+    @ObservationIgnored private var confirmSink: ConfirmSink = .launch
+
+    /// The origins a refused Start Scan names (`out_of_scope` reads its authority from the first).
+    private var launchOrigins: [String] { surface.editedProfile?.target.origins ?? [] }
+
+    /// The origins a refused Scan Again names: the finished job's targets.
+    private func scanAgainOrigins(_ job: String) -> [String] { surface.statuses[job]?.targets ?? [] }
+
+    /// The one bus send for Start Scan, Map Only and Scan Again, read as D9 reads it: a
+    /// `needs_confirmation` answer first, then a start result, and a thrown error last.
+    /// `onRefusal` is the verb's own home for an error (`applyLaunchError` or
+    /// `applyScanAgainError`); a start result goes through `applyStart` either way, and
+    /// the job it selected gets the card's entrance (D12, `.start`).
+    private func send(
+        tool: String, args: [String: JSONValue], origins: [String], onRefusal: (ScanLaunchError) -> Void
+    ) async {
         let value: JSONValue
         do {
             value = try await session.runCommand(tool, args)
         } catch {
-            surface.applyLaunchError(ScanLaunchError(busMessage: BusService.describe(error), origins: origins))
+            onRefusal(ScanLaunchError(busMessage: BusService.describe(error), origins: origins))
             return
         }
         if let request = L4ConfirmRequest(json: value) {
             surface.applyConfirm(tool: tool, args: args, request: request)
             return
         }
+        let result: ScanStartResult
         do {
-            surface.applyStart(try ScanStartResult(json: value))
+            result = try ScanStartResult(json: value)
         } catch {
-            surface.applyLaunchError(ScanLaunchError(
+            onRefusal(ScanLaunchError(
                 code: nil, message: "\(tool) returned a result this app cannot read", origins: origins))
             return
         }
+        let previous = surface.selectedJob
+        surface.applyStart(result)
+        noteSelection(previous: previous, cause: .start)
         pollGeneration += 1
     }
 
@@ -657,6 +726,7 @@ final class ScanPanelState {
             let value = try await session.runCommand("scan.cancel", ["job": .string(job)])
             if let status = try? ScanJobStatus(json: value) {
                 updateSurface { $0.applyStatus(status) }
+                announceIfEnded()
             } else {
                 await refreshStatus(job)
             }
@@ -861,6 +931,81 @@ final class ScanPanelState {
         Task { await refreshL4Scope() }
     }
 
+    // MARK: Surface intents: job selection and the card's entrance (Jobs view D12)
+
+    /// How many times the selection changed by a cause that gets the card's one
+    /// entrance: a pointer click, a start (this app's or another client's, through the
+    /// list), the first list. Never by keyboard and never by a status beat. The card's
+    /// blocks key on it (`.id(generation)`); `firstEntrance` tells the table whether to
+    /// take part. Observed on purpose: the view animates when it moves, and it moves
+    /// only on a selection change, never on a beat that changed nothing.
+    private(set) var entranceGeneration = 0
+
+    /// The tab's first selected job: the only entrance the table joins (on a row click
+    /// the operator is pointing at the table, which must not move).
+    var firstEntrance: Bool { entranceGeneration <= 1 }
+
+    /// Select a job, saying why (D12). Keyboard selection runs with animation off and
+    /// never bumps the generation; the other causes bump it when the job actually
+    /// changes. Picking another job also takes the inline Scan Again error down (the
+    /// Kit's `select(job:)`, D13).
+    func select(_ job: String, cause: ScanSelectionCause) {
+        let previous = surface.selectedJob
+        if cause == .keyboard {
+            withTransaction(Transaction(animation: nil)) { surface.select(job: job) }
+        } else {
+            surface.select(job: job)
+        }
+        noteSelection(previous: previous, cause: cause)
+    }
+
+    /// ↑↓ in the Jobs table: the Kit's clamp over the listed rows decides the target
+    /// (probed on a copy so the clamp lives once), then `select(_:cause: .keyboard)`.
+    func moveSelection(by delta: Int) {
+        var probe = surface
+        probe.moveSelection(in: .jobs, by: delta)
+        guard let job = probe.selectedJob else { return }
+        select(job, cause: .keyboard)
+    }
+
+    /// The bookkeeping behind every selection change, including the two the Kit makes
+    /// on its own (`applyStart`, D3's list rule): the generation moves only when the
+    /// selected job actually changed and the cause is one that animates.
+    private func noteSelection(previous: String?, cause: ScanSelectionCause) {
+        guard cause.animatesEntrance, surface.selectedJob != previous else { return }
+        entranceGeneration += 1
+    }
+
+    // MARK: Surface intents: the end-of-job announcement (Jobs view D14)
+
+    /// The selected job's merged state as last seen, per job, so a non-terminal →
+    /// terminal step is detected whichever read (status, list, cancel reply) moved it.
+    /// Not observed: the poll writes it every beat and no view reads it.
+    @ObservationIgnored private var seenStates: [String: ScanJobState] = [:]
+    /// The jobs already announced: once per job, however many reads land after the end.
+    @ObservationIgnored private var announced: Set<String> = []
+
+    private static let scanLog = Logger(subsystem: "com.mrbrutti.aitmproxy", category: "scan")
+
+    /// After a status or list lands: when the selected job's merged state went from
+    /// non-terminal to terminal since it was last seen, post the one VoiceOver
+    /// announcement (`ScanFormat.endAnnouncement`) and write one `announce:` line to
+    /// the unified log, the observable the live proof counts (AC29; the app has no
+    /// command recorder). A job first seen already finished is never announced.
+    private func announceIfEnded() {
+        guard let job = surface.selectedJob, let facts = surface.facts(for: job) else { return }
+        let state = facts.summary.state
+        defer { seenStates[job] = state }
+        guard let seen = seenStates[job], !seen.isTerminal, state.isTerminal, !announced.contains(job) else { return }
+        announced.insert(job)
+        let text = ScanFormat.endAnnouncement(facts)
+        NSAccessibility.post(
+            element: NSApp as Any,
+            notification: .announcementRequested,
+            userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+        Self.scanLog.info("announce: \(text, privacy: .public)")
+    }
+
     /// Takes a status line down after a while, and only while it is still the line
     /// this state put up.
     private func clearStatusLine(_ line: String, after delay: Duration) {
@@ -872,6 +1017,18 @@ final class ScanPanelState {
             savedLine = nil
         }
     }
+}
+
+/// Why the Jobs selection changed (Jobs view D12): the card's one entrance fires for
+/// a pointer click, a start and the first list, never for a key press.
+enum ScanSelectionCause: Equatable {
+    case pointer
+    case keyboard
+    case start
+    case list
+
+    /// Whether a selection change for this cause gets the card's entrance.
+    var animatesEntrance: Bool { self != .keyboard }
 }
 
 /// The Scan page. Which page that is depends only on what the bus lists (D11):
