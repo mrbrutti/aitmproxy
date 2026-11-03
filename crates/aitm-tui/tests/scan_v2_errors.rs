@@ -708,8 +708,11 @@ fn a_verb_outside_d3_fails_onto_the_jobs_tab() {
         "an Error toast"
     );
     let shown = screen(&app);
+    // Jobs view Task 4.3 (D19, T2): the Jobs banner's error carries the
+    // age of the values on screen after it, 0 s right after the open's
+    // list folded.
     assert!(
-        banner_text(&shown).ends_with("scan.frobnicate: boom"),
+        banner_text(&shown).ends_with("scan.frobnicate: boom · showing values from 0s ago"),
         "the Jobs banner reads it verbatim:\n{shown}"
     );
     for tab in [ScanTab::Profiles, ScanTab::SiteMap, ScanTab::Issues] {
@@ -721,8 +724,9 @@ fn a_verb_outside_d3_fails_onto_the_jobs_tab() {
         );
     }
     let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    // Jobs view Task 4.3: the age clause rides along.
     assert!(
-        banner_text(&screen(&app)).ends_with("scan.frobnicate: boom"),
+        banner_text(&screen(&app)).ends_with("scan.frobnicate: boom · showing values from 0s ago"),
         "the Jobs error survives the tab walk"
     );
 }

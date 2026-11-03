@@ -22,8 +22,8 @@ use aitm_scan_model::JobState;
 
 use crate::app::App;
 use crate::scan::{
-    severity_runs, JobPane, JobRow, LegacyRun, ScanOffer, BAR_EMPTY, BAR_FILLED, PROBE_BAR_CELLS,
-    PROFILE_MAX, SEVERITY_BAR_CELLS, TARGETS_MAX,
+    severity_runs, JobPane, JobRow, LegacyRun, ScanOffer, BAR_EMPTY, BAR_FILLED, PROFILE_MAX,
+    PROGRESS_BAR_CELLS, SEVERITY_BAR_CELLS, TARGETS_MAX,
 };
 use crate::text::{cells, elide_middle, fit, right, truncate, width};
 use crate::theme::Theme;
@@ -78,7 +78,10 @@ struct Columns {
     profile: usize,
     targets: usize,
     state: usize,
-    probes: usize,
+    /// The progress text; the bar sits beside it ([`PROGRESS_BAR_CELLS`]).
+    progress: usize,
+    /// The probe budget, a number without a bar (Jobs view D19, T2).
+    budget: usize,
     points: usize,
     elapsed: usize,
     /// Whether the `profile` and `targets` columns are drawn.
@@ -97,8 +100,9 @@ impl Columns {
             job: widest(|r| &r.id, 3),
             profile: widest(|r| &r.profile, 7).min(PROFILE_MAX),
             targets: widest(|r| &r.targets, 7).min(TARGETS_MAX),
-            state: widest(|r| &r.state_phase, 11),
-            probes: widest(|r| &r.probes, 6),
+            state: widest(|r| &r.state_phase, 5),
+            progress: widest(|r| &r.progress, 8),
+            budget: widest(|r| &r.budget, 6),
             points: widest(|r| &r.points, 6),
             elapsed: widest(|r| &r.elapsed, 3),
             full: false,
@@ -108,8 +112,9 @@ impl Columns {
     }
 
     /// The cells a row takes with (`full`) or without the `profile` and
-    /// `targets` columns: the cursor mark, the columns, the gaps, the probe
-    /// bar beside its number and the severity bar.
+    /// `targets` columns: the cursor mark, the columns, the gaps, the
+    /// progress bar beside its number, the budget number and the severity
+    /// bar.
     fn total(&self, full: bool) -> usize {
         let mut n = 1 + self.job;
         if full {
@@ -118,9 +123,11 @@ impl Columns {
         n + GAP
             + self.state
             + GAP
-            + self.probes
+            + self.progress
             + 1
-            + PROBE_BAR_CELLS
+            + PROGRESS_BAR_CELLS
+            + GAP
+            + self.budget
             + GAP
             + self.points
             + GAP
@@ -171,8 +178,8 @@ fn list(
     );
 }
 
-/// `job  profile  targets  state/phase  probes  points  issues  el.`, the
-/// middle two only in the full layout.
+/// `job  profile  targets  state  progress  budget  points  issues  el.`
+/// (Jobs view D19, T2), `profile` and `targets` only in the full layout.
 fn header(theme: &Theme, cols: &Columns) -> Line<'static> {
     let style = theme.text_secondary();
     let gap = GAP_TEXT;
@@ -189,9 +196,10 @@ fn header(theme: &Theme, cols: &Columns) -> Line<'static> {
     }
     spans.push(Span::styled(
         format!(
-            "{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
-            fit("state/phase", cols.state),
-            fit("probes", cols.probes + 1 + PROBE_BAR_CELLS),
+            "{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
+            fit("state", cols.state),
+            fit("progress", cols.progress + 1 + PROGRESS_BAR_CELLS),
+            fit("budget", cols.budget),
             fit("points", cols.points),
             fit("issues", SEVERITY_BAR_CELLS),
             right("el.", cols.elapsed),
@@ -201,9 +209,10 @@ fn header(theme: &Theme, cols: &Columns) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One row: the cursor mark, the text cells, the probe bar (filled cells in
-/// primary text, the rest tertiary), the severity bar (one span per
-/// non-zero severity in its `Theme::severity` hue) and the elapsed time.
+/// One row: the cursor mark, the text cells, the progress bar (filled
+/// cells in primary text, the rest tertiary), the budget number, the
+/// severity bar (one span per non-zero severity in its `Theme::severity`
+/// hue) and the elapsed time.
 fn row_line(
     theme: &Theme,
     cols: &Columns,
@@ -232,13 +241,19 @@ fn row_line(
         fit(&row.state_phase, cols.state),
         state_style(theme, state),
     ));
+    // The number is right-aligned in its column so the bar always sits
+    // beside it, whatever its width under the `progress` header.
     spans.push(Span::styled(
-        format!("{gap}{} ", fit(&row.probes, cols.probes)),
+        format!("{gap}{} ", right(&row.progress, cols.progress)),
         theme.text_primary(),
     ));
-    spans.extend(probe_spans(theme, row));
+    spans.extend(progress_spans(theme, row));
     spans.push(Span::styled(
-        format!("{gap}{}{gap}", fit(&row.points, cols.points)),
+        format!(
+            "{gap}{}{gap}{}{gap}",
+            fit(&row.budget, cols.budget),
+            fit(&row.points, cols.points)
+        ),
         theme.text_primary(),
     ));
     spans.extend(severity_spans(theme, row));
@@ -249,14 +264,15 @@ fn row_line(
     Line::from(spans)
 }
 
-/// The probe bar: the row's typed `probe_fill` cells filled in primary
-/// text, the rest empty in tertiary (an unknown row has a fill of 0).
-fn probe_spans(theme: &Theme, row: &JobRow) -> Vec<Span<'static>> {
-    let fill = row.probe_fill.min(PROBE_BAR_CELLS);
+/// The progress bar: the row's typed `progress_fill` cells filled in
+/// primary text, the rest empty in tertiary (an indeterminate or unknown
+/// row has a fill of 0; Jobs view D8, D19).
+fn progress_spans(theme: &Theme, row: &JobRow) -> Vec<Span<'static>> {
+    let fill = row.progress_fill.min(PROGRESS_BAR_CELLS);
     vec![
         Span::styled(BAR_FILLED.repeat(fill), theme.text_primary()),
         Span::styled(
-            BAR_EMPTY.repeat(PROBE_BAR_CELLS - fill),
+            BAR_EMPTY.repeat(PROGRESS_BAR_CELLS - fill),
             theme.text_tertiary(),
         ),
     ]
@@ -328,7 +344,13 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
     let mut lines: Vec<Line<'static>> = vec![Line::from(first)];
     for (label, value) in jobs.detail_text() {
         if label.is_empty() {
-            lines.push(Line::styled(format!(" {value}"), theme.text_tertiary()));
+            // A sentence row (the first line, an attention row): cut to
+            // the pane with the same `…` the labelled lines get (Task
+            // 4.5c, the Part 4 security minor).
+            lines.push(Line::styled(
+                format!(" {}", truncate(&value, w.saturating_sub(1))),
+                theme.text_tertiary(),
+            ));
             continue;
         }
         // `label value`, one space between (the D11 mockup's shape): no
@@ -409,28 +431,125 @@ mod tests {
         assert_eq!(tiny.detail.height, 0);
     }
 
-    /// The fixture's row is 100 cells wide with its profile and targets
+    /// The fixture's row is 106 cells wide with its profile and targets
     /// columns (the two take 33 of them); below that width the two are
-    /// dropped and the rest of the columns keep their header widths.
+    /// dropped and the rest of the columns keep their header widths. (Jobs
+    /// view D19, T2 re-pinned the literal: `state` reads the phase word,
+    /// the progress column and its bar replace the probe one, the budget
+    /// column is new.)
     #[test]
     fn columns_drop_profile_and_targets_when_the_row_does_not_fit() {
         let row = JobRow {
             id: "scan-1a2b3c4d".into(),
             profile: "standard".into(),
             targets: "http://127.0.0.1:8080".into(),
-            state_phase: "running/audit".into(),
-            probes: "418/2000".into(),
-            probe_fill: 2,
+            state_phase: "auditing".into(),
+            progress: "3236/6468".into(),
+            progress_fill: 3,
+            budget: "418/2000".into(),
             points: "80/120".into(),
             issues: Default::default(),
             elapsed: "42s".into(),
         };
-        let cols = Columns::measure(std::slice::from_ref(&row), 100);
-        assert_eq!(cols.total(true), 100, "the full row's width");
-        assert_eq!(cols.total(false), 67, "without profile and targets");
-        assert!(cols.full, "a 100-cell row fits 100 cells");
+        let cols = Columns::measure(std::slice::from_ref(&row), 106);
+        assert_eq!(cols.total(true), 106, "the full row's width");
+        assert_eq!(cols.total(false), 73, "without profile and targets");
+        assert!(cols.full, "a 106-cell row fits 106 cells");
         assert_eq!((cols.profile, cols.targets), (8, 21));
-        let narrow = Columns::measure(std::slice::from_ref(&row), 99);
+        assert_eq!((cols.state, cols.progress, cols.budget), (8, 9, 8));
+        let narrow = Columns::measure(std::slice::from_ref(&row), 105);
         assert!(!narrow.full, "one cell short drops the two columns");
+    }
+
+    /// The text of a line, spans concatenated.
+    fn text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The auditing row AC42 names: checks 3,236 of 6,468, probes 418 of
+    /// 2,000, built through `row` from a status.
+    fn auditing_row() -> JobRow {
+        use crate::scan::{row, ReadStatus};
+        use aitm_scan_model::{JobStatus, Phase};
+
+        let mut status = JobStatus {
+            job: "scan-1a2b3c4d".into(),
+            state: JobState::Running,
+            phase: Phase::Auditing,
+            profile_name: "standard".into(),
+            targets: vec!["http://127.0.0.1:8080".into()],
+            elapsed_ms: 42_000,
+            ..Default::default()
+        };
+        status.checks.done = 3236;
+        status.checks.scheduled = 6468;
+        status.probes.sent = 418;
+        status.probes.budget = 2000;
+        status.points.audited = 80;
+        status.points.found = 120;
+        row(&status.summary(), Some(&ReadStatus::new(status)))
+    }
+
+    /// Jobs view AC42 (D19, T2): the full-layout header names the columns
+    /// in this order; the narrow one drops `profile` and `targets`.
+    #[test]
+    fn header_reads_the_progress_and_budget_columns() {
+        let theme = Theme::new(true);
+        let row = auditing_row();
+        let cols = Columns::measure(std::slice::from_ref(&row), 200);
+        assert!(cols.full);
+        let line = text(&header(&theme, &cols));
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            words,
+            [
+                "job", "profile", "targets", "state", "progress", "budget", "points", "issues",
+                "el."
+            ],
+            "{line:?}"
+        );
+        let narrow = Columns::measure(std::slice::from_ref(&row), 80);
+        assert!(!narrow.full);
+        let line = text(&header(&theme, &narrow));
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            words,
+            ["job", "state", "progress", "budget", "points", "issues", "el."],
+            "{line:?}"
+        );
+    }
+
+    /// Jobs view AC42 (D19, T2): the auditing row shows `3236/6468` beside
+    /// a six-cell bar with three cells filled, and `418/2000` in the budget
+    /// column with no bar after it.
+    #[test]
+    fn row_draws_progress_bar_and_budget_number() {
+        let theme = Theme::new(true);
+        let row = auditing_row();
+        assert_eq!(row.progress_fill, 3);
+        let cols = Columns::measure(std::slice::from_ref(&row), 200);
+        let line = row_line(&theme, &cols, &row, Some(JobState::Running), false);
+        let shown = text(&line);
+        assert!(
+            shown.contains("auditing  3236/6468 ━━━───  418/2000  80/120"),
+            "{shown:?}"
+        );
+        assert!(
+            !shown.contains("418/2000 ━") && !shown.contains("418/2000 ─"),
+            "the budget has no bar: {shown:?}"
+        );
+        // The filled cells are primary text, the empty ones tertiary.
+        let filled = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "━━━")
+            .expect("the filled run");
+        assert_eq!(filled.style, theme.text_primary());
+        let empty = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "───")
+            .expect("the empty run");
+        assert_eq!(empty.style, theme.text_tertiary());
     }
 }

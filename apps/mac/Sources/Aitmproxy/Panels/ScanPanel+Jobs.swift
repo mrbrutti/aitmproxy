@@ -447,8 +447,8 @@ private struct ScanJobRow: View {
     /// The State cell (D10): the 18 pt slot holds the progress ring while the job is
     /// queued or running and the tone dot otherwise (breathing only while
     /// cancelling, D12); the agent dot when an agent started the job; the state or
-    /// phase word, crossfading on a change; and, for a finished job, the stopped-reason
-    /// sentence (D4) or the error's first line as a second line.
+    /// phase word, crossfading on a change; and, for a finished job, the Kit's
+    /// `rowSubLine` (the stopped-reason sentence, D4, or the error's first line; D21).
     private var stateCell: some View {
         let word = ScanFormat.stateWord(facts)
         return VStack(alignment: .leading, spacing: 0) {
@@ -473,7 +473,7 @@ private struct ScanJobRow: View {
                     .contentTransition(.opacity)
                     .animation(ScanMotion.ease(ScanMotion.state), value: word)
             }
-            if let subLine {
+            if let subLine = ScanEndText.rowSubLine(facts) {
                 Text(subLine)
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.secondary.color)
@@ -482,22 +482,6 @@ private struct ScanJobRow: View {
                     .help(subLine)
             }
         }
-    }
-
-    /// A finished job's second line: the stopped-reason sentence when the Kit has one
-    /// for the reason, else the error's first line; nil for a live job or one with
-    /// neither.
-    private var subLine: String? {
-        guard summary.state.isTerminal, let status = facts.status else { return nil }
-        if let reason = status.stoppedReason,
-            let sentence = ScanEndText.stoppedReason(
-                reason, state: summary.state, probesBudget: summary.probes.budget, error: status.error)
-        {
-            return sentence
-        }
-        guard let error = status.error else { return nil }
-        let first = error.split(whereSeparator: \.isNewline).first.map(String.init) ?? error
-        return first.isEmpty ? nil : first
     }
 
     /// Probes: the count in primary ink, the unit (`of 2,000`) muted (D10).
@@ -510,8 +494,9 @@ private struct ScanJobRow: View {
             .counterTick(value: sent + unit, reduceMotion: reduceMotion)
     }
 
-    /// Issues: each non-zero tally in its severity ink, comma-separated in secondary;
-    /// the Kit's `no issues yet` / `no issues` in tertiary when there are none (D10).
+    /// Issues: the Kit's severity words through the one builder, each in its severity
+    /// ink, comma-separated in secondary, in the data face (D10, D21); the Kit's `no
+    /// issues yet` / `no issues` in tertiary when there are none.
     private var issuesCell: some View {
         let parts = ScanFormat.severityWordParts(by: summary.issues.bySeverity)
         return Group {
@@ -520,19 +505,8 @@ private struct ScanJobRow: View {
                     .font(Tok.Face.ui(Tok.Typography.Size.md))
                     .foregroundStyle(Tok.Ink.tertiary.color)
             } else {
-                HStack(spacing: 0) {
-                    ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
-                        if index > 0 {
-                            Text(", ")
-                                .font(Tok.Face.data(Tok.Typography.Size.md))
-                                .foregroundStyle(Tok.Ink.secondary.color)
-                        }
-                        Text(part.1)
-                            .font(Tok.Face.data(Tok.Typography.Size.md))
-                            .foregroundStyle(ScanToneColors.severity(part.0))
-                    }
-                }
-                .counterTick(value: parts.map(\.1).joined(), reduceMotion: reduceMotion)
+                ScanSeverityWordsText.text(parts, font: Tok.Face.data(Tok.Typography.Size.md))
+                    .counterTick(value: parts.map(\.word).joined(), reduceMotion: reduceMotion)
             }
         }
         .lineLimit(1)

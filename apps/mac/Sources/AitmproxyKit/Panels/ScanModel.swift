@@ -831,6 +831,21 @@ struct ScanWire {
         try strings(key).map(Self.token)
     }
 
+    /// `vocabs`, bounded in count (fix 3.0a): duplicates dropped by raw wire value (the
+    /// first occurrence kept, wire order preserved), then cut to the engine's `listMax`
+    /// items, so eight copies of one token do not hide the rest. Every item is still
+    /// type-checked as a string, so a malformed item past the cap is refused, unlike
+    /// `boundedArray`.
+    func boundedVocabs<V: ScanVocabulary>(_ key: String) throws -> [V] {
+        var seen = Set<String>()
+        var kept: [V] = []
+        for raw in try strings(key) where seen.insert(raw).inserted {
+            kept.append(Self.token(raw))
+            if kept.count == Self.listMax { break }
+        }
+        return kept
+    }
+
     private static func token<V: ScanVocabulary>(_ raw: String) -> V {
         let word = cleaned(raw, max: tokenMax)
         return V(rawValue: word) ?? V.other(word)
@@ -1109,8 +1124,11 @@ public struct ScanLaneReport: Hashable, Sendable {
 extension ScanLaneReport {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanLaneReport")
-        requested = try wire.vocabs("requested")
-        run = try wire.vocabs("run")
+        // The Crawl well's Lanes row is `run` joined word by word, so both lists are
+        // bounded in count at decode like every other list the wells draw, not only
+        // per token (fix 3.0a, the round-3 `vocabs` follow-up).
+        requested = try wire.boundedVocabs("requested")
+        run = try wire.boundedVocabs("run")
         skipped = try wire.boundedArray("skipped").map { try ScanSkippedLane(json: $0) }
     }
 }

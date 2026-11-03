@@ -105,24 +105,10 @@ nonisolated enum CardMetrics {
 // MARK: - Inked text
 
 /// One `Text` from several, joined by interpolation (`+` on `Text` is deprecated on
-/// macOS 26), and the two inkings the card repeats: a number run in the data face and
-/// one named token (a check id) in the data face.
+/// macOS 26), and the one inking the card repeats: a number run in the data face.
 private enum ScanInked {
     static func joined(_ parts: [Text]) -> Text {
         parts.reduce(Text(verbatim: "")) { Text("\($0)\($1)") }
-    }
-
-    /// `text` with the one `token` it contains set in the data face and `tokenInk`
-    /// (the now tag's check id); `text` unchanged when the token is absent.
-    static func token(_ text: String, token: String?, size: CGFloat, ink: Color, tokenInk: Color) -> Text {
-        guard let token, !token.isEmpty, let range = text.range(of: token) else {
-            return Text(verbatim: text).font(Tok.Face.ui(size)).foregroundStyle(ink)
-        }
-        return joined([
-            Text(verbatim: String(text[..<range.lowerBound])).font(Tok.Face.ui(size)).foregroundStyle(ink),
-            Text(verbatim: token).font(Tok.Face.data(size)).foregroundStyle(tokenInk),
-            Text(verbatim: String(text[range.upperBound...])).font(Tok.Face.ui(size)).foregroundStyle(ink),
-        ])
     }
 
     /// `text` with every run of digits and their separators (`11:32`, `1:04`, `3,236`) in
@@ -424,14 +410,23 @@ struct ScanJobLane: View {
         }
     }
 
-    /// The now tag while live: the Kit's `now · <id>` form, or the phase line while
-    /// reporting (`Writing results`, D11 §2); nil when terminal (the end sentence stands).
-    private var tagText: String? {
+    /// The now tag while live (D11 §2, D21): the Kit's `nowTagParts` inked by role (the
+    /// check id in the data face and `Tok.Ink.primary`, the plain words in the UI face and
+    /// `Tok.Ink.secondary`), or the phase line while reporting (`Writing results`); nil
+    /// when terminal (the end sentence stands) and when nothing runs.
+    private var tagText: Text? {
         guard !terminal else { return nil }
+        let size = Tok.Typography.Size.sm
         if summary.state == .running || summary.state == .cancelling, summary.phase == .reporting {
-            return progress.phaseLine
+            return Text(verbatim: progress.phaseLine).font(Tok.Face.ui(size)).foregroundStyle(Tok.Ink.secondary.color)
         }
-        return progress.nowTag
+        guard let parts = progress.nowTagParts else { return nil }
+        return ScanInked.joined(parts.map { part in
+            switch part.role {
+            case .checkId: Text(verbatim: part.text).font(Tok.Face.data(size)).foregroundStyle(Tok.Ink.primary.color)
+            case .plain, .figure, .agent: Text(verbatim: part.text).font(Tok.Face.ui(size)).foregroundStyle(Tok.Ink.secondary.color)
+            }
+        })
     }
 
     private var startedClock: String? {
@@ -641,16 +636,13 @@ struct ScanJobLane: View {
                         .transition(.swapTransition(reduceMotion: reduceMotion))
                 }
             } else if let tag = tagText {
-                ScanInked.token(
-                    tag, token: status?.checks.running.first, size: Tok.Typography.Size.sm,
-                    ink: Tok.Ink.secondary.color, tokenInk: Tok.Ink.primary.color
-                )
-                .lineLimit(1)
-                .fixedSize()
-                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { tagWidth = $0 }
-                .padding(.leading, min(max(0, g.markX - tagWidth / 2), max(0, width - tagWidth)))
-                .animation(progressAnimation, value: fillFraction)
-                .transition(.swapTransition(reduceMotion: reduceMotion))
+                tag
+                    .lineLimit(1)
+                    .fixedSize()
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { tagWidth = $0 }
+                    .padding(.leading, min(max(0, g.markX - tagWidth / 2), max(0, width - tagWidth)))
+                    .animation(progressAnimation, value: fillFraction)
+                    .transition(.swapTransition(reduceMotion: reduceMotion))
             }
         }
         .padding(.top, Space.md)
@@ -844,7 +836,7 @@ struct ScanKPICell: View {
     var unit: String?
     var lead: Bool
     /// The Issues cell's words, each in its severity ink; empty for the other cells.
-    var severity: [(ScanSeverity, String)] = []
+    var severity: [(severity: ScanSeverity, word: String)] = []
     /// The Issues cell's `no issues yet` / `no issues` when `severity` is empty.
     var emptyWords: String?
     var help: String?
@@ -891,20 +883,10 @@ struct ScanKPICell: View {
         .help(help ?? "")
     }
 
-    /// `1 high, 2 low`, each word in its severity ink, the commas in the secondary ink.
+    /// `1 high, 2 low` through the one builder (D21): each word in its severity ink, the
+    /// commas in the secondary ink, in the UI face.
     private var severityText: Text {
-        var parts: [Text] = []
-        for (index, (level, word)) in severity.enumerated() {
-            if index > 0 {
-                parts.append(
-                    Text(verbatim: ", ").font(Tok.Face.ui(Tok.Typography.Size.md))
-                        .foregroundStyle(Tok.Ink.secondary.color))
-            }
-            parts.append(
-                Text(verbatim: word).font(Tok.Face.ui(Tok.Typography.Size.md))
-                    .foregroundStyle(ScanToneColors.severity(level)))
-        }
-        return ScanInked.joined(parts)
+        ScanSeverityWordsText.text(severity, font: Tok.Face.ui(Tok.Typography.Size.md))
     }
 }
 

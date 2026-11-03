@@ -1,0 +1,50 @@
+ ›•‹ aitmproxy  ● rec  ✎ compose  ⌫ clear                ● aitmproxy · listening 127.0.0.1:18180 · sys-proxy off · CA trusted                 [⚙ Agent ● auto · 18/min]  : palette  ▄▄ below  b sidebar
+  All 1 │ HTTP2 HTTPS3 WebSocket4 │ TCP5 UDP6 L47 │ h18 h29 │ JSON0 Form XML JS CSS GraphQL Document Media Other                                                                             ⌕ / filter
+┌ Scan ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1 Profiles  2 Jobs  3 Site map  4 Issues     idle                                                                                                                                                    │
+│ no jobs yet: start one from Profiles (s)                                                                                                                                                             │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ x cancel  ⏎ issues of this job  s start  m map  Esc back                                    – / 0 rows · 0 in scope                                   — ↑ — ↓ — (F4)  ● bus 127.0.0.1:19190 · operator

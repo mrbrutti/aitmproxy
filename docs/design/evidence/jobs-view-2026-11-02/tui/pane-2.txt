@@ -1,0 +1,50 @@
+ ›•‹ aitmproxy  ● rec  ✎ compose  ⌫ clear                ● aitmproxy · listening 127.0.0.1:18180 · sys-proxy off · CA trusted                 [⚙ Agent ● auto · 18/min]  : palette  ▄▄ below  b sidebar
+  All 1 │ HTTP2 HTTPS3 WebSocket4 │ TCP5 UDP6 L47 │ h18 h29 │ JSON0 Form XML JS CSS GraphQL Document Media Other                                                                             ⌕ / filter
+┌ Scan ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1 Profiles  2 Jobs  3 Site map  4 Issues     idle                                                                                                                                                    │
+│ name               lanes                intensity  speed                                │ ⏎ opens the profile under the cursor · N new profile                                                       │
+│>l4-full         ·  l4_packet l4_stream  medium     normal                               │                                                                                                            │
+│ l4-stream-safe  ·  l4_stream            medium     normal                               │                                                                                                            │
+│ light-http      ·  http                 light      fast                                 │                                                                                                            │
+│ map-only        ·  http                 passive    normal                               │                                                                                                            │
+│ passive-only    ·  http                 passive    normal                               │                                                                                                            │
+│ standard        ·  http ws              medium     normal                               │                                                                                                            │
+│ thorough        ·  http ws              medium     thorough                             │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │                                                                                                            │
+│                                                                                         │ L4 launch disabled: the L4 layer is not on this bus (l4.scope.list)                                        │
+│                                                                                         │ s start · m map · w save as · e edit · Space toggle                                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ s start  m map  w save as  e edit  Space toggle  Esc back                                   – / 0 rows · 0 in scope                                   — ↑ — ↓ — (F4)  ● bus 127.0.0.1:19190 · operator

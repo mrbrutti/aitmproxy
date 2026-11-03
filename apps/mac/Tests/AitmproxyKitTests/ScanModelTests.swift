@@ -1308,4 +1308,37 @@ extension ScanModelTests {
         let lane = try ScanJobStatus(json: skipped).lanes.skipped.first?.lane
         #expect(lane == .other(String(repeating: "q", count: 64)))
     }
+
+    /// Fix 3.0a (mac PR 3 security minor, the round-3 `vocabs` follow-up): `lanes.run` and
+    /// `lanes.requested` are cut to the engine's cap of 8 at decode like every other list
+    /// the wells draw (`ScanWire.listMax`): the Crawl well's Lanes row is `lanes.run`
+    /// joined, so without the cap a hostile core could put a hundred words in one row.
+    /// Duplicates are dropped first (by raw wire value, first occurrence kept, order
+    /// preserved), then the cap applies, so eight copies of one lane do not hide the rest.
+    @Test func laneReportRunAndRequestedAreBoundedAtDecode() throws {
+        let hundred = JSONValue.array((0..<100).map { .string("lane\($0)") })
+        var status = try ScanPack.load("scan.status.json")
+        status = ScanPack.edited(status, path: ["lanes", "run"], to: hundred)
+        status = ScanPack.edited(status, path: ["lanes", "requested"], to: hundred)
+        let decoded = try ScanJobStatus(json: status)
+        #expect(ScanWire.listMax == 8)
+        #expect(decoded.lanes.run.count == 8)
+        #expect(decoded.lanes.run == (0..<8).map { ScanLane.other("lane\($0)") })
+        #expect(decoded.lanes.requested.count == 8)
+        #expect(decoded.lanes.requested.first == .other("lane0"))
+        #expect(decoded.lanes.requested.last == .other("lane7"))
+
+        // Duplicates collapse before the cap: first occurrence kept, wire order preserved.
+        let twice = try ScanLaneReport(json: ["requested": ["ws", "http", "ws"], "run": ["http", "http", "ws"], "skipped": []])
+        #expect(twice.run == [.http, .ws])
+        #expect(twice.requested == [.ws, .http])
+
+        // Eight copies of `http` then nine distinct lanes: the cap counts distinct tokens.
+        let padded = JSONValue.array(
+            (0..<8).map { _ in JSONValue.string("http") } + (0..<9).map { .string("l\($0)") })
+        let report = try ScanLaneReport(json: ["requested": [], "run": padded, "skipped": []])
+        #expect(report.run.count == 8)
+        #expect(report.run == [.http] + (0..<7).map { ScanLane.other("l\($0)") })
+        #expect(report.requested.isEmpty)
+    }
 }

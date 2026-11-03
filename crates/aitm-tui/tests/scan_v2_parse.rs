@@ -233,25 +233,24 @@ fn helpers_pin_their_literals() {
     assert_eq!(elapsed_text(125_000), "2m05s");
     assert_eq!(elapsed_text(3_725_000), "1h02m");
 
+    // Jobs view Task 4.2 (D19, T2): the phase word while running, the
+    // state word otherwise.
     assert_eq!(
         state_phase_text(JobState::Running, Phase::Auditing),
-        "running/audit"
+        "auditing"
     );
-    assert_eq!(
-        state_phase_text(JobState::Queued, Phase::Queued),
-        "queued/queued"
-    );
+    assert_eq!(state_phase_text(JobState::Queued, Phase::Queued), "queued");
     assert_eq!(
         state_phase_text(JobState::Running, Phase::Crawling),
-        "running/crawl"
+        "crawling"
     );
     assert_eq!(
         state_phase_text(JobState::Running, Phase::Passive),
-        "running/passive"
+        "passive"
     );
     assert_eq!(
         state_phase_text(JobState::Cancelling, Phase::Reporting),
-        "cancelling/report"
+        "cancelling"
     );
     assert_eq!(state_phase_text(JobState::Done, Phase::Done), "done");
     assert_eq!(

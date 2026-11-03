@@ -1,0 +1,57 @@
+ok   target boots with 300 ms per response (H81)
+ok   ui: the TUI attached to bus 127.0.0.1:52999 as the operator
+ok   seed: GET / with the session cookie only (no Authorization header) answered 200 (H55)
+ok   seed: GET /search (no session headers, H55) answered 200 and reflected the marker
+ok   seed: the core captured the seeded flow (flow.table)
+ok   seed: the core captured the session-bearing GET / (flow.table; the T7-20 source, H55)
+ok   seed: the TUI painted the seeded flow
+ok   T7-17: the editor's crawl `browser` field reads `never` before the launch (H42)
+ok   T7-17: the editor's `speed` field reads `thorough` before the launch (H62)
+ok   T7-17: the start reply for scan-0e7fdffd landed on the Jobs tab with its row before any tab key (H72)
+ok   T7-17: `J` pinned the Issues filter to this job (its id on the filter line)
+ok   T7-17: the issue is on the Issues tab while scan.status still says `running`
+ok   T7-17: the issue sits under its `LOW` severity header
+ok   T7-17: the cursor lands on the issue row (its name cell, after the glyphs, reads the issue's name)
+ok   T7-17: scan.issue reports an evidence.payload for the issue
+ok   T7-17: the detail shows the `payload` scan.issue reports
+ok   T7-17: scan.issue reports a probe flow for the issue
+FAIL T7-17: `⏎` on the first probe flow opened the inspector (Request/Response panes, the flow's method and path, the Scan strip gone)  -- GET '/'; screen: '                                                 │\n                           
+FAIL T7-17: `f` marked the issue `false_positive` on screen and in scan.issue  -- scan.issue status open; screen: '                                                                                     │                                     
+ok   T7-17: after `f` the cursor stays on the marked issue's row for 2 s (its name cell reads the issue's name; the issues list refetch keeps the id, H75/H76)
+ok   T7-17: `u` cleared `false_positive` from the screen and scan.issue reads `open`
+ok   T7-17: after `u` the cursor stays on the reopened issue's row for 2 s before `P` (its name cell reads the issue's name, H76)
+note T7-17: no PoC for this issue (the TUI toasted it; nothing to open)  -- this issue has no PoC
+ok   T7-16: the held `standard` editor carries the target origin on its `origins` line
+ok   T7-16: the editor's crawl `browser` field reads `never` before the launch (H42)
+ok   T7-16: the editor's `speed` field reads `thorough` before the launch (H62)
+ok   T7-16: the editor's `intensity` field reads `intrusive` before the launch (H70)
+ok   T7-16: the engine asked to confirm the intrusive launch (the `Confirm over the wire: scan launch` overlay after `s` carries "may disrupt the target"); `y` answers it (H77)
+ok   T7-16: scan.list reports a job id in the engine's form
+ok   T7-16: the Jobs tab drew and carries the row for scan-a486ae72
+ok   T7-16: at least 3 screen samples carry the row's probes cell
+ok   T7-16: the on-screen `sent` is non-decreasing across the samples
+ok   T7-16: every sample's on-screen `sent` lies inside the scan.status bracket taken just before and just after it
+ok   T7-16: `x` left the row of scan-a486ae72 reading `cancelled`
+ok   T7-16: the row's state cell changed at least once across the samples and the post-`x` `cancelled` row (H80)
+ok   T7-16: scan.status agrees scan-a486ae72 is `cancelled`
+ok   T7-16: the second bus client saw a `progress` and a `cancelled` line for scan-a486ae72
+ok   T7-16: the second bus client's subscription socket is still alive (its drain thread runs; it stops only on `stop()` or a dead socket)
+ok   T7-18: `t` accepted the L4 target into the editor
+ok   T7-18: the editor shows the D7 reason (`capability inject`, `l4.scope.add`)
+ok   T7-18: `s` under the gate started nothing (scan.list unchanged for 3 s)
+ok   T7-18: the TUI's l4.scope.list pass cleared the gate
+ok   T7-18: `s` opened the wire-confirm overlay containing "may disrupt the target"
+FAIL T7-18: `y` re-issued the launch and the screen answered as the harness's own scan.start did (a Jobs row for a job; the D9 wording for refused_l4 / lane_unavailable)  -- tui job None row False wordings ['out_of_scope'] (pre-existing [])
+ok   T7-18: `n` cancelled the launch (`scan.start cancelled`) and no job appeared
+ok   T7-19: the editor's crawl `browser` field reads `never` before the launch (H42)
+ok   T7-19: the map job reached `done`
+ok   T7-19: the Site map tab drew the live read's 30 nodes for this job (` 30 nodes` on the Nodes pane head after `J`)
+ok   T7-19: every host of the live scan.sitemap is rendered
+ok   T7-19: every `METHOD path_template` of the live scan.sitemap is rendered
+ok   T7-19: every point name of the live scan.sitemap is rendered
+ok   T7-19: `g` put the cursor back on the walk's first row and the row under it is a node of the live read (H74)
+ok   T7-19: the node under the cursor carries a flow to open
+ok   T7-19: `⏎` on the node under the cursor opened its first flow in the inspector (Request/Response panes, the flow's method and path, the Scan strip gone)
+ok   T7-20: no Scan-surface screen sample carried the seeded Cookie value (whole or its first 12 hex chars)
+ok   T7-20: `q` ended aitm-tui with exit 0
+FAIL: 52 ok, 1 noted, 3 failed; aitm-tui Scan surface on bus 127.0.0.1:52999: jobs ['scan-0e7fdffd', 'scan-a486ae72', 'scan-bd857906']; target latency 300 ms; failed: ["T7-17: `⏎` on the first probe flow opened the inspector (Request/Resp

@@ -410,8 +410,8 @@ Same words, state table, progress definition, stopped-reason sentences and
 hover help. Web: the locked comp is itself HTML and CSS, so W2 reproduces its
 composition (card, lane, ledger, gauge, KPI strip, table, wells) with the
 tokens as CSS variables and its motion as CSS transitions on
-`transform`/`opacity`/`width` under `prefers-reduced-motion`; D18's W2 row
-layout is re-cut to the comp before Part 3 opens (D18 amendment). TUI:
+`transform`/`opacity`/`width` under `prefers-reduced-motion`; D18 W2 is that
+re-cut (2026-11-02), and every word comes from D21's Kit forms. TUI:
 the row's probe bar becomes the progress bar (box-drawing, `━`/`─`), the
 detail's first lines are the sentence, the progress line and the Now line;
 severity by `Theme::severity`, everything else bold/dim.
@@ -441,6 +441,12 @@ lands first: it closes C1, C2, C6 (decoding and words), C10 and C12 inside the
 the derived progress, motion, Scan Again, the announcement and the banner. Decisions D1 to
 D7 are PR 1; D8 to D17 are PR 2; D18 to D20 cover web, TUI and testing and
 name their own two steps. The acceptance criteria carry the same prefixes.
+
+**A third mac PR, Kit rows and parts (D21, 2026-11-02),** lands between PR 2
+and the parity parts. It moves the last view-side derivations (the well
+rows, the severity word parts, the row's progress text and sub-line, the now
+tag's parts) into the Kit with behaviour unchanged, so the web and the TUI
+copy one set of forms. Its criteria carry the prefix **P3**.
 
 ### Part A: PR 1, correctness in the current layout (mac)
 
@@ -808,8 +814,8 @@ non-breaking space; it never reads `100 %` for a running job unless
 8 by the engine). The fraction may fall when `scheduled` grows; the model
 reports the new value and D12's motion eases to it.
 
-Web: `jobProgress(j: JobSummary | JobStatus): JobProgress` in `helpers.ts`,
-same fields (`ring: 'none' | 'indeterminate' | { determinate: number } | { finished: number | null }`,
+Web: `jobProgress(j: JobSummary | JobStatus): JobProgress` in `helpers.ts`
+(re-cut 2026-11-02 to `jobProgress(f: JobFacts)`, D18 W2), same fields (`ring: 'none' | 'indeterminate' | { determinate: number } | { finished: number | null }`,
 `fraction`, `percentText`, `phaseLine`, `nowLine`, `helpText`). TUI:
 `pub fn progress(summary: &JobSummary, full: Option<&JobStatus>) -> JobProgress`
 in `scan/jobs.rs` with `ring: Ring`, `fraction: Option<f64>`,
@@ -1222,8 +1228,10 @@ generation, the breathing from a system-driven repeating animation; no view
 owns a `Timer` or sleeps (AC32). Web: CSS `transition` on `transform` /
 `opacity` / `width` with `var(--motion-ease-out)` and the new
 `--motion-counter` / `--motion-progress` / `--motion-stagger`; the comp's
-stylesheet is the reference; the existing global `prefers-reduced-motion`
-rule in `base.css` already zeroes durations. TUI: none.
+stylesheet is the reference. `base.css`'s global `prefers-reduced-motion`
+rule zeroes every duration with `!important`, which would also drop the
+opacity fades this table keeps, so the Jobs view's own classes override it
+inside the same media query (D18 W2, amended 2026-11-02). TUI: none.
 
 #### D13. Scan Again (decided; coordinator ruling 1)
 
@@ -1393,45 +1401,178 @@ phase word alone while running. `JobsView.tsx` renders the Overview's
 `cancelling` (`jobOf` already merges held status over the summary; it gains
 the terminal-wins rule of D2).
 
-**W2, redesign.** `JobsView.tsx` row = ring (`<svg>` circle with
-`stroke-dasharray` driven by `fraction`, `role="presentation"`) + line 1
-`<Phase> · <profile>` with elapsed trailing + line 2 host with the severity
-words trailing (`.sevWord[data-severity]` coloured by
-`--color-severity-<level>-fg`) + a 4 px rule (`width: calc(fraction *
-100%)`, `transition: width var(--motion-progress) var(--motion-ease-out)`).
-The detail: heading `<h2>` `<Phase> <host>`, the subtitle, the summary card
-(`background: var(--color-ground-raised); border-radius: var(--radius-panel)`)
-with `percentText` in `font: var(--font-weight-medium) var(--font-size-xl)
-var(--font-data)` and `font-variant-numeric: tabular-nums`, the rule, the
-Now line, the three tiles, attention lines as `<details>`, Notices, then
-the detail sections as `<details>` collapsed. End state: the sentence block
-replaces the card body (`transition: opacity var(--motion-sheet)`), the
-error in `color: var(--color-status-server-error)`, the raw line in
-`--font-size-xs` `--color-text-tertiary`. `JobStrip.tsx` shows the ring,
-`stateWords`, `percentText`, `phaseLine`, the `nowLine`, the severity words
-and elapsed; its Cancel follows the same gate. Scan Again: `store.ts` gains
-`scanAgain(job)` building `{ profile_name, overrides: { target: { origins } } }`
-and reusing the launch path's confirm handling (`launch.ts`'s
-`needs_confirmation` branch); the button sits beside Cancel in the detail
-head, `aria-label="Scan again <job>"`, `title` = the help text; a refusal is
-reported through `report('launch', …)` beside the head. The list head keeps
-`Jobs · 4` and gains `· 1 running`. Rows stay `role="option"` with
-`aria-label` = the sentence of D14; the detail region gets
-`aria-live="polite"` on the end sentence only (one announcement). The
-existing `ReconnectNote` becomes the banner text of D15 with the age from
-`jobsLoadedAt`.
+**W2, redesign (re-cut to the locked comp, 2026-11-02).** The comp is HTML
+and CSS, so the web Jobs tab reproduces `committed.html` block for block:
+one column on `--color-ground-surface` holding the bus banner (D15), the
+selected job's card, the jobs table and the two wells. The first draft's
+row + inspector layout (a two-line row over a 4 px rule, a detail pane with
+tiles) is withdrawn. W1 above is unchanged, and so are its selectors: the
+card keeps `[data-field=stopped]` (the reason line) and
+`[data-field="stopped-raw"]` (the raw line in the attention block), so AC35
+still reads them.
 
-**Amendment (2026-11-02, locked comp).** W2 above describes the first
-draft's row + inspector layout. The locked comp is HTML and CSS
-(`docs/design/mockup/scan-jobs/committed.html`), so W2 reproduces the comp's
-composition (card, lane, ledger, gauge, KPI strip, table, wells) with the
-tokens as CSS variables (`--color-ground-card`, `--shadow-float`,
-`--shadow-rest`, `--motion-counter`, `--motion-progress`, `--motion-stagger`)
-and the same derived values (`jobProgress` gains `checksToGoText`, `nowTag`,
-`estimateText`, `estimateHelp`; `findingLine`, `ledgerGroups`,
-`budgetWarning` are added to `helpers.ts` with the mac literals). The W2
-paragraph and Tasks 3.5, 3.7 and 3.8 are re-cut to the comp by a spec and
-plan amendment before Part 3 opens; W1 is unchanged.
+- **Words.** Every string is the Kit's, byte for byte, through `helpers.ts`;
+  plan Task 3.5 lists each helper with its mac counterpart and its pinned
+  literal. The helpers take one input, `JobFacts { summary: JobSummary;
+  status: JobStatus | null }`, the web's `ScanJobFacts` (the summary merged
+  by W1's `mergeJob`), so the "until the status lands" rules read as the
+  Kit's do **(Architect's call: D8's web signature `jobProgress(j:
+  JobSummary | JobStatus)` becomes `jobProgress(f: JobFacts)`)**. The well
+  rows, the severity word parts, the row's progress text, the row's
+  sub-line and the now tag's parts are copied from D21's Kit forms, never
+  re-derived. Started-by words follow the Kit's rule with the surface's own
+  client label in its first test: the mac's label is `aitm-mac`, the web has
+  none (the `/bus` carries `client_label: null`), so a job this web UI
+  started reads `by the operator`, a job the mac app started reads `by
+  aitm-mac`, and `the CLI`, `an agent` and an operator client's label read
+  as on the mac **(Architect's call)**.
+- **The card** (`JobCard.tsx`) is `<section role="region" aria-label="Selected
+  job" data-job data-state data-tone>`, the element `scan-live.mjs` already
+  calls `STRIP`. Chrome: `--color-ground-card`, a hairline of
+  `--color-line-border`, `--radius-floating`, `box-shadow:
+  var(--shadow-float)`, padding `--space-5` / `--space-6`, and a 3 px left
+  edge in the tone's colour that recolours over `--motion-popover`. Top to
+  bottom:
+  1. **Title row.** The state chip `[data-field=state]`: a 22 px pill on
+     `--radius-pill` in the tone pair (`progress` accent, `pending`
+     intercept, `success` / `danger` / `neutral` the state pairs) with a
+     6 px dot that breathes only while cancelling; the running dot is
+     static, as on the mac (D12, Part 2 ruling). The heading `<h2>` is
+     `jobHeading` in the data face at `--font-size-xxl` 600, `title` =
+     `jobHeadingHelp`. Under it the reason line `[data-field=stopped]` when
+     `reasonLine` is non-null, then the finding line `[data-field=finding]`
+     whose parts are spans with `data-role` (`figure` and `checkId` in
+     `--color-text-primary`, `checkId` in the data face, `agent` in
+     `--color-agent-base`). At the right the verbs, 32 px: `Show Site Map`
+     and `Show Issues` (outline), then one primary: `Cancel Scan` with
+     `aria-label="Cancel scan <job>"` and `title` = `CANCEL_SCAN_HELP`,
+     disabled and reading `Cancelling…` while the merged state is
+     `cancelling` or a cancel is in flight; or, for a terminal job, `Scan
+     Again` with `aria-label="Scan again <job>"` and `title` = the refusal or
+     `scanAgainHelp`. The slot is disabled while the bus is not open. A
+     Scan Again refusal reads `Unable to scan again: <text>`
+     (`[data-field=scan-again-error]`, `--color-status-server-error`) under
+     the row.
+  2. **Scan lane** `[data-field=lane]`: `role="progressbar"`,
+     `aria-label="Progress"`, `aria-valuetext` = `progressAccessibilityValue`
+     or the phase line, `data-fraction` (the fraction to 4 decimals). A 64 px
+     track (`--size-row-card`) on `--color-ground-raised` with
+     `--radius-panel`; the crawl cap in `--color-accent-deep` (labels `crawl`
+     / `46 pages`); the audit fill in `--color-accent-base` at
+     `calc((100% - var(--jobs-crawl-cap)) * var(--jobs-f))` (labels `audit` /
+     `3,236 checks done` in `--color-text-on-accent`); `checksToGoText` at the
+     right in `--color-text-tertiary`; the now mark (2 px
+     `--color-text-primary`, overshooting the track by 10 px, a 3 px halo at
+     12 %, a 10 px dot that breathes while live) at the fill's trailing
+     edge; the now tag `[data-field=now]` drawn from `nowTagParts`; the scale
+     row `started 11:32` · `elapsed 1:04` · `estimateText`
+     (`[data-field=estimate]`, `title` = `estimateHelp`). The phase variants
+     are D11 §2's. When the job ends the now tag swaps for the end sentence
+     `[data-field=end]` (`aria-live="polite"`, the only live region on the
+     tab) and the mark fades.
+  3. **Issue ledger** `[data-field=ledger]`, `role="img"`, `aria-label` =
+     `issuesTileHelp`: one `[data-severity]` group per `ledgerGroups` entry
+     with `marks` 8 × 16 marks and the count word. No element of the Jobs
+     tab carries `data-count`: the live script's step 04 counts
+     `[data-severity][data-count]` across the panel.
+  4. **Probe gauge** `[data-field=gauge]`, `role="img"`, `aria-label` =
+     `gaugeAccessibilityLabel`, `data-warn` while `budgetWarning`: a 3 px track,
+     the fill in `--color-text-tertiary` or `--color-intercept-base`,
+     `probeBudgetText` beside it.
+  5. **KPI strip** `[data-field=kpis]`: five cells labelled `KPI_LABELS` on
+     `--color-ground-surface` split by hairlines; numerals in the data face
+     at `--font-size-display`; Progress in `--color-accent-base`; units in
+     `--color-text-secondary`; the Issues words from `severityWordParts` in
+     their inks.
+  6. **Attention block** `[data-field=attention]`, only when non-empty: a
+     `<details>` per `attention` line with samples, the Failed error
+     `[data-field=error]`, the raw lines `[data-field="stopped-raw"]` and
+     `[data-field="crawl-raw"]` (data face, `--font-size-xs`, tertiary), and
+     the Notices.
+- **The table** (`JobsTable.tsx`): a header row (`aria-hidden`, 32 px,
+  `TABLE_HEADERS`, sentence case, tertiary) over the listbox
+  `role="listbox" aria-label="Jobs"` (the selector the live script and the
+  tests use; it does not change). `jobsCaption` (`4 jobs · 1 running`)
+  reaches assistive technology through `aria-describedby` on a visually
+  hidden span **(Architect's call: the mac's caption is the table's label;
+  the web keeps `Jobs` as the label because three test suites and the live
+  script select by it)**. Rows are `role="option"` with `data-job`,
+  `aria-selected` and `aria-label` = `jobAccessibilityLabel`, laid out on one
+  CSS grid with the mac's `CardMetrics` columns: State `148fr`, Profile
+  120 px, Target `220fr`, Progress `220fr`, Probes 120 px, Points 120 px,
+  Issues 124 px, Elapsed 80 px and the 84 px action column. (NOTES.md's grid
+  arithmetic, a 300 px Progress column and no Elapsed, is superseded by the
+  comp's own markup, which has both Elapsed and the action column; gap 36.)
+  Cells: State = the ring (live) or the tone dot (breathing while
+  cancelling), the agent dot when `agentOriginated`, `stateWord` in
+  `[data-field=state]` and `rowSubLine` in `[data-field=sub]`; Profile
+  `profileText`; Target `hostsText` in the data face with the full list as
+  `title`; Progress `rowText` in `[data-field=progress]`; Probes `287` with
+  ` of 2,000` muted in `[data-field=probes]`; Points `97 of 1,020` in
+  `[data-field=points]`; Issues `severityWordParts` in their inks, or `no
+  issues yet` / `no issues` tertiary, in `[data-field=issues]`; Elapsed in
+  `[data-field=elapsed]`. The action column holds the hover `Cancel`,
+  pointer-only (`aria-hidden="true"`, `tabIndex={-1}`): an `option` may not
+  own a control, and the keyboard and screen-reader path is the card's
+  `Cancel scan <job>` **(Architect's call)**. The selected row is on
+  `--color-ground-active` with a 3 px inset edge in `--color-accent-base`;
+  hover `--color-ground-hover`; 44 px rows split by `--color-line-rule`. The
+  web gets no row context menu **(Architect's call: the scanner has no
+  context-menu idiom on the web; every menu verb is on the card)**.
+- **The wells** (`JobWells.tsx`): two `<section aria-label>` wells 16 px
+  apart on `--color-ground-card` with a hairline, `--radius-floating`,
+  `box-shadow: var(--shadow-rest)` and padding `--space-4` / `--space-5`; a
+  title with its subtitle at the right; one 28 px row per `wellRows` row,
+  the cells joined by `WELL_CELL_SEPARATOR`, each cell in its ink (`value`
+  primary, `muted` tertiary, a severity its `[data-severity]` ink).
+- **Motion**, D12's table in CSS. Every duration and curve is a
+  `var(--motion-*)`; the only animated properties are `transform`,
+  `opacity`, `width`, `stroke-dashoffset`, `color` and `background-color`.
+  The entrance: the title row, the lane block (lane, ledger, gauge), the KPI
+  strip and the wells carry `.enter` with block index 0, 1, 2 and 3 and play
+  `jobsEnter` (an 8 px rise and a fade, `--motion-sheet`,
+  `--motion-ease-out`) with `animation-delay: calc(var(--motion-stagger) *
+  <index>)`; the table takes index 2 on the tab's first selection only. It
+  plays when the selection changes by a pointer, by a start or by the first
+  list, never by the keyboard; the card carries `data-generation` and
+  `data-entrance="play"` or `"none"`. The lane fill and the ring ease over
+  `--motion-progress`. A counter is a span keyed by its text: a new text
+  remounts it and `jobsTick` (from a 3 px rise at opacity 0.35,
+  `--motion-counter`) plays once, with no timer. Ledger marks rise in with
+  `jobsRise`; the chip and the edge recolour over `--motion-popover`; the
+  end swap fades with a 2 px rise over `--motion-sheet`; the hover Cancel
+  fades over `--motion-hover`; breathing is `jobsBreathe` over
+  `--motion-intercept-pulse` on `--motion-pulse`, alternate, to opacity
+  0.4, on the now mark's dot (live, not cancelling, bus open) and the
+  cancelling dots only. No Jobs view file calls `setTimeout`,
+  `setInterval` or `requestAnimationFrame`.
+- **Reduce Motion**, D12's right-hand column. `base.css` zeroes every
+  duration with `!important` under `prefers-reduced-motion: reduce`;
+  `jobs.module.css` overrides it inside the same media query with
+  class-level `!important` rules: the entrance keeps its stagger and its
+  `--motion-sheet` duration with the opacity-only keyframe `jobsEnterFade`;
+  the ledger mark arrival, the end swap and the hover Cancel keep their
+  opacity fades; the chip and the edge keep their colour transition;
+  breathing is `animation: none`; the lane, the ring and the counters are
+  left to the blanket rule (instant), and the counter keyframe loses its
+  travel.
+- **Styles** live in a new `apps/web/src/panels/scanner/jobs.module.css`
+  (`scanner.module.css` keeps the other tabs'). A metrics block on `.jobs`
+  declares every geometric constant once as a `--jobs-*` custom property
+  (the web's `CardMetrics`; plan Task 3.7 lists the names); no `px`, `ms`
+  or colour literal appears outside it; colours are only `var(--color-*)`;
+  severity inks appear only on `[data-severity=…]` selectors.
+  `styles.test.ts` pins all of it.
+- **The rest of W2 stands:** Scan Again in `store.ts` / `launch.ts` (`{
+  profile_name, overrides: { target: { origins } } }`, the launch path's
+  confirm handling, a refusal through `report('launch', …)`); D15's banner
+  above the card (`linkBannerText`, the age from `jobsLoadedAt`); every
+  control disabled while the bus is not open; the empty state reads the
+  Kit's `No jobs yet — pick a profile and Start Scan.` with an `Open
+  Profiles` button. The old `JobStrip` is hidden on the Jobs tab (the card
+  is the selected job's region there) and stays on the other tabs, without
+  its severity bar, reading `stateWord`, `rowText`, `severityWords` and the
+  elapsed time.
 
 #### D19. TUI (`crates/aitm-tui/src/scan/jobs.rs`, `ui/scan/jobs.rs`)
 
@@ -1474,6 +1615,89 @@ banner (the Jobs error banner already carries the last error; it gains the
 age clause `showing values from 42s ago`), Scan Again (no key is added; the
 `s` start key from Profiles is the way; a follow-up may bind `a`).
 
+**Note (2026-11-02, Part 3/4 re-cut).** T1 and T2 read D21's Kit forms as
+their parity source (plan Tasks 4.1 and 4.2 name each). The TUI decodes the
+engine's own `aitm_scan_model::StoppedReason` and `CrawlErrorKind`, closed
+enums with no unknown variant, so an unknown wire token fails the whole
+`JobStatus` parse there: P8 (`Stopped early for a reason this app does not
+know.`) cannot be reached in the TUI and is excluded from its copy of the
+pin with a test comment, and P14's unknown crawl error is pinned through
+`Transport` / `Other` (`the connection failed`). A lenient `Other(String)`
+variant in the model crate is an engine-lane follow-up, not Part 4.
+
+**Amendment (2026-11-02, Task 4.6 live proof run 1: the hung core).** T2's
+"the Jobs error banner already carries the last error" is wrong for a core
+that stops answering without closing its socket. After `kill -STOP` of the
+core the TUI showed its stale rows for 75 s with no banner at all. The TUI
+bus client (`crates/aitm-tui/src/bus.rs`) has no per-request timeout (only
+the 500 ms → 10 s reconnect back-off after a transport failure) and its
+session serves one call at a time; the TCP connection stays open, so the
+in-flight `scan.list` never returns, no error reply or transport failure
+happens, `JobsState::error` stays empty and the age clause has nothing to
+attach to. This is the TUI's own C12 (the mac's bus client times a read out
+after 30 s, D6; the web tells an open socket from a closed one). The Jobs
+view therefore gains a **hung-core detector** in the reducer:
+
+- **What it watches: the one `scan.list` in flight** (single-slot tag
+  `scan.list`; Architect's call). `JobsState.list_sent_at_tick: Option<u64>`
+  is the tick that list left, cleared when its reply settles (ok or error)
+  and when the bus drops. `scan.status` / `scan.cancel` are not watched: the
+  session is sequential, so a hung core holds every call and a list is
+  always among them within one list period (10 s while the Scan view is
+  shown); the list is the read the age clause counts from, so the banner's
+  two clauses speak of the same read; and a `scan.list` error is cleared by
+  the very fold that ends the hang, with no new clearing rule (a keyed
+  `scan.status:<job>` error would need H66's rules).
+- **When: `LIST_OVERDUE_TICKS = 80`, 20 s at 250 ms a tick** (Architect's
+  call). `list_overdue(now, list_sent_at_tick, 80)` is `now − sent ≥ 80`,
+  the comparison of the reducer's `due`. Why 20 s: the values on screen are
+  normally 0–10 s old (one list period), so a list outstanding for two whole
+  periods has certainly missed a beat; a shorter limit would flag a list
+  merely queued behind one slow call on the sequential session (a large
+  import, a `poc.run`); the mac's 30 s client timeout is the upper
+  reference, and the TUI should not be the slowest surface to notice. On
+  the steady cadence a list leaves on every fortieth tick, so the banner
+  first appears 20–30 s after the freeze and its first age reads `30s`
+  (`29s` when the last list took a tick to fold): `LIST_POLL_TICKS +
+  LIST_OVERDUE_TICKS` = 120 ticks since the last fold. A list sent off the
+  cadence (opening the view, a `not_found` self-heal) can make the first age
+  as low as `20s`.
+- **What it says.** It records `ScanError::uncoded("scan.list", "the bus did
+  not reply in time")` through `ScanState::set_error` (the Jobs slot and
+  `last_error`), so the existing banner reads `scan.list: the bus did not
+  reply in time · showing values from 30s ago` and the clause keeps
+  counting. The core text is the mac's (`Unable to list jobs: the bus did
+  not reply in time.`); the form is the TUI's `<verb>: <detail>` (D9 of the
+  TUI spec). No toast: the banner stands, and the mac does not toast either
+  (Architect's call).
+- **What it does not do.** The request is not cancelled (the client has no
+  cancel, and the tag dedupe keeps a second list from leaving while one is
+  held). The detector fires once per request: it takes `list_sent_at_tick`
+  when it fires and re-arms when the next list leaves. A late reply folds as
+  today: `scan_reply` clears the `scan.list` error, `listed_ok_at_tick` is
+  stamped, and the banner and its clause go. A late error reply replaces the
+  sentence with its own text.
+- **`x` while the core is not answering: refused** (Architect's call, after
+  D6's rule that the mac disables Cancel while `!link.verbsEnabled`).
+  `JobsState::unanswered()` is true while the Jobs error is this sentence
+  under `scan.list`; `x` then sends nothing and toasts `scan.cancel not
+  sent: the bus did not reply in time` (Warn). The session is sequential, so
+  a cancel pressed now would queue behind the hung call and fire whenever
+  the core wakes, unseen; the banner cannot carry a notice here (the error
+  outranks the notice), hence the toast. `x` works again once a list folds.
+
+A client-side timeout in `bus.rs` is not this fix: it belongs to the shared
+bus client and every TUI call, not the Jobs view, and is a follow-up. AC43's
+live literal and AC60 follow this amendment (plan Task 4.5a, gap 66).
+
+**Note (2026-11-02, Part 4 panel round 1).** The `points` detail line groups
+every count it carries (`found 1,020 · queued 12 · audited 1,008 · 722
+skipped as repetitive · 6 skipped by rule · 0 skipped at the per-request
+cap`), like the Kit's Points rows: the skip words are grouped by the Kit
+text, so an ungrouped `found 1020` beside `1,200 skipped by rule` would be
+the inconsistency. The sibling label-value lines (`crawl`, `checks`, …) keep
+their plain numbers (coordinator ruling; plan gap 68).
+
 ### Part D: testing
 
 #### D20. Tests per surface and the live proof
@@ -1501,9 +1725,11 @@ age clause `showing values from 42s ago`), Scan Again (no key is added; the
   mac tests; `live.test.ts` pins the W1 re-read (a list that turns a job
   terminal while the held status is running issues one `scan.status`);
   `JobsView.test.tsx` pins the row text, the stopped sentence plus raw line,
-  the disabled Cancel while cancelling, Scan Again's arguments; `styles.test.ts`
-  pins that `scanner.module.css` uses only `var(--…)` colours, radii and
-  durations.
+  the disabled Cancel while cancelling, Scan Again's arguments, the entrance
+  rule; `JobCard.test.tsx`, `JobsTable.test.tsx` and `JobWells.test.tsx` pin
+  the comp's blocks (D18 W2); `styles.test.ts` pins that `scanner.module.css`
+  and `jobs.module.css` use only `var(--…)` colours, radii and durations, and
+  that `jobs.module.css` keeps its geometric literals in its metrics block.
 - **TUI, unit** (`cargo test -p aitm-tui`): `scan/jobs.rs` tests pin
   `progress`, `progress_bar`, `end_sentence`, `stopped_text`,
   `crawl_error_words`, `fold_list` follow-ups for a terminal-vs-stale job,
@@ -1546,9 +1772,127 @@ age clause `showing values from 42s ago`), Scan Again (no key is added; the
   app + real core + headless Chrome; merged in #293 and wrapped by the e2e
   cell `test_t8_web_live`), extended with steps for the Jobs view states;
   `scripts/shot.mjs` only for stills. Its step 03c races at phase
-  boundaries, so a new step polls the terminal *state*, never the word. TUI:
+  boundaries, so a new step polls the terminal *state*, never the word. The
+  harness writes its audit logs under its own run directory
+  (`fix/web-harness-audit-log`, its own PR off `main`, merged before the
+  proof), so the proof may read that log and never touches the operator's.
+  TUI:
   a pty recording of the Jobs tab through the same job. The frames go to
   `docs/design/evidence/jobs-view-<date>/` in the PR.
+
+### Part E: Kit rows and parts (mac PR 3, the parity source)
+
+#### D21. Kit rows and parts (plan gap 39)
+
+The Part 2 panel accepted five view-side derivations for PR 2 on one
+condition: they move into the Kit before the parity parts open, so the web
+and the TUI copy one set of forms instead of re-deriving them (plan gap 39;
+Review log, Part 2 round 1, quality). PR 3 does that and nothing else.
+Nothing on screen changes. Everything below is in `ScanSurface.swift`:
+
+```swift
+extension ScanLane {
+    /// HTTP 0, WebSocket 1, L4 packet 2, L4 stream 3, anything newer 4.
+    var displayOrder: Int { get }            // internal; replaces GroupKey.laneOrder and the wells' copy
+}
+
+/// One skipped-points row of the Crawl well.
+public struct ScanPointSkipWords: Equatable, Sendable {
+    public var count: Int                    // 722
+    public var words: String                 // "skipped as repetitive"
+    public var text: String { get }          // "722 skipped as repetitive"
+}
+
+/// One value of a well row and the ink it is drawn in.
+public struct ScanWellCell: Equatable, Sendable {
+    public enum Ink: Equatable, Sendable { case value, severity(ScanSeverity), muted }
+    public var text: String
+    public var ink: Ink
+}
+public struct ScanWellRow: Equatable, Sendable {
+    public var key: String
+    public var cells: [ScanWellCell]
+    public var text: String { get }          // the cells joined by ScanFormat.wellCellSeparator
+}
+public struct ScanWellRows: Equatable, Sendable {
+    public var crawl: [ScanWellRow]
+    public var issues: [ScanWellRow]
+}
+
+extension ScanFormat {
+    public static let wellCellSeparator = " · "
+    public static func pointSkipWords(_ skipped: ScanPointCounters.Skipped) -> [ScanPointSkipWords]
+    public static func wellRows(_ facts: ScanJobFacts) -> ScanWellRows
+    public static func severityWordParts(by: BySeverity) -> [(severity: ScanSeverity, word: String)]
+}
+extension ScanJobProgress {
+    public var rowText: String               // the table's Progress cell
+    public var nowTagParts: [ScanFindingLine.Part]?
+}
+extension ScanEndText {
+    public static func reasonLine(_ facts: ScanJobFacts) -> String?
+    public static func rowSubLine(_ facts: ScanJobFacts) -> String?
+}
+```
+
+Rules, each a copy of what PR 2's views compute at 2a5c6b98:
+
+- **`wellRows`** returns the wells' rows in D11's order. Crawl and points:
+  Pages fetched, Pages waiting, Depth, Forms submitted, Forms not submitted
+  (status values, `—` until the status lands), Crawl errors (only when
+  `crawl.errors > 0`), Points found, Waiting for audit, Audited (summary
+  values), the three skipped-points rows (key = the words, one cell = the
+  grouped count: `skipped as repetitive` → `722`), Lanes (one cell, `HTTP,
+  WebSocket`, or `—`), one `Lane skipped` row per `lanes.skipped` entry
+  (`skippedLaneWords`), Probes by lane (one cell per lane in `displayOrder`
+  then wire name, `HTTP 240` · `WebSocket 47`; one `—` when the bus listed
+  none), Session (only with `status.session`: four cells, reused · lost ·
+  canary · browser partial), and the four L4 rows (only with `status.l4`).
+  Issues: `Critical · High · Medium` (three cells), Low, Info, `Certain ·
+  Firm · Tentative` (three), `Probe errors · timeouts · rate waits` (three),
+  `Checks scheduled · done · errors · skipped` (four, or one `—` before the
+  status lands). Inks: `.severity(level)` for a severity count above zero,
+  `.muted` for a severity count of zero, `.value` for everything else,
+  `—` included.
+- **`pointSkipWords`** returns `frequent` / `skipped as repetitive`,
+  `ignored` / `skipped by rule`, `limit` / `skipped at the per-request cap`,
+  in that order, zeros included; `text` is today's sentence.
+- **`severityWordParts`** is `ledgerGroups(by:)` mapped to `(severity,
+  word)`: one word rule. The labelled tuple keeps every `.0` / `.1` read
+  compiling. `severityWords` and `issuesTileHelp` read it, and the app draws
+  it through one builder, `ScanSeverityWordsText` in
+  `ScanProgressViews.swift`, in the table's Issues cell (data face) and the
+  KPI Issues cell (UI face). The table cell's `HStack` of words becomes one
+  interpolated `Text`, so a long cell truncates at its tail as one line
+  **(Architect's call)**.
+- **`rowText`** is set in the same switch of `ScanJobProgress.init` that
+  sets `phaseLine`: `—` whenever no status has landed (any state), while
+  queued and for an unknown state; `50 % · 3,236 of 6,468` while running or
+  cancelling in auditing with something scheduled, `Scheduling checks` with
+  nothing scheduled; the crawl line (`46 pages, 12 queued`) while crawling;
+  `Passive checks`; `Writing results`; the phase word for a phase D8 does
+  not name; `3,236 of 6,468` for a terminal job (`0 of 0` included).
+  `rowProgressText(_:_:)` stays and returns `progress.rowText`.
+- **`reasonLine`** is `ScanEndText.stoppedReason(reason, state:,
+  probesBudget: summary.probes.budget, error: status.error)` when the merged
+  state is terminal, a status has landed and it carries a `stopped_reason`;
+  nil otherwise (and `stoppedReason`'s own nils stand: `cancelled` on a
+  cancelled job, `failed` with an error). `findingLine(_:timeZone:).reason`
+  is `reasonLine(facts)`.
+- **`rowSubLine`** is `reasonLine`, else the first non-empty line of
+  `status.error` for a terminal job; nil for a live job, before the status
+  lands, and when neither exists.
+- **`nowTagParts`** is `now · ` (`.plain`), the first running id
+  (`.checkId`) and, for more than one, ` and <n> more` (`.plain`); joined,
+  it is `nowTag`; nil with it. The lane inks the id by its role instead of
+  finding it inside the sentence.
+
+In the app target the wells render `wellRows` (the view's `ScanWellRow`
+typealias, its row builders and its `laneOrder` copy go), the row's sub-line
+reads `rowSubLine`, the lane's now tag renders `nowTagParts`, and
+`ScanCheckTree.GroupKey` sorts by `displayOrder`. The web (plan Task 3.5)
+and the TUI (Tasks 4.1, 4.2) copy these forms; the parity pin P1–P23 does
+not move.
 
 ## Acceptance criteria
 
@@ -1556,7 +1900,7 @@ Each criterion is either a unit test of a pure function with a literal
 expected value, or an observation on the real app with a real core and real
 traffic (`aitm-testtarget-serve --latency-ms 400`, a dead port for the
 connect-refused case). Prefixes: **P1** = mac PR 1, **P2** = mac PR 2,
-**W** = web, **T** = TUI. Each cites the finding (C1–C12) or the state-table
+**P3** = mac PR 3 (D21), **W** = web, **T** = TUI. Each cites the finding (C1–C12) or the state-table
 row it closes.
 
 ### PR 1 (mac, correctness)
@@ -1942,23 +2286,85 @@ Locked-comp additions (numbered after the existing 43 so no reference moves):
     fact reads the sentence and a `[data-field="stopped-raw"]` element
     reads `stopped_reason: errors`; the detail Cancel is disabled while the
     merged state is `cancelling`.
-36. **AC36 (W2, D18; unit).** `jobProgress` matches AC13's table
-    (`percentText === '50 %'`, `phaseLine === '3,236 of 6,468 checks'`,
-    crawling fraction `0.7931 ± 0.0001`); `endSentence` matches AC15's three
-    sentences byte for byte; `crawlTroubleText` and `crawlErrorWords` match
-    AC9.
-37. **AC37 (W2, D18; unit + live).** A row renders the ring `<svg>`, `Auditing
-    · standard`, the host, `4 low` in `.sevWord[data-severity="low"]`, and a
-    rule whose inline width is `50%` for `3236 / 6468`; Scan Again sends
-    `scan.start` with `{ profile_name, overrides: { target: { origins } } }`
-    (store test); `styles.test.ts` finds no literal colour, radius or `ms`
-    duration in `scanner.module.css`. Live: `scripts/scan-live.mjs` (with
-    Jobs-view steps added) captures running, cancelled and the dead-target
-    done states showing the same sentences as AC16.
-38. **AC38 (W2, D18; unit).** The `ReconnectNote` text with `jobsLoadedAt`
-    42 s old reads `Bus disconnected · showing values from 0:42 ago ·
-    reconnecting…`; every control in the Jobs view is disabled while the bus
-    is not open (existing test extended to Scan Again).
+36. **AC36 (W2, D18, D21; unit).** `helpers.test.ts`: `jobProgress` matches
+    AC13's table and the D8 amendment (`percentText === '50 %'`,
+    `phaseLine === '3,236 of 6,468 checks'`, crawling fraction `0.7931 ±
+    0.0001`, `checksToGoText === '3,232 checks to go'`, `nowTag === 'now ·
+    xss-reflected and 3 more'`, `estimateText === 'at this pace, about 1:04
+    to go'`) and its `rowText` the AC54 forms; `endSentence` matches AC15's
+    three sentences; `crawlTroubleText` and `crawlErrorWords` match AC9;
+    `wellRows`, `pointSkipWords`, `severityWordParts`, `reasonLine`,
+    `rowSubLine` and `nowTagParts` return AC51–AC56's literals for the same
+    inputs; `findingLine` for a web-started job (`frontend: 'operator'`,
+    `client_label: null`) reads `4 low issues so far · xss-reflected and 3
+    more checks running now · standard · started 11:32 by the operator`;
+    every other Kit word of plan Task 3.5's table equals its literal; P1–P23
+    are present verbatim.
+37. **AC37 (W2, D18; unit).** `JobCard.test.tsx`, `JobsTable.test.tsx`,
+    `JobWells.test.tsx`, `JobsView.test.tsx`: for the comp's running job
+    (`standard` on `127.0.0.1:8117`, 3,236 of 6,468, 287 of 2,000 probes, 97
+    of 1,020 points, 4 low, four running ids) the region `Selected job` has
+    `data-job`, a `[data-field=state]` chip reading `Auditing`, an `<h2>`
+    reading `127.0.0.1:8117`, a finding line that starts `4 low issues so far
+    · xss-reflected and 3 more checks running now · standard · started ` and
+    ends ` by the operator`, the buttons `Show Site
+    Map`, `Show Issues` and `Cancel scan <job>` (enabled), a lane with
+    `data-fraction="0.5003"` and `aria-valuetext="50 percent"`, a now tag
+    `now · xss-reflected and 3 more`, four `[data-severity="low"]` marks and
+    `4 low`, a gauge labelled `Probe budget, 287 of 2,000` without
+    `data-warn`, and KPI cells `50 %`, `3,236` + `of 6,468`, `287` + `of
+    2,000`, `97` + `of 1,020`, `4` + `4 low`; the listbox `Jobs` row reads `Auditing`,
+    `standard`, `127.0.0.1:8117`, `50 % · 3,236 of 6,468`, `287 of 2,000`,
+    `97 of 1,020`, `4 low`, `1:04`; the wells hold AC51's rows. A click on a
+    row bumps the card's `data-generation` with `data-entrance="play"`; an
+    ArrowDown changes `data-job` with the generation unchanged and
+    `data-entrance="none"`. The dead-target status renders `Stopped early:
+    too many errors from the target.` in `[data-field=stopped]`, `7 checks
+    could not run` in the attention block and `stopped_reason: errors` in
+    `[data-field="stopped-raw"]`; a `done` job shows `Scan again <job>`, and
+    clicking it sends `scan.start` with `{ profile_name, overrides: { target:
+    { origins } } }` (store test). On the Jobs tab exactly one `Selected
+    job` region exists and it is the card; on the Issues tab it is the strip.
+    `styles.test.ts` passes on `jobs.module.css` (plan Task 3.7: no colour,
+    `px` or `ms` literal outside the metrics block, the metrics names, the
+    severity and tone selectors, the animated-property list, the
+    reduced-motion overrides). Its live half is AC58 and AC59.
+38. **AC38 (W2, D18; unit).** The banner above the card reads `Bus
+    disconnected · showing values from 0:42 ago · reconnecting…` with
+    `jobsLoadedAt` 42 s old; while the bus is not open every control of the
+    Jobs tab is disabled (the card's verbs, Scan Again, the row's hover
+    Cancel), the card's now dot does not carry the breathing class, and the
+    rows keep their values.
+
+Live web criteria (numbered after AC57 so no reference moves):
+
+58. **AC58 (W2, D18, D20; live).** `apps/web/scripts/scan-live.mjs` with
+    its Jobs-view steps, on a real `aitm web` and core from the branch,
+    `aitm-testtarget-serve --latency-ms 400` and a dead port in scope,
+    passes: (a) running/auditing with the now mark: the chip reads
+    `Auditing`, the now tag names the witness's `checks.running[0]`, the
+    lane's `data-fraction` is within 0.02 of `done / scheduled` from the
+    concurrent `scan.status`, the KPI Progress numeral within 1 of
+    `floor(100 * done / scheduled)`, and the row's progress text starts with
+    the same percent; (b) cancelled: one press of the card's `Cancel scan
+    <job>`, the chip reads `Cancelled` and the end sentence is `Cancelled
+    after m:ss; N of M checks had run. What it found stays.` with the
+    witness's numbers, and the run directory's audit log holds exactly one
+    `scan.cancel` for the job; (c) dead-target done: `[data-field=stopped]`
+    reads `Stopped early: too many errors from the target.`, the open
+    attention line reads `<n> checks could not run` with `n` = the witness's
+    `checks.errors`, and `stopped_reason: errors` is the only `errors` token
+    inside the card. Each state's capture follows a poll of the witness's
+    `scan.status` *state*, never the rendered word, and its JSON is kept
+    beside the still.
+59. **AC59 (W2, D18; live).** Stills at 1440 × 900 of the running,
+    cancelled and dead-target states sit beside `committed-1440.jpg` in the
+    evidence README with a block-by-block row (card chrome and edge, chip,
+    heading and finding line, verbs, lane, ledger, gauge, KPI strip, table,
+    wells); the written harness config carries `mcp.audit_log` and
+    `ca.audit_log` under the run directory, quoted; and the size and
+    sha256 of Matt's real `audit.jsonl` and `ca-audit.jsonl` are the same
+    before and after the run.
 
 ### TUI parity
 
@@ -1982,8 +2388,9 @@ Locked-comp additions (numbered after the existing 43 so no reference moves):
     Some(full))` gives `fraction ≈ 0.5003`, `phase_line == "3,236 of 6,468
     checks"`; `progress_bar(Some(0.5), 6) == "━━━───"`, `progress_bar(None,
     6) == "──────"`, `progress_bar(Some(1.0), 6) == "━━━━━━"`;
-    `end_sentence(done, 69_000, 1020, 6468) == "Done in 1:09 · 1,020 points
-    · 6,468 checks."`; `state_phase_text(Running, Auditing) == "auditing"`, `(Cancelling, Auditing) == "cancelling"`,
+    `end_sentence(Done, 69_000, 1020, 0, 6468) == Some("Done in 1:09 · 1,020
+    points · 6,468 checks.")` (state, elapsed, points found, checks done,
+    checks scheduled: the five arguments of plan Task 4.1; gap 65); `state_phase_text(Running, Auditing) == "auditing"`, `(Cancelling, Auditing) == "cancelling"`,
     `(Done, Done) == "done"`.
 42. **AC42 (T2, D19; unit).** The header line reads `job  profile  targets
     state  progress  budget  points  issues  el.` in the full layout; a row
@@ -1993,10 +2400,129 @@ Locked-comp additions (numbered after the existing 43 so no reference moves):
     label-value lines.
 43. **AC43 (T2, D19; live).** A pty recording of `aitm tui` on the Jobs tab
     through a `standard` job shows the progress column rising, the detail's
-    `now` line, `x` producing `cancelling` then `cancelled`, and the
+    `now` line, `x` producing the reply's state (`cancelling` while the engine still drains probes, else `cancelled` within a tick; plan gap 73) then `cancelled`, and the
     detail's first line `Cancelled after …; … of … checks had run. What it
-    found stays.`; the Jobs banner after `kill -STOP` carries `showing values
-    from 4xs ago`.
+    found stays.`. After `kill -STOP` of the core, within 31 s a frame shows
+    the Jobs banner `scan.list: the bus did not reply in time · showing
+    values from <N>s ago` with N from 20 to 30 on its first frame (`29` or
+    `30` on the steady list cadence, D19 amendment), and a frame 5 s later
+    reads N + 5 (± 1); after `kill -CONT`, within 5 s a frame shows neither
+    `did not reply` nor `showing values`. (Amended 2026-11-02: the first
+    draft's `4xs` assumed an error the TUI never produced; plan gap 66.)
+60. **AC60 (T2, D19 amendment; unit).** `list_overdue(119, Some(40), 80) ==
+    false`, `list_overdue(120, Some(40), 80) == true`, `list_overdue(500,
+    None, 80) == false`, `list_overdue(10, Some(40), 80) == false`. Through
+    the app: a `scan.list` that leaves at tick 40 and gets no reply sets no
+    Jobs error by tick 119; at tick 120 the Jobs error reads `scan.list: the
+    bus did not reply in time`, the banner row ends `scan.list: the bus did
+    not reply in time · showing values from 30s ago` (last fold at tick 0),
+    `scan.list` is still in flight and no second `scan.list` left between
+    ticks 41 and 120; `x` on the running job then sends nothing and toasts
+    `scan.cancel not sent: the bus did not reply in time`; the late list
+    reply at tick 121 clears the banner (no `showing values`), stamps
+    `listed_ok_at_tick == Some(121)` and `unanswered()` reads false.
+61. **AC61 (T2, D19, D20; acceptance cell).** `python3 -I
+    tests/e2e/tui/test_tui_scan_live.py --selftest` exits 0 with its Jobs
+    fixture drawn with the header `job  profile  targets  state  progress
+    budget  points  issues  el.`; `row_state` reads `crawling`, `auditing`
+    and `cancelled` off the new rows and returns `None` for an old-shape
+    cell (`running/crawl`, `running/audit`, `cancelled/done`: the negative
+    control); `row_probes` reads the budget cell (`418/2000` → `(418,
+    2000)`), not the progress cell, also when the progress cell is `...`;
+    one Terminal run of the cell against the real core exits 0 (plan Task
+    4.6).
+
+### Kit rows and parts (mac PR 3)
+
+51. **AC51 (P3, D21; unit).** `ScanFormat.wellRows` for a running auditing
+    job with crawl pages 46, queued 12, depth 3, forms submitted 5, forms
+    skipped 2, crawl errors 1; points found 1,020, queued 923, audited 97,
+    skipped frequent 722 / ignored 6 / limit 0; lanes run `http`, `ws` and
+    skipped `l4_stream` (`no L4 scope entry`); probes by lane `ws` 47, `http`
+    240 (in that wire order); the fixture's session; L4 cases 1,024, crashes
+    0, liveness failures 2, retired elements 7; issues 1 high, 4 low;
+    confidence 1 / 2 / 2; probe errors 0, timeouts 3, rate waits 1; checks
+    scheduled 6,468, done 3,236, errors 7, skipped 3 gives the crawl rows
+    `(key, text)` in this order: (`Pages fetched`, `46`), (`Pages waiting`,
+    `12`), (`Depth`, `3`), (`Forms submitted`, `5`), (`Forms not submitted`,
+    `2`), (`Crawl errors`, `1`), (`Points found`, `1,020`), (`Waiting for
+    audit`, `923`), (`Audited`, `97`), (`skipped as repetitive`, `722`),
+    (`skipped by rule`, `6`), (`skipped at the per-request cap`, `0`),
+    (`Lanes`, `HTTP, WebSocket`), (`Lane skipped`, `L4 stream: no L4 scope
+    entry`), (`Probes by lane`, `HTTP 240 · WebSocket 47`), (`Session`, `yes ·
+    no · ok · no`), (`L4 cases`, `1,024`), (`L4 crashes`, `0`), (`L4 liveness
+    failures`, `2`), (`L4 retired elements`, `7`); and the issue rows
+    (`Critical · High · Medium`, `0 · 1 · 0`) with inks `[.muted,
+    .severity(.high), .muted]`, (`Low`, `4`) with `[.severity(.low)]`,
+    (`Info`, `0`) with `[.muted]`, (`Certain · Firm · Tentative`, `1 · 2 ·
+    2`), (`Probe errors · timeouts · rate waits`, `0 · 3 · 1`), (`Checks
+    scheduled · done · errors · skipped`, `6,468 · 3,236 · 7 · 3`), every
+    cell not named here `.value`. With no status the crawl rows have no
+    `Crawl errors`, `Lane skipped`, `Session` or L4 row, and `Pages
+    fetched` … `Forms not submitted`, `Lanes` and the Checks row read `—`.
+52. **AC52 (P3, D21; unit).** `pointSkipWords(Skipped(ignored: 6, frequent:
+    722, limit: 0))` is `[(722, "skipped as repetitive"), (6, "skipped by
+    rule"), (0, "skipped at the per-request cap")]` and its `.map(\.text)`
+    is `["722 skipped as repetitive", "6 skipped by rule", "0 skipped at the
+    per-request cap"]`; `(ignored: 1200, frequent: 0, limit: 3)` maps to
+    `["0 skipped as repetitive", "1,200 skipped by rule", "3 skipped at the
+    per-request cap"]`. `[.other("quic"), .l4Stream, .ws, .l4Packet,
+    .http]` sorted by `displayOrder` is `[.http, .ws, .l4Packet, .l4Stream,
+    .other("quic")]`, and the check-tree pins
+    `checkTreeGroupsAndKeepsOneSelection` and
+    `checkTreeListsAMultiLaneCheckUnderEachLane` pass unchanged.
+53. **AC53 (P3, D21; unit).** `severityWordParts(by: 2 critical, 1 medium,
+    5 info)` has `.map(\.word) == ["2 critical", "1 medium", "5 info"]` and
+    `.map(\.severity) == [.critical, .medium, .info]`; for that tally and
+    for `(1 high, 3 low)`, `(30 low)` and `(zero)` its words equal
+    `ledgerGroups(by:).map(\.word)`; the existing `.0` / `.1` pins in
+    `rowWordsAndCaption`, `kitHalvesOfTheCardLiveProofs` and
+    `anOversizedPageDecodesWhole` compile and pass unchanged.
+54. **AC54 (P3, D21; unit).** `ScanJobProgress(f).rowText` equals
+    `ScanFormat.rowProgressText(f, ScanJobProgress(f))` as it stood at
+    2a5c6b98 for all 43 facts of the AC32 sweep (7 states × 6 phases + one
+    unread), proved before `rowProgressText` forwards; and reads `50 % ·
+    3,236 of 6,468` (auditing, U+00A0 before `%`), `46 pages, 12 queued`
+    (crawling), `Passive checks`, `Scheduling checks` (auditing, 0
+    scheduled), `Writing results`, `—` (queued), `6,468 of 6,468` (done),
+    `3,236 of 6,468` (cancelled), `0 of 0` (done, nothing scheduled), `50 %
+    · 3,236 of 6,468` (cancelling), `—` (done without a status) and `—`
+    (running without a status).
+55. **AC55 (P3, D21; unit).** `reasonLine` / `rowSubLine`: `done` +
+    `errors` → both `Stopped early: too many errors from the target.`;
+    `done` + `budget` with `probes.budget` 2000 → both P4; `failed` +
+    `failed` + error `"boom\nsecond"` → nil / `boom`; `failed`, no reason,
+    error `"\nboom"` → nil / `boom`; `failed`, no reason, error `""` → nil /
+    nil; `cancelled` + `cancelled` → nil / nil; `running` + `errors` → nil /
+    nil; `done` without a status → nil / nil (the two newline cases are
+    built on the decoded status; the wire decoder strips newlines, plan gap
+    70). Over the AC32 sweep `findingLine(f, timeZone:).reason ==
+    reasonLine(f)`.
+56. **AC56 (P3, D21; unit).** `nowTagParts` for four running ids is
+    `[("now · ", .plain), ("xss-reflected", .checkId), (" and 3 more",
+    .plain)]`, for one id `[("now · ", .plain), ("xss-reflected",
+    .checkId)]`, for none nil; over the AC32 sweep the parts joined equal
+    `nowTag`.
+57. **AC57 (P3, D21; gate + live).** `grep -nE 'typealias
+    ScanWellRow|func laneOrder|func skipRow|isNewline|ScanInked\.token'` over
+    the four Jobs view files and `grep -rn 'func laneOrder'
+    apps/mac/Sources/AitmproxyKit` print nothing; the PR 2 pins `rowWordsAndCaption`,
+    `headingAndFindingLine`, `ledgerTonesAndGauge`,
+    `wellWordsForSkippedLanesSessionAndL4`, `jobProgressFollowsTheDerivedRule`,
+    `jobsWordsAvoidTheBannedTerms`, `endTextIsTheSpecsSentences`,
+    `ScanJobsViewPinsTests.kitHalvesOfTheCardLiveProofs`,
+    `.wordsSurviveWhatTheDecoderLetsThrough` and
+    `.jobsViewsCarryNoLiteralsOrTimers` (still `metricsLines == 40`), and
+    `ScanModelTests.anOversizedPageDecodesWhole` pass, with exactly two
+    mechanical edits (the two `pointSkipWords` comparisons in
+    `ledgerTonesAndGauge` and the sweep's `pointSkipWords` term read
+    `.map(\.text)`); the mac gate is green. Live: on the dev bundle with a
+    real core, each well row of a running `standard` job reads the Kit's
+    `wellRows(facts).text` for the concurrent `scan.status`, the finished
+    `light-http` row's Issues cell and KPI Issues cell read `1 high, 2 low`
+    in their inks, the dead-target row's sub-line reads `Stopped early: too
+    many errors from the target.`, and the now tag names the concurrent
+    `checks.running[0]` in the data face.
 
 ## Left to the builder
 
@@ -2008,6 +2534,11 @@ Locked-comp additions (numbered after the existing 43 so no reference moves):
   AC50 holds and keyboard selection shows none.
 - The attention disclosures' default open/closed state.
 - Whether the chip draws its 6 pt dot (the comp does; it is static while running and breathes while cancelling — ruled at the Part 2 panel, 2026-11-02).
+- Web: how the indeterminate ring looks (a static or slowly turning arc
+  within the motion tokens; static under Reduce Motion), how the now tag is
+  clamped inside the track (CSS `clamp()` or a measurement), and whether the
+  stills of AC59 come from the live driver's own browser at 1440 × 900 or
+  from `shot.mjs`.
 
 ## Open questions
 
@@ -2034,5 +2565,23 @@ autonomous mode; Matt may overrule any of them at the PR 2 review:
    job scans over). The word never appears on screen (the element's
    accessibility label is `Progress`; its segments read `crawl` / `audit`),
    so the glossary is untouched; the view type is `ScanJobLane` (`ScanLane` is the Kit's lane enum).
-7. Web W2 is re-cut to the comp before Part 3 opens (D18 amendment); the
-   TUI keeps its own layout and gains only the derived words.
+7. Web W2 is re-cut to the comp (D18 W2, 2026-11-02); the TUI keeps its
+   own layout and gains only the derived words.
+8. The Part 3/4 re-cut (2026-11-02) added these calls: the web helpers take
+   `JobFacts`, not a summary-or-status (D18 W2); the web's started-by words
+   use its own client label, none, so web-started jobs read `by the
+   operator` and mac-started ones `by aitm-mac`; the listbox keeps the label
+   `Jobs` and carries `jobsCaption` as its description; the row's hover
+   Cancel is pointer-only and the web has no row context menu; the table
+   cell's severity words become one `Text` on the mac (D21); PR 3 proves
+   "behaviour unchanged" by its pins and one short live check.
+9. The Part 4 hung-core amendment (2026-11-02, D19) added these calls: the
+   TUI watches the one `scan.list` in flight, not `scan.status` /
+   `scan.cancel`; it declares the core not answering after 80 ticks (20 s);
+   it says `scan.list: the bus did not reply in time` through the existing
+   Jobs banner and age clause, with no toast; the request is not cancelled
+   and a late reply clears the banner; `x` is refused with the toast
+   `scan.cancel not sent: the bus did not reply in time` while the sentence
+   stands; a client timeout in the TUI's bus client is a follow-up. The
+   acceptance cell's evidence keeps its JSON key names
+   (`screen_state_phase`, `screen_sent`) across the row re-pin.
