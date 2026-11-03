@@ -1,0 +1,24 @@
+[22:26:27] == target on 8117 (latency 400 ms)
+[22:26:27] == server
+Connection to 127.0.0.1 port 19190 [tcp/*] succeeded!
+[22:26:28] == TUI in tmux
+[22:26:29] ok   1  TUI is up
+[22:26:30] ok   2  the Scan view opens
+[22:26:31] ok   3  the Jobs tab opens (empty until a job exists)
+[22:26:31] == start a standard job over the bus (operator)
+[22:26:31] ok   4  the row appears with a running phase word
+[22:26:31] ok   5  the Jobs header shows the progress and budget columns
+[22:26:44] ok   6  the progress column moved between the two captures
+[22:26:45] ok   7  the detail carries the now line while auditing
+[22:26:52] FAIL 8  the progress cell rises while auditing (n/m to a larger n/m)
+[22:26:52] == cancel with x
+[22:26:57] FAIL 9  x shows cancelling at once (sampled every 50 ms)
+[22:26:57] ok   10  then cancelled
+[22:26:57] ok   11  the detail opens with the Cancelled sentence
+[22:26:58] == freeze the core for the banner age clause
+[22:27:19] ok   12  the Jobs banner names the hung core within 31 s (Task 4.5a: an overdue scan.list)
+[22:27:25] ok   13  x while unanswered is refused with the toast
+[22:27:25] ok   14  the clause clears once the core answers again
+[22:27:25] == shutdown
+[22:27:27] == done: 2 failed step(s); work <run dir>; evidence /Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/scan-jobs-view-tui/docs/design/evidence/jobs-view-2026-11-02/tui
+TUI-PROOF-DONE fails=2
