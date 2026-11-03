@@ -3482,3 +3482,200 @@ extension ScanSurfaceTests {
         }
     }
 }
+
+// MARK: - Kit rows and parts: the tester's edges (Jobs view D21, plan Task 3.0T)
+
+extension ScanSurfaceTests {
+    /// AC54 held as literals: once `rowProgressText` forwards to `rowText`, comparing the
+    /// two proves nothing, so the Progress cell is pinned for every state × phase of the
+    /// AC32 sweep (`scan.status.json`'s crawl is 37 pages, 0 queued), the unread row, a
+    /// phase D8 does not name, the floor, the clamp and a zero schedule.
+    @Test func rowTextLiteralsForEveryStateAndPhase() throws {
+        let liveByPhase = [
+            "queued": "Queued", "crawling": "37 pages, 0 queued", "passive": "Passive checks",
+            "auditing": "50\u{00A0}% · 3,236 of 6,468", "reporting": "Writing results", "done": "Done",
+        ]
+        var seen = 0
+        for f in try Self.ac32Sweep() {
+            let expected: String
+            switch (f.status == nil, f.summary.state) {
+            case (true, _), (false, .queued), (false, .other): expected = "—"
+            case (false, .running), (false, .cancelling): expected = try #require(liveByPhase[f.summary.phase.rawValue])
+            case (false, .done), (false, .cancelled), (false, .failed): expected = "3,236 of 6,468"
+            }
+            #expect(ScanJobProgress(f).rowText == expected,
+                    "\(f.summary.state.rawValue) / \(f.summary.phase.rawValue), status \(f.status == nil ? "unread" : "read")")
+            seen += 1
+        }
+        #expect(seen == 43)
+
+        // A phase D8 does not name reads its wire token, the same as the card's phase line.
+        let unnamed = ScanJobProgress(try Self.progressFacts(state: .running, phase: .other("warming")))
+        #expect(unnamed.rowText == "warming")
+        #expect(unnamed.phaseLine == "warming")
+        // The percent floors (3,233 of 6,468 is 49.98 %), in the row and the KPI alike.
+        let floor = ScanJobProgress(try Self.progressFacts(state: .running, phase: .auditing, edits: Self.checks(done: 3233, scheduled: 6468)))
+        #expect(floor.rowText == "49\u{00A0}% · 3,233 of 6,468")
+        #expect(floor.percentText == "49\u{00A0}%")
+        // A core reporting `done` past `scheduled`: the fraction clamps, the counters are quoted as sent.
+        let over = try Self.progressFacts(state: .running, phase: .auditing, edits: Self.checks(done: 7000, scheduled: 6468))
+        #expect(ScanJobProgress(over).rowText == "100\u{00A0}% · 7,000 of 6,468")
+        #expect(ScanJobProgress(over).fraction == 1)
+        let overDone = try Self.progressFacts(state: .done, phase: .done, edits: Self.checks(done: 7000, scheduled: 6468))
+        #expect(ScanJobProgress(overDone).rowText == "7,000 of 6,468")
+        // Nothing scheduled but something done: no fraction, so `Scheduling checks`; terminal, the bus truth.
+        let zeroSchedule = try Self.progressFacts(state: .running, phase: .auditing, edits: Self.checks(done: 5, scheduled: 0))
+        #expect(ScanJobProgress(zeroSchedule).rowText == "Scheduling checks")
+        #expect(ScanJobProgress(zeroSchedule).percentText == nil)
+        let zeroScheduleDone = try Self.progressFacts(state: .failed, phase: .done, edits: Self.checks(done: 5, scheduled: 0))
+        #expect(ScanJobProgress(zeroScheduleDone).rowText == "5 of 0")
+        // Cancelling while crawling freezes the crawl line, like running.
+        let cancellingCrawl = try Self.progressFacts(
+            state: .cancelling, phase: .crawling, edits: [(["crawl", "pages"], 46), (["crawl", "queued"], 12)])
+        #expect(ScanJobProgress(cancellingCrawl).rowText == "46 pages, 12 queued")
+    }
+
+    /// AC55 over the sweep and through the wire. The sweep carries `error: "boom"` and no
+    /// `stopped_reason`, so the sub-line is `boom` for exactly the terminal rows whose
+    /// status landed. The decoder (`ScanWire.cleaned`) drops every newline and separator
+    /// scalar, so the first-line rule is proved pure in `reasonAndSubLine` and shown here
+    /// to be unreachable from the bus: a two-line error arrives as one line. An oversized
+    /// error is cut to `detailMax` before the rule sees it. Then the reason tokens the
+    /// first pin does not walk.
+    @Test func subLineOverTheSweepAndThroughTheWire() throws {
+        for f in try Self.ac32Sweep() {
+            let expected: String? = (f.summary.state.isTerminal && f.status != nil) ? "boom" : nil
+            #expect(ScanEndText.rowSubLine(f) == expected, "\(f.summary.state.rawValue) / \(f.summary.phase.rawValue)")
+            #expect(ScanEndText.reasonLine(f) == nil, "the sweep carries no stopped_reason")
+        }
+
+        let twoLines = try Self.progressFacts(state: .failed, phase: .done, edits: [(["error"], "boom\nsecond")])
+        #expect(twoLines.status?.error == "boomsecond", "the decoder drops the newline: the first-line rule never fires from the bus")
+        #expect(ScanEndText.rowSubLine(twoLines) == "boomsecond")
+        let separators = try Self.progressFacts(state: .failed, phase: .done, edits: [(["error"], "\u{2028}boom\r\n\u{2029}\u{0085}")])
+        #expect(separators.status?.error == "boom")
+        #expect(ScanEndText.rowSubLine(separators) == "boom")
+        let blankLines = try Self.progressFacts(state: .failed, phase: .done, edits: [(["error"], "\n\n")])
+        #expect(blankLines.status?.error == "", "only newlines: the decoder leaves an empty text")
+        #expect(ScanEndText.rowSubLine(blankLines) == nil)
+
+        let oversized = try Self.progressFacts(
+            state: .failed, phase: .done, edits: [(["error"], .string(String(repeating: "e", count: 1000)))])
+        #expect(ScanWire.detailMax == 400)
+        #expect(ScanEndText.rowSubLine(oversized) == String(repeating: "e", count: 400), "cut to the decoder's bound, no ellipsis")
+
+        let unknownReason = try Self.progressFacts(state: .done, phase: .done, edits: [(["stopped_reason"], "paused")])
+        #expect(ScanEndText.reasonLine(unknownReason) == "Stopped early for a reason this app does not know.")
+        #expect(ScanEndText.rowSubLine(unknownReason) == "Stopped early for a reason this app does not know.")
+        let failedNoError = try Self.progressFacts(
+            state: .failed, phase: .done, edits: [(["stopped_reason"], "failed"), (["error"], .null)])
+        #expect(ScanEndText.reasonLine(failedNoError) == "Stopped early: an error ended the job.")
+        #expect(ScanEndText.rowSubLine(failedNoError) == "Stopped early: an error ended the job.")
+        let failedEmptyError = try Self.progressFacts(
+            state: .failed, phase: .done, edits: [(["stopped_reason"], "failed"), (["error"], "")])
+        #expect(ScanEndText.reasonLine(failedEmptyError) == "Stopped early: an error ended the job.", "an empty error is no error")
+        #expect(ScanEndText.rowSubLine(failedEmptyError) == "Stopped early: an error ended the job.")
+        let doneCancelled = try Self.progressFacts(state: .done, phase: .done, edits: [(["stopped_reason"], "cancelled")])
+        #expect(ScanEndText.reasonLine(doneCancelled) == "Stopped early: the job was cancelled.", "`cancelled` is silent only on a cancelled job")
+        #expect(ScanEndText.rowSubLine(doneCancelled) == "Stopped early: the job was cancelled.")
+        let reasonAndError = try Self.progressFacts(
+            state: .done, phase: .done, edits: [(["stopped_reason"], "errors"), (["error"], "boom")])
+        #expect(ScanEndText.rowSubLine(reasonAndError) == "Stopped early: too many errors from the target.", "the reason wins over the error")
+        let cancellingWithBoth = try Self.progressFacts(
+            state: .cancelling, phase: .auditing, edits: [(["stopped_reason"], "errors"), (["error"], "boom")])
+        #expect(ScanEndText.reasonLine(cancellingWithBoth) == nil, "cancelling is live")
+        #expect(ScanEndText.rowSubLine(cancellingWithBoth) == nil)
+        let queuedWithError = try Self.progressFacts(state: .queued, phase: .queued, edits: [(["error"], "boom")])
+        #expect(ScanEndText.rowSubLine(queuedWithError) == nil)
+    }
+
+    /// AC51 at its edges: lanes the app does not know sort last by wire name in `Probes
+    /// by lane` and read their token in `Lanes`; one `Lane skipped` row per entry in wire
+    /// order; an empty `lanes.run` reads `—`; `Crawl errors` 0 is no row; every severity
+    /// above zero takes its own ink; a seven-figure count groups; every key is a `WellKey`
+    /// or one of the three skip-words keys, in both wells, read or unread.
+    @Test func wellRowsEdgesLanesAndKeys() throws {
+        typealias Key = ScanFormat.WellKey
+        let facts = try Self.wellFacts(
+            shared: [
+                (["probes", "by_lane"], ["ws": 47, "http": 240, "quic": 3, "l4_packet": 9, "aaa": 1, "l4_stream": 2]),
+                (["points", "found"], 1_234_567),
+            ] + Self.issues(critical: 2, high: 1, medium: 1, low: 3, info: 4),
+            statusOnly: [
+                (["lanes", "run"], ["http", "quic"]),
+                (["lanes", "skipped"], [["lane": "l4_stream", "reason": "no L4 scope entry"], ["lane": "quic", "reason": "not on this build"]]),
+                (["crawl", "errors"], 0),
+            ])
+        let rows = ScanFormat.wellRows(facts)
+        let crawl = rows.crawl
+        #expect(crawl.first { $0.key == Key.probesByLane }?.cells.map(\.text)
+                == ["HTTP 240", "WebSocket 47", "L4 packet 9", "L4 stream 2", "aaa 1", "quic 3"])
+        #expect(crawl.first { $0.key == Key.probesByLane }?.text == "HTTP 240 · WebSocket 47 · L4 packet 9 · L4 stream 2 · aaa 1 · quic 3")
+        #expect(crawl.first { $0.key == Key.lanes }?.text == "HTTP, quic")
+        #expect(crawl.filter { $0.key == Key.laneSkipped }.map(\.text) == ["L4 stream: no L4 scope entry", "quic: not on this build"])
+        #expect(crawl.first { $0.key == Key.pointsFound }?.text == "1,234,567")
+        #expect(!crawl.map(\.key).contains(Key.crawlErrors), "errors 0 is no row")
+        #expect(rows.issues[0].cells.map(\.ink) == [.severity(.critical), .severity(.high), .severity(.medium)])
+        #expect(rows.issues[0].text == "2 · 1 · 1")
+        #expect(rows.issues[1].cells == [ScanWellCell(text: "3", ink: .severity(.low))])
+        #expect(rows.issues[2].cells == [ScanWellCell(text: "4", ink: .severity(.info))])
+
+        let noLanesRan = try Self.wellFacts(shared: [], statusOnly: [(["lanes", "run"], []), (["lanes", "skipped"], [])])
+        #expect(ScanFormat.wellRows(noLanesRan).crawl.first { $0.key == Key.lanes }?.text == "—", "an empty list the bus sent reads the missing mark")
+        #expect(!ScanFormat.wellRows(noLanesRan).crawl.map(\.key).contains(Key.laneSkipped))
+
+        let skipKeys = ScanFormat.pointSkipWords(.init(ignored: 0, frequent: 0, limit: 0)).map(\.words)
+        #expect(skipKeys == ["skipped as repetitive", "skipped by rule", "skipped at the per-request cap"])
+        let issueKeys = [Key.criticalHighMedium, Key.low, Key.info, Key.certainFirmTentative, Key.probeErrors, Key.checks]
+        for f in [facts, noLanesRan, ScanJobFacts(summary: facts.summary, status: nil)] {
+            let wells = ScanFormat.wellRows(f)
+            #expect(wells.crawl.map(\.key).filter { !Key.all.contains($0) } == skipKeys, "the only non-WellKey keys are the three skip rows, once each")
+            #expect(wells.issues.map(\.key) == issueKeys, "the Issues well is six rows in D11's order, read or unread")
+            #expect(wells.crawl.allSatisfy { !$0.cells.isEmpty } && wells.issues.allSatisfy { !$0.cells.isEmpty }, "no empty row")
+            #expect(wells.crawl.map(\.text).allSatisfy { !$0.isEmpty } && wells.issues.map(\.text).allSatisfy { !$0.isEmpty })
+        }
+    }
+
+    /// AC56 at its edges: over the sweep the id is the second part, in `.checkId`, once;
+    /// nine ids through the wire are the decoder's eight (`listMax`, the engine's own cap
+    /// on `checks.running`), so the tag says ` and 7 more`; a 500-scalar id is cut to
+    /// `detailMax`; control scalars in an id are dropped before the tag sees it; the
+    /// parts stand while reporting (the lane chooses the phase line itself).
+    @Test func nowTagPartsHoldTheDecodedFirstId() throws {
+        for f in try Self.ac32Sweep() {
+            let progress = ScanJobProgress(f)
+            guard let status = f.status, let first = status.checks.running.first else {
+                #expect(progress.nowTagParts == nil, "no status, no ids")
+                continue
+            }
+            let parts = try #require(progress.nowTagParts)
+            #expect(parts.count == 3 && parts[1] == ScanFindingLine.Part(text: first, role: .checkId),
+                    "\(f.summary.state.rawValue) / \(f.summary.phase.rawValue)")
+            #expect(parts.filter { $0.role == .checkId }.count == 1, "one id in the data face")
+            #expect(parts.last?.text == " and 3 more")
+        }
+
+        let nine = (1...9).map { "check-\($0)" }
+        let capped = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing, edits: Self.checks(done: 1, scheduled: 9, running: nine)))
+        #expect(ScanWire.listMax == 8)
+        #expect(capped.nowTagParts?.map(\.text) == ["now · ", "check-1", " and 7 more"], "the decoder keeps eight")
+        #expect(capped.nowTag == "now · check-1 and 7 more")
+
+        let cut = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing,
+            edits: Self.checks(done: 1, scheduled: 9, running: [String(repeating: "x", count: 500)])))
+        #expect(cut.nowTagParts?.map(\.text) == ["now · ", String(repeating: "x", count: ScanWire.detailMax)])
+        #expect(cut.nowTagParts?.map(\.role) == [.plain, .checkId])
+
+        let dirty = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .auditing,
+            edits: Self.checks(done: 1, scheduled: 9, running: ["xss\u{0000}-re\nflected\u{200B}", "b"])))
+        #expect(dirty.nowTagParts?.map(\.text) == ["now · ", "xss-reflected", " and 1 more"])
+
+        let reporting = ScanJobProgress(try Self.progressFacts(
+            state: .running, phase: .reporting, edits: Self.checks(done: 6468, scheduled: 6468, running: ["xss-reflected"])))
+        #expect(reporting.nowTagParts?.map(\.text) == ["now · ", "xss-reflected"])
+        #expect(reporting.phaseLine == "Writing results")
+    }
+}
