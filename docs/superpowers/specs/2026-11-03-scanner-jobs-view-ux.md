@@ -2400,7 +2400,7 @@ Live web criteria (numbered after AC57 so no reference moves):
     label-value lines.
 43. **AC43 (T2, D19; live).** A pty recording of `aitm tui` on the Jobs tab
     through a `standard` job shows the progress column rising, the detail's
-    `now` line, `x` producing `cancelling` then `cancelled`, and the
+    `now` line, `x` producing the reply's state (`cancelling` while the engine still drains probes, else `cancelled` within a tick; plan gap 73) then `cancelled`, and the
     detail's first line `Cancelled after …; … of … checks had run. What it
     found stays.`. After `kill -STOP` of the core, within 31 s a frame shows
     the Jobs banner `scan.list: the bus did not reply in time · showing
