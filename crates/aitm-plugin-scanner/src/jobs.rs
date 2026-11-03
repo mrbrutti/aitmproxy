@@ -1817,6 +1817,11 @@ pub(crate) mod test_support {
         fn charge(&self, units: u32) -> bool {
             self.job.charge(units)
         }
+
+        /// The fake answers every probe itself; no captured flow built it.
+        fn captured(&self) -> Option<aitm_core::HttpFlow> {
+            None
+        }
     }
 
     /// A [`Lane`] that discovers a scripted point list and ships scripted checks.

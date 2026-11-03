@@ -1,0 +1,12 @@
+121,125c121,125
+< {"at":<ms>,"marker":"start","pid":76166,"schema":1,"stream":"control","version":"0.5.16"}
+< {"at":<ms>,"marker":"start","pid":76513,"schema":1,"stream":"control","version":"0.5.16"}
+< {"at":<ms>,"marker":"start","pid":76562,"schema":1,"stream":"control","version":"0.5.16"}
+< {"at":<ms>,"marker":"start","pid":76567,"schema":1,"stream":"control","version":"0.5.16"}
+< {"at":<ms>,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_ddca1fed9fb6a232-1","command":"scan.sitemap","args":"{}","result":{"error":"scan: not_found: no scan job has run yet"}}
+---
+> {"at":<ms>,"origin":"operator","client_label":"web-bridge","connection_id":"conn_01ecd2833fbf8621-1","command":"scope.add","args":"{\"host\":\"example.com\"}","result":"ok"}
+> {"at":<ms>,"origin":"operator","client_label":"web-bridge","connection_id":"conn_01ecd2833fbf8621-1","command":"flow.intercept","args":"{\"enabled\":true}","result":"ok"}
+> {"at":<ms>,"origin":"operator","client_label":"web-bridge","connection_id":"conn_01ecd2833fbf8621-1","command":"flow.intercept","args":"{\"enabled\":false}","result":"ok"}
+> {"at":<ms>,"origin":"operator","client_label":"web-bridge","connection_id":"conn_01ecd2833fbf8621-1","command":"scope.remove","args":"{\"host\":\"example.com\"}","result":"ok"}
+> {"at":<ms>,"marker":"start","pid":78766,"schema":1,"stream":"control","version":"0.5.16"}

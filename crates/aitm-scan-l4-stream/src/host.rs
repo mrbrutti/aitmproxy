@@ -805,6 +805,24 @@ impl ProbeHost for StreamHost {
         self.job.cancelled()
     }
 
+    /// The job's budgeted client, lent for a bridge send (amendment 72b).
+    ///
+    /// Not this host's `client` field, which is the L4 stream transport.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        Some(self.job.client())
+    }
+
+    /// `None`: an l4 stream point is generated from a grammar, never from a
+    /// captured HTTP flow.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+
+    /// Debited against the one job budget, like every case sent.
+    fn charge(&self, units: u32) -> bool {
+        self.job.charge(units)
+    }
+
     fn held_flows(&self) -> Vec<aitm_core::Flow> {
         // The lane holds no HTTP flow; `L4Evidence.sent_hex` is its record.
         Vec::new()
@@ -1395,6 +1413,30 @@ mod tests {
         assert_eq!(host.state.cases_sent.load(Ordering::SeqCst), 0);
     }
 
+    /// Amendment 72b: `client`, `charge` and `captured` are required, and the
+    /// stream host answers them from its job.
+    #[tokio::test]
+    async fn the_stream_host_lends_the_job_client_and_debits_its_budget() {
+        let job = Arc::new(TestJob::new());
+        let client = Arc::new(CountingClient::live());
+        let host = test_host(endpoint(6379), Some(loopback_guard()), &job, &client);
+
+        let lent = host
+            .client()
+            .expect("the stream host lends the job's client");
+        assert!(
+            Arc::ptr_eq(&lent, &job.client()),
+            "the host lends the job's own budgeted client, not a second one"
+        );
+        assert!(host.charge(2), "two units are affordable");
+        assert_eq!(job.charges(), 2, "the charge reaches the job's budget");
+        assert_eq!(client.count(), 0, "answering the three costs no exchange");
+        assert!(
+            host.captured().is_none(),
+            "an l4 stream point came from no captured HTTP flow"
+        );
+    }
+
     /// C4's host half across the whole profile surface: no built-in profile,
     /// and no profile with every `l4` knob at its maximum and the lane
     /// explicitly included, makes a denylisted message sendable. The client
@@ -1560,6 +1602,22 @@ mod tests {
             .expect("a case under the ceiling still goes out");
         assert_eq!(response.body, b"+PONG\r\n".to_vec());
         assert_eq!(client.writes(), 1);
+    }
+
+    /// Amendment 72b, the refusal half: the host's `charge` is the job's answer,
+    /// not a `budget_left` comparison. This job refuses every charge while
+    /// still reporting a thousand units left, so a host that only compared the
+    /// two would wrongly say yes.
+    #[tokio::test]
+    async fn the_stream_host_refuses_a_charge_the_job_refuses() {
+        let job = Arc::new(TestJob::new().broke());
+        let client = Arc::new(CountingClient::live());
+        let host = test_host(endpoint(6379), Some(loopback_guard()), &job, &client);
+
+        assert_eq!(job.budget_left(), 1000, "the job still reports units left");
+        assert!(!host.charge(2), "the job refused, so the host refuses");
+        assert_eq!(job.charges(), 0, "a refused charge debits nothing");
+        assert_eq!(client.count(), 0, "a refused charge sends nothing");
     }
 
     #[tokio::test]

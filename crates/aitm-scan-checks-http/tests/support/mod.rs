@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
@@ -451,6 +451,22 @@ impl ProbeHost for ScriptedHost {
 
     fn held_flows(&self) -> Vec<aitm_core::Flow> {
         Vec::new()
+    }
+
+    /// None to lend: a scripted host answers from its table and never sends.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        None
+    }
+
+    /// The script, not a captured flow, is where every answer comes from.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+
+    /// Affordable up to `budget_left`, debiting nothing: a scripted probe is
+    /// what spends this host's budget.
+    fn charge(&self, units: u32) -> bool {
+        self.budget_left() >= units
     }
 }
 

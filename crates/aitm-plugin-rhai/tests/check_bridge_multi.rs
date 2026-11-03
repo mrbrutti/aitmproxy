@@ -329,6 +329,19 @@ impl ProbeHost for ClientlessHost {
     fn shared(&self) -> Option<Arc<dyn ProbeHost>> {
         self.me.upgrade().map(|host| host as Arc<dyn ProbeHost>)
     }
+    /// **The point of this host:** it lends no client at all, so the bridge
+    /// must refuse a script send rather than route it unbudgeted.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        None
+    }
+    /// No captured flow built this host.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+    /// Affordable up to `budget_left`, debiting nothing.
+    fn charge(&self, units: u32) -> bool {
+        self.budget_left() >= units
+    }
 }
 
 /// Wave-2/3 security fix: a host that lends no client is a wiring bug, exactly

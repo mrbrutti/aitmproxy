@@ -530,6 +530,22 @@ impl ProbeHost for WsProbeHost {
         self.job.cancelled()
     }
 
+    /// The job's budgeted client, lent for a bridge send (amendment 72b).
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        Some(self.job.client())
+    }
+
+    /// `None`: a ws point is re-driven from a captured conversation, not from
+    /// one captured HTTP flow (the handshake is in `held_flows`).
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+
+    /// Debited against the one job budget, like every dial and frame.
+    fn charge(&self, units: u32) -> bool {
+        self.job.charge(units)
+    }
+
     /// The baseline conversation first, then the probes newest first.
     fn held_flows(&self) -> Vec<Flow> {
         let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
@@ -728,6 +744,72 @@ mod tests {
             job.charged(),
             3,
             "one unit for the dial, one for the replayed frame, one for the mutated frame"
+        );
+    }
+
+    /// Amendment 72b: `client`, `charge` and `captured` are required, and the
+    /// ws host answers them from its job.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ws_host_lends_the_job_client_and_debits_its_budget() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(10);
+        let host = host_for("msg", &job, transport);
+
+        let lent = host.client().expect("the ws host lends the job's client");
+        assert!(
+            Arc::ptr_eq(&lent, &job.client()),
+            "the host lends the job's own budgeted client, not a second one"
+        );
+        assert!(host.charge(2), "two units out of ten are affordable");
+        assert_eq!(job.charged(), 2, "the charge reaches the job's budget");
+        assert_eq!(job.budget_left(), 8);
+        assert!(
+            host.captured().is_none(),
+            "a ws point came from no captured HTTP flow"
+        );
+    }
+
+    /// Amendment 72b, the refusal half: the host's `charge` is the job's, so a
+    /// charge the budget cannot cover is refused and debits nothing — what is
+    /// left stays affordable for a smaller stimulus.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ws_host_refuses_a_charge_the_job_budget_cannot_cover() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(1);
+        let host = host_for("msg", &job, transport);
+
+        assert!(!host.charge(2), "two units out of one are refused");
+        assert_eq!(job.charged(), 0, "a refused charge debits nothing");
+        assert_eq!(job.budget_left(), 1, "the one unit is still there");
+
+        assert!(host.charge(1), "what is left is still affordable");
+        assert_eq!(job.budget_left(), 0);
+    }
+
+    /// C9: the ws handshake is `held_flows`' business, never `captured`'s. Even
+    /// once the host holds conversations, `captured()` answers `None` — a
+    /// passive check on this lane reads the held flows, not one captured HTTP
+    /// flow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ws_host_holds_the_handshake_and_captures_nothing() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+        let host = host_for("msg", &job, transport);
+
+        host.baseline().await.expect("the baseline");
+        host.probe(&text("a", PayloadMode::Replace))
+            .await
+            .expect("the probe");
+
+        let held = host.held_flows();
+        assert!(
+            held.iter().any(|flow| matches!(flow, Flow::Http(_))),
+            "the handshake is held as an HTTP flow: {} held",
+            held.len()
+        );
+        assert!(
+            host.captured().is_none(),
+            "the handshake is not this point's captured flow"
         );
     }
 

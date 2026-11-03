@@ -1265,6 +1265,27 @@ mod tests {
         assert_eq!(s.system_proxy.bypass, vec!["corp.test".to_string()]);
     }
 
+    /// The embedded-core harness twin (AC5 of the harness audit-log spec): the
+    /// exact `mcp:` fragment the mac app writes for a dev-bundle or live run,
+    /// `operator_token` then `audit_log` at two-space indent, parses to an
+    /// explicit `AuditLogSetting::Path` with the operator token intact. The
+    /// Swift `audit_log_line_sits_inside_the_mcp_block_and_is_what_the_core_parses`
+    /// test pins this literal and this function's name in this file.
+    #[test]
+    fn mcp_audit_log_path_the_mac_app_emits_parses() {
+        use aitm_core::AuditLogSetting;
+        use std::path::PathBuf;
+
+        let cfg =
+            parse("mcp:\n  operator_token: \"11\"\n  audit_log: \"/tmp/store/audit.jsonl\"\n")
+                .unwrap();
+        assert_eq!(
+            cfg.mcp.audit_log,
+            AuditLogSetting::Path(PathBuf::from("/tmp/store/audit.jsonl"))
+        );
+        assert_eq!(cfg.mcp.operator_token.as_deref(), Some("11"));
+    }
+
     /// C6 fills `state_file` only when the file leaves it unset: an explicit path
     /// is kept, and the default follows an operator-set `ca.audit_log`, not the
     /// built-in one.

@@ -24,6 +24,14 @@
 //! (all default-bodied) on 2026-10-31, then [`ProbeHost::baseline_peer_addr`],
 //! [`JobCtx::report_session_canary`], [`JobCtx::report_session_browser_partial`]
 //! and [`ProbeHost::charge`] (default-bodied too) on 2026-11-01.
+//!
+//! **One recorded exception (spec amendment 72b, 2026-11-02).** Once every lane
+//! implemented them, [`ProbeHost::client`], [`ProbeHost::captured`] and
+//! [`ProbeHost::charge`] lost their default bodies, so a lane that forgets one no
+//! longer builds: the compiler is the contract. That change was made with every
+//! in-tree implementation updated in the same commit, under the coordinator's
+//! cross-crate ruling; it is not a licence for further required methods.
+//! [`ProbeHost::shared`] and [`ProbeHost::baseline_peer_addr`] keep their defaults.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -135,11 +143,10 @@ pub trait ProbeHost: Send + Sync {
     /// `http.send` runs through this client, so scope, rate, marks and the
     /// record policy still apply (spec D9.3).
     ///
-    /// `None` by default: a host that cannot lend its client out makes the
-    /// bridge fall back to refusing the send rather than sending unbudgeted.
-    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
-        None
-    }
+    /// **Required (amendment 72b).** A lane that holds a [`JobCtx`] answers
+    /// `Some(job.client())`; a host with no client to lend answers `None`,
+    /// which makes the bridge refuse the send rather than send unbudgeted.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>>;
 
     /// An owning handle to this host, for a bridge that must keep it alive past
     /// the borrow it was handed — the scripting tier parks it in a thread-local
@@ -154,11 +161,10 @@ pub trait ProbeHost: Send + Sync {
     /// The captured flow this point came from, for a passive check that must
     /// read what was already observed and send nothing at all.
     ///
-    /// `None` by default, and `None` for any point that was not built from a
-    /// captured flow.
-    fn captured(&self) -> Option<aitm_core::HttpFlow> {
-        None
-    }
+    /// **Required (amendment 72b).** A host built from a captured HTTP flow
+    /// answers `Some` with that flow; every synthetic or non-HTTP point (the
+    /// ws and L4 lanes, a generated point) answers `None`.
+    fn captured(&self) -> Option<aitm_core::HttpFlow>;
 
     /// The peer address the baseline response actually came from, when the host
     /// knows it (an HTTP host fills it from the baseline flow's connection), so
@@ -175,12 +181,11 @@ pub trait ProbeHost: Send + Sync {
     /// in `scan.status.probes`. Returns `false` when the budget cannot cover
     /// it; the caller must then not send.
     ///
-    /// The default only checks [`ProbeHost::budget_left`] and charges nothing
-    /// because the trait has no job handle; the engine's host overrides it to
-    /// charge the job's `JobBudget` and pace through the guard.
-    fn charge(&self, units: u32) -> bool {
-        self.budget_left() >= units
-    }
+    /// **Required (amendment 72b).** The charge must actually debit the job's
+    /// budget — a lane that holds a [`JobCtx`] answers `job.charge(units)`, so
+    /// the stimulus is paced and counted like every other. A host that cannot
+    /// debit anything answers `false` for anything it cannot cover.
+    fn charge(&self, units: u32) -> bool;
 }
 
 /// The engine-owned, per-job surface a [`Lane`] consumes (spec D5).
@@ -476,11 +481,12 @@ mod tests {
         assert!(discovery.nodes.is_empty());
     }
 
-    /// T1b (spec D2, D9.3): the three `ProbeHost` additions are default-bodied,
-    /// so a lane written against T1a still compiles and answers `None` — the
-    /// engine's own hosts override them.
+    /// Amendment 72b (spec D2, D9.3): `client` and `captured` are required, and
+    /// the null host — no job handle, no captured flow — spells out `None` for
+    /// both. `shared` keeps its default body, so a host that is not behind an
+    /// `Arc` still inherits "none to give".
     #[test]
-    fn probe_host_defaults_are_none() {
+    fn the_null_host_lends_nothing_and_shared_still_defaults_to_none() {
         let host = NullHost::new();
 
         assert!(host.client().is_none());
@@ -525,12 +531,14 @@ mod tests {
         assert_eq!(dynamic.budget_left(), 7);
     }
 
-    /// T3 security panel (2026-11-01): a stimulus that bypasses `probe` must
-    /// still be budgeted. The default body only *checks* — it has no job handle
-    /// to charge — so a host written before this method refuses exactly what it
-    /// cannot afford and its budget is unchanged either way.
+    /// T3 security panel (2026-11-01), under amendment 72b: a stimulus that
+    /// bypasses `probe` must still be budgeted. `charge` is required of every
+    /// host, and the null host has no job handle to debit, so its answer only
+    /// *checks*: it refuses exactly what it cannot afford and its budget is
+    /// unchanged either way. The lane hosts that do hold a `JobCtx` debit for
+    /// real, each pinned in its own crate's `host.rs` tests.
     #[test]
-    fn probe_host_charge_default_checks_the_budget_and_spends_nothing() {
+    fn the_null_host_charge_checks_the_budget_and_spends_nothing() {
         let host = NullHost::new();
         let dynamic: &dyn ProbeHost = &host;
         assert_eq!(dynamic.budget_left(), 3);
@@ -540,7 +548,7 @@ mod tests {
         assert_eq!(
             dynamic.budget_left(),
             3,
-            "the default body charges nothing: it has no job handle"
+            "the null host charges nothing: it has no job handle"
         );
     }
 
