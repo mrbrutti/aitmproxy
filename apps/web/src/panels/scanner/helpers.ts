@@ -1,7 +1,8 @@
 // Pure helpers for the v2 Scan surface (D-T8.4): no Solid, no bus, no DOM — every function here is
 // a total function of its arguments so the views, the live model and the launch path share one
-// answer. The fixed operator texts of D-T8.6 (errors, pre-flight notes, the D11 L4 hint) and
-// D-T8.7 (`stopped_reason`) live here too, so a text is written once and asserted once.
+// answer. The fixed operator texts of D-T8.6 (errors, pre-flight notes, the D11 L4 hint) and the
+// Jobs view's end-state sentences (D4: `stopped_reason`, crawl trouble) live here too, so a text is
+// written once and asserted once; the end-state words copy the mac Kit's `ScanEndText` byte for byte.
 //
 // Nothing here enforces anything: the core is the enforcement (`panels/l4/model.ts:141`). The scope
 // predicates below only let the UI explain, ahead of the round trip, why a launch would be refused.
@@ -10,15 +11,19 @@ import type { L4ScopeEntryWire } from '~/panels/l4/model';
 import { scopeCoversInterface } from '~/panels/l4/model';
 
 import type {
+  CheckCounters,
   CheckMeta,
   CheckSelection,
   Confidence,
+  CrawlCounters,
+  CrawlErrorKind,
   IssueStatus,
   IssueSummary,
   JobState,
   JobStatus,
   JobSummary,
   Lane,
+  Phase,
   ScanErrorCode,
   ScanProfile,
   Severity,
@@ -86,34 +91,163 @@ export function jobTone(state: JobState): 'neutral' | 'success' | 'danger' {
   return 'neutral';
 }
 
-/** `running · auditing` while live; a terminal state prints alone (its phase adds nothing). */
+/**
+ * The re-read rule (Jobs view D2): a listed job owes a `scan.status` read while nothing is stored
+ * for it, or when the list calls it terminal while the stored status is still live (the one-beat
+ * gap in which a finished job would otherwise keep its last running read for ever).
+ */
+export function needsStatusRead(summary: Pick<JobSummary, 'state'>, stored: JobStatus | null): boolean {
+  return stored === null || (isTerminal(summary.state) && !isTerminal(stored.state));
+}
+
+/** The shared counters of a status, in the list row's shape. */
+function summaryOf(s: JobStatus): JobSummary {
+  return {
+    job: s.job,
+    state: s.state,
+    phase: s.phase,
+    elapsed_ms: s.elapsed_ms,
+    probes: s.probes,
+    points: s.points,
+    issues: s.issues,
+  };
+}
+
+/**
+ * One truth per job (Jobs view D2): the shared counters come from, in order, a terminal status
+ * (final, every field present); else a terminal list row (the list turned terminal while the
+ * stored status is still live); else whichever of the two has the higher `elapsed_ms`, the status
+ * on a tie. The detail-only fields stay on the status the caller holds.
+ */
+export function mergeJob(summary: JobSummary, status: JobStatus | null): JobSummary {
+  if (status === null) return summary;
+  if (isTerminal(status.state)) return summaryOf(status);
+  if (isTerminal(summary.state)) return summary;
+  return status.elapsed_ms >= summary.elapsed_ms ? summaryOf(status) : summary;
+}
+
+const GROUPED = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
+
+/** `6,468`: a count with the en-US thousands comma whatever the browser locale (D4, D11). */
+export function grouped(n: number): string {
+  return GROUPED.format(Number.isFinite(n) ? Math.trunc(n) : 0);
+}
+
+/** `1 check` / `6,468 checks`: the one singular rule of the end-state sentences. */
+function plural(n: number, noun: string): string {
+  return `${grouped(n)} ${noun}${n === 1 ? '' : 's'}`;
+}
+
+const STATE_WORDS: Record<JobState, string> = {
+  queued: 'Queued',
+  running: 'Running',
+  cancelling: 'Cancelling',
+  done: 'Done',
+  cancelled: 'Cancelled',
+  failed: 'Failed',
+};
+
+const PHASE_WORDS: Record<Phase, string> = {
+  queued: 'Queued',
+  crawling: 'Crawling',
+  passive: 'Passive',
+  auditing: 'Auditing',
+  reporting: 'Reporting',
+  done: 'Done',
+};
+
+/** The glossary word: the phase while running (`Auditing`), else the state (`Done`, `Cancelling`). */
 export function stateWords(s: Pick<JobSummary, 'state' | 'phase'>): string {
-  if (isTerminal(s.state) || s.state === s.phase) return s.state;
-  return `${s.state} · ${s.phase}`;
+  return s.state === 'running' ? PHASE_WORDS[s.phase] : STATE_WORDS[s.state];
 }
 
 /* ------------------------------------------------------------------ fixed texts */
 
-/** The eight `stopped_reason` tokens as the Jobs view prints them (D-T8.7). */
-export function stoppedReasonText(reason: StoppedReason): string {
+/**
+ * The stopped-reason sentence of the Jobs view (D4); `null` for a reason the state sentence already
+ * says (`cancelled` on a cancelled job) or the error text already shows (`failed` with an error).
+ * The decoder maps a token it does not know to `null`, so the last arm is reached only if one gets
+ * past it; it still says something rather than printing the raw token (glossary rule).
+ */
+export function stoppedReasonText(
+  reason: StoppedReason,
+  state: JobState,
+  probesBudget: number,
+  error: string | null,
+): string | null {
   switch (reason) {
     case 'budget':
-      return 'stopped: probe budget reached';
+      return `Stopped early: the probe budget of ${grouped(probesBudget)} was spent. Raise it in the profile to go further.`;
     case 'time':
-      return 'stopped: time budget reached';
+      return 'Stopped early: the time budget ran out.';
     case 'cancelled':
-      return 'cancelled by operator';
+      return state === 'cancelled' ? null : 'Stopped early: the job was cancelled.';
     case 'session_lost':
-      return 'stopped: session lost';
+      return 'Stopped early: the session was lost and the profile says stop when that happens.';
     case 'errors':
-      return 'stopped: too many errors';
+      return 'Stopped early: too many errors from the target.';
     case 'policy':
-      return 'stopped: agent policy changed';
+      return 'Stopped early: the agent policy changed to paused or read-only.';
     case 'guard_refused':
-      return 'stopped: guard refused';
+      return 'Stopped early: the L4 guard refused a target mid-run.';
     case 'failed':
-      return 'failed';
+      return error !== null && error !== '' ? null : 'Stopped early: an error ended the job.';
+    default:
+      return 'Stopped early for a reason this app does not know.';
   }
+}
+
+/** `stopped_reason: errors`: the raw token, for the data-face line only. */
+export function rawReasonLine(reason: StoppedReason): string {
+  return `stopped_reason: ${reason}`;
+}
+
+/**
+ * The one sentence for a terminal job (D4); `null` while the job is live. `checks` are the stored
+ * status's counters and are `null` until a terminal status has landed: during the one-beat gap in
+ * which the list says terminal and the stored status is still live, a live read's numbers must not
+ * be quoted, so the caller passes `null` and the sentence waits for the final ones.
+ */
+export function endSentence(j: JobSummary | JobStatus, checks: CheckCounters | null): string | null {
+  if (checks === null || !isTerminal(j.state)) return null;
+  const elapsed = fmtElapsed(j.elapsed_ms);
+  switch (j.state) {
+    case 'done':
+      return `Done in ${elapsed} · ${plural(j.points.found, 'point')} · ${plural(checks.scheduled, 'check')}.`;
+    case 'cancelled':
+      return `Cancelled after ${elapsed}; ${grouped(checks.done)} of ${plural(checks.scheduled, 'check')} had run. What it found stays.`;
+    case 'failed':
+      return `Failed after ${elapsed}.`;
+    default:
+      return null;
+  }
+}
+
+/** `The crawl fetched 1 page and hit 1 error`; `null` when the crawl hit none (D4). */
+export function crawlTroubleText(crawl: CrawlCounters): string | null {
+  if (crawl.errors <= 0) return null;
+  return `The crawl fetched ${plural(crawl.pages, 'page')} and hit ${plural(crawl.errors, 'error')}`;
+}
+
+/** The words for a `crawl.last_error` token; `transport`, `other` and an unknown token all read as a failed connection. */
+export function crawlErrorWords(kind: CrawlErrorKind | string): string {
+  switch (kind) {
+    case 'connect_refused':
+      return 'the target refused the connection';
+    case 'tls':
+      return 'TLS handshake failed';
+    case 'timeout':
+      return 'the target did not answer in time';
+    case 'h2_not_negotiated':
+      return 'the target does not speak HTTP/2';
+    default:
+      return 'the connection failed';
+  }
+}
+
+/** `crawl.last_error: connect_refused`: the raw token, for the data-face line only. */
+export function rawCrawlErrorLine(kind: CrawlErrorKind | string): string {
+  return `crawl.last_error: ${kind}`;
 }
 
 /** Why active scanning is off for an agent session; the core enforces it, the panel explains it. */

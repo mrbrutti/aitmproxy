@@ -18,9 +18,13 @@ import {
   PROFILE_NAME_HINT,
   applyCheckToggle,
   checkIsOn,
+  crawlErrorWords,
+  crawlTroubleText,
+  endSentence,
   filterIssues,
   fmtElapsed,
   groupBySeverity,
+  grouped,
   hostInScope,
   hostKey,
   isLive,
@@ -32,16 +36,20 @@ import {
   jobTone,
   l4Covered,
   l4EntryCovers,
+  mergeJob,
   needsConfirmNote,
+  needsStatusRead,
   nodesByHost,
   originHost,
   profileHasL4,
+  rawCrawlErrorLine,
+  rawReasonLine,
   scanErrorText,
   stateWords,
   stoppedReasonText,
   unknownSelectors,
 } from './helpers';
-import type { CheckSelection } from './model';
+import type { CheckSelection, CrawlCounters, JobStatus, JobSummary, StoppedReason } from './model';
 import {
   parseChecksResult,
   parseIssuesResult,
@@ -56,6 +64,26 @@ const status = () => parseJobStatus(fixture('scan.status.json'))!;
 const issueRows = () => parseIssuesResult(fixture('scan.issues.json'))!.issues;
 const checks = () => parseChecksResult(fixture('scan.checks.json'))!.checks;
 const profile = () => parseScanProfile(fixture('scan.profile.get.json'))!;
+
+/** The fixture status (running · auditing, 0:42) with the case's fields over it. */
+const statusWith = (over: Partial<JobStatus>): JobStatus => ({ ...status(), ...over });
+
+/** A `scan.list` row cut from the fixture status, with the case's fields over it. */
+const summaryWith = (over: Partial<JobSummary>): JobSummary => {
+  const s = status();
+  return {
+    job: s.job,
+    state: s.state,
+    phase: s.phase,
+    elapsed_ms: s.elapsed_ms,
+    probes: s.probes,
+    points: s.points,
+    issues: s.issues,
+    ...over,
+  };
+};
+
+const crawlWith = (over: Partial<CrawlCounters>): CrawlCounters => ({ ...status().crawl, ...over });
 
 const entry = (over: Partial<L4ScopeEntryWire> = {}): L4ScopeEntryWire => ({
   id: 'e',
@@ -88,11 +116,67 @@ describe('job state predicates', () => {
     expect(jobTone('cancelled')).toBe('neutral');
   });
 
-  it('prints the words of a live state and a terminal state alone', () => {
-    expect(stateWords({ state: 'running', phase: 'auditing' })).toBe('running · auditing');
-    expect(stateWords({ state: 'queued', phase: 'queued' })).toBe('queued');
-    expect(stateWords({ state: 'done', phase: 'done' })).toBe('done');
-    expect(stateWords({ state: 'failed', phase: 'auditing' })).toBe('failed');
+  it('prints the glossary word: the phase while running, else the state (P23)', () => {
+    expect(stateWords({ state: 'running', phase: 'auditing' })).toBe('Auditing');
+    expect(stateWords({ state: 'running', phase: 'crawling' })).toBe('Crawling');
+    expect(stateWords({ state: 'done', phase: 'done' })).toBe('Done');
+    expect(stateWords({ state: 'cancelling', phase: 'auditing' })).toBe('Cancelling');
+    expect(stateWords({ state: 'queued', phase: 'queued' })).toBe('Queued');
+    expect(stateWords({ state: 'cancelled', phase: 'auditing' })).toBe('Cancelled');
+    expect(stateWords({ state: 'failed', phase: 'auditing' })).toBe('Failed');
+  });
+});
+
+describe('needsStatusRead (D2 re-read rule, AC3)', () => {
+  it('owes a read while nothing is stored or the list went terminal ahead of the stored status', () => {
+    const running = statusWith({ state: 'running' });
+    const done = statusWith({ state: 'done', phase: 'done' });
+    const cancelled = statusWith({ state: 'cancelled', phase: 'auditing' });
+    expect(needsStatusRead({ state: 'running' }, null)).toBe(true);
+    expect(needsStatusRead({ state: 'done' }, running)).toBe(true);
+    expect(needsStatusRead({ state: 'running' }, running)).toBe(false);
+    expect(needsStatusRead({ state: 'done' }, done)).toBe(false);
+    expect(needsStatusRead({ state: 'cancelled' }, cancelled)).toBe(false);
+  });
+});
+
+describe('mergeJob (D2: one truth per job, AC4)', () => {
+  it('a terminal list row beats a stored status still running', () => {
+    const merged = mergeJob(
+      summaryWith({ state: 'done', phase: 'done', elapsed_ms: 69_000 }),
+      statusWith({ state: 'running', elapsed_ms: 65_000 }),
+    );
+    expect(merged.state).toBe('done');
+    expect(merged.elapsed_ms).toBe(69_000);
+  });
+
+  it('with both live, the higher elapsed_ms wins (the status on a tie)', () => {
+    const live = mergeJob(
+      summaryWith({ state: 'running', elapsed_ms: 65_000 }),
+      statusWith({ state: 'running', elapsed_ms: 66_000 }),
+    );
+    expect(live.elapsed_ms).toBe(66_000);
+    const later = mergeJob(
+      summaryWith({ state: 'running', elapsed_ms: 67_000 }),
+      statusWith({ state: 'running', elapsed_ms: 66_000 }),
+    );
+    expect(later.elapsed_ms).toBe(67_000);
+    const tie = mergeJob(
+      summaryWith({ state: 'running', phase: 'crawling', elapsed_ms: 66_000 }),
+      statusWith({ state: 'running', phase: 'auditing', elapsed_ms: 66_000 }),
+    );
+    expect(tie.phase).toBe('auditing');
+  });
+
+  it('a terminal status wins over a later live list row; no status leaves the row as is', () => {
+    const merged = mergeJob(
+      summaryWith({ state: 'running', elapsed_ms: 70_000 }),
+      statusWith({ state: 'cancelled', elapsed_ms: 69_500 }),
+    );
+    expect(merged.state).toBe('cancelled');
+    expect(merged.elapsed_ms).toBe(69_500);
+    const row = summaryWith({ state: 'running', elapsed_ms: 70_000 });
+    expect(mergeJob(row, null)).toEqual(row);
   });
 });
 
@@ -116,16 +200,107 @@ describe('isStale (W-5: counters never step backwards)', () => {
   });
 });
 
-describe('stoppedReasonText (D-T8.7)', () => {
-  it('prints the eight reasons', () => {
-    expect(stoppedReasonText('budget')).toBe('stopped: probe budget reached');
-    expect(stoppedReasonText('time')).toBe('stopped: time budget reached');
-    expect(stoppedReasonText('cancelled')).toBe('cancelled by operator');
-    expect(stoppedReasonText('session_lost')).toBe('stopped: session lost');
-    expect(stoppedReasonText('errors')).toBe('stopped: too many errors');
-    expect(stoppedReasonText('policy')).toBe('stopped: agent policy changed');
-    expect(stoppedReasonText('guard_refused')).toBe('stopped: guard refused');
-    expect(stoppedReasonText('failed')).toBe('failed');
+describe('stoppedReasonText (Jobs view D4; P4-P8)', () => {
+  it('prints the eight reasons as D4 sentences, grouping the budget', () => {
+    expect(stoppedReasonText('budget', 'done', 2000, null)).toBe(
+      'Stopped early: the probe budget of 2,000 was spent. Raise it in the profile to go further.',
+    );
+    expect(stoppedReasonText('time', 'done', 2000, null)).toBe('Stopped early: the time budget ran out.');
+    expect(stoppedReasonText('cancelled', 'done', 2000, null)).toBe('Stopped early: the job was cancelled.');
+    expect(stoppedReasonText('session_lost', 'done', 2000, null)).toBe(
+      'Stopped early: the session was lost and the profile says stop when that happens.',
+    );
+    expect(stoppedReasonText('errors', 'done', 2000, null)).toBe('Stopped early: too many errors from the target.');
+    expect(stoppedReasonText('policy', 'done', 2000, null)).toBe(
+      'Stopped early: the agent policy changed to paused or read-only.',
+    );
+    expect(stoppedReasonText('guard_refused', 'done', 2000, null)).toBe(
+      'Stopped early: the L4 guard refused a target mid-run.',
+    );
+    expect(stoppedReasonText('failed', 'failed', 2000, null)).toBe('Stopped early: an error ended the job.');
+    expect(stoppedReasonText('failed', 'failed', 2000, '')).toBe('Stopped early: an error ended the job.');
+  });
+
+  it('is null when the state sentence or the error already says it (P6, P7)', () => {
+    expect(stoppedReasonText('cancelled', 'cancelled', 2000, null)).toBeNull();
+    expect(stoppedReasonText('failed', 'failed', 2000, 'boom')).toBeNull();
+  });
+
+  it('names an unknown token as a reason this app does not know (P8)', () => {
+    // The decoder maps an unknown token to null, so this branch is reached only by a cast.
+    expect(stoppedReasonText('paused' as StoppedReason, 'done', 2000, null)).toBe(
+      'Stopped early for a reason this app does not know.',
+    );
+  });
+
+  it('prints the raw token for the data-face line (P9)', () => {
+    expect(rawReasonLine('errors')).toBe('stopped_reason: errors');
+    expect(rawReasonLine('guard_refused')).toBe('stopped_reason: guard_refused');
+    expect(rawCrawlErrorLine('connect_refused')).toBe('crawl.last_error: connect_refused');
+  });
+});
+
+describe('endSentence (Jobs view D4; P1-P3)', () => {
+  const checks = (done: number, scheduled: number) => ({ ...status().checks, done, scheduled });
+
+  it('Done in <elapsed> · <points> · <checks>.', () => {
+    const s = statusWith({ state: 'done', phase: 'done', elapsed_ms: 69_000 });
+    s.points = { ...s.points, found: 1020 };
+    expect(endSentence(s, checks(6468, 6468))).toBe('Done in 1:09 · 1,020 points · 6,468 checks.');
+  });
+
+  it('Cancelled after <elapsed>; <done> of <scheduled> checks had run. What it found stays.', () => {
+    const s = statusWith({ state: 'cancelled', elapsed_ms: 115_000 });
+    expect(endSentence(s, checks(3236, 6468))).toBe(
+      'Cancelled after 1:55; 3,236 of 6,468 checks had run. What it found stays.',
+    );
+  });
+
+  it('Failed after <elapsed>.', () => {
+    expect(endSentence(statusWith({ state: 'failed', elapsed_ms: 12_000 }), checks(3, 240))).toBe(
+      'Failed after 0:12.',
+    );
+  });
+
+  it('singulars: 1 point, 1 check', () => {
+    const s = statusWith({ state: 'done', phase: 'done', elapsed_ms: 1_000 });
+    s.points = { ...s.points, found: 1 };
+    expect(endSentence(s, checks(1, 1))).toBe('Done in 0:01 · 1 point · 1 check.');
+  });
+
+  it('is null while the job is live and until a terminal status has landed', () => {
+    expect(endSentence(statusWith({ state: 'running' }), checks(180, 240))).toBeNull();
+    expect(endSentence(summaryWith({ state: 'cancelling' }), checks(180, 240))).toBeNull();
+    expect(endSentence(summaryWith({ state: 'done', phase: 'done', elapsed_ms: 69_000 }), null)).toBeNull();
+  });
+});
+
+describe('crawlTroubleText / crawlErrorWords (Jobs view D4; P10-P14)', () => {
+  it('counts the pages and the errors with singulars; null with no error', () => {
+    expect(crawlTroubleText(crawlWith({ pages: 1, errors: 1 }))).toBe('The crawl fetched 1 page and hit 1 error');
+    expect(crawlTroubleText(crawlWith({ pages: 46, errors: 2 }))).toBe('The crawl fetched 46 pages and hit 2 errors');
+    expect(crawlTroubleText(crawlWith({ pages: 0, errors: 1 }))).toBe('The crawl fetched 0 pages and hit 1 error');
+    expect(crawlTroubleText(crawlWith({ pages: 37, errors: 0 }))).toBeNull();
+  });
+
+  it('words every last_error token; transport, other and an unknown token read as a failed connection', () => {
+    expect(crawlErrorWords('connect_refused')).toBe('the target refused the connection');
+    expect(crawlErrorWords('tls')).toBe('TLS handshake failed');
+    expect(crawlErrorWords('timeout')).toBe('the target did not answer in time');
+    expect(crawlErrorWords('h2_not_negotiated')).toBe('the target does not speak HTTP/2');
+    expect(crawlErrorWords('transport')).toBe('the connection failed');
+    expect(crawlErrorWords('other')).toBe('the connection failed');
+    expect(crawlErrorWords('x')).toBe('the connection failed');
+  });
+});
+
+describe('grouped (the en-US thousands comma of D4 and D11)', () => {
+  it('groups every three digits and leaves small numbers alone', () => {
+    expect(grouped(6468)).toBe('6,468');
+    expect(grouped(1020)).toBe('1,020');
+    expect(grouped(1234567)).toBe('1,234,567');
+    expect(grouped(0)).toBe('0');
+    expect(grouped(999)).toBe('999');
   });
 });
 
