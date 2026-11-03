@@ -1270,4 +1270,42 @@ extension ScanModelTests {
         #expect(notices.last == "Skipped ws: r7")
         #expect(Set(notices).count == 16)
     }
+
+    /// Fix 2.12c (PR 2 security minor, round 2): an unknown vocabulary token is cleaned
+    /// and cut to `ScanWire.tokenMax` at the one choke point (`vocab`, `optionalVocab`,
+    /// `vocabs`) and so are the keys `counts` keeps, so a `ScanLane.other` word or a
+    /// `by_lane` key, which the Jobs view draws verbatim, can carry neither a bidi
+    /// override nor a newline nor more than 64 scalars. Known tokens are short ASCII,
+    /// so the cleaning is identity on them and `.http` still decodes to its case.
+    @Test func unknownLaneTokensAreCleanedAtDecode() throws {
+        // 300 scalars: a newline, a right-to-left override, then "ab" 149 times.
+        let hostileKey = "\n\u{202E}" + String(repeating: "ab", count: 149)
+        #expect(hostileKey.unicodeScalars.count == 300)
+        var status = try ScanPack.load("scan.status.json")
+        status = ScanPack.edited(status, path: ["probes", "by_lane"], to: .object([hostileKey: 3]))
+        status = ScanPack.edited(status, path: ["lanes", "run"], to: .array(["http", "x\u{202E}y"]))
+        status = ScanPack.edited(status, path: ["lanes", "requested"], to: .array(["a\nb"]))
+        status = ScanPack.edited(
+            status, path: ["lanes", "skipped"], to: .array([.object(["lane": "l4\u{200B}_stream", "reason": "r"])]))
+        let decoded = try ScanJobStatus(json: status)
+
+        let kept = String(repeating: "ab", count: 32)
+        #expect(kept.unicodeScalars.count == 64)
+        #expect(decoded.probes.byLane == [kept: 3])
+        for key in decoded.probes.byLane.keys {
+            #expect(!key.contains("\n"))
+            #expect(!key.contains("\u{202E}"))
+        }
+        #expect(decoded.lanes.run == [.http, .other("xy")])
+        #expect(decoded.lanes.requested == [.other("ab")])
+        #expect(decoded.lanes.skipped == [ScanSkippedLane(lane: .other("l4_stream"), reason: "r")])
+
+        // A single unknown token through `vocab`, and a long one cut to 64.
+        var skipped = try ScanPack.load("scan.status.json")
+        skipped = ScanPack.edited(
+            skipped, path: ["lanes", "skipped"],
+            to: .array([.object(["lane": .string(String(repeating: "q", count: 100)), "reason": "r"])]))
+        let lane = try ScanJobStatus(json: skipped).lanes.skipped.first?.lane
+        #expect(lane == .other(String(repeating: "q", count: 64)))
+    }
 }

@@ -144,7 +144,14 @@ import Testing
 
         let appSources = try FileManager.default.subpathsOfDirectory(atPath: Self.root.appending(path: "apps/mac/Sources").path)
             .filter { $0.hasSuffix(".swift") }
-        #expect(appSources.count == 189, "the walk found the app's 189 sources; found \(appSources.count)")
+        // The walk is rooted at the app's sources and reached the Jobs files (not a literal
+        // file count: that pinned every other team's file list, PR 2 quality minor, fix 2.12c).
+        // `subpathsOfDirectory` returns paths relative to `apps/mac/Sources`.
+        for required in ["Aitmproxy/Panels/ScanPanel+Jobs.swift", "Aitmproxy/Panels/ScanJobCard.swift",
+                         "Aitmproxy/Panels/ScanJobWells.swift", "Aitmproxy/Panels/ScanProgressViews.swift",
+                         "Aitmproxy/App.swift", "Aitmproxy/UI/Tokens.swift"] {
+            #expect(appSources.contains(required), "the walk missed \(required)")
+        }
         var survivors: [String] = []
         for path in appSources {
             let text = try Self.source("apps/mac/Sources/\(path)")

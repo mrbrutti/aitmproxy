@@ -114,21 +114,23 @@ struct ScanAgentDot: View {
 // MARK: - Chip
 
 /// The card's state chip (D11): a 22 pt pill in the tone pair with a 6 pt dot before
-/// the word. The dot breathes only while `breathing` (the caller passes cancelling and
-/// not Reduce Motion, D12: the chip's cancelling dot breathes, its running dot is
-/// static). The word crossfades and the pair recolours over `ScanMotion.state` (D12);
-/// both are opacity and colour, so Reduce Motion keeps them.
+/// the word. The dot breathes only while `breathing` and not `reduceMotion` (the caller
+/// passes cancelling; D12: the chip's cancelling dot breathes, its running dot is
+/// static), the same contract as `ScanStateDot`. The word crossfades and the pair
+/// recolours over `ScanMotion.state` (D12); both are opacity and colour, so Reduce
+/// Motion keeps them.
 struct ScanStateChip: View {
     var word: String
     var tone: ScanJobTone
     var breathing: Bool
+    var reduceMotion: Bool
 
     var body: some View {
         let dot = Circle()
             .fill(ScanToneColors.chipForeground(tone))
             .frame(width: CardMetrics.dot, height: CardMetrics.dot)
         HStack(spacing: Tok.Metric.gapTight) {
-            if breathing {
+            if breathing, !reduceMotion {
                 dot.modifier(Breathing())
             } else {
                 dot

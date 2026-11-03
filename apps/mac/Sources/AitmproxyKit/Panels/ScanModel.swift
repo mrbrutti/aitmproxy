@@ -801,28 +801,39 @@ struct ScanWire {
 
     /// An object of whole numbers (`by_lane`); absent reads as empty. Every value is
     /// type-checked, then the first `listMax` keys in sorted order are kept (the parsed
-    /// object is a dictionary, so the wire order is gone; sorting makes the cut deterministic).
+    /// object is a dictionary, so the wire order is gone; sorting makes the cut
+    /// deterministic). The kept keys are cleaned and cut to `tokenMax` like any other
+    /// vocabulary token (fix 2.12c); two keys that clean to one word collapse,
+    /// last writer wins, so the count stays at most `listMax`.
     func counts(_ key: String) throws -> [String: Int] {
         guard let value = try optionalObject(key)?.objectValue else { return [:] }
         let all = try value.mapValues { try whole($0, key, "an object of whole numbers") }
-        guard all.count > Self.listMax else { return all }
         var kept: [String: Int] = [:]
-        for name in all.keys.sorted().prefix(Self.listMax) { kept[name] = all[name] }
+        for name in all.keys.sorted().prefix(Self.listMax) {
+            kept[Self.cleaned(name, max: Self.tokenMax)] = all[name]
+        }
         return kept
     }
 
+    // The one choke point for vocabulary tokens (fix 2.12c): the raw wire string is
+    // cleaned and cut to `tokenMax` before matching. The known tokens are short ASCII,
+    // so the cleaning is identity on them; only an unknown word reaching `.other` changes.
+
     func vocab<V: ScanVocabulary>(_ key: String) throws -> V {
-        let raw = try string(key)
-        return V(rawValue: raw) ?? V.other(raw)
+        Self.token(try string(key))
     }
 
     func optionalVocab<V: ScanVocabulary>(_ key: String) throws -> V? {
-        guard let raw = try optionalString(key) else { return nil }
-        return V(rawValue: raw) ?? V.other(raw)
+        try optionalString(key).map(Self.token)
     }
 
     func vocabs<V: ScanVocabulary>(_ key: String) throws -> [V] {
-        try strings(key).map { V(rawValue: $0) ?? V.other($0) }
+        try strings(key).map(Self.token)
+    }
+
+    private static func token<V: ScanVocabulary>(_ raw: String) -> V {
+        let word = cleaned(raw, max: tokenMax)
+        return V(rawValue: word) ?? V.other(word)
     }
 
     /// A canary; absent or `null` is `.none`.

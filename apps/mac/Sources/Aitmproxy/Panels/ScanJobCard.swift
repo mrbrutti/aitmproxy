@@ -234,10 +234,10 @@ struct ScanJobTitleRow: View {
             HStack(alignment: .top, spacing: Space.md) {
                 VStack(alignment: .leading, spacing: Space.xs) {
                     HStack(spacing: Space.md) {
-                        // The chip's dot breathes while cancelling and Reduce Motion is off (D12).
+                        // The chip's dot breathes while cancelling; the chip skips it under Reduce Motion (D12).
                         ScanStateChip(
                             word: ScanFormat.stateWord(facts), tone: ScanFormat.tone(facts),
-                            breathing: facts.summary.state == .cancelling && !reduceMotion)
+                            breathing: facts.summary.state == .cancelling, reduceMotion: reduceMotion)
                         Text(ScanFormat.jobHeading(facts))
                             .font(Tok.Face.data(Tok.Typography.Size.xxl, .semibold))
                             .foregroundStyle(Tok.Ink.primary.color)
@@ -465,7 +465,6 @@ struct ScanJobLane: View {
     }
 
     private var progressAnimation: Animation? { reduceMotion ? nil : ScanMotion.ease(ScanMotion.progress) }
-    private var swap: AnyTransition { .swapTransition(reduceMotion: reduceMotion) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -639,7 +638,7 @@ struct ScanJobLane: View {
                         .font(Tok.Face.ui(Tok.Typography.Size.md))
                         .foregroundStyle(Tok.Ink.primary.color)
                         .lineLimit(1)
-                        .transition(swap)
+                        .transition(.swapTransition(reduceMotion: reduceMotion))
                 }
             } else if let tag = tagText {
                 ScanInked.token(
@@ -651,7 +650,7 @@ struct ScanJobLane: View {
                 .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { tagWidth = $0 }
                 .padding(.leading, min(max(0, g.markX - tagWidth / 2), max(0, width - tagWidth)))
                 .animation(progressAnimation, value: fillFraction)
-                .transition(swap)
+                .transition(.swapTransition(reduceMotion: reduceMotion))
             }
         }
         .padding(.top, Space.md)
