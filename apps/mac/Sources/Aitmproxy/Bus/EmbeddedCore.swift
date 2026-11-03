@@ -187,10 +187,16 @@ actor EmbeddedCore {
         let workDir: URL
         let configURL: URL
         let endpointURL: URL
+        // Bound once and used twice: as the config's `mcp.audit_log` and as the signal that the
+        // child's inherited `AITM_AUDIT_LOG` must go (`childEnvironment`, below), so one value
+        // drives both the key and the removal (AC8).
+        let harnessAuditLog: URL?
         do {
             workDir = try makeWorkDir()
             configURL = workDir.appending(path: "config.yaml")
             endpointURL = workDir.appending(path: "bus.endpoint")
+            harnessAuditLog = EmbeddedCoreLaunch.harnessAuditLogFile(
+                environment: ProcessInfo.processInfo.environment, workDir: workDir)
             // A stale rendezvous from a killed prior run must not be read as this
             // core's address: start from a clean slate (Rust truncates on write).
             try? FileManager.default.removeItem(at: endpointURL)
@@ -205,7 +211,11 @@ actor EmbeddedCore {
                 captureEnabled: captureEnabled,
                 scopeHosts: scopeHosts,
                 systemProxyAuto: systemProxyAuto,
-                systemProxyBypass: systemProxyBypass
+                systemProxyBypass: systemProxyBypass,
+                // A harness run (dev bundle `APP_STORE`, live self-test `APP_LIVE`) keeps
+                // its durable audit under its own directory, never the operator's real
+                // `audit.jsonl`; a normal launch passes nil and the config is unchanged.
+                auditLogFile: harnessAuditLog
             )
             try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)  // yaml() escapes/validates spliced paths
         } catch {
@@ -222,16 +232,25 @@ actor EmbeddedCore {
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "RUST_LOG")
         environment["AITM_OBSCURA_BIN"] = binaries.obscura.path
-        // A dev bundle, harness or live self-test (an overridden store) publishes its core pointer
-        // under its own store, never in the operator's run dir: otherwise the CLI's one-shots see
-        // "two running cores" beside the installed app (seen on the 0.5.14 acceptance run). The
-        // installed app keeps the core's default dir, which is where the CLI looks. An explicit
-        // AITM_RUN_DIR in the launch environment wins over the store's (the core's own rule: a
-        // non-empty AITM_RUN_DIR is the operator's choice).
+        // Three things follow an overridden store (a dev bundle, the harness, the live self-test),
+        // and they read as one rule because both Kit helpers hang off
+        // `SettingsDomain.overriddenStoreURL`:
+        //   1. the settings suite: `SettingsDomain.select` picks the isolated, wiped suite;
+        //   2. the run dir: `AITM_RUN_DIR = isolatedRunDir` (#308, unchanged here). The core
+        //      publishes its pointer under `<store>/run/cores`, never in the operator's run dir,
+        //      otherwise the CLI's one-shots see "two running cores" beside the installed app
+        //      (seen on the 0.5.14 acceptance run). The installed app keeps the core's default
+        //      dir, which is where the CLI looks. An explicit non-empty AITM_RUN_DIR in the launch
+        //      environment still wins over the store's (the core's own rule: the operator's choice);
+        //   3. the audit log: `auditLogFile = harnessAuditLogFile` in the config above, plus the
+        //      removal of an inherited AITM_AUDIT_LOG from the child (`childEnvironment`), because
+        //      the core's env.rs would let that variable beat the config and send a harness core's
+        //      audit to the operator's real `audit.jsonl` (AC8).
         if (environment[EmbeddedCoreLaunch.runDirEnvironmentKey] ?? "").isEmpty,
            let runDir = EmbeddedCoreLaunch.isolatedRunDir(environment: environment) {
             environment[EmbeddedCoreLaunch.runDirEnvironmentKey] = runDir.path
         }
+        environment = EmbeddedCoreLaunch.childEnvironment(environment, harnessAuditLogFile: harnessAuditLog)
         process.environment = environment
 
         let out = Pipe()
