@@ -1,0 +1,1 @@
+banner first seen 21 s after SIGSTOP

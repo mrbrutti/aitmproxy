@@ -220,14 +220,15 @@ fn jobs_narrow_row_drops_profile_and_targets_into_the_detail() {
     let mut app = populated();
     let _ = app.update(Action::ScanTab(ScanTab::Jobs));
     let text = screen_at(&mut app, 90, 40);
+    // Jobs view D19, T2: `state`, `progress` and `budget` columns.
     let header = text
         .lines()
-        .find(|l| l.contains("state/phase"))
+        .find(|l| l.contains("progress"))
         .unwrap_or_else(|| panic!("no Jobs header:\n{text}"));
     let words: Vec<&str> = header.trim_matches('│').split_whitespace().collect();
     assert_eq!(
         words,
-        ["job", "state/phase", "probes", "points", "issues", "el."],
+        ["job", "state", "progress", "budget", "points", "issues", "el."],
         "the narrow header: {header:?}"
     );
     assert!(!header.contains("profile") && !header.contains("targets"));
@@ -250,8 +251,8 @@ fn jobs_narrow_row_drops_profile_and_targets_into_the_detail() {
     );
     let row = text
         .lines()
-        .find(|l| l.contains("running/audit"))
-        .unwrap_or_else(|| panic!("no running/audit row:\n{text}"));
+        .find(|l| l.contains("auditing"))
+        .unwrap_or_else(|| panic!("no auditing row:\n{text}"));
     assert!(
         !row.contains("standard"),
         "the narrow row does not carry the profile: {row:?}"
@@ -274,21 +275,12 @@ fn jobs_narrow_row_drops_profile_and_targets_into_the_detail() {
     );
     let header = wide
         .lines()
-        .find(|l| l.contains("state/phase"))
+        .find(|l| l.contains("progress"))
         .unwrap_or_else(|| panic!("no wide Jobs header:\n{wide}"));
     let words: Vec<&str> = header.trim_matches('│').split_whitespace().collect();
     assert_eq!(
         words,
-        [
-            "job",
-            "profile",
-            "targets",
-            "state/phase",
-            "probes",
-            "points",
-            "issues",
-            "el."
-        ],
+        ["job", "profile", "targets", "state", "progress", "budget", "points", "issues", "el."],
         "the full header: {header:?}"
     );
 }

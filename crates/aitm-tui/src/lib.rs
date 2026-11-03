@@ -45,6 +45,13 @@ use crate::app::App;
 use crate::caps::TermCaps;
 use crate::theme::Theme;
 
+/// The period of one `Tick` in milliseconds: the unit the Jobs banner's
+/// age clause counts in (`ui::scan::values_age_text`).
+pub const TICK_MS: u64 = 250;
+/// The period of one `Tick`: the runtime's interval, [`TICK_MS`] as a
+/// `Duration`.
+pub const TICK: Duration = Duration::from_millis(TICK_MS);
+
 /// Where the UI gets its bus.
 pub enum TransportChoice {
     /// A running proxy's loopback TCP transport.
@@ -140,7 +147,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let size = terminal.size()?;
     let _ = app.update(Action::Resize(size.width, size.height));
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut tick = tokio::time::interval(TICK);
 
     let result: anyhow::Result<()> = loop {
         if let Err(e) = terminal.draw(|f| ui::view(&app, &theme, f)) {

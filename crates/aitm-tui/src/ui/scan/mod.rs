@@ -21,7 +21,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::scan::{ScanError, ScanOffer, ScanTab, NO_SCANNER};
+use crate::scan::{elapsed_text, ScanError, ScanOffer, ScanTab, NO_SCANNER};
 use crate::text::{cells, fit, truncate, width};
 use crate::theme::Theme;
 use crate::tokens::color::status;
@@ -115,7 +115,9 @@ const ISSUES_DEGRADED: &str = "issues need scan.issues (scanner v2)";
 
 /// The one-line state of the active tab (D11, D13), in this order: no
 /// scanner at all, the last error of this tab (`error`, found once per
-/// frame by [`tab_error`]), the notice a key left (`already <state>`, which
+/// frame by [`tab_error`]; on Jobs with the age of the values on screen
+/// after it, ` · showing values from 42s ago`, Jobs view D19 T2 and
+/// [`values_age_text`]), the notice a key left (`already <state>`, which
 /// answers the operator's last key and so outranks a standing degraded
 /// text), the tab's degraded text (a legacy bus, or a v2 bus missing the
 /// tab's verb), a refresh in flight over an empty pane, or `idle`. The
@@ -126,7 +128,14 @@ fn banner(app: &App, error: Option<&ScanError>) -> String {
         return NO_SCANNER.to_string();
     }
     if let Some(e) = error {
-        return e.wording();
+        let mut text = e.wording();
+        if app.scan.tab == ScanTab::Jobs {
+            if let Some(age) = values_age_text(app.ticks, app.scan.jobs.listed_ok_at_tick) {
+                text.push_str(" · ");
+                text.push_str(&age);
+            }
+        }
+        return text;
     }
     if let Some(notice) = &app.scan.notice {
         return notice.clone();
@@ -138,6 +147,18 @@ fn banner(app: &App, error: Option<&ScanError>) -> String {
         return format!("refreshing {verb}...");
     }
     "idle".to_string()
+}
+
+/// How old the Jobs values on screen are (Jobs view D15, D19 T2): the
+/// ticks since the last `scan.list` that folded (`listed_ok_at_tick`,
+/// stamped by the reducer), [`crate::TICK`] each, as `showing values from
+/// 42s ago` in the row's elapsed shape ([`elapsed_text`]); `None` before
+/// the first list lands. A core that stops answering leaves the banner's
+/// error on screen, and this says the numbers under it are from before it.
+pub fn values_age_text(now_tick: u64, listed_ok_at_tick: Option<u64>) -> Option<String> {
+    let since = now_tick.saturating_sub(listed_ok_at_tick?);
+    let ms = since.saturating_mul(crate::TICK_MS);
+    Some(format!("showing values from {} ago", elapsed_text(ms)))
 }
 
 /// The active tab's degraded text, when the bus cannot serve it (D2): on a
@@ -917,5 +938,22 @@ mod tests {
         assert_eq!(short.list, Rect::new(0, 0, 50, 2));
         assert_eq!(short.rule, None);
         assert_eq!(short.detail, Rect::new(0, 2, 50, 0));
+    }
+
+    /// Jobs view Task 4.5c (5), 4.5d: one tick period. The age clause counts
+    /// [`crate::TICK_MS`] per tick, the runtime's own interval
+    /// ([`crate::TICK`] is built from the same number), so 168 ticks of
+    /// 250 ms read `42s`; the constant is the one the runtime polls on.
+    #[test]
+    fn values_age_counts_the_runtime_tick() {
+        assert_eq!(crate::TICK_MS, 250);
+        assert_eq!(
+            crate::TICK,
+            std::time::Duration::from_millis(crate::TICK_MS)
+        );
+        assert_eq!(
+            values_age_text(168, Some(0)).as_deref(),
+            Some("showing values from 42s ago")
+        );
     }
 }
