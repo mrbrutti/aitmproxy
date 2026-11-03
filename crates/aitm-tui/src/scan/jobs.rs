@@ -1564,6 +1564,12 @@ mod tests {
         // The template carries a literal placeholder; the caller formats the number.
         assert!(stopped_text(StoppedReason::Budget).contains("the probe budget of"));
         assert!(stopped_text(StoppedReason::Budget).contains("{budget}"));
+        // Tester, Task 4.4: the whole template, so a re-wording cannot slip
+        // past the two `contains` above.
+        assert_eq!(
+            stopped_text(StoppedReason::Budget),
+            "Stopped early: the probe budget of {budget} was spent. Raise it in the profile to go further."
+        );
         // P4.
         assert_eq!(
             stopped_sentence(StoppedReason::Budget, JobState::Done, 2000, None).as_deref(),
@@ -2272,5 +2278,204 @@ mod tests {
             lines_of(&queued)[0],
             ("", "Waiting for the engine to start this job.".to_string())
         );
+    }
+
+    /// Tester, Task 4.4 (AC39's edges; D19 T1, D4 amendment): the re-read
+    /// rule is `is_terminal` on both sides, not a `Done` comparison. A
+    /// `cancelling` read the list turns `cancelled`, and a `running` read
+    /// the list turns `failed`, are re-read; a `done` read the list calls
+    /// `failed` is not (both terminal); a list that keeps the job live asks
+    /// nothing; an empty list asks nothing and lets the stale read go.
+    /// Until the re-read lands the row follows the list (the finished bar
+    /// keeps the stored counters' fill) while the Detail pane keeps the
+    /// live first line: a sentence is never built from a live status.
+    #[test]
+    fn fold_list_followups_follow_is_terminal_across_states() {
+        let id = "scan-1a2b3c4d".to_string();
+        let mut jobs = JobsState::default();
+
+        jobs.fold_status(fixture_status(JobState::Cancelling));
+        let followups = jobs.fold_list(ListResult {
+            jobs: vec![listed(&id, JobState::Cancelled)],
+        });
+        assert_eq!(followups, vec![id.clone()], "cancelling -> cancelled");
+
+        jobs.fold_status(fixture_status(JobState::Running));
+        let followups = jobs.fold_list(ListResult {
+            jobs: vec![listed(&id, JobState::Failed)],
+        });
+        assert_eq!(followups, vec![id.clone()], "running -> failed");
+        let row = jobs.row_of(&id);
+        assert_eq!(row.state_phase, "failed");
+        assert_eq!(
+            (row.progress.as_str(), row.progress_fill),
+            ("180/240", 4),
+            "the finished bar keeps the stored counters' fill"
+        );
+        assert_eq!(
+            jobs.detail_text()[0],
+            ("", "75\u{a0}% · 180 of 240 checks".to_string()),
+            "a live stored status never yields a sentence"
+        );
+
+        jobs.fold_status(fixture_status(JobState::Done));
+        let followups = jobs.fold_list(ListResult {
+            jobs: vec![listed(&id, JobState::Failed)],
+        });
+        assert_eq!(
+            followups,
+            Vec::<JobId>::new(),
+            "done vs failed: both terminal, nothing to re-read"
+        );
+        assert_eq!(
+            jobs.detail_text()[0],
+            ("", "Done in 0:42 · 120 points · 240 checks.".to_string())
+        );
+
+        jobs.fold_status(fixture_status(JobState::Running));
+        let followups = jobs.fold_list(ListResult {
+            jobs: vec![listed(&id, JobState::Running)],
+        });
+        assert_eq!(
+            followups,
+            Vec::<JobId>::new(),
+            "the list keeps it live: the timer polls it"
+        );
+
+        let followups = jobs.fold_list(ListResult { jobs: vec![] });
+        assert_eq!(followups, Vec::<JobId>::new());
+        assert!(jobs.full.is_empty() && jobs.order.is_empty());
+        assert_eq!(
+            jobs.detail_text(),
+            vec![("", WAITING_FOR_STATUS.to_string())]
+        );
+    }
+
+    /// Tester, Task 4.4 (D6 hostile-core bounds on the T2 model): the
+    /// derived progress, the percent, the bar and the sentences take any
+    /// `u64` the core sends without a panic, clamp where D8 says so, and
+    /// read the bounded lists, never the core's.
+    #[test]
+    fn progress_and_sentences_survive_hostile_counters() {
+        let status = |state: JobState, phase: Phase| JobStatus {
+            state,
+            phase,
+            ..Default::default()
+        };
+        let of = |s: &JobStatus| progress(&s.summary(), Some(s));
+
+        // More done than scheduled, at the top of the range: clamped at 1.
+        let mut auditing = status(JobState::Running, Phase::Auditing);
+        auditing.checks.done = u64::MAX;
+        auditing.checks.scheduled = 1;
+        let p = of(&auditing);
+        assert_eq!(p.ring, Ring::Determinate(1.0));
+        assert_eq!(p.fraction, Some(1.0));
+        assert_eq!(percent_text(p.fraction).as_deref(), Some("100\u{a0}%"));
+        assert_eq!(p.phase_line, "18,446,744,073,709,551,615 of 1 check");
+        assert_eq!(progress_bar(p.bar_fraction(), 6), "━━━━━━");
+        assert_eq!(
+            progress_text(&p, &auditing.summary(), Some(&auditing)),
+            "18446744073709551615/1"
+        );
+
+        // Crawl counters whose sum would overflow saturate.
+        let mut crawling = status(JobState::Running, Phase::Crawling);
+        crawling.crawl.pages = u64::MAX;
+        crawling.crawl.queued = u64::MAX;
+        let p = of(&crawling);
+        assert_eq!(p.fraction, Some(1.0));
+        assert_eq!(
+            p.phase_line,
+            "18,446,744,073,709,551,615 pages, 18,446,744,073,709,551,615 queued"
+        );
+        assert_eq!(
+            progress_text(&p, &crawling.summary(), Some(&crawling)),
+            "18446744073709551615/18446744073709551615"
+        );
+        let mut done = status(JobState::Done, Phase::Done);
+        done.crawl.queued = u64::MAX;
+        assert_eq!(
+            of(&done).ring,
+            Ring::Finished(Some(0.0)),
+            "nothing fetched, everything queued: a finished bar with no fill"
+        );
+        assert_eq!(progress_bar(of(&done).bar_fraction(), 6), "──────");
+
+        // The bar and the percent on values the model never produces.
+        assert_eq!(progress_bar(Some(-1.0), 6), "──────");
+        assert_eq!(progress_bar(Some(f64::INFINITY), 6), "──────");
+        assert_eq!(progress_bar(Some(f64::NEG_INFINITY), 6), "──────");
+        assert_eq!(progress_bar(Some(f64::NAN), 6), "──────");
+        assert_eq!(progress_bar(Some(0.5), 0), "");
+        assert_eq!(progress_bar(None, 0), "");
+        assert_eq!(progress_bar(Some(1.0), 1), "━");
+        assert_eq!(progress_bar(Some(0.999), 1), "─");
+        assert_eq!(percent_text(Some(-0.5)).as_deref(), Some("0\u{a0}%"));
+        assert_eq!(percent_text(Some(0.0)).as_deref(), Some("0\u{a0}%"));
+        assert_eq!(percent_text(Some(0.999)).as_deref(), Some("99\u{a0}%"));
+        assert_eq!(percent_text(Some(7.0)).as_deref(), Some("100\u{a0}%"));
+        assert_eq!(percent_text(None), None);
+
+        // Empty and oversized inputs to the sentences.
+        assert_eq!(
+            end_sentence(JobState::Done, 0, 0, 0, 0).as_deref(),
+            Some("Done in 0:00 · 0 points · 0 checks.")
+        );
+        assert_eq!(
+            end_sentence(JobState::Cancelled, 0, 0, 0, 0).as_deref(),
+            Some("Cancelled after 0:00; 0 of 0 checks had run. What it found stays.")
+        );
+        assert_eq!(
+            end_sentence(JobState::Failed, u64::MAX, u64::MAX, u64::MAX, u64::MAX).as_deref(),
+            Some("Failed after 5124095576030:25:51.")
+        );
+        assert_eq!(
+            end_sentence(JobState::Done, 59_999, u64::MAX, 0, u64::MAX).as_deref(),
+            Some(
+                "Done in 0:59 · 18,446,744,073,709,551,615 points · 18,446,744,073,709,551,615 checks."
+            )
+        );
+        assert_eq!(
+            stopped_sentence(StoppedReason::Budget, JobState::Done, u64::MAX, None).as_deref(),
+            Some(
+                "Stopped early: the probe budget of 18,446,744,073,709,551,615 was spent. Raise it in the profile to go further."
+            )
+        );
+        assert_eq!(
+            stopped_sentence(StoppedReason::Budget, JobState::Done, 0, None).as_deref(),
+            Some(
+                "Stopped early: the probe budget of 0 was spent. Raise it in the profile to go further."
+            )
+        );
+        let crawl = CrawlCounters {
+            pages: 0,
+            errors: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            crawl_trouble(&crawl).as_deref(),
+            Some("The crawl fetched 0 pages and hit 18,446,744,073,709,551,615 errors")
+        );
+        assert_eq!(elapsed_text(u64::MAX), "5124095576030h25m");
+        assert_eq!(grouped(u64::MAX), "18,446,744,073,709,551,615");
+
+        // `now_line` reads the bounded list: a thousand running ids are
+        // cut to DETAIL_LIST_MAX at fold, and the line counts what was
+        // kept, never the core's thousand; an empty list gives none.
+        let mut running = fixture_status(JobState::Running);
+        running.checks.running = (0..1000).map(|k| format!("c{k}")).collect();
+        let read = ReadStatus::new(running);
+        assert_eq!(read.dropped.running, 1000 - DETAIL_LIST_MAX);
+        let p = progress(&read.summary(), Some(&read.status));
+        assert_eq!(p.now_line.as_deref(), Some("Now: c0 and 7 more"));
+        let lines = detail_lines(&read);
+        assert_eq!(
+            lines[1],
+            ("now", "c0, c1, c2, c3, c4, c5, c6, c7 +992".to_string())
+        );
+        let mut none = fixture_status(JobState::Running);
+        none.checks.running.clear();
+        assert_eq!(of(&none).now_line, None);
     }
 }

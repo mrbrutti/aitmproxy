@@ -975,3 +975,139 @@ fn banner_carries_the_values_age() {
         "no error, no age clause: {strip:?}"
     );
 }
+
+/// Tester, Task 4.4 (AC39 through the app; D19 T1): a `scan.list` that
+/// turns the job terminal while its stored status is still live issues one
+/// `scan.status` follow-up for it and stamps the fold's tick; the row reads
+/// the list's state at once with the finished bar keeping its fill, while
+/// the Detail pane keeps the live first line until the re-read lands; the
+/// next list, both sides terminal, asks nothing.
+#[test]
+fn a_list_that_turns_the_job_terminal_rereads_it() {
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    let mut list = fixture("scan.list.json");
+    list["jobs"].as_array_mut().expect("rows").truncate(1);
+    list["jobs"][0]["state"] = json!("cancelled");
+    list["jobs"][0]["phase"] = json!("done");
+    app.ticks = 40;
+    let reqs = app.on_bus(reply("scan.list", "scan.list", list.clone()));
+    assert_eq!(
+        reqs,
+        vec![tagged(
+            &format!("scan.status:{JOB}"),
+            "scan.status",
+            json!({ "job": JOB })
+        )],
+        "one re-read for the job the list turned terminal"
+    );
+    assert_eq!(app.scan.jobs.listed_ok_at_tick, Some(40));
+    let text = screen(&app);
+    let row = line_with(&text, JOB).expect("the row");
+    assert!(
+        row.contains("cancelled   180/240 ━━━━──  418/2000"),
+        "the row follows the list, the finished bar keeps its fill (the progress column is right-aligned to its 8-cell minimum): {row:?}"
+    );
+    assert_eq!(
+        app.scan.jobs.detail_text()[0],
+        ("", "75\u{a0}% · 180 of 240 checks".to_string()),
+        "the stale live read never yields a sentence"
+    );
+
+    let mut done = status_in("cancelled", "done");
+    done["elapsed_ms"] = json!(115_000);
+    done["checks"]["done"] = json!(3236);
+    done["checks"]["scheduled"] = json!(6468);
+    done["checks"]["running"] = json!([]);
+    let _ = app.on_bus(status_reply(done));
+    assert_eq!(
+        app.scan.jobs.detail_text()[0],
+        (
+            "",
+            "Cancelled after 1:55; 3,236 of 6,468 checks had run. What it found stays.".to_string()
+        )
+    );
+    let reqs = app.on_bus(reply("scan.list", "scan.list", list));
+    assert_eq!(reqs, Vec::new(), "both terminal: nothing to re-read");
+}
+
+/// Tester, Task 4.4 (D6 hostile-core bounds through the screen; D8): a
+/// core reporting more checks done than scheduled renders a full bar and
+/// `100 %`, never more; an auditing job with nothing scheduled renders `...`
+/// with an empty bar and `Scheduling checks`; a crawling job's progress
+/// reads pages over known with its percent floored; and an unknown
+/// `stopped_reason` token (the parity table's P8, unrepresentable in the
+/// model's closed enum) fails the status parse, so nothing of that reply
+/// folds and the Jobs banner names the contract mismatch.
+#[test]
+fn hostile_counters_render_a_clamped_progress() {
+    let mut app = app();
+    let mut body = status_in("running", "auditing");
+    body["checks"]["done"] = json!(u64::MAX);
+    body["checks"]["scheduled"] = json!(240);
+    body["checks"]["running"] = json!([]);
+    let _ = app.on_bus(status_reply(body));
+    let text = screen(&app);
+    let row = line_with(&text, JOB).expect("the row");
+    assert!(
+        row.contains("auditing  18446744073709551615/240 ━━━━━━  418/2000"),
+        "{row:?}"
+    );
+    assert_eq!(
+        app.scan.jobs.detail_text()[0],
+        (
+            "",
+            "100\u{a0}% · 18,446,744,073,709,551,615 of 240 checks".to_string()
+        )
+    );
+
+    let mut body = status_in("running", "auditing");
+    body["checks"]["done"] = json!(0);
+    body["checks"]["scheduled"] = json!(0);
+    body["checks"]["running"] = json!([]);
+    let _ = app.on_bus(status_reply(body));
+    let text = screen(&app);
+    let row = line_with(&text, JOB).expect("the row");
+    assert!(
+        row.contains("... ──────  418/2000") && !row.contains('━'),
+        "indeterminate: dots and an empty bar: {row:?}"
+    );
+    assert_eq!(
+        app.scan.jobs.detail_text()[0],
+        ("", "Scheduling checks".to_string())
+    );
+
+    let mut body = status_in("running", "crawling");
+    body["crawl"]["pages"] = json!(46);
+    body["crawl"]["queued"] = json!(12);
+    body["checks"]["running"] = json!([]);
+    let _ = app.on_bus(status_reply(body));
+    let text = screen(&app);
+    let row = line_with(&text, JOB).expect("the row");
+    assert!(
+        row.contains("crawling     46/58 ━━━━──  418/2000"),
+        "{row:?}"
+    );
+    assert_eq!(
+        app.scan.jobs.detail_text()[0],
+        ("", "79\u{a0}% · 46 pages, 12 queued".to_string())
+    );
+
+    // P8 has no TUI form: the parse refuses the token and folds nothing.
+    let before = app.scan.jobs.full.get(JOB).cloned();
+    let mut body = status_in("done", "done");
+    body["stopped_reason"] = json!("paused");
+    let _ = app.on_bus(status_reply(body));
+    assert_eq!(
+        app.scan.jobs.full.get(JOB).cloned(),
+        before,
+        "a reply outside the contract folds nothing"
+    );
+    let shown = screen(&app);
+    let strip = banner_row(&shown);
+    assert!(
+        strip.contains("scan.status: reply did not match the contract (unknown variant `paused`"),
+        "{strip:?}"
+    );
+    assert!(!shown.contains("Stopped early"), "{shown}");
+}
