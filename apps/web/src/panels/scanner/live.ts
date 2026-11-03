@@ -34,6 +34,7 @@ import {
   type InsertionPoint,
   type Issue,
   type IssueSummary,
+  type JobState,
   type JobStatus,
   type JobSummary,
   type SiteNode,
@@ -155,6 +156,13 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
   const issueTriggers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Jobs whose list-driven `scan.status` read has not answered yet (the re-read rule's dedupe). */
   const listReads = new Set<string>();
+  /**
+   * The list row each job showed when its list-driven read last failed (Task 3.12 B). A failing
+   * job holds nothing, so `needsStatusRead` would owe it a read on every list reply — a list of
+   * 1,024 jobs the core refuses is 1,024 reads per 5 s poll, for ever. The read is re-issued only
+   * once that row changes; the entry goes when a status lands or the bus resyncs.
+   */
+  const failedRows = new Map<string, { state: JobState; elapsed_ms: number }>();
   let statusPoll: ReturnType<typeof setInterval> | null = null;
   let listPoll: ReturnType<typeof setInterval> | null = null;
   let issuesPoll: ReturnType<typeof setInterval> | null = null;
@@ -212,13 +220,24 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
    * Without a push line the 1 Hz poll stops the moment the list turns terminal, which would leave
    * the held status at its last running read for ever; with push the terminal line already
    * triggered a read, so this is the fallback. One read per job is in flight at a time: a second
-   * list reply landing before the first read answered does not send another.
+   * list reply landing before the first read answered does not send another. A read that failed
+   * is not repeated while the job's row reads the same (`failedRows`): the card's Retry calls
+   * `refreshStatus` directly and is never gated.
    */
   function rereadTurnedTerminal(listed: JobSummary[]): void {
+    // A job the list no longer names owes nothing and holds no slot: the map cannot outgrow the list.
+    const named = new Set(listed.map((j) => j.job));
+    for (const job of failedRows.keys()) if (!named.has(job)) failedRows.delete(job);
     for (const j of listed) {
       if (listReads.has(j.job) || !needsStatusRead(j, own(statuses, j.job) ?? null)) continue;
+      const failed = failedRows.get(j.job);
+      if (failed && failed.state === j.state && failed.elapsed_ms === j.elapsed_ms) continue;
+      const row = { state: j.state, elapsed_ms: j.elapsed_ms };
       listReads.add(j.job);
-      void refreshStatus(j.job).finally(() => listReads.delete(j.job));
+      void refreshStatus(j.job).finally(() => {
+        listReads.delete(j.job);
+        if (own(statusErrors, j.job)) failedRows.set(j.job, row);
+      });
     }
   }
 
@@ -232,6 +251,7 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
    * answers with the parsed `cancelling` status).
    */
   function applyStatus(next: JobStatus): void {
+    failedRows.delete(next.job);
     const held = own(statuses, next.job);
     if (held && isStale(held, next)) return;
     setStatuses(next.job, { ...next });
@@ -456,6 +476,7 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
 
   /** Every (re)connection is a new stream (`app.ts:721`): re-read the list and every job. */
   async function resync(): Promise<void> {
+    failedRows.clear();
     await refreshJobs();
     for (const j of untrack(jobs)) await refreshStatus(j.job);
   }

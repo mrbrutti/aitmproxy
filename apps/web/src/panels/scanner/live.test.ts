@@ -444,4 +444,131 @@ describe('createLiveModel: the re-read rule (W1)', () => {
     await h.m.refreshJobs();
     expect(h.count('scan.status')).toBe(before + 1);
   });
+
+  // Task 3.12 B (security round 1, gap 79): a job whose `scan.status` keeps failing holds nothing,
+  // so `needsStatusRead` would owe it a read on every list reply — a hostile list of 1,024 failing
+  // jobs is 1,024 reads per 5 s poll, for ever. A failed list-driven read is re-issued only when
+  // that job's list row changes (`state` or `elapsed_ms`), the status lands, or the bus resyncs.
+  const otherRow = (patch: Raw = {}): Raw => ({ ...(raw('scan.list.json')['jobs'] as Raw[])[1]!, ...patch });
+
+  it('failing_status_reread_only_when_its_row_changes: one read per job per list row, not per list', async () => {
+    const h = harness();
+    h.fail('scan.status', 'scan: not_found: whichever');
+    h.reply('scan.list', listOf(jobRow(), otherRow()));
+
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.argsOf('scan.status').map((a) => a['job'])).toEqual([JOB, OTHER]);
+    expect(h.m.statusError(JOB)).toBe('scan: not_found: whichever');
+    expect(h.m.statusError(OTHER)).toBe('scan: not_found: whichever');
+    expect(h.m.status(JOB)).toBeNull();
+
+    // The same two rows again, three times over: nothing is owed.
+    await h.m.refreshJobs();
+    await tick(0);
+    await h.m.refreshJobs();
+    await tick(0);
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(2);
+
+    // OTHER's row moved: exactly one read, for OTHER alone.
+    h.reply('scan.list', listOf(jobRow(), otherRow({ elapsed_ms: 99000 })));
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(3);
+    expect(h.argsOf('scan.status').at(-1)).toEqual({ job: OTHER });
+
+    // JOB's state moved: exactly one read, for JOB alone.
+    h.reply('scan.list', listOf(jobRow({ state: 'cancelling' }), otherRow({ elapsed_ms: 99000 })));
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(4);
+    expect(h.argsOf('scan.status').at(-1)).toEqual({ job: JOB });
+
+    // And those rows again: still nothing owed.
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(4);
+  });
+
+  it('failing_status_that_then_parses_is_held_and_not_reread', async () => {
+    const h = harness();
+    h.reply('scan.list', listOf(jobRow()));
+    h.fail('scan.status', 'bus closed');
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(1);
+    expect(h.m.statusError(JOB)).toBe('bus closed');
+    // The same row again: the failed read is not repeated.
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(1);
+
+    // The row moves and the core answers this time: one read, held, error cleared.
+    h.reply('scan.status', raw('scan.status.json'));
+    h.reply('scan.list', listOf(jobRow({ elapsed_ms: 43000 })));
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(2);
+    expect(h.m.status(JOB)!.probes.sent).toBe(418);
+    expect(h.m.statusError(JOB)).toBeNull();
+
+    // Held and live over a live row: W1 owes nothing, whatever the row does.
+    h.reply('scan.list', listOf(jobRow({ elapsed_ms: 44000 })));
+    await h.m.refreshJobs();
+    await tick(0);
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(2);
+
+    // The list turning it terminal still costs the W1 read (the gate is only for a failed read).
+    h.reply('scan.list', listOf(jobRow({ state: 'done', phase: 'done', elapsed_ms: 44000 })));
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(3);
+  });
+
+  it('failed_rows_follow_the_list: a job the list drops is forgotten, and read once if it returns', async () => {
+    const h = harness();
+    h.fail('scan.status', 'bus closed');
+    h.reply('scan.list', listOf(jobRow(), otherRow()));
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(2);
+
+    h.reply('scan.list', listOf(jobRow()));
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(2);
+
+    // OTHER is back with the very row it failed on: the list changed its mind, so one read.
+    h.reply('scan.list', listOf(jobRow(), otherRow()));
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(3);
+    expect(h.argsOf('scan.status').at(-1)).toEqual({ job: OTHER });
+  });
+
+  it('retry_is_never_gated: the card\'s Retry calls refreshStatus directly and always reads', async () => {
+    const h = harness();
+    h.reply('scan.list', listOf(jobRow()));
+    h.fail('scan.status', 'bus closed');
+    await h.m.refreshJobs();
+    await tick(0);
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(1);
+
+    await h.m.refreshStatus(JOB);
+    expect(h.count('scan.status')).toBe(2);
+    await h.m.refreshStatus(JOB);
+    expect(h.count('scan.status')).toBe(3);
+    expect(h.m.statusError(JOB)).toBe('bus closed');
+
+    // A list after a failed Retry with the same row still owes nothing.
+    await h.m.refreshJobs();
+    await tick(0);
+    expect(h.count('scan.status')).toBe(3);
+  });
 });
