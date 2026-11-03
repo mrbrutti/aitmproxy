@@ -22,7 +22,7 @@
 //! orderly exit. The bus and web tokens never reach it.
 
 use std::future::Future;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1422,12 +1422,31 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         // only a failed restore's warning (by design, spec D4) or the
         // audit-flush integrity warning (S7) may follow it.
         let stdio_transport = matches!(cfg.mcp.transport, McpTransport::Stdio);
+        // Spec D1: `aitm web` with the stdio transport on a terminal stdin
+        // serves nothing on it — the first `read(0)` from a background process
+        // group would stop the whole group (SIGTTIN) and SIGTERM would stay
+        // pending until SIGKILL. The web bridge's own `McpServer` (`bus`) and
+        // the operator bus are untouched; the agent `McpServer` is dropped
+        // unused with the never-ending future. `is_terminal()` is `isatty`
+        // (a `tcgetattr` ioctl), which raises no job-control signal itself.
+        let serve_agent =
+            serve_agent_transport(&mode, stdio_transport, std::io::stdin().is_terminal());
+        if !serve_agent {
+            info!("{WEB_STDIO_TTY_NOTE}");
+        }
+        let agent_run = async move {
+            if serve_agent {
+                mcp.serve().await
+            } else {
+                std::future::pending().await
+            }
+        };
         let mut stdio_eof = None;
         let served = tokio::select! {
             result = proxy.run_on(proxy_listener) => result,
             result = proxy.run_browser_on(browser_listener) => result,
-            result = mcp.serve() => {
-                stdio_eof = stdio_eof_note(stdio_transport, &result);
+            result = agent_run => {
+                stdio_eof = stdio_eof_note(stdio_transport && serve_agent, &result);
                 result
             }
             result = web_run => result,
@@ -1504,6 +1523,22 @@ fn configured_agent_port(transport: &McpTransport) -> Option<u16> {
         McpTransport::StreamableHttp { bind, .. } => bind.port(),
     };
     (port != 0).then_some(port)
+}
+
+/// The one `info` line `aitm web` logs when it withholds the stdio MCP
+/// transport because stdin is a terminal (spec D2). A terminal is not an MCP
+/// channel: reading it from a background process group stops the whole group
+/// with SIGTTIN, which is how the 0.5.18 acceptance saw "`aitm web` ignores
+/// SIGTERM". Log-only: no reporter note, no card change, no path or token.
+const WEB_STDIO_TTY_NOTE: &str = "mcp.transport is stdio and stdin is a terminal; aitm web does not serve the agent transport on it (an MCP client hands aitm a pipe)";
+
+/// Whether the agent transport is served by `mcp.serve()` this run (spec D1).
+/// `false` only for `aitm web` with the stdio transport on a terminal stdin;
+/// bare `aitm` on a terminal stays the stdio MCP server, a loopback or HTTP
+/// transport never reads stdin, and a pipe stdin in web mode is served (an
+/// MCP client or supervisor keeps today's transport and the R14 EOF exit).
+fn serve_agent_transport(mode: &Mode, transport_is_stdio: bool, stdin_is_terminal: bool) -> bool {
+    !(mode == &Mode::Web && transport_is_stdio && stdin_is_terminal)
 }
 
 /// The reporter's last line of a serving session when the stdio MCP arm ended
@@ -1772,6 +1807,43 @@ mod tests {
         assert_eq!(super::stdio_eof_note(false, &ok), None);
         assert_eq!(super::stdio_eof_note(true, &err), None);
         assert_eq!(super::stdio_eof_note(false, &err), None);
+    }
+
+    /// Spec D1 / AC3: the agent transport is withheld only for `aitm web`
+    /// with the stdio transport on a terminal stdin; every other combination
+    /// serves it (bare `aitm` on a terminal stays the stdio MCP server).
+    #[test]
+    fn serve_agent_transport_is_withheld_only_for_web_stdio_on_a_terminal() {
+        assert!(!super::serve_agent_transport(&Mode::Web, true, true));
+        assert!(super::serve_agent_transport(&Mode::Web, true, false));
+        assert!(super::serve_agent_transport(&Mode::Web, false, true));
+        assert!(super::serve_agent_transport(&Mode::Server, true, true));
+    }
+
+    /// Spec D2 / AC4: the withheld-transport log line, in exactly these
+    /// words, and carrying no token, URL or link fragment.
+    #[test]
+    fn web_stdio_tty_note_words_and_no_secrets() {
+        assert_eq!(
+            super::WEB_STDIO_TTY_NOTE,
+            "mcp.transport is stdio and stdin is a terminal; aitm web does not serve the agent transport on it (an MCP client hands aitm a pipe)"
+        );
+        for needle in ["token", "http://", "/#t="] {
+            assert!(!super::WEB_STDIO_TTY_NOTE.contains(needle), "{needle}");
+        }
+    }
+
+    /// Spec D3 / AC5: when the transport was withheld the call site passes
+    /// `false` ("served", not "configured"), so no stdin-EOF note is produced;
+    /// a served stdio transport that ended `Ok` still yields it.
+    #[test]
+    fn stdio_eof_note_is_none_when_the_transport_was_withheld() {
+        let ok: anyhow::Result<()> = Ok(());
+        assert_eq!(super::stdio_eof_note(false, &ok), None);
+        assert_eq!(
+            super::stdio_eof_note(true, &ok),
+            Some("stdin closed · stdio MCP transport ended")
+        );
     }
 
     /// S7: the reporter's audit-flush integrity warning names the estimate of
