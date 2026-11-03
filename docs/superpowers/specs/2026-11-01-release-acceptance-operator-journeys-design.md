@@ -130,7 +130,7 @@ that fails blocks the release until it is fixed or Matt accepts it in writing in
   (either differs; the report quotes both), `SKIP <reason>` (not performed: no window, no yes,
   port held, missing dependency, or not applicable on this surface), `BLOCKED <step>` (a step
   this one depends on FAILed, was SKIPped or BLOCKED, so this one cannot be judged). Dependencies:
-  MAC-8 ← MAC-5 and (MAC-6 or MAC-7); MAC-9a ← MAC-7 and MAC-8; MAC-9b ← MAC-6 and MAC-8;
+  MAC-8 ← MAC-5 and (MAC-6 or MAC-7); MAC-16 ← MAC-5b; MAC-9a ← MAC-7 and MAC-8; MAC-9b ← MAC-6 and MAC-8;
   MAC-10/11/12 ← MAC-8; MAC-14 ← MAC-7; MAC-15 ← MAC-6; TUI-4/5 ← TUI-2 and TUI-3; TUI-7 ← TUI-3;
   WEB-5/6 ← WEB-3 and WEB-4; WEB-7 ← WEB-4; CLI-4/5/N4 ← a running core; CLI-3/6/8 ← free ports;
   CLI-10 ← MAC-8. Neither `SKIP` nor `BLOCKED` is ever counted as green. A sixth result, `N/A`,
@@ -185,6 +185,7 @@ a proxied flow carries none.
 | MAC-3 | auto | Proxy ▸ Status (⌘0) | "Getting started" list in the order Core, Bus, System proxy, All Apps, Scope, CA, First flow. With nothing routed and an empty Scope: "system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core." (button "Set as System Proxy"); "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)" (button "Capture All Apps"); "Add a host to Scope (for now as example.com:443)" (button "Open Scope…"); CA step omitted or done when trusted; "Set aitmproxy as the system proxy, or open the browser". | `proxy.system.status.state == "off"`, `capture.status.enabled == false`, `scope.list == []`, `proxy.status.decrypt.advice == "Nothing is decrypted until a host is in Scope."` |
 | MAC-4 | auto | Flows page, empty | "No flows yet" with one row per closed route carrying the full line and its button(s) (the MAC-3 words). | `flow.table.flows == []` |
 | MAC-5 | auto | Proxy ▸ Scope… (⇧⌘O), then on the page the Edit Scope sheet: type `example.com:80` (then `httpbin.org:443`) into the field with placeholder "host:443 or host:80 (for now), host:port or *.wildcard:port", press "Add" (⌘⏎) | The host appears as a normal row (not tertiary "pending") within one poll (≤ 2 s). Status bar shows no "add to scope:" error. Overview/sidebar Scope count rises. | `scope.list` contains the entry; audit has one `scope.add` with `origin: operator`, `result: "ok"`. Persisted: after MAC-13's restart, `scope.list` still contains it (spec 2026-10-31-macos-scope-persistence). |
+| MAC-5b | auto | Escape (`type.sh --escape`: System Events `key code 53`, app frontmost) to close the Edit Scope sheet after the adds; also the last UI action of every window run | The sheet is gone: no AXTextField with identifier `scope-add-host` in the window dump; the hosts added in MAC-5 are still listed on the Scope page. | `scope.list` equals MAC-5's reading (adds apply over the bus as typed; closing the sheet loses nothing). Precondition for MAC-16: AppKit refuses `quit` while a sheet is attached (0.5.19 install: `tell application "Aitmproxy" to quit` → -128). |
 | MAC-6 | **yes** (precondition: the Settings ▸ Proxy "Bypass hosts" key is set and carries the operator's tooling; an unset key means the app would pass its own default, which the run cannot read back, so the step is SKIP `bypass list absent in the app's Settings` until Matt saves the field once) | Proxy ▸ "Set as System Proxy" (⌥⌘P) — or the first-run row 1 / Status button | Status step becomes "system proxy on · 127.0.0.1:8080"; menu item title flips to "Restore System Proxy"; Flows banner no longer names the system proxy. `scutil --proxy` shows `HTTPEnable 1`, `HTTPSEnable 1`, `HTTPProxy 127.0.0.1`, `HTTPPort 8080` and the bypass list. | `proxy.system.status` = `{state: "points_at_us", managed_by_us: true}`; `proxy.status.system_proxy.state == "points_at_us"`; audit `proxy.system.set` ok; `system-proxy-state.json` written (0600). |
 | MAC-7 | **yes** | Proxy ▸ "Capture All Apps" (⌃⌘A) | Status All Apps lane word "all apps on · <n> hosts in scope", detail "attached · <n> hosts in scope · <m> flows handed off" (or "on, core not attached · <reason>") — #303, 2026-11-03; the Getting Started step title "All Apps is on" counts only while that card is shown (or "on, nothing in scope" before MAC-5). If macOS asks: "All Apps waiting for approval — approve the extension in System Settings" and the Apps empty state "Waiting for approval". | `capture.status` = `{enabled: true, feeder.state: "listening", provider.state: "attached"}`; `systemextensionsctl list` shows `[activated enabled]`. |
 | MAC-8 | hand | In Safari (or Chrome), open `http://example.com/` then `https://httpbin.org/get` | Flows rows: `GET http://example.com/ 200` and `GET https://httpbin.org/get 200` with tunnel "decrypted" (not "passthrough"); a `CONNECT` row for httpbin. Sidebar Flows/Domains counts rise. No banner about the CA. | `flow.table` rows with `authority` = the hosts, `status 200`, `tunnel == "decrypted"`, `tunnel_reason == null`; a row from the extension carries `capture_interface == "macos-ne"` and a `source_app`; a proxied row carries `source_app == null`. |
@@ -347,7 +348,7 @@ Where each negative is observed (its cell):
   ax-cache}`), falling back to the System Events `entire contents` walk when `swiftc` is absent. It
   performs no click, keystroke or focus change and refuses unless exactly one
   `/Applications/Aitmproxy.app` process is running and the terminal holds Accessibility permission.
-  `lib/ax_focus.sh` gives one element keyboard focus by accessibility identifier (AXFocused), the harness's only UI-state write besides typing, window-gated. Every `ax_texts.sh` call in the cell has a 30 s budget; since the compiled walk returns in well
+  `lib/ax_focus.sh` gives one element keyboard focus by accessibility identifier (AXFocused); the harness's only UI-state writes besides typing are that focus and the post-MAC-5 / end-of-run Escape (`type.sh --escape`), both window-gated. Every `ax_texts.sh` call in the cell has a 30 s budget; since the compiled walk returns in well
   under a second, a dump that exceeds it indicts the app's accessibility tree, not the harness;
   `screencapture -R` loop for N1. tui: `aitm_e2e/tui_pty.py` (extracted from `tests/e2e/tui/test_tui_flows_render.py`:
   `TIOCSWINSZ` and the grid replayer; a plan task, not an existing module). web: Playwright
@@ -631,3 +632,14 @@ points at 8080; `aitm web` does not exit on SIGTERM. Evidence on the installed 0
 (`docs/testing/2026-11-03-release-acceptance-0.5.18/run-20261103T192247Z`): MAC-5 PASS (sheet by identifier,
 focus via `ax_focus.sh`, both hosts typed and shown), MAC-7 PASS, MAC-13 PASS "back on 8080 True", N4-TUI and
 N4-WEB PASS behind the pid gate; TUI-1's pill wait awaits a ports-free run.
+
+Run follow-up (2026-11-03, `fix/acceptance-dismiss-scope-sheet`): the MAC-5 cell left the Edit Scope sheet
+attached after typing; AppKit refuses to terminate an app whose window has a sheet, so the v0.5.19
+install's `tell application "Aitmproxy" to quit` came back -128 "User canceled" and the app had to be
+SIGTERMed, which orphans the embedded core until loginwindow reaps it (unified log, macOS review session).
+That quit was the install step's, outside the cell (MAC-16 stays hand). The cell now presses Escape
+through the gated `type.sh --escape` after MAC-5 (row MAC-5b, in D3 and `EXPECTED_STEPS`) and again as the
+last UI action of every window run (row SHEET on failure), asserting `scope-add-host` is gone; nothing is
+lost because adds apply over the bus as typed. Product item, card task_15c30fb3 ("quit ends open sheets"):
+AppKit refuses termination before `applicationShouldTerminate`, so only an `NSApplication` subclass
+overriding `terminate(_:)` (end attached sheets, then super) covers menu, ⌘Q and the Apple event.
