@@ -150,16 +150,17 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
         return;
     };
 
-    let (connect, label) = aitm_tui::connector(TransportChoice::Tcp {
+    let (connect, label, push) = aitm_tui::connector(TransportChoice::Tcp {
         addr,
         token: OPERATOR_TOKEN.into(),
     })
     .expect("build the TCP connector");
     assert_eq!(label, addr.to_string());
+    assert!(push, "the TCP bus carries server pushes");
 
     let (req_tx, req_rx) = mpsc::channel::<BusRequest>(16);
     let (ev_tx, mut ev_rx) = mpsc::channel::<BusEvent>(256);
-    let bus_task = tokio::spawn(aitm_tui::bus::run(connect, req_rx, ev_tx, POLL));
+    let bus_task = tokio::spawn(aitm_tui::bus::run(connect, req_rx, ev_tx, POLL, push));
 
     // 1. The first event is the handshake result, read straight off the live
     //    tools/list: exactly the tools the TUI's `CORE_TOOLS` says today's

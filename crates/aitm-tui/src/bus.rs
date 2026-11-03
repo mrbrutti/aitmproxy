@@ -1,9 +1,10 @@
 //! The bus task: the one place the TUI talks to the proxy. It connects
-//! (initialize → tools/list → proxy.status → flow.subscribe), polls
-//! `flow.list` + `flow.get` on a timer (push lines are a trigger, the poll is
-//! the truth; scanner v2 D5/D6), runs the app's [`BusRequest`]s and reports
-//! everything as [`BusEvent`]s. Features the bus does not offer are simply
-//! not polled: the app reads `tools/list` and degrades (§2.10).
+//! (initialize → tools/list → proxy.status → flow.subscribe, the last only on
+//! a transport with a push sink), polls `flow.list` + `flow.get` on a timer
+//! (push lines are a trigger, the poll is the truth; scanner v2 D5/D6), runs
+//! the app's [`BusRequest`]s and reports everything as [`BusEvent`]s.
+//! Features the bus does not offer are simply not polled: the app reads
+//! `tools/list` and degrades (§2.10).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -42,11 +43,18 @@ pub const REFUSED: &str = "bus refused the token: it matched neither the agent n
 /// back-off (500 ms doubling to 10 s, reset after each successful connect).
 /// The one exception is a token refusal during the handshake: that is
 /// reported as [`REFUSED`] and the task stops, since no retry can succeed.
+///
+/// `push` says whether the transport `connect` makes can deliver server
+/// pushes: `true` for the loopback TCP bus, `false` for the in-process
+/// transport of `aitm tui`, whose server has no push sink by design and
+/// refuses `flow.subscribe` (T7 spec D5). When `false` the handshake never
+/// calls `flow.subscribe` and raises no toast; the poll is the truth.
 pub async fn run(
     connect: Connector,
     mut rx: mpsc::Receiver<BusRequest>,
     tx: mpsc::Sender<BusEvent>,
     poll_every: Duration,
+    push: bool,
 ) {
     let mut backoff = Duration::from_millis(500);
     loop {
@@ -66,7 +74,7 @@ pub async fn run(
             }
         };
         backoff = Duration::from_millis(500);
-        let mut session = Session::new(client, tx.clone());
+        let mut session = Session::new(client, tx.clone(), push);
         match session.serve(&mut rx, poll_every).await {
             Outcome::Closed => return,
             Outcome::Refused(why) => {
@@ -106,13 +114,16 @@ struct Session {
     intercept: L4Availability,
     /// The running capture ids from the last `l4.capture.status`.
     captures: Vec<String>,
+    /// Whether this connection can receive server pushes (see [`run`]).
+    push: bool,
 }
 
 impl Session {
-    fn new(client: Arc<BusClient>, tx: mpsc::Sender<BusEvent>) -> Self {
+    fn new(client: Arc<BusClient>, tx: mpsc::Sender<BusEvent>, push: bool) -> Self {
         Self {
             client,
             tx,
+            push,
             tools: Vec::new(),
             summaries: HashMap::new(),
             polls: 0,
@@ -193,8 +204,14 @@ impl Session {
     /// flow lines reach this connection. A tool error is a warning, not a
     /// session loss: the poll cadence still carries scan progress. The
     /// result value is ignored.
+    ///
+    /// On a transport with no push sink (`push == false`: the in-process
+    /// server of `aitm tui`, T7 spec D5 as amended 2026-11-03) nothing is
+    /// called and nothing is said: the server would only refuse, and the
+    /// Warn toast that refusal used to raise on every start hid the startup
+    /// note (0.5.16 acceptance, TUI-1). The poll is the truth there.
     async fn subscribe(&self) -> Result<(), Outcome> {
-        if !self.has("flow.subscribe") {
+        if !self.push || !self.has("flow.subscribe") {
             return Ok(());
         }
         match self.client.call("flow.subscribe", json!({})).await {
@@ -763,7 +780,9 @@ mod tests {
             answer,
         })));
         let (tx, rx) = mpsc::channel(1024);
-        (Session::new(client, tx), calls, rx)
+        // A push-capable (TCP-shaped) session: these tests cover the reads,
+        // not the handshake.
+        (Session::new(client, tx, true), calls, rx)
     }
 
     fn tool(name: &str, props: &[&str]) -> ToolInfo {
