@@ -1134,7 +1134,10 @@ impl WsConn {
                 trailers: HeaderMap::new(),
                 body: Body::Empty,
                 timestamp: self.opened,
-                peer: None,
+                // The dialer knows exactly which address answered the
+                // upgrade; the wire carrier is `server_conn.peer`, this field
+                // keeps the in-memory response honest with it (amendment 59).
+                peer: Some(self.peer),
             }),
             client_conn: conn.clone(),
             server_conn: Some(conn.clone()),
@@ -1721,7 +1724,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn into_flows_records_a_replay_conversation() {
         let (transport, _log) = ws_server(None, echo_handler);
-        let dialer = WsDialer::new(transport);
+        let dialer = WsDialer::new(transport.clone() as Arc<dyn crate::transport::WsTransport>);
         let (handshake, _) = captured_conversation();
         let guard = guard_in_scope();
         let mut conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
@@ -1741,6 +1744,25 @@ mod tests {
         let (http, ws) = conn.into_flows(vec!["scan:job-1".to_string()]);
 
         assert_eq!(http.response.as_ref().map(|r| r.status), Some(101));
+        // The response carries the dialled peer, the same address the wire
+        // carrier `server_conn.peer` reports (amendment 59, WS half).
+        let response_peer = http.response.as_ref().and_then(|r| r.peer);
+        assert!(response_peer.is_some(), "the WS dialer knows its peer");
+        assert_eq!(response_peer, http.server_conn.as_ref().map(|c| c.peer));
+        // And it is the address this dial actually connected to — the
+        // transport recorded it — not merely an address consistent with the
+        // flow's own `server_conn` (tester, PR 3b).
+        assert_eq!(
+            transport.connects().len(),
+            1,
+            "one dial: {:?}",
+            transport.connects()
+        );
+        assert_eq!(
+            response_peer,
+            transport.connects().first().map(|(addr, _, _)| *addr),
+            "the response names the address the dialer asked the transport for"
+        );
         assert!(http.metadata.is_replay);
         assert_eq!(http.metadata.marks, vec!["scan:job-1".to_string()]);
         assert_eq!(

@@ -24,8 +24,12 @@ Assert:
   `cmdi` on /ping is satisfied by either `cmdi` (the Rhai echo marker; T10's seed
   shell answers `echo <word>` since #291, spec amendment 64) or the native
   `cmdi-time`, both class cmdi. `xxe` on
-  /xml and `nosqli` on /api/login are likewise pending until the HTTP lane emits a
-  whole-body insertion point for XML/JSON bodies (spec amendment 65, T2's follow-up
+  the three script-only seeds (`POST /api/login` JSON, `POST /api/profile` JSON,
+  `POST /xml` XML) are reachable only through the index page's inline script, i.e.
+  by a browser crawl; without obscura on the rig this cell makes those three
+  requests itself through the proxy before each job, so the lane's `entire_body`
+  points exist (T1b PR 3b, 2026-11-02). `nosqli` on /api/login is then asserted
+  strictly; `xxe` on /xml stays pending while the XML half of amendment 65 is open
   after #223): both checks are keyed on `entire_body`. On a build whose `scan.checks`
   reports the HTTP lane's source as `interim`, `open-redirect` and `path-traversal`
   are pending too (spec amendment 63: that lane sets no point traits, and both checks
@@ -54,6 +58,7 @@ from aitm_e2e import check, free_port, ok, repo_root, section, skip  # noqa: E40
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
+from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     boot_target,
     brief,
@@ -96,6 +101,26 @@ def script_ids() -> dict:
         skip("bundled active script(s) declare no add_check id: " + ", ".join(silent)
              + " (T3's add_check conversion is not on this build)")
     return found
+
+
+def seed_script_only_routes(proxy_port: int, target) -> None:
+    """Make the three requests the index page's inline script makes in a browser
+    (`INDEX_SCRIPT` in the target): the routes have no anchor or form, so the
+    interim crawl never reaches them and the lane has no body to build an
+    `entire_body` point from. Through the proxy, so the flows are captured like
+    any operator traffic; `test_t2_crawl.py` covers the real browser path."""
+    posts = (
+        ("/api/login", "application/json", b'{"username":"alice","password":"x"}'),
+        ("/api/profile", "application/json", b'{"profile":{"address":{"city":"Paris"}}}'),
+        ("/xml", "text/xml", b'<order id="7"><name>pen</name></order>'),
+    )
+    seen = []
+    for path, ctype, body in posts:
+        r = via_proxy(proxy_port, "POST", target.base + path,
+                      headers={"content-type": ctype}, body=body)
+        seen.append(f"{path} {r.status}")
+    ok(f"{target.mode}: seeded the three script-only routes through the proxy "
+       f"({', '.join(seen)})")
 
 
 def run_standard(op, target) -> tuple[list, int, dict]:
@@ -168,6 +193,7 @@ def main() -> None:
                   f"(observed {verdict.get('outcome')!r})")
 
             section("the scheduled catalogue finds the nine seeded classes on V")
+            seed_script_only_routes(cfg.proxy_port, v)
             iss_v, seq_v, status_v = run_standard(op, v)
             # Spec amendment 40 (T1b follow-up): the per-host error ladder still counts
             # a 5xx answer to an injection payload as a host failure, and the
@@ -200,14 +226,14 @@ def main() -> None:
                           f"observed classes [{brief(iss_v, 16)}]")
                     pending.add(cls)
                     continue
-                if cls in ("xxe", "nosqli") and not hits:
-                    # Spec amendment 65: `xxe` and `nosqli-json` are keyed on the whole
-                    # body (a document-level DOCTYPE; an operator object that value-level
-                    # typed replacement would stringify), and the HTTP lane emits an
-                    # `entire_body` point for XML/JSON bodies only from T2's follow-up
-                    # after #223. Pending, not a failure, until that point exists.
-                    print(f"  ~ V: class {cls!r} on {path} pending the whole-body insertion point "
-                          f"(amendment 65, T2 follow-up); observed classes [{brief(iss_v, 16)}]")
+                if cls == "xxe" and not hits:
+                    # Spec amendment 65, XML half: the seeded `POST /xml` gives the lane
+                    # an XML `entire_body` point, but the shipped `xxe` check has not
+                    # been proven to take it yet. Pending, not a failure, until it is;
+                    # the JSON half (`nosqli-json` on the seeded /api/login body) is
+                    # asserted strictly below since T1b PR 3b.
+                    print(f"  ~ V: class {cls!r} on {path} pending the XML whole-body check "
+                          f"(amendment 65, XML half); observed classes [{brief(iss_v, 16)}]")
                     pending.add(cls)
                     continue
                 check(hits, f"V: class {cls!r} found on {path} [{brief(iss_v, 16)}]")
@@ -227,6 +253,7 @@ def main() -> None:
                       "probes really arrived on the wire")
 
             section("the patched twin yields none of them")
+            seed_script_only_routes(cfg.proxy_port, p)
             iss_p, seq_p, _status_p = run_standard(op, p)
             leaked = sorted({i.get("class") for i in iss_p if i.get("class") in SEEDED})
             check(not leaked,

@@ -131,7 +131,7 @@ One row per script; the manual verb is `check.<id>`.
 | `ldapi` | ldapi | query, body_param | medium | boolean | high | no | Always-true filter differential (directory error refines it) |
 | `methods` | risky-http-methods | query (origin-scoped) | light | observe | info | no | `Allow` advertises a write or debug method |
 | `nosqli` | nosqli | query, body_param | medium | boolean | high | no | `$ne`/`$gt` operator changes the result set |
-| `nosqli-json` | nosqli | json_value | medium | boolean | critical | no | A JSON string value replaced by an operator document |
+| `nosqli-json` | nosqli | json_value, entire_body | medium | boolean | critical | no | A JSON string value, or each string field of a whole JSON body, replaced by an operator document |
 | `path_traversal` | path-traversal | query, body_param, json_value, path_filename, multipart_filename | medium | reflected | critical | yes | A well-known system file comes back |
 | `paths` | exposed-path | query (origin-scoped) | light | observe | medium | no | Well-known VCS/config/debug paths answering 200 |
 | `sqli` | sqli | query, body_param, json_value, cookie | medium | error | critical | yes | A database error signature after a single quote |

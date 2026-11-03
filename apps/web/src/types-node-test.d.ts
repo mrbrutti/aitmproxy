@@ -7,6 +7,14 @@ declare module 'node:fs' {
   export function readdirSync(path: string, opts: { withFileTypes: true }): { name: string; isDirectory(): boolean; isFile(): boolean }[];
   export function readdirSync(path: string): string[];
   export function existsSync(path: string): boolean;
+  // `live-env.audit-log.test.ts` writes the config documents `assertAuditLogIsolated` reads.
+  export function mkdtempSync(prefix: string): string;
+  export function writeFileSync(path: string, data: string): void;
+  // ... and removes its temp dir in `afterAll`.
+  export function rmSync(path: string, opts?: { recursive?: boolean; force?: boolean }): void;
+}
+declare module 'node:os' {
+  export function tmpdir(): string;
 }
 declare module 'node:path' {
   export function resolve(...parts: string[]): string;
