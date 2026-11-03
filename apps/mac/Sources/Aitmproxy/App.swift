@@ -85,7 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 enum Store {
     /// True when APP_STORE points somewhere else (tests, the dev bundle).
     static var isOverridden: Bool {
-        !(ProcessInfo.processInfo.environment["APP_STORE"] ?? "").isEmpty
+        SettingsDomain.overriddenStoreURL(environment: ProcessInfo.processInfo.environment) != nil
     }
 
     /// The store for the connection settings (`bus.*`, `proxy.*`, `capture.enabled`):
@@ -100,8 +100,8 @@ enum Store {
     }()
 
     static var url: URL {
-        if let path = ProcessInfo.processInfo.environment["APP_STORE"], !path.isEmpty {
-            return URL(fileURLWithPath: path, isDirectory: true)
+        if let overridden = SettingsDomain.overriddenStoreURL(environment: ProcessInfo.processInfo.environment) {
+            return overridden
         }
         let dir = URL.applicationSupportDirectory.appending(path: "Aitmproxy", directoryHint: .isDirectory)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -825,3 +825,17 @@ private final class TestPortHolder {
         if fd >= 0 { Darwin.close(fd); fd = -1 }
     }
 }
+
+/// MS-R2: a harness launch (`APP_STORE`) makes its core publish under its own store so the installed
+/// app's run dir stays the only one the CLI's one-shots see.
+@Suite struct EmbeddedCoreRunDirTests {
+    @Test func devBundlesGetTheirOwnRunDirAndTheInstalledAppDoesNot() {
+        #expect(EmbeddedCoreLaunch.isolatedRunDir(environment: [:]) == nil)
+        #expect(EmbeddedCoreLaunch.isolatedRunDir(environment: ["APP_STORE": ""]) == nil)
+        #expect(EmbeddedCoreLaunch.isolatedRunDir(environment: ["APP_STORE": "/tmp/Aitmproxy-dev-state-x"])?.path
+                == "/tmp/Aitmproxy-dev-state-x/run/cores")
+        #expect(EmbeddedCoreLaunch.runDirEnvironmentKey == "AITM_RUN_DIR")
+        #expect(SettingsDomain.overriddenStoreURL(environment: ["APP_STORE": "/tmp/s"])?.path == "/tmp/s")
+        #expect(SettingsDomain.overriddenStoreURL(environment: ["APP_LIVE": "1"]) == nil)
+    }
+}

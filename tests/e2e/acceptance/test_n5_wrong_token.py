@@ -6,11 +6,12 @@ holds the default ports.
 N5-TUI: the installed `aitm-tui --bus <app bus> --token-file <wrong>` must show
 `bus refused the token: it matched neither the agent nor the operator token (check the token you
 supplied)` and stop retrying. N4-TUI / N4-WEB: `aitm tui` / `aitm web` started for at most 5 s
-while 8080 is held must print `cannot start: the proxy port 127.0.0.1:8080 is already in use.`
-before any screen and exit by themselves (read-only: a refused start changes nothing; the only
-process touched is the child this cell started). N5-WEB is judged by the web cell when `aitm web`
-runs (it owns the agent URL; spec D7 places it there), so this cell writes no N5-WEB row. N5-CLI
-is CLI-6's one-shot refusal: `N/A` here (spec D1). SKIP when the app's core is not running.
+while 8080 is held must print `cannot start: the proxy port 127.0.0.1:8080 is already in use`
+(wave 1's M2 panel, `N4_PANEL`) before any screen and exit by themselves (read-only: a refused
+start changes nothing; the only process touched is the child this cell started). N5-WEB is
+judged by the web cell when `aitm web` runs (it owns the agent URL; spec D7 places it there), so
+this cell writes no N5-WEB row. N5-CLI is CLI-6's one-shot refusal: `N/A` here (spec D1). SKIP
+when the app's core is not running.
 Steps → negatives-steps.tsv.
 """
 from __future__ import annotations
@@ -32,9 +33,15 @@ os.makedirs(OUT, exist_ok=True)
 TUI = os.environ.get("AITM_TUI", "/opt/homebrew/bin/aitm-tui")
 AITM = os.environ.get("AITM", INSTALLED_CLI)
 REFUSAL = "bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)"
-N4_PANEL = "cannot start: the proxy port 127.0.0.1:8080 is already in use."
+# Wave 1's M2 panel (spec 2026-11-01-cli-terminal-reporting-design, M2 "after"): the headline has no
+# trailing period, the two why sentences follow, and the holder command is the panel's `fix:` line
+# on a pipe / `▸` on a TTY (0.5.10 said "in use." and "Find the holder with:"). The TTY form wraps
+# the why lines at the terminal's width (80 in the spec's M2 drawing), so `N4_CHECKS` matches the
+# words across any whitespace.
+N4_PANEL = "cannot start: the proxy port 127.0.0.1:8080 is already in use"
 N4_HOLDER_LINE = "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program."
-N4_LSOF = "Find the holder with:  lsof -nP -iTCP:8080 -sTCP:LISTEN"
+N4_FREE_LINE = "Free it, or set `listen:` to another address in"
+N4_LSOF = "lsof -nP -iTCP:8080 -sTCP:LISTEN"
 EXPECTED_STEPS = ("N5-TUI", "N5-CLI", "N4-TUI", "N4-WEB")
 
 w = StepWriter(os.path.join(OUT, "negatives-steps.tsv"), EXPECTED_STEPS)
@@ -45,9 +52,26 @@ def strip_ansi(s: str) -> str:
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", s)
 
 
+def _words(phrase: str) -> str:
+    """Regex for `phrase` with any run of whitespace between its words (the TTY form wraps)."""
+    return r"\s+".join(re.escape(w) for w in phrase.split())
+
+
+# The two marks that tell wave 1's panel from 0.5.10's are pinned: the headline is not followed by
+# a period, and the holder command stands on the fix line (`fix: lsof …` piped, `▸ lsof …` on a TTY).
+N4_CHECKS = (
+    ("headline without a trailing period", re.compile(_words(N4_PANEL) + r"(?!\.)")),
+    ("holder sentence", re.compile(_words(N4_HOLDER_LINE))),
+    ("free-it sentence", re.compile(_words(N4_FREE_LINE))),
+    ("fix line (`fix:` or `▸` + lsof)", re.compile(r"(?:fix:|▸)[ \t]+" + _words(N4_LSOF))),
+)
+
+
 def n4_words(text: str) -> tuple[bool, list[str]]:
-    miss = [x for x in (N4_PANEL, N4_HOLDER_LINE, N4_LSOF) if x not in text]
-    return N4_PANEL in text, miss
+    """Wave 1's port-in-use panel: the headline (no trailing period) decides; the why sentences
+    and the `fix:`/`▸ lsof` line are reported when missing."""
+    miss = [name for name, rx in N4_CHECKS if not rx.search(text)]
+    return N4_CHECKS[0][0] not in miss, miss
 
 
 def n5_tui(core) -> None:

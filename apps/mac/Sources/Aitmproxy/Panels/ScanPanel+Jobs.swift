@@ -28,8 +28,9 @@ struct ScanJobsTab: View {
 
     @ViewBuilder private var list: some View {
         VStack(spacing: 0) {
-            if let error = state.surface.jobsError {
-                // `jobsError` inline above the rows (D11): the list it could not refresh stays.
+            if let error = state.surface.inlineJobsError(ageMs: state.link.valuesAgeMs) {
+                // The inline error above the rows (D11): the list it could not refresh stays,
+                // and a failed list says how old its values are (Jobs view D6).
                 ScanInlineError(text: error)
                 Rule(color: Tok.Line.rule)
             }
@@ -50,27 +51,29 @@ struct ScanJobsTab: View {
     private var rows: some View {
         ScrollView {
             LazyVStack(spacing: 0) {
+                // Every row reads the Kit's merged facts (Jobs view D2): the list row and
+                // the stored status, reconciled once, so the row and the detail never disagree.
                 ForEach(state.surface.jobs, id: \.job) { summary in
-                    ScanJobRow(
-                        summary: summary,
-                        status: state.surface.statuses[summary.job],
-                        selected: summary.job == state.surface.selectedJob,
-                        hovered: summary.job == hoveredJob,
-                        cancel: { cancel(summary.job) }
-                    )
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        state.surface.select(job: summary.job)
-                        listFocused = true
-                    }
-                    .onHover { inside in
-                        if inside {
-                            hoveredJob = summary.job
-                        } else if hoveredJob == summary.job {
-                            hoveredJob = nil
+                    if let facts = state.surface.facts(for: summary.job) {
+                        ScanJobRow(
+                            facts: facts,
+                            selected: facts.job == state.surface.selectedJob,
+                            hovered: facts.job == hoveredJob,
+                            cancelable: mayCancel(facts.job),
+                            select: { select(facts.job) },
+                            cancel: { cancel(facts.job) }
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture { select(facts.job) }
+                        .onHover { inside in
+                            if inside {
+                                hoveredJob = facts.job
+                            } else if hoveredJob == facts.job {
+                                hoveredJob = nil
+                            }
                         }
+                        .contextMenu { rowMenu(facts.job) }
                     }
-                    .contextMenu { rowMenu(summary) }
                 }
             }
         }
@@ -89,16 +92,28 @@ struct ScanJobsTab: View {
         .accessibilityLabel("Jobs")
     }
 
-    /// The row's verbs (D5): Cancel Scan while the job can still be stopped, the
-    /// two tab jumps, and the id for a terminal or a bug report.
-    @ViewBuilder private func rowMenu(_ summary: ScanJobSummary) -> some View {
-        if !summary.state.isTerminal {
-            Button("Cancel Scan") { cancel(summary.job) }
+    /// The row's verbs (D5): Cancel Scan while the job can still be stopped and the
+    /// link is live, the two tab jumps, and the id for a terminal or a bug report.
+    @ViewBuilder private func rowMenu(_ job: String) -> some View {
+        if mayCancel(job) {
+            Button("Cancel Scan") { cancel(job) }
         }
-        Button("Show Issues") { state.showIssues(job: summary.job) }
-        Button("Show Site Map") { state.showSitemap(job: summary.job) }
+        Button("Show Issues") { state.showIssues(job: job) }
+        Button("Show Site Map") { state.showSitemap(job: job) }
         Divider()
-        Button("Copy Job ID") { Pasteboard.copy(summary.job) }
+        Button("Copy Job ID") { Pasteboard.copy(job) }
+    }
+
+    /// Whether a row may offer Cancel: the Kit's predicate on the merged state
+    /// (queued or running; never cancelling or terminal, Jobs view D2) and the
+    /// link's verb gate (Jobs view D6).
+    private func mayCancel(_ job: String) -> Bool {
+        state.surface.mayCancel(job: job) && state.verbsEnabled
+    }
+
+    private func select(_ job: String) {
+        state.surface.select(job: job)
+        listFocused = true
     }
 
     private func cancel(_ job: String) {
@@ -108,9 +123,8 @@ struct ScanJobsTab: View {
     // MARK: Detail
 
     @ViewBuilder private var detail: some View {
-        if let job = state.surface.selectedJob,
-           let summary = state.surface.jobs.first(where: { $0.job == job }) {
-            ScanJobDetail(state: state, summary: summary, status: state.surface.statuses[job])
+        if let job = state.surface.selectedJob, let facts = state.surface.facts(for: job) {
+            ScanJobDetail(state: state, facts: facts)
         } else {
             Text(scanSelectJobText)
                 .font(Tok.Face.ui(Tok.Typography.Size.md))
@@ -123,27 +137,35 @@ struct ScanJobsTab: View {
 // MARK: - Row
 
 /// One job (D5): `<State or phase> · <profile> · <hosts>` over the probe / point /
-/// elapsed line, then the severity bar. The profile name and hosts come from
-/// `scan.status`, so a job whose status has not been read yet shows `—` for them.
+/// elapsed line, then the severity bar. The counters are the merged facts' (Jobs
+/// view D2); the profile name and hosts come from `scan.status`, so a job whose
+/// status has not been read yet shows `—` for them. The row is one accessibility
+/// element with the button trait, the selected trait while selected, a `Select`
+/// action and the identifier `scan-job-<id>` (Jobs view D5).
 private struct ScanJobRow: View {
-    var summary: ScanJobSummary
-    var status: ScanJobStatus?
+    var facts: ScanJobFacts
     var selected: Bool
     var hovered: Bool
+    /// Whether the hover Cancel shows: the merged state is queued or running and
+    /// the link is live (Jobs view D2, D6).
+    var cancelable: Bool
+    var select: () -> Void
     var cancel: () -> Void
+
+    private var summary: ScanJobSummary { facts.summary }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.xs) {
             HStack(spacing: Space.sm) {
-                Text(ScanFormat.jobRowLine1(summary, status: status))
+                Text(ScanFormat.jobRowLine1(summary, status: facts.status))
                     .font(Tok.Face.ui(Tok.Typography.Size.md, .medium))
                     .foregroundStyle(Tok.Ink.primary.color)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: Space.xs)
-                if hovered, !summary.state.isTerminal {
+                if hovered, cancelable {
                     FlatButton("Cancel", action: cancel)
-                        .help("Stop this job; its issues stay (⌥⌘.)")
+                        .help(ScanFormat.cancelHelpText)
                 }
             }
             // The line keeps the button's height whether or not it shows, so a
@@ -161,7 +183,11 @@ private struct ScanJobRow: View {
         .background(selected ? Tok.Ground.active.color : .clear)
         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(ScanFormat.jobAccessibilityLabel(summary, status: status))
+        .accessibilityLabel(ScanFormat.jobAccessibilityLabel(summary, status: facts.status))
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { select() }
+        .accessibilityAction(named: "Select") { select() }
+        .accessibilityIdentifier("scan-job-\(facts.job)")
     }
 }
 
@@ -217,22 +243,26 @@ struct ScanSeverityBar: View {
 
 // MARK: - Detail
 
-/// The selected job's `scan.status` (D5). The counters the row already has
-/// (probes, points, issues, state, phase, elapsed) fall back to the row's summary
-/// while the first status read is in flight, so no number is ever blank; the
-/// rest reads `—` until the status arrives, and keeps its last value through
+/// The selected job's `scan.status` (D5), read through the merged facts (Jobs
+/// view D2): the counters the row already has (probes, points, issues, state,
+/// phase, elapsed) are the facts' summary, the newer of the list row and the
+/// stored status, so no number is ever blank and the detail never lags the row;
+/// the rest reads `—` until the status arrives, and keeps its last value through
 /// every later refresh (D11).
 private struct ScanJobDetail: View {
     @Bindable var state: ScanPanelState
-    var summary: ScanJobSummary
-    var status: ScanJobStatus?
+    var facts: ScanJobFacts
 
-    private var jobState: ScanJobState { status?.state ?? summary.state }
-    private var phase: ScanPhase { status?.phase ?? summary.phase }
-    private var elapsedMs: Int { status?.elapsedMs ?? summary.elapsedMs }
-    private var probes: ScanProbeCounters { status?.probes ?? summary.probes }
-    private var points: ScanPointCounters { status?.points ?? summary.points }
-    private var issues: ScanIssueCounters { status?.issues ?? summary.issues }
+    private var summary: ScanJobSummary { facts.summary }
+    private var status: ScanJobStatus? { facts.status }
+
+    /// The Stopped section shows only once the merged state is terminal, and then for
+    /// a stopped reason, an error, or a crawl that hit errors (Jobs view D4); a live
+    /// job's crawl error is not a stop.
+    private func hasStoppedFacts(_ status: ScanJobStatus) -> Bool {
+        guard summary.state.isTerminal else { return false }
+        return status.stoppedReason != nil || status.error != nil || status.crawl.errors > 0
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -249,7 +279,7 @@ private struct ScanJobDetail: View {
                     if !clampedLines.isEmpty { clampedSection }
                     if let session = status?.session { sessionSection(session) }
                     if let l4 = status?.l4 { l4Section(l4) }
-                    if status?.stoppedReason != nil || status?.error != nil { stoppedSection }
+                    if let status, hasStoppedFacts(status) { stoppedSection(status) }
                 }
                 .padding(Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -263,21 +293,42 @@ private struct ScanJobDetail: View {
 
     private var header: some View {
         HStack(spacing: Space.md) {
-            Text([jobState.word, phase.word, ScanFormat.elapsed(ms: elapsedMs)].joined(separator: " · "))
+            Text([summary.state.word, summary.phase.word, ScanFormat.elapsed(ms: summary.elapsedMs)].joined(separator: " · "))
                 .font(Tok.Face.ui(Tok.Typography.Size.xl, .medium))
                 .foregroundStyle(Tok.Ink.primary.color)
                 .lineLimit(1)
             Spacer(minLength: Space.sm)
-            if !jobState.isTerminal {
-                PrimaryButton("Cancel Scan") { Task { await state.cancel(job: summary.job) } }
-                    .keyboardShortcut(".", modifiers: [.command, .option])
-                    .help("Stop this job; its issues stay (⌥⌘.)")
+            // Cancel Scan while the merged state is queued or running; disabled and
+            // titled by the cancelling word while the cancel is on the wire or the core
+            // calls the job cancelling (Jobs view D2); the whole verb is off while the
+            // link is not live (Jobs view D6).
+            switch summary.state {
+            case .queued, .running:
+                if state.cancelInFlight(facts.job) {
+                    cancellingButton
+                } else {
+                    PrimaryButton("Cancel Scan") { Task { await state.cancel(job: facts.job) } }
+                        .keyboardShortcut(".", modifiers: [.command, .option])
+                        .help(ScanFormat.cancelHelpText)
+                        .disabled(!state.verbsEnabled)
+                }
+            case .cancelling:
+                cancellingButton
+            default:
+                EmptyView()
             }
-            FlatButton("Show Issues") { state.showIssues(job: summary.job) }
-            FlatButton("Show Site Map") { state.showSitemap(job: summary.job) }
+            FlatButton("Show Issues") { state.showIssues(job: facts.job) }
+            FlatButton("Show Site Map") { state.showSitemap(job: facts.job) }
         }
         .padding(.horizontal, Space.md)
         .frame(height: Tok.Size.inspectorHeader)
+    }
+
+    /// The header's verb while a cancel is on the wire or the core calls the job
+    /// cancelling: the cancelling word, disabled (Jobs view D2).
+    private var cancellingButton: some View {
+        PrimaryButton(ScanFormat.cancellingTitle) {}
+            .disabled(true)
     }
 
     // MARK: Sections
@@ -285,17 +336,17 @@ private struct ScanJobDetail: View {
     private var probesSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
             ScanSectionTitle("Probes")
-            Text("\(probes.sent) / \(probes.budget)")
+            Text("\(summary.probes.sent) / \(summary.probes.budget)")
                 .font(Tok.Face.data(Tok.Typography.Size.xl, .medium))
                 .foregroundStyle(Tok.Ink.primary.color)
-            ScanJobProgressRule(done: probes.sent, total: probes.budget)
+            ScanJobProgressRule(done: summary.probes.sent, total: summary.probes.budget)
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat("Errors", "\(probes.errors)")
-                ScanStat("Timeouts", "\(probes.timeouts)")
-                ScanStat("Rate waits", "\(probes.rateWaits)")
+                ScanStat("Errors", "\(summary.probes.errors)")
+                ScanStat("Timeouts", "\(summary.probes.timeouts)")
+                ScanStat("Rate waits", "\(summary.probes.rateWaits)")
             }
-            if !probes.byLane.isEmpty {
-                ScanStat("By lane", probes.byLane.keys.sorted().map { "\($0) \(probes.byLane[$0] ?? 0)" }
+            if !summary.probes.byLane.isEmpty {
+                ScanStat("By lane", summary.probes.byLane.keys.sorted().map { "\($0) \(summary.probes.byLane[$0] ?? 0)" }
                     .joined(separator: " · "))
             }
         }
@@ -317,14 +368,14 @@ private struct ScanJobDetail: View {
         VStack(alignment: .leading, spacing: Space.sm) {
             ScanSectionTitle("Points")
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat("Found", "\(points.found)")
-                ScanStat("Queued", "\(points.queued)")
-                ScanStat("Audited", "\(points.audited)")
+                ScanStat("Found", "\(summary.points.found)")
+                ScanStat("Queued", "\(summary.points.queued)")
+                ScanStat("Audited", "\(summary.points.audited)")
             }
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat("Skipped ignored", "\(points.skipped.ignored)")
-                ScanStat("Skipped frequent", "\(points.skipped.frequent)")
-                ScanStat("Skipped limit", "\(points.skipped.limit)")
+                ScanStat("Skipped ignored", "\(summary.points.skipped.ignored)")
+                ScanStat("Skipped frequent", "\(summary.points.skipped.frequent)")
+                ScanStat("Skipped limit", "\(summary.points.skipped.limit)")
             }
         }
     }
@@ -354,19 +405,19 @@ private struct ScanJobDetail: View {
     private var issuesSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
             ScanSectionTitle("Issues")
-            ScanSeverityBar(by: issues.bySeverity, height: 12)
+            ScanSeverityBar(by: summary.issues.bySeverity, height: 12)
             // The counts in words beside the bar, so severity is never colour alone.
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat(ScanSeverity.critical.word, "\(issues.bySeverity.critical)")
-                ScanStat(ScanSeverity.high.word, "\(issues.bySeverity.high)")
-                ScanStat(ScanSeverity.medium.word, "\(issues.bySeverity.medium)")
-                ScanStat(ScanSeverity.low.word, "\(issues.bySeverity.low)")
-                ScanStat(ScanSeverity.info.word, "\(issues.bySeverity.info)")
+                ScanStat(ScanSeverity.critical.word, "\(summary.issues.bySeverity.critical)")
+                ScanStat(ScanSeverity.high.word, "\(summary.issues.bySeverity.high)")
+                ScanStat(ScanSeverity.medium.word, "\(summary.issues.bySeverity.medium)")
+                ScanStat(ScanSeverity.low.word, "\(summary.issues.bySeverity.low)")
+                ScanStat(ScanSeverity.info.word, "\(summary.issues.bySeverity.info)")
             }
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat("Certain", "\(issues.byConfidence.certain)")
-                ScanStat("Firm", "\(issues.byConfidence.firm)")
-                ScanStat("Tentative", "\(issues.byConfidence.tentative)")
+                ScanStat("Certain", "\(summary.issues.byConfidence.certain)")
+                ScanStat("Firm", "\(summary.issues.byConfidence.firm)")
+                ScanStat("Tentative", "\(summary.issues.byConfidence.tentative)")
             }
         }
     }
@@ -396,7 +447,7 @@ private struct ScanJobDetail: View {
     /// result) first, then any `clamped` row of the status the notices did not
     /// already spell out.
     private var clampedLines: [String] {
-        let notices = state.surface.launchNotices[summary.job] ?? []
+        let notices = state.surface.launchNotices[facts.job] ?? []
         let fromStatus = (status?.clamped ?? []).map(ScanFormat.clampedText)
         return notices + fromStatus.filter { !notices.contains($0) }
     }
@@ -440,20 +491,53 @@ private struct ScanJobDetail: View {
         }
     }
 
-    private var stoppedSection: some View {
+    /// Why the job stopped, in words (Jobs view D4): the stopped-reason sentence,
+    /// the crawl-trouble line (with the last error's words when the engine set one),
+    /// the engine's error text verbatim, and last the raw tokens in the data face,
+    /// the one place they appear. Every line is the Kit's; the view only stacks them.
+    private func stoppedSection(_ status: ScanJobStatus) -> some View {
         VStack(alignment: .leading, spacing: Space.sm) {
             ScanSectionTitle("Stopped")
-            if let reason = status?.stoppedReason {
-                ScanStat("Reason", reason.rawValue)
+            if let reason = status.stoppedReason,
+               let sentence = ScanEndText.stoppedReason(
+                   reason, state: summary.state, probesBudget: summary.probes.budget, error: status.error)
+            {
+                stoppedSentence(sentence)
             }
-            if let error = status?.error {
+            if let trouble = ScanEndText.crawlTroubleLine(status.crawl) {
+                stoppedSentence(trouble)
+            }
+            if let error = status.error {
                 Text(error)
                     .font(Tok.Face.data(Tok.Typography.Size.md))
                     .foregroundStyle(Tok.Status.serverError.color)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let reason = status.stoppedReason {
+                rawLine(ScanEndText.rawReasonLine(reason))
+            }
+            if let kind = status.crawl.lastError {
+                rawLine(ScanEndText.rawCrawlErrorLine(kind))
+            }
         }
+    }
+
+    /// A Stopped-section sentence: UI face, md, secondary ink.
+    private func stoppedSentence(_ text: String) -> some View {
+        Text(text)
+            .font(Tok.Face.ui(Tok.Typography.Size.md))
+            .foregroundStyle(Tok.Ink.secondary.color)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// A raw-token line (`stopped_reason: errors`): data face, xs, tertiary ink.
+    private func rawLine(_ text: String) -> some View {
+        Text(text)
+            .font(Tok.Face.data(Tok.Typography.Size.xs))
+            .foregroundStyle(Tok.Ink.tertiary.color)
+            .textSelection(.enabled)
     }
 
     // MARK: Pieces

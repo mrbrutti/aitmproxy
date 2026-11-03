@@ -1,0 +1,207 @@
+[12:53:14] == 0 targets
+[12:53:16] == 1 relaunch the dev bundle with the branch build
+obscura
+share
+app pid 16421
+core pid 16428 proxy port 49396 bus 127.0.0.1:49403
+pressed AXButton '' -> 0
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[12:53:47] frame 00-empty
+[12:53:47] == 2 AC8: a job started by another bus client is selected when nothing is selected
+[12:53:47] light-http job scan-96d88a90
+[12:53:51] frame 01-ac8-autoselected
+running crawling None 4749 0 0 0
+[12:53:51] == 3 AC5/AC7: cancel through the app's button; Cancelling… then Cancelled; a second press sends nothing
+[12:53:51] standard job scan-1ff41c68
+[12:53:58] frame 02-ac5-running-selected
+pressed AXButton 'Cancel Scan' -> 0
+[12:54:14] frame 03-ac5-cancelling
+no AXButton starting with 'Cancelling' (0 matched, walked 137)
+[12:54:20] frame 04-ac5-cancelled
+cancelled done cancelled 21629 0 0 0
+[12:54:21] waiting 60 s for the AC5 stability frame
+[12:55:21] frame 05-ac5-cancelled-60s
+cancelled done cancelled 21629 0 0 0
+[12:55:21] == 4 AC10: dead target ends done + errors; words, then the raw line
+[12:55:21] dead-target job scan-b765d6ee
+[12:55:21] == 5 AC6 meanwhile: the finished light-http job, selected after it finished
+running auditing None 139723 1039 1386 0
+[12:56:10] frame 06-ac6-row2
+[12:56:14] frame 07-ac6-row3
+done done errors 30008 49 135 7
+[12:56:19] frame 08-ac10-dead-target-detail
+[12:56:19] AC10 raw-token lines: 1; bare 'errors' texts: 0
+[12:56:19] AC11 row elements: 3
+AXButton		scan-job-scan-b765d6ee
+AXButton		scan-job-scan-1ff41c68
+AXButton		scan-job-scan-96d88a90
+[12:56:19] == 6 AC12: freeze the core under a running job
+[12:56:19] thorough job scan-fcfbab68
+[12:56:26] core 16428 stopped
+[12:56:36] frame 09-ac12-10s
+[12:57:03] frame 10-ac12-36s
+AXButton			true
+[12:57:04] core continued
+[12:57:10] frame 11-ac12-recovered
+AXButton			true
+[12:57:11] thorough cancelled over the bus (cleanup)
+[12:57:11] == done
+[12:58:48] == AC6 second pass for finished
+1 scan-fcfbab68 cancelled
+2 scan-b765d6ee done
+3 scan-1ff41c68 cancelled
+4 scan-96d88a90 running
+[12:58:52] frame 12-ac6-finished-selected
+AXButton			Done, done, standard, 127.0.0.1:8121, 1 of 2000 probes, 0 of 14 points audited, no issues
+AXButton			Running, auditing, light-http, 127.0.0.1:8118, 660 of 2000 probes, 180 of 292 points audited, 4 issues: 1 high, 3 low
+AXStaticText		Running · Auditing · 5:05	
+AXButton			Cancel Scan
+AXStaticText		Scheduled	
+AXStaticText		Done	
+AXStaticText		Running	
+[12:58:53] == AC7 audit log: scan.cancel count for the AC5 job
+bus.endpoint
+config.yaml
+[12:58:53] no audit jsonl under /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/90ADE63B-8565-4A3F-8C0B-8E83CBD4A206
+[12:58:53] == done pass 2
+[AC7] durable audit log ~/Library/Application Support/aitmproxy/audit.jsonl: scan.cancel for scan-1ff41c68 appears exactly once (origin operator, client_label aitm-mac, conn_2f68e0fb25cc48cd-1, result ok); the AX press on the disabled/absent "Cancelling" button sent nothing. The dev bundle's embedded core writes the audit to the real config dir, not the isolated APP_STORE (note for the coordinator; outside this spec).
+[AC6] proven with the dead-target job (frame 08): it finished while the cancelled job was selected; selected afterwards it reads Done · Done · 0:30 with checks 49 / 135 and the Stopped words, matching the concurrent scan.status (done, errors, 49/135, 7 check errors). The light-http job was still auditing at 5:05 under 400 ms latency; its Done frame is captured in pass 3.
+[AC12] NOT met at 36 s: the status read timed out first ("Unable to read job scan-fcfbab68: the bus did not reply in time"), Cancel Scan stayed enabled; link tied to the list alone. Spec D6 amended (any failed Jobs read marks the link); fix task 1.5c; re-proof in pass 3.
+[13:19:03] == pass 3: relaunch on c4d6de70
+share
+app pid 30086
+core pid 30093 proxy port 55722 bus 127.0.0.1:55730
+pressed AXButton '' -> 0
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[13:19:32] == AC6: light-http job to completion (no latency target would be faster; 8118 has 400 ms)
+[13:19:32] light-http job scan-3ea69f4e on 8120
+[13:19:32] == AC12: freeze the core with a running job selected
+[13:19:32] thorough job scan-d1f37f5b
+[13:19:39] frame 20-ac12-running-selected
+[13:19:39] core 30093 stopped
+[13:19:50] frame 21-ac12-10s
+[13:20:17] frame 22-ac12-36s
+AXButton			Cancel Scan	false
+[13:20:17] core continued
+[13:20:24] frame 23-ac12-recovered
+AXButton			Cancel Scan	true
+[13:20:25] thorough cancelled over the bus (cleanup)
+[13:20:25] == AC6: wait for scan-3ea69f4e to finish (poll the state, up to 8 min)
+AC6 status done done 95870 171 171 3
+[13:21:19] frame 24-ac6-light-http-done
+AXButton			Done, done, light-http, 127.0.0.1:8120, 143 of 2000 probes, 36 of 36 points audited, 3 issues: 1 high, 2 low
+AXStaticText		Done · Done · 1:35	
+AXStaticText		Scheduled	
+AXStaticText		Done	
+[13:21:20] == done pass 3
+[AC12 pass 3, c4d6de70] frame 22 at 36 s frozen: inline "Unable to list jobs: the bus did not reply in time. Showing values from 0:02 ago; retrying every 2 s.", Cancel Scan AX enabled=false; frame 23 after CONT: error gone, Cancel Scan enabled=true. Which read fails first depends on where the freeze lands in the tick (here the list; in pass 1 the status) and both now mark the link. DEFECT: the age clause read 0:02 for values 36 s old: nowMs advances only at the top of a pollTick and the tick is blocked inside the hung read, so the clock stalls -> fix 1.5d (an independent 1 s clock task in ScanPanelState).
+[AC6 pass 3] frame 24: light-http scan-3ea69f4e selected after it finished reads Done · Done · 1:35; AX row label "Done, done, light-http, 127.0.0.1:8120, 143 of 2000 probes, 36 of 36 points audited, 3 issues: 1 high, 2 low"; bus status done/171 of 171 checks/3 issues. PASS.
+[13:47:26] == pass 4: relaunch on dffdadc5
+share
+app pid 42645
+core pid 42651 proxy port 61366 bus 127.0.0.1:61371
+pressed AXButton 'Not Now' -> 0
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[13:47:57] window 36247
+[13:47:57] == AC5/AC7: standard job, select, frame loop, Cancel Scan press, then two ⌥⌘. presses
+[13:47:57] standard job scan-ae833d2f
+[13:48:12] frame 30-ac5-running
+pressed AXButton 'Cancel Scan' -> 0
+posted key 47 flags 1572864 to 42645
+posted key 47 flags 1572864 to 42645
+[13:48:16] frames captured: 16
+[13:48:21] frame 31-ac5-cancelled
+[13:48:21] AC7 audit scan.cancel for scan-ae833d2f: before=0
+0 after=1 (expect after-before == 1)
+{"at":1793656093629,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_dac41ae4b9acf7c4-1","command":"scan.cancel","args":"{\"job\":\"scan-ae83
+[13:48:21] == AC10: dead target (three-line form, no suffix when pages > 0)
+[13:48:21] dead-target job scan-453c1a02
+[13:49:05] frame 32-ac10-dead-target
+109:AXStaticText		Stopped early: too many errors from the target.
+110:AXStaticText		The crawl fetched 1 page and hit 1 error
+111:AXStaticText		stopped_reason: errors
+[13:49:06] == AC11: selected attribute
+AXButton		Done, done, standard, 127.0.0.1:8121, 1 of 2000 probes, 0 of 12 points audited, no issues	true	scan-job-scan-453c1a02
+AXButton		Cancelled, done, standard, 127.0.0.1:8117, 34 of 2000 probes, 0 of 0 points audited, no issues	true	scan-job-scan-ae833d2f
+scan-job-scan-453c1a02	AXButton	selected=true	focused=nil
+scan-job-scan-ae833d2f	AXButton	selected=nil	focused=nil
+rows: 2
+[13:49:07] == AC12: freeze with a running job selected; age clause must advance
+[13:49:07] thorough job scan-4fafab5f
+[13:49:13] core 42651 stopped
+[13:49:50] frame 33-ac12-36s
+AXUnknown			Error: Unable to read job scan-4fafab5f: the bus did not reply in time. Showing values from 0:36 ago; retrying every 2 s.	true
+AXButton			Cancel Scan	false
+AXUnknown		
+[13:50:01] core continued
+[13:50:08] frame 35-ac12-recovered
+AXButton			Cancel Scan	true
+[13:50:09] thorough cancelled over the bus (cleanup)
+[13:50:09] == done pass 4
+[pass 4 summary, dffdadc5] AC7 PASS: audit scan.cancel for scan-ae833d2f before=0 after=1 with one button press + two ⌥⌘. (real key events). AC10 PASS: three lines (sentence, "The crawl fetched 1 page and hit 1 error", raw line); suffix lands with engine amendment 89. AC11 PASS: scan-job rows are AXButton; the selected one reports selected=true. AC12 PASS: frame 33 at +37 s "Unable to read job scan-4fafab5f: the bus did not reply in time. Showing values from 0:36 ago; retrying every 2 s.", Cancel Scan enabled=false; frame 35 after CONT: Cancel Scan enabled=true. AC5: 16 frames in ac5-frames/ around the press (see the frame notes below).
+[AC5 pass 4] ac5-frames/f03 (before the press): Running · Crawling · 0:14, Cancel Scan enabled. f04 (~0.3 s after the press): header "Cancelling · Crawling · 0:15", button "Cancelling…" disabled, row "Cancelling · standard". f05/f06: "Cancelled · Done · 0:15", button gone, row "Cancelled". PASS.
+[14:18:17] == pass 5: relaunch on 35a3148f
+share
+app pid 77865
+core pid 77906 proxy port 51146 bus 127.0.0.1:51150
+pressed AXButton '' -> 0
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[14:18:47] frame 40-empty
+[14:18:47] == AC8: bus-started light-http selected with no click
+[14:18:47] light-http job scan-bb82a8d0
+[14:18:52] frame 41-ac8-autoselected
+AXButton			Running, crawling, light-http, 127.0.0.1:8120, 8 of 2000 probes, 0 of 0 points audited, no issues
+AXStaticText		Running · Crawling · 0:04	
+AXButton			Cancel Scan
+[14:18:52] == AC5: standard job, cancel, +5 s and +60 s frames
+[14:18:52] standard job scan-e9680407
+pressed AXButton '' -> 0
+[14:19:12] frame 42-ac5-cancelled-5s
+AXButton			Cancelled, done, standard, 127.0.0.1:8117, 26 of 2000 probes, 0 of 0 points audited, no issues
+AXButton			Running, auditing, light-http, 127.0.0.1:8120, 52 of 2000 probes, 30 of 320 points audited, 3 issues: 3 low
+AXStaticText		Cancelled · Done · 0:13	
+[14:19:12] waiting 60 s
+[14:20:13] frame 43-ac5-cancelled-65s
+AXButton			Cancelled, done, standard, 127.0.0.1:8117, 26 of 2000 probes, 0 of 0 points audited, no issues
+AXButton			Running, auditing, light-http, 127.0.0.1:8120, 204 of 2000 probes, 68 of 320 points audited, 3 issues: 3 low
+AXStaticText		Cancelled · Done · 0:13	
+[14:20:13] AC5 +60 s: differences -> /tmp/claude/jobsux-proof/pr1/42-43.diff
+[14:20:13] == AC6: wait for scan-bb82a8d0, then select it
+[AC5 pass 5] frames 42 (+5 s) and 43 (+65 s): the cancelled job's row label and the header "Cancelled · Done · 0:13" are identical; the only diff lines are the still-running light-http row's own counters (probes 52 → 204, points 30 → 68) and the traffic counters. PASS.
+AC6 status running 488773 1519 1521 5
+[14:27:00] frame 44-ac6-light-http-done
+[14:27:01] == done pass 5
+AC6 status done 492587 1521 1521 5
+[14:27:39] frame 45-ac6-light-http-done
+[14:27:40] == done pass 5b
+pressed AXButton 'Jobs 2' -> 0
+1 scan-e9680407 cancelled
+2 scan-bb82a8d0 done
+[14:31:26] frame 46-ac6-light-http-done
+AXButton			Done, done, light-http, 127.0.0.1:8120, 1219 of 2000 probes, 320 of 320 points audited, 5 issues: 2 high, 3 low
+AXStaticText		Done · Done · 8:12	
+AXStaticText		Scheduled	
+AXStaticText		Done	
+[14:31:27] == done pass 5c
+[14:36:26] == pass 6 on df1060c5 (app build 35a3148f)
+[14:36:29] standard job scan-7045785e
+pressed AXButton '' -> 0
+posted key 47 flags 1572864 to 77865
+posted key 47 flags 1572864 to 77865
+AC5 status cancelled cancelled 13255
+[14:36:49] frame 50-ac5-cancelled
+[14:36:49] AC7 audit scan.cancel for scan-7045785e: before=0
+0 after=1
+{"at":1793659002306,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_bd6a4b49b2ed02b3-1","command":"scan.cancel","args":"{\"job\":\"scan-7045785e\"}","result":"ok"}
+[14:36:49] == AC11: three rows, selected attribute
+scan-job-scan-7045785e	AXButton	selected=true	focused=nil
+scan-job-scan-e9680407	AXButton	selected=nil	focused=nil
+scan-job-scan-bb82a8d0	AXButton	selected=nil	focused=nil
+rows: 3
+[14:36:50] == done pass 6
+[AC5 pass 6, 35a3148f] ac5-frames-6/f03–f04: Running · Crawling · 0:12 with Cancel Scan enabled (before the press); f06 and f08: header "Cancelling · Crawling · 0:13", button "Cancelling…" disabled, row "Cancelling · standard"; 50-ac5-cancelled.png + 50-ac5-status.json: cancelled/cancelled at 13,255 ms. One scan.cancel in the audit log after the button press + two ⌥⌘. (audit-grep.txt). PASS at head, with the in-flight flip from the press.
+[AC11 pass 6] 51-ax-selected.txt: three scan-job rows, selected=true on the selected one, nil on the other two. PASS.
