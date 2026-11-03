@@ -1370,4 +1370,73 @@ import Testing
         // The CFNetwork read alone, at us: done too (the route, not the source).
         #expect(withFacts(nil, systemProxy: both("127.0.0.1", 8080), flows: 3).allStepsDone)
     }
+
+    // MARK: Listen-port fallback (spec 2026-11-03-mac-listen-port-fallback-notice-design D3; AC3, AC4, AC5)
+
+    private let fallbackRemedy = "Port 8080 was busy; listening on 8081 — Restart Core tries 8080 again"
+    private let fallbackNotice = "Port 8080 was busy; listening on 8081"
+
+    /// AC3: an embedded, ready core that bound 8081 while 8080 was asked for keeps the word `running` and the
+    /// detail, but the lane is `.warning` with the remedy; the summary carries the fact, the pill keeps the
+    /// address, and the tooltip gains the notice as a fourth line.
+    @Test func theCoreLaneWarnsAndNamesTheRemedyWhileFallingBack() {
+        let s = make(core: core(.ready, proxy: "127.0.0.1:8081"), bus: .connected("x"), role: "operator")
+        #expect(s.core == ConnectionLane(kind: .core, state: .warning, word: "running",
+                                         detail: "Embedded · proxy 127.0.0.1:8081", remedy: fallbackRemedy,
+                                         actions: [.restartCore, .showCoreLog]))
+        #expect(s.portFallback == ListenPortFallback(preferred: 8080, bound: 8081))
+        #expect(s.coreAddressShown == true)
+        #expect(s.tooltip.hasSuffix("\nPort 8080 was busy; listening on 8081"))
+        #expect(s.tooltip == "Core: running — Embedded · proxy 127.0.0.1:8081\nBus: connected — operator · x\n"
+                + "All Apps: all apps off — extension not installed\nPort 8080 was busy; listening on 8081")
+        #expect(s.tooltip.split(separator: "\n", omittingEmptySubsequences: false).count == 4)
+    }
+
+    /// Spec Constraints: `.warning` outranks `.ok`, so the fallback lane is `worst` when the other lanes are fine
+    /// and the compact surfaces read `core: running` under a warning dot (accepted).
+    @Test func theFallbackIsTheWorstLaneWhenTheOthersAreFine() {
+        let s = make(core: core(.ready, proxy: "127.0.0.1:8081"), bus: .connected("x"), role: "operator",
+                     capability: .capturing, hosts: 2)
+        #expect(s.overall == .warning)
+        #expect(s.worst.kind == .core)
+        #expect(s.worst.compact.hasPrefix("core: running"))
+    }
+
+    /// AC4: without a fallback the `.ready` lane is byte-identical to before, the summary carries nothing, the
+    /// address is still shown and the tooltip has its three lines.
+    @Test func theReadyLaneIsUnchangedWithoutAFallback() {
+        let s = make(core: core(.ready), bus: .connected("x"), role: "operator")
+        #expect(s.core == ConnectionLane(kind: .core, state: .ok, word: "running",
+                                         detail: "Embedded · proxy 127.0.0.1:8080", remedy: nil,
+                                         actions: [.restartCore, .showCoreLog]))
+        #expect(s.portFallback == nil)
+        #expect(s.coreAddressShown == true)
+        #expect(s.tooltip == "Core: running — Embedded · proxy 127.0.0.1:8080\nBus: connected — operator · x\n"
+                + "All Apps: all apps off — extension not installed")
+        #expect(s.tooltip.split(separator: "\n", omittingEmptySubsequences: false).count == 3)
+    }
+
+    /// AC5: the `coreRunning` step stays done with its Kit-pinned title (the core is running); the notice is its
+    /// detail while falling back and nil otherwise.
+    @Test func theCoreRunningStepCarriesTheNoticeAsItsDetail() {
+        let falling = make(core: core(.ready, proxy: "127.0.0.1:8081"), bus: .connected("x"), role: "operator")
+        #expect(step(falling, .coreRunning)?.done == true)
+        #expect(step(falling, .coreRunning)?.title == "Core is running")
+        #expect(step(falling, .coreRunning)?.action == nil)
+        #expect(step(falling, .coreRunning)?.detail == fallbackNotice)
+        let plain = make(core: core(.ready), bus: .connected("x"), role: "operator")
+        #expect(step(plain, .coreRunning)?.detail == nil)
+        #expect(step(plain, .coreRunning)?.title == "Core is running")
+    }
+
+    /// AC3 (external half): an external active kind surfaces no fallback whatever the connection value says, and
+    /// a working lane keeps the pill's ` · core starting…` branch (`coreAddressShown` false).
+    @Test func anExternalActiveKindSurfacesNoFallback() {
+        let s = make(core: core(.ready, proxy: "127.0.0.1:8081"), kind: .external, bus: .connected("127.0.0.1:9090"))
+        #expect(s.portFallback == nil)
+        #expect(s.core.word == "external")
+        #expect(s.coreAddressShown == false)
+        #expect(s.tooltip.split(separator: "\n", omittingEmptySubsequences: false).count == 3)
+        #expect(make(core: core(.starting, proxy: "127.0.0.1:8081")).coreAddressShown == false)
+    }
 }
