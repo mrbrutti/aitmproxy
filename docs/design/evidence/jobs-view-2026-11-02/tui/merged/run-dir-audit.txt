@@ -1,0 +1,3 @@
+run dir audit.jsonl bytes: 542
+scan.cancel lines: 1
+ca-audit.jsonl: absent
