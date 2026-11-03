@@ -13,5 +13,5 @@
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSPrincipalClass</key><string>AitmApplication</string>
+<key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>

@@ -29,6 +29,11 @@ struct AitmproxyApp: App {
         .windowToolbarStyle(.unified)
         .commands {
             FlowCommands(session: session)
+            // Quit ends open sheets first (spec 2026-11-03-mac-quit-ends-open-sheets, D1a); stock title and ⌘Q.
+            CommandGroup(replacing: .appTermination) {
+                Button("Quit Aitmproxy") { Quit.endSheetsAndTerminate() }
+                    .keyboardShortcut("q")
+            }
         }
 
         // S-061: the inspector in its own window; closing it returns to the previous layout.
@@ -66,6 +71,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print(why)
             exit(1)
         }
+        // Replaces AppKit's own quit handler (which only called `terminate:`) so the Apple event, Dock
+        // Quit, log out and shut down take the same teardown as menu Quit (spec D1b). It must be
+        // registered here, after `finishLaunching` installed AppKit's, not in `applicationWillFinishLaunching`.
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleQuitAppleEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kCoreEventClass),
+            andEventID: AEEventID(kAEQuitApplication))
         // Started from a terminal, the process is not a foreground app yet.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
@@ -73,6 +86,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// The quit Apple event (`tell application … to quit`, `NSRunningApplication.terminate()`, Dock
+    /// Quit, log out, shut down). The reply is never written and the event never suspended: the
+    /// delegate answers `NSTerminateNow` and the process exits inside `terminate`, as AppKit's own
+    /// handler does (spec D1, "The reply descriptor"); a future `NSTerminateLater` would need
+    /// `NSAppleEventManager.shared().suspendCurrentAppleEvent()` here.
+    @objc func handleQuitAppleEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        Quit.endSheetsAndTerminate()
+    }
 
     /// The self-test's result becomes the exit code, after a normal quit.
     func applicationWillTerminate(_ notification: Notification) {
