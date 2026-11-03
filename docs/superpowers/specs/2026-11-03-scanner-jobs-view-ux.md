@@ -257,7 +257,7 @@ in the context menu and on ⌥⌘..
 - Tab order: Scan tabs → the card's verbs → the table → the attention
   disclosures and wells.
 - ↑↓ in the table move the selection (no animation, no entrance); Return or
-  → focuses the card's first enabled verb; Escape returns to the table; ⌥⌘.
+  → focuses the card's primary verb (Cancel Scan or Scan Again) when enabled, else its first enabled verb (plan gap 77); Escape returns to the table; ⌥⌘.
   cancels the selected job.
 - Each row is one accessibility element whose label is a sentence:
   "Auditing, standard, 127.0.0.1:8117, 50 percent, 3,236 of 6,468 checks, 4
@@ -1312,7 +1312,7 @@ public static func scanAgainHelp(_ status: ScanJobStatus) -> String
 - **Keyboard**: Tab order Scan tabs → the card's verbs → the table →
   disclosures and wells. In the table: ↑↓ move the selection (no animation,
   no entrance), Return or → calls `inspectorFocused = true` (`@FocusState`
-  on the card's first enabled verb), Escape from the card returns focus to
+  on the card's primary verb, else its first enabled verb; gap 77), Escape from the card returns focus to
   the table, ⌥⌘. is Cancel Scan (existing). The context menu is reachable with the keyboard
   through the system's menu key / ⌃-click as today.
 - Text is never below `Tok.Typography.Size.xs` (11 pt); every colour pair is
@@ -2181,7 +2181,7 @@ row it closes.
     host heading is announced as a heading; the lane reports `Progress, 50
     percent`; when the selected job ends, exactly one announcement is heard
     (one `announce:` line in the unified log); Return moves focus to the
-    card's first enabled verb and Escape returns it to the table.
+    card's primary verb (else its first enabled verb, gap 77) and Escape returns it to the table.
 30. **AC30 (P2, D15, C12; live).** `kill -STOP` the core: at 10 s the rows
     are unchanged and no banner shows; at 35 s the banner above the card
     reads `The core is not answering · showing values from 0:3x ago ·
