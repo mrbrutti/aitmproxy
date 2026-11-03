@@ -22,7 +22,10 @@ never `git add -A`. The gate for this branch is `npm run build && npm test` from
 - **Depends on:** none
 - **Files:** `apps/web/scripts/live-env.mjs` (modify: `renderConfig`, new export, `node:fs` import gains
   `readFileSync`, `node:path` import gains `isAbsolute`),
-  `apps/web/src/panels/scanner/live-env.audit-log.test.ts` (create)
+  `apps/web/src/panels/scanner/live-env.audit-log.test.ts` (create),
+  `apps/web/src/types-node-test.d.ts` (modify: the hand-written `node:*` shim the test files are
+  type-checked against gains `mkdtempSync`/`writeFileSync` on `node:fs` and a `node:os` module with
+  `tmpdir()`; amendment 2026-11-02, the test writes real files and `apps/web` has no `@types/node` by design)
 - **Change:**
   - `renderConfig({ ..., auditLogDir = null })`: spec Design 1, exactly. Absent/`null` changes nothing.
   - `export function assertAuditLogIsolated(cfgPath: string, runDir: string): void` (JSDoc types; the
@@ -154,6 +157,8 @@ never `git add -A`. The gate for this branch is `npm run build && npm test` from
 - **Done when:** no open Critical or Important finding; each Minor fixed or accepted by Matt in the Review log.
 
 ## Review log
+
+- 2026-11-02, Task 1 coder gap: `npm run build` type-checks test files against `src/types-node-test.d.ts`, which lacked `mkdtempSync`, `writeFileSync` and `node:os`; the shim is added to Task 1's files (above). Prettier is not installed in `apps/web` and the repo has no config, so the coder rule "prettier --write" does not apply here; style is hand-matched to `tester.live-env.test.ts`.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
