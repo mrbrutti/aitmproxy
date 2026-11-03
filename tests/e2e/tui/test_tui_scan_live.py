@@ -41,7 +41,7 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
         and inside a scan.status bracket taken around the sample; x right after the last
         sample yields `cancelled` on screen and in scan.status (on a fresh `thorough`
         `intrusive` job, sampled the same way before its x, when the sampled one finished
-        first, H37), and the state/phase cell changes at least once across the samples and
+        first, H37), and the state cell changes at least once across the samples and
         that `cancelled` row; the second client saw a `progress` and a `cancelled` line for
         the cancelled job (the detail says what the wait before x saw).
         Every launch (s, m, the confirm's y) returns only once its start reply has landed
@@ -170,10 +170,10 @@ ROW_APPEAR_S = 20.0
 SAMPLE_GAP_S = 0.5
 # Never fewer than SAMPLES_MIN samples; the sampling goes on past them until the row reads
 # an audit phase with `sent > 0` AND the second bus client has counted a `progress` line
-# for the job (H83: the eleventh live run's three samples at 0.5 s all read `running/crawl`,
+# for the job (H83: the eleventh live run's three samples at 0.5 s all read `crawling`,
 # so `x` cancelled the job before any probe ran and the subscriber saw `started`, two
 # `phase` and `cancelled` lines but no `progress`; the seventh's three all read
-# `running/audit`, H80). Bounded by PROGRESS_WAIT_S from the first sample (then `x`
+# `auditing`, H80). Bounded by PROGRESS_WAIT_S from the first sample (then `x`
 # regardless and the push check's detail says what was seen) and by SAMPLES_HARD_MAX
 # samples, so `status-pairs.json` stays readable.
 SAMPLES_MIN, SAMPLES_HARD_MAX = 3, 120
@@ -201,10 +201,19 @@ SECRET_PREFIX = 12
 
 REDACTED = "<seeded-secret-redacted>"
 JOB_ID_RE = re.compile(r"scan-[0-9a-f]{8}")
+# The state cell's words alone (Jobs view D19, T2, `state_phase_text`): the phase word
+# while running, the state word otherwise. Bounded so a `/` or a word character on either
+# side fails the match: an old `state/phase` cell (`running/crawl`, `running/audit`,
+# `cancelled/done`) reads None, never a word lifted out of it (AC61's negative control).
 STATE_RE = re.compile(
-    r"\b(queued|running|cancelling|done|cancelled|failed)(?:/(queued|crawl|passive|audit|report|done))?\b"
+    r"(?<![\w/])(queued|crawling|passive|auditing|reporting|cancelling|done|cancelled|failed)(?![\w/])"
 )
 PROBES_RE = re.compile(r"(\d+)/(\d+)")
+# The phase words the state cell reads while a job is `running` (Jobs view D19, T2).
+RUNNING_PHASES = ("crawling", "passive", "auditing", "reporting")
+# The row's 6-cell progress bar (`BAR_FILLED` / `BAR_EMPTY`, PROBE_BAR_CELLS): the budget
+# cell is the first `n/m` after it.
+BAR_RE = re.compile(r"[━─]{6}")
 # The Scan view is drawn inside a box (`boxed(theme, "Scan", ..)`, crates/aitm-tui/src/ui/
 # scan/mod.rs), so every screen row starts with the box's left border `│` and the list
 # pane of each tab (Profiles, Jobs, the Site map's Nodes, Issues) sits at the box's inner
@@ -986,16 +995,23 @@ def line_with(text, needle):
 
 
 def row_tail(text, job):
-    """The job row's text after its id (profile, targets, state/phase, counters)."""
+    """The job row's text after its id (profile, targets, state, progress, budget, counters)."""
     line = line_with(text, job)
     return line.split(job, 1)[1] if line else None
 
 
 def row_probes(text, job):
+    """The budget cell as `(sent, budget)`: the first `n/m` after the progress bar (the
+    first run of six `━`/`─` cells after the job id), never the progress cell's `n/m`
+    before the bar, so it reads the same when that cell is `...` (Jobs view D19, T2; AC61).
+    None without a row or a bar."""
     tail = row_tail(text, job)
     if tail is None:
         return None
-    m = PROBES_RE.search(tail)
+    bar = BAR_RE.search(tail)
+    if bar is None:
+        return None
+    m = PROBES_RE.search(tail, bar.end())
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
@@ -1625,15 +1641,15 @@ def back_to_scan_list(ctx, step):
 
 
 def phases_of(samples):
-    """The state/phase cells the samples carry (the empty ones dropped)."""
+    """The state cells the samples carry (the empty ones dropped)."""
     return [s["screen_state_phase"] for s in samples if s["screen_state_phase"]]
 
 
 def audit_sample(samples):
-    """The ordinal (`n`) of the first sample whose row reads an audit phase
-    (`running/audit`: the probes are being sent) with `sent > 0`, or None (H83)."""
+    """The ordinal (`n`) of the first sample whose row reads the audit phase
+    (`auditing`: the probes are being sent) with `sent > 0`, or None (H83)."""
     for s in samples:
-        if (s["screen_state_phase"] or "").endswith("/audit") and (s["screen_sent"] or 0) > 0:
+        if s["screen_state_phase"] == "auditing" and (s["screen_sent"] or 0) > 0:
             return s["n"]
     return None
 
@@ -1658,8 +1674,8 @@ def more_samples(samples, seen, wait_s=PROGRESS_WAIT_S):
     0` AND the second client has counted a `progress` line for the job (`cancel_ready`),
     so the cancel lands on a job whose probes are running and whose push stream carries
     the `progress` the T7-16 push check asserts. The eleventh live run's three samples at
-    0.5 s all read `running/crawl` and `x` cancelled the job before any probe ran; the
-    seventh's three all read `running/audit` (H80). Off at SAMPLES_HARD_MAX samples or
+    0.5 s all read `crawling` and `x` cancelled the job before any probe ran; the
+    seventh's three all read `auditing` (H80). Off at SAMPLES_HARD_MAX samples or
     `wait_s` (PROGRESS_WAIT_S) seconds, whatever was seen: then `x` regardless. A job that
     leaves `running` ends the sampling from the caller (H37)."""
     if len(samples) >= SAMPLES_HARD_MAX or seen["elapsed_s"] >= wait_s:
@@ -1690,8 +1706,10 @@ def before_x_words(seen, wait_s=PROGRESS_WAIT_S):
 
 def sample_of(n, text, job, before, after, caught_up):
     """One T7-16 sample of `job`'s row on the screen `text`, bracketed by the scan.status
-    reads `before` and `after` (`status-pairs.json`): the on-screen `sent/budget` and
-    state/phase cells, the bracket's `sent` and `state`. `n` is the sample's ordinal, or
+    reads `before` and `after` (`status-pairs.json`): the on-screen budget cell
+    (`sent/budget`) and state cell (the keys keep their earlier names, `screen_sent` and
+    `screen_state_phase`, so older runs' evidence stays comparable), the bracket's `sent`
+    and `state`. `n` is the sample's ordinal, or
     `cancel` for the post-`x` row that ends the phase-change assertion (H80)."""
     probes = row_probes(text, job)
     return {"n": n, "job": job, "screen_sent": None if probes is None else probes[0],
@@ -1918,7 +1936,7 @@ def step_t7_16(ctx):
             f"pre-x state {pre_x.get('state')}; {before_x_words(seen_x)}; banner {banner_of(text)!r}; "
             f"{ctx.screen('t7-16')}")
     phases = phases_of(samples)
-    c.check("T7-16: the row's state/phase text changed at least once across the samples and the "
+    c.check("T7-16: the row's state cell changed at least once across the samples and the "
             "post-`x` `cancelled` row (H80)", len(set(phases)) > 1, phases)
     final = wait_field(lambda: status_of(ctx.bus, cancel_job), "state", "cancelled", CANCEL_S)
     c.check(f"T7-16: scan.status agrees {cancel_job} is `cancelled`", final.get("state") == "cancelled",
@@ -2959,9 +2977,23 @@ def profiles_frame(editor, offset=0, browser="auto", origins=ORIGIN, l4="none", 
 JOB = "scan-1a2b3c4d"
 
 
+# The Jobs row's cells as `ui/scan/jobs.rs` draws them for a crawling job (Jobs view D19,
+# T2; AC61): the state cell is the phase word alone while running, the progress cell is
+# `pages/known` (`checks done/total` while auditing, `...` while indeterminate) right-aligned
+# in its column and followed by one space and the 6-cell progress bar (P16: 46 of 58 is
+# floored to 4 filled cells), the budget cell `sent/budget` has no bar, then points, the
+# 6-cell severity run (`BAR_NONE` dots for a zero tally) and the elapsed time. The widths
+# are the renderer's `Columns::measure` for this one row: each at least its header's.
+JOBS_HEADER = ("job", "profile", "targets", "state", "progress", "budget", "points", "issues", "el.")
+JOB_PROGRESS, JOB_BAR, JOB_BUDGET = "46/58", "━━━━──", "12/400"
+
+
 def jobs_frame():
     """Jobs (ui/scan/jobs.rs): the table stacked over its detail (full width, one
-    horizontal rule), the one row under the cursor, the Jobs footer."""
+    horizontal rule), the one row under the cursor, the Jobs footer. The header, the row
+    and the detail lines are copied from a real 200x50 render of the crate at f79ae01b
+    for a `crawling` job (46 pages, 12 queued; 12 of 400 probes; 3 of 9 points; no
+    issues; 12 s), not typed by hand (Jobs view D19, T2; plan Task 4.5b)."""
     f = Frame()
     chrome(f)
     lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 2)
@@ -2969,14 +3001,25 @@ def jobs_frame():
     for yy in range(y, y + bh):
         f.put(rule_x, yy, " ")
     target = "http://127.0.0.1:8080"
-    f.put(lx, y, f" {'job':<13}{GAP_TEXT}{'profile':<8}{GAP_TEXT}{'targets':<21}{GAP_TEXT}{'state/phase':<13}"
-                 f"{GAP_TEXT}{'probes':<13}{GAP_TEXT}{'points':<6}{GAP_TEXT}{'issues':<6}{GAP_TEXT}{'el.':>3}")
-    f.put(lx, y + 1, f">{JOB:<13}{GAP_TEXT}{'standard':<8}{GAP_TEXT}{target:<21}{GAP_TEXT}{'running/crawl':<13}"
-                     f"{GAP_TEXT}{'12/400':<6} ━━────{GAP_TEXT}{'3/9':<6}{GAP_TEXT}──────{GAP_TEXT}{'12s':>3}")
+    job, profile, targets, state, progress, budget, points, issues, el = JOBS_HEADER
+    f.put(lx, y, f" {job:<13}{GAP_TEXT}{profile:<8}{GAP_TEXT}{targets:<21}{GAP_TEXT}{state:<8}"
+                 f"{GAP_TEXT}{progress:<15}{GAP_TEXT}{budget:<6}{GAP_TEXT}{points:<6}{GAP_TEXT}{issues:<6}"
+                 f"{GAP_TEXT}{el:>3}")
+    f.put(lx, y + 1, f">{JOB:<13}{GAP_TEXT}{'standard':<8}{GAP_TEXT}{target:<21}{GAP_TEXT}{'crawling':<8}"
+                     f"{GAP_TEXT}{JOB_PROGRESS:>8} {JOB_BAR}{GAP_TEXT}{JOB_BUDGET:<6}{GAP_TEXT}{'3/9':<6}"
+                     f"{GAP_TEXT}······{GAP_TEXT}{'12s':>3}")
     f.put(lx, y + 2, "─" * (COLS - 2))
     f.put(lx, y + 3, f" {JOB}")
-    f.put(lx, y + 4, " state running · phase crawl")
-    f.put(lx, y + 5, f" targets {target}")
+    # The percent is joined to its sign by a no-break space (`percent_text`).
+    f.put(lx, y + 4, " 79\u00a0% · 46 pages, 12 queued")
+    f.put(lx, y + 5, " lanes requested http ws · run http ws")
+    f.put(lx, y + 6, " started by operator (aitm-tui)")
+    f.put(lx, y + 7, f" probes sent {JOB_BUDGET} · errors 0 · timeouts 0 · rate waits 0 · by lane http 12")
+    f.put(lx, y + 8, " crawl pages 46 · queued 12 · depth 3 · forms 0")
+    f.put(lx, y + 9, " points found 9 · queued 6 · audited 3 · 0 skipped as repetitive · 0 skipped by rule "
+                     "· 0 skipped at the per-request cap")
+    f.put(lx, y + 10, " checks 0/0 done")
+    f.put(lx, y + 11, " session new · canary GET /account")
     f.put(lx, y + bh - 1, " " + key_text([JOBS_KEYS]))
     return f.text()
 
@@ -3348,8 +3391,10 @@ class ScriptedJobsRun:
 
     def text(self):
         phase, sent, _ = self.rows[self.sample()]
-        return (jobs_frame().replace(f"{'running/crawl':<13}", f"{phase:<13}", 1)
-                .replace(f"{'12/400':<6}", f"{sent}/{self.budget}".ljust(6), 1))
+        # The state cell carries the phase word while running and the state word
+        # otherwise (Jobs view D19, T2); the budget cell carries `sent/budget`.
+        return (jobs_frame().replace(f"{'crawling':<8}", f"{phase:<8}", 1)
+                .replace(f"{JOB_BUDGET:<6}", f"{sent}/{self.budget}".ljust(6), 1))
 
     def press(self, keys):
         self.keys.append((keys, self.sample()))
@@ -3358,7 +3403,7 @@ class ScriptedJobsRun:
         assert name == "scan.status", name
         self.status_calls += 1
         phase, sent, _ = self.rows[self.sample()]
-        return {"job": (args or {}).get("job"), "state": phase.split("/")[0],
+        return {"job": (args or {}).get("job"), "state": "running" if phase in RUNNING_PHASES else phase,
                 "probes": {"sent": sent, "budget": self.budget}}
 
     def of(self, _job):
@@ -3465,9 +3510,37 @@ def selftest():
             repr(cursor_row(shifted)))
 
     jobs = jobs_frame()
-    c.check("selftest: Jobs: the cursor row is the job and its cells read back",
+    c.check("selftest: Jobs: the cursor row is the job and its cells read back: the state cell "
+            "`crawling`, the budget cell `12/400` and never the progress cell `46/58` (AC61)",
             (cursor_row(jobs) or "").startswith(JOB) and row_probes(jobs, JOB) == (12, 400)
-            and row_state(jobs, JOB) == "running/crawl", repr(cursor_row(jobs)))
+            and row_state(jobs, JOB) == "crawling",
+            f"{cursor_row(jobs)!r}; probes {row_probes(jobs, JOB)} state {row_state(jobs, JOB)!r}")
+    header = line_with(jobs, "progress") or ""
+    c.check("selftest: Jobs: the fixture's header reads `job  profile  targets  state  progress  budget  "
+            "points  issues  el.` and neither `state/phase` nor `probes` (Jobs view D19, T2; AC61)",
+            header.strip().strip("│").split() == list(JOBS_HEADER) and "state/phase" not in jobs
+            and re.search(r"\bprobes\b", header) is None, repr(header))
+    old_cells = ("running/crawl", "running/audit", "cancelled/done")
+
+    def old_row(cell):
+        # The row shape before Jobs view T2: a `state/phase` cell, then the probes cell
+        # with the bar beside it, then points and the severity run.
+        return (f"│>{JOB}  standard  http://127.0.0.1:8080  {cell:<13}  12/400 ━━────  3/9     ──────"
+                "  12s")
+
+    c.check("selftest: Jobs: row_state reads `None` off an old-shape `state/phase` cell (`running/crawl`, "
+            "`running/audit`, `cancelled/done`), never a word lifted out of it (the negative control, "
+            "AC61)", all(row_state(old_row(cell), JOB) is None for cell in old_cells),
+            repr([row_state(old_row(cell), JOB) for cell in old_cells]))
+    new_row = (f"│>{JOB}  standard  http://127.0.0.1:8080  auditing  {{progress:>9}} {{bar}}  418/2000  80/120  "
+               f"▆▆▄▄▂▂  42s")
+    determinate = new_row.format(progress="3236/6468", bar="━━━───")
+    indeterminate = new_row.format(progress="...", bar="──────")
+    c.check("selftest: Jobs: row_probes reads the budget cell (`418/2000`) after the progress bar, not the "
+            "progress cell `3236/6468`, and still when the progress cell is `...` (AC61)",
+            row_probes(determinate, JOB) == (418, 2000) and row_probes(indeterminate, JOB) == (418, 2000)
+            and row_state(determinate, JOB) == "auditing" and row_state(indeterminate, JOB) == "auditing",
+            f"{row_probes(determinate, JOB)} {row_probes(indeterminate, JOB)}")
     c.check("selftest: Jobs: the Jobs footer is the tab's marker (H5)",
             re.search(TAB_MARKERS["2"], jobs) is not None and re.search(TAB_MARKERS["1"], jobs) is None,
             row_of(jobs, "cancel"))
@@ -4040,22 +4113,23 @@ def selftest():
                 f"{three.intensity!r} keys {three.keys!r}; gap {SAMPLE_GAP_S}")
 
         # Cell items from the seventh and eleventh live smoke runs: H80, H83. Run 7's three
-        # samples at 0.5 s all read `running/audit` (the crawl phase had passed before the
-        # row appeared); run 11's three all read `running/crawl` and `x` cancelled the job
+        # samples at 0.5 s all read `auditing` (the crawl phase had passed before the
+        # row appeared); run 11's three all read `crawling` and `x` cancelled the job
         # before any probe ran, so the second client counted `started 1, phase 2, cancelled
         # 1` and no `progress`. So the sampling goes on, never fewer than SAMPLES_MIN, until
         # the row reads an audit phase with `sent > 0` AND the second client has counted a
         # `progress` line for the job, bounded by PROGRESS_WAIT_S (60 s) and SAMPLES_HARD_MAX
         # (120); then `x` regardless, the detail naming what was missing; the post-`x`
         # `cancelled` row is the last sample of the phase-change assertion.
-        audit = {"screen_state_phase": "running/audit", "screen_sent": 1, "n": 0}
-        cancel_row = sample_of("cancel", "│>" + JOB + "  standard  http://127.0.0.1:8080  cancelled"
-                               "      220/2000", JOB, {"probes": {"sent": 220}, "state": "cancelled"},
+        audit = {"screen_state_phase": "auditing", "screen_sent": 1, "n": 0}
+        cancel_row = sample_of("cancel", "│>" + JOB + "  standard  http://127.0.0.1:8080  cancelled   "
+                               "180/240 ━━━━──  220/2000  80/120  ▆▆▄▄▂▂  42s", JOB,
+                               {"probes": {"sent": 220}, "state": "cancelled"},
                                {"probes": {"sent": 220}, "state": "cancelled"}, True)
         c.check("selftest: T7-16 sampling: the `cancelled` row folds as a bracketed sample whose phase "
                 "differs from the samples' (H80)",
                 len(set(phases_of([audit, audit, audit]))) == 1
-                and phases_of([audit, audit, audit, cancel_row]) == ["running/audit"] * 3 + ["cancelled"]
+                and phases_of([audit, audit, audit, cancel_row]) == ["auditing"] * 3 + ["cancelled"]
                 and cancel_row["n"] == "cancel" and cancel_row["job"] == JOB
                 and cancel_row["screen_sent"] == 220 and cancel_row["screen_budget"] == 2000
                 and cancel_row["status_before_sent"] == 220 and cancel_row["status_after_state"] == "cancelled"
@@ -4074,23 +4148,23 @@ def selftest():
                 and not more_samples([audit] * 120, none_seen)
                 and not more_samples([audit] * 3, dict(none_seen, elapsed_s=60.0))
                 and more_samples([audit] * 3, dict(none_seen, elapsed_s=59.9))
-                and audit_sample([dict(audit, screen_sent=0), dict(audit, n=1, screen_state_phase="running/crawl",
+                and audit_sample([dict(audit, screen_sent=0), dict(audit, n=1, screen_state_phase="crawling",
                                                                     screen_sent=5), dict(audit, n=2)]) == 2
                 and audit_sample([dict(audit, screen_sent=0)]) is None,
                 f"none {none_seen} both {both_seen}")
-        crawl, audit_quiet, audit_pushed = ("running/crawl", 0, 0), ("running/audit", 30, 0), ("running/audit", 31, 1)
+        crawl, audit_quiet, audit_pushed = ("crawling", 0, 0), ("auditing", 30, 0), ("auditing", 31, 1)
         staged = ScriptedJobsRun([crawl, crawl, crawl, audit_quiet, audit_pushed])
         staged_checks = Checks(out=io.StringIO())
         st_samples, st_seen, st_pre = sample_then_cancel(
             Ctx(staged_checks, staged, staged, staged, s_ev, 0, "", ORIGIN, 8080, set()), JOB, gap_s=0.02)
         st_words = before_x_words(st_seen)
-        c.check("selftest: sample_then_cancel (H83): a row that reads `running/crawl` for three samples, "
-                "then `running/audit` with `sent > 0` while the second client has no `progress` yet, then "
+        c.check("selftest: sample_then_cancel (H83): a row that reads `crawling` for three samples, "
+                "then `auditing` with `sent > 0` while the second client has no `progress` yet, then "
                 "the same with one `progress` counted, is sampled five times and `x` is pressed once, at "
                 "the fifth sample and not before; the three crawl samples count toward the minimum, every "
                 "sample sits inside its bracket, the Jobs-row check passed and the detail says both were seen",
                 staged.keys == [("x", 4)] and len(st_samples) == 5
-                and phases_of(st_samples) == ["running/crawl"] * 3 + ["running/audit"] * 2
+                and phases_of(st_samples) == ["crawling"] * 3 + ["auditing"] * 2
                 and [s["screen_sent"] for s in st_samples] == [0, 0, 0, 30, 31]
                 and all(s["status_before_sent"] <= s["screen_sent"] <= s["status_after_sent"] for s in st_samples)
                 and st_seen["audit_sample"] == 3 and st_seen["progress_pushes"] == 1
@@ -4111,9 +4185,9 @@ def selftest():
             Ctx(Checks(out=io.StringIO()), quiet, quiet, quiet, s_ev, 0, "", ORIGIN, 8080, set()), JOB,
             tag="T7-16-selftest", wait_s=0.3, gap_s=0.02)
         sl_words, q_words = before_x_words(sl_seen, 0.3), before_x_words(q_seen, 0.3)
-        c.check("selftest: sample_then_cancel (H83): a row that never leaves `running/crawl` is sampled "
+        c.check("selftest: sample_then_cancel (H83): a row that never leaves `crawling` is sampled "
                 "until the bound runs out, then `x` is pressed anyway and the detail names both missing "
-                "conditions; one stuck at `running/audit` with `sent > 0` and no `progress` line names "
+                "conditions; one stuck at `auditing` with `sent > 0` and no `progress` line names "
                 "the push alone",
                 stalled.keys == [("x", 0)] and len(sl_samples) >= SAMPLES_MIN and 0.3 <= sl_took < 3
                 and sl_seen["ended_by"] == "bound" and sl_pre.get("state") == "running"
