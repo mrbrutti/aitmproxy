@@ -18,7 +18,7 @@ struct ScopeSheet: View {
                 Spacer()
             }
             .padding(.horizontal, Space.lg).padding(.top, Space.xl).padding(.bottom, Space.md)
-            ScopePanel(showsLabel: false)
+            ScopePanel(showsLabel: false, focusesFieldOnAppear: true)
             Rule()
             HStack {
                 Spacer()

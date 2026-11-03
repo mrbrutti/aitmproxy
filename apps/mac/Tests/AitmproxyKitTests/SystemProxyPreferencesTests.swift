@@ -77,6 +77,24 @@ import Testing
         #expect(SystemProxyPreferences.bypassField(defaults) == "corp.test")
     }
 
+    /// Release acceptance MAC-6/15: the first read of an unwritten key persists the recommended list,
+    /// so `defaults read` carries what the app will pass as the bypass before Settings is ever opened;
+    /// an operator's own value — including an empty field — is never overwritten.
+    @Test func theFirstReadPersistsTheRecommendedListAndNeverOverwritesAnOperatorValue() {
+        let suite = "com.mrbrutti.aitmproxy.tests.sysproxy-prefs-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        #expect(defaults.string(forKey: SystemProxyPreferences.bypassKey) == nil)
+        _ = SystemProxyPreferences.bypassField(defaults)
+        #expect(defaults.string(forKey: SystemProxyPreferences.bypassKey) == SystemProxyPreferences.defaultBypassField)
+        defaults.set("", forKey: SystemProxyPreferences.bypassKey)
+        #expect(SystemProxyPreferences.bypassField(defaults) == "")
+        #expect(defaults.string(forKey: SystemProxyPreferences.bypassKey) == "", "a cleared field is not re-filled")
+        defaults.set("corp.test", forKey: SystemProxyPreferences.bypassKey)
+        #expect(SystemProxyPreferences.bypassField(defaults) == "corp.test")
+        #expect(defaults.string(forKey: SystemProxyPreferences.bypassKey) == "corp.test")
+    }
+
     // MARK: Edges a bus client must survive (tester, stage 5)
 
     /// Tabs and CRLF are whitespace like any other; a pasted Windows line ending is not a host.

@@ -10,6 +10,11 @@ struct ScopePanel: View {
     @Environment(Session.self) private var session
     /// Off in the sheet, which carries its own title.
     var showsLabel = true
+    /// The Edit Scope sheet exists to add a host, so the field takes focus the moment it opens,
+    /// whether or not Scope already has hosts (release acceptance MAC-5: on 0.5.14–0.5.16 a sheet
+    /// over a populated Scope opened with nothing focused and typed text went nowhere). The page
+    /// keeps the quieter rule: focus only an empty list, so landing on Scope never steals focus.
+    var focusesFieldOnAppear = false
 
     @State private var draft = ""
     @State private var selected: String?
@@ -18,7 +23,10 @@ struct ScopePanel: View {
     @FocusState private var fieldFocused: Bool
     @FocusState private var tableFocused: Bool
 
-    init(showsLabel: Bool = true) { self.showsLabel = showsLabel }
+    init(showsLabel: Bool = true, focusesFieldOnAppear: Bool = false) {
+        self.showsLabel = showsLabel
+        self.focusesFieldOnAppear = focusesFieldOnAppear
+    }
 
     /// Fixed columns after Host; Host takes what is left, at least `hostMin`.
     private static let limitWidth: CGFloat = 160
@@ -81,7 +89,7 @@ struct ScopePanel: View {
                 draft = host
                 session.scopeSheetHost = nil
                 fieldFocused = true
-            } else if entries.isEmpty {
+            } else if focusesFieldOnAppear || entries.isEmpty {
                 fieldFocused = true
             }
         }
@@ -105,10 +113,14 @@ struct ScopePanel: View {
                     .focused($fieldFocused)
                     .onSubmit(add)
                     .accessibilityLabel("Host to add to scope")
+                    // Stable handles for assistive tech and the release-acceptance harness
+                    // (`tests/e2e/acceptance`, MAC-5 click-before-probe); the label above is its fallback.
+                    .accessibilityIdentifier("scope-add-host")
                 PrimaryButton("Add", hint: "⌘⏎", action: add)
                     .disabled(!canAdd)
                     .keyboardShortcut(.return, modifiers: .command)
                     .help(validation ?? "Add the host to scope (⌘⏎)")
+                    .accessibilityIdentifier("scope-add")
             }
             if let validation {
                 Text(validation).font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Intercept.deep.color)
