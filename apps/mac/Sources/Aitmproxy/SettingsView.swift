@@ -196,9 +196,13 @@ struct ProxySettings: View {
         @Bindable var session = session
         Section("Embedded proxy") {
             TextField("Listen port", value: $port, format: .number.grouping(.never))
-            if usesEmbedded, let bound = session.coreHealth.connection?.proxyAddress,
-               Self.port(from: bound) != port {
-                LabeledContent("Bound address", value: bound)
+            // The listen-port fallback (spec 2026-11-03-mac-listen-port-fallback-notice §D5): the Kit's one
+            // sentence and the one action that fixes it. Nil for an external core and until the core is ready.
+            if let fallback = session.coreHealth.connection?.portFallback {
+                Text(fallback.notice)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button(fallback.restartTitle) { session.restartCoreTick += 1 }
             }
             Toggle("Verify upstream TLS", isOn: $verifyTLS)
             if !verifyTLS {
@@ -263,7 +267,7 @@ struct ProxySettings: View {
             Button("Apply and Restart Core") { session.restartCoreTick += 1 }
                 .disabled(!canApply)
             Text(usesEmbedded
-                 ? "The bundled core restarts to apply these — the proxy and bus briefly drop and rebind. If the chosen port is taken, the core picks a free one, shown above as the bound address."
+                 ? "The bundled core restarts to apply these — the proxy and bus briefly drop and rebind. If the chosen port is taken, the core picks a free one and says so above."
                  : "The active core is external; its port and TLS come from the config.yaml it was launched with. Switch to the embedded core in Bus to manage them here.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -272,11 +276,6 @@ struct ProxySettings: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
-    }
-
-    /// The port in a `host:port` bound address, for comparing against the preferred port.
-    private static func port(from address: String) -> Int? {
-        Int(address.split(separator: ":").last ?? "")
     }
 }
 
