@@ -20,7 +20,15 @@ enum Quit {
     /// check runs before the delegate is asked. It is bounded by the window count at entry so
     /// it finishes even if `endSheet(_:)` fails to detach a sheet; AppKit then refuses exactly
     /// as before. Never asks, alerts or beeps, and never inspects what a sheet shows.
+    ///
+    /// AppKit's modal-sheet check consults `preventsApplicationTerminationWhenModal` on each
+    /// attached sheet window, so clearing that flag first is the guarantee that `terminate` goes
+    /// through whatever the detach timing of `endSheet(_:)` (spec D2 amendment). The end-sheets
+    /// loop stays so nothing is left on screen while the app exits.
     static func endSheetsAndTerminate() {
+        for sheet in NSApp.windows where sheet.sheetParent != nil {
+            sheet.preventsApplicationTerminationWhenModal = false
+        }
         var remaining = NSApp.windows.count
         while remaining > 0,
             let innermost = NSApp.windows.first(where: { $0.sheetParent != nil && $0.attachedSheet == nil }),
