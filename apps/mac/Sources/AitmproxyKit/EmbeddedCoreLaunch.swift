@@ -168,8 +168,11 @@ public enum EmbeddedCoreLaunch {
     /// isolates its settings always isolates its audit, whatever `APP_LIVE` spells.
     /// (`SelfTest.live` wants exactly `APP_LIVE=1`, but that is the stricter question
     /// of whether the live self-test RUNS, not whether the run is a harness.)
-    /// - `APP_STORE` non-empty (a dev bundle, `tools/snap-dev.sh`): `<APP_STORE>/audit.jsonl`
-    ///   — the store wins when both are set, as it does for `Store.url` (AC2);
+    /// - an overridden store (`SettingsDomain.overriddenStoreURL`: `APP_STORE` non-empty, a dev
+    ///   bundle, `tools/snap-dev.sh`): `<store>/audit.jsonl` — the store wins when both are set,
+    ///   as it does for `Store.url` (AC2). The helper does not read `APP_STORE` itself: the store
+    ///   predicate has one reading, shared with `isolatedRunDir`, so "store -> run dir -> audit
+    ///   log" is one rule (Amendment 2);
     /// - else `APP_LIVE` non-empty (the live self-test): `<workDir>/audit.jsonl`, the
     ///   per-run `0700` dir the manager deletes at teardown, so the record dies with
     ///   the run (AC3);
@@ -177,8 +180,8 @@ public enum EmbeddedCoreLaunch {
     /// Both destinations are absolute, as `mcp.audit_log` requires; the core's writer
     /// preflight creates the file `0600` and any missing parent `0700`.
     public static func harnessAuditLogFile(environment: [String: String], workDir: URL) -> URL? {
-        if let store = environment["APP_STORE"], !store.isEmpty {
-            return URL(fileURLWithPath: store, isDirectory: true).appending(path: "audit.jsonl")
+        if let store = SettingsDomain.overriddenStoreURL(environment: environment) {
+            return store.appending(path: "audit.jsonl")
         }
         if let live = environment["APP_LIVE"], !live.isEmpty {
             return workDir.appending(path: "audit.jsonl")
@@ -444,6 +447,29 @@ extension EmbeddedCoreLaunch {
     /// The core's environment key for its run dir (`aitm-mcp` `pointer::RUN_DIR_ENV`): the
     /// directory where it publishes its pointer for the CLI's one-shots to find.
     public static let runDirEnvironmentKey = "AITM_RUN_DIR"
+
+    /// The core's environment key for its audit-log override (`crates/aitm/src/env.rs`): in the
+    /// core's precedence it wins over the file's `mcp.audit_log`.
+    public static let auditLogEnvironmentKey = "AITM_AUDIT_LOG"
+
+    /// The environment to launch the core with, given the environment `spawn` already built and
+    /// the SAME `harnessAuditLogFile` value it passed to `Config`. A harness run (non-nil file)
+    /// gets the dictionary without `auditLogEnvironmentKey`: the core's `env.rs` `apply` lets an
+    /// inherited `AITM_AUDIT_LOG` beat the config (`on|true|1|yes|default` means the DEFAULT file,
+    /// the operator's real `audit.jsonl`; `off` disables the record; a path redirects it), and the
+    /// child inherits `ProcessInfo.processInfo.environment`, so without this the store isolation
+    /// could be defeated silently by a variable in the launch shell or `tests/e2e/run.py`'s
+    /// default `off`. Removing the override makes `mcp.audit_log` authoritative (AC8). A normal
+    /// launch (nil) returns `environment` unchanged, the key included: the installed app keeps the
+    /// core's own rule. This is #313's goal (the web harness fails closed on an inherited
+    /// `AITM_AUDIT_LOG`) by a different mechanism: the app owns the child's environment, and an
+    /// abort would surface as a degraded core in a UI harness. Pure, so it is unit-testable.
+    public static func childEnvironment(_ environment: [String: String], harnessAuditLogFile: URL?) -> [String: String] {
+        guard harnessAuditLogFile != nil else { return environment }
+        var child = environment
+        child.removeValue(forKey: auditLogEnvironmentKey)
+        return child
+    }
 
     /// Where an app launched on an overridden store (a dev bundle, the harness, the live
     /// self-test: `APP_STORE` set, the same signal `SettingsDomain` reads) must make its core
