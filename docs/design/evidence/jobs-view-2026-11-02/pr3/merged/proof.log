@@ -1,0 +1,27 @@
+[09:03:31] == PR 3 live check: bundle tree 9b5cb2ad = kit 9b5cb2ad code 6972acd4 + #310
+obscura
+share
+app pid 36802
+core pid 36872 proxy port 58758 bus 127.0.0.1:58764
+[09:03:49] #310 PASS: audit log under the isolated store (/tmp/Aitmproxy-dev-state-jobsux/audit.jsonl)
+[09:03:49] setup sheet dismissed: pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[09:03:54] dead-target job scan-a2faf01f (8121), alone (gap 40: a concurrent crawl collapses)
+[09:04:24] dead job done: errors
+left-clicked 1297 -572 in pid 36802 via HID tap
+selected now: scan-job-scan-a2faf01f (wanted scan-job-scan-a2faf01f)
+[09:04:48] frame 03 dead-target row + card
+[09:04:48] light-http job scan-b5262617 (8120, latency 100), alone
+[09:08:18] light-http done: issues {'critical': 0, 'high': 2, 'info': 0, 'low': 4, 'medium': 0} checks 3798
+left-clicked 1297 -572 in pid 36802 via HID tap
+selected now: scan-job-scan-b5262617 (wanted scan-job-scan-b5262617)
+[09:08:26] frame 02 finished light-http row + card
+[09:08:26] standard job scan-4f6c898a (8117)
+[09:08:50] standard phase auditing running ['xss-reflected']
+left-clicked 1297 -628 in pid 36802 via HID tap
+selected now: scan-job-scan-4f6c898a (wanted scan-job-scan-4f6c898a)
+[09:08:58] frame 01 standard running: wells + lane now tag
+[09:09:01] == quitting the bundle (quit-when-idle rule)
+down
