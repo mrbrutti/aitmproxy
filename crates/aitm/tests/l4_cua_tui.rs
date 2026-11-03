@@ -582,14 +582,14 @@ async fn tui_l4_cua_against_a_live_core() {
     let t0 = epoch_ms();
 
     // (G) The real TUI bus client over the real `TcpTransport`, operator token.
-    let (connect, label) = aitm_tui::connector(TransportChoice::Tcp {
+    let (connect, label, push) = aitm_tui::connector(TransportChoice::Tcp {
         addr,
         token: OPERATOR_TOKEN.into(),
     })
     .expect("build the TCP connector");
     let (req_tx, req_rx) = mpsc::channel::<BusRequest>(64);
     let (ev_tx, ev_rx) = mpsc::channel::<BusEvent>(256);
-    let bus_task = tokio::spawn(aitm_tui::bus::run(connect, req_rx, ev_tx, POLL));
+    let bus_task = tokio::spawn(aitm_tui::bus::run(connect, req_rx, ev_tx, POLL, push));
 
     let mut app = App::new(TermCaps::full(), label);
     let _ = app.update(aitm_tui::action::Action::Resize(200, 60));
