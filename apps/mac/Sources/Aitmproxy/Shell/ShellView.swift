@@ -57,7 +57,8 @@ struct ShellView: View {
             RulesSheet().environment(session).themed().noInitialFocus()
         }
         .sheet(isPresented: Binding(get: { session.scopeSheetVisible }, set: { session.scopeSheetVisible = $0 })) {
-            ScopeSheet().environment(session).themed().noInitialFocus()
+            // The sheet applies its own calm-open hook, with the follow that focuses its field (MAC-5).
+            ScopeSheet().environment(session).themed()
         }
         // The first-run sheet (spec D17.8): once per store, when the embedded core is ready, the
         // bus is the operator's and the OS store says the CA is not trusted.

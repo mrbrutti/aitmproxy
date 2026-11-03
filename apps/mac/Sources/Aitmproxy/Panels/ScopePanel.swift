@@ -10,11 +10,13 @@ struct ScopePanel: View {
     @Environment(Session.self) private var session
     /// Off in the sheet, which carries its own title.
     var showsLabel = true
-    /// The Edit Scope sheet exists to add a host, so the field takes focus the moment it opens,
-    /// whether or not Scope already has hosts (release acceptance MAC-5: on 0.5.14–0.5.16 a sheet
-    /// over a populated Scope opened with nothing focused and typed text went nowhere). The page
-    /// keeps the quieter rule: focus only an empty list, so landing on Scope never steals focus.
-    var focusesFieldOnAppear = false
+    /// Bumped by the Edit Scope sheet right after the calm-open hook has cleared the first responder
+    /// (`noInitialFocus(then:)`): the sheet exists to add a host, so its field takes focus whether or
+    /// not Scope already has hosts (release acceptance MAC-5: on 0.5.14–0.5.16 a sheet over a
+    /// populated Scope opened with nothing focused and typed text went nowhere; an `onAppear` focus
+    /// alone loses to that clear, which runs a turn later). The page keeps the quieter rule — focus
+    /// only an empty list — so landing on Scope never steals focus.
+    var focusRequest = 0
 
     @State private var draft = ""
     @State private var selected: String?
@@ -23,10 +25,16 @@ struct ScopePanel: View {
     @FocusState private var fieldFocused: Bool
     @FocusState private var tableFocused: Bool
 
-    init(showsLabel: Bool = true, focusesFieldOnAppear: Bool = false) {
+    init(showsLabel: Bool = true, focusRequest: Int = 0) {
         self.showsLabel = showsLabel
-        self.focusesFieldOnAppear = focusesFieldOnAppear
+        self.focusRequest = focusRequest
     }
+
+    /// Stable handles for assistive tech and the release-acceptance harness (MAC-5's click-before-
+    /// probe looks for `scope-add-host` in the sheet). The page's copy of the same field is named
+    /// apart, so a walk over the window never finds two controls with one identifier.
+    private var fieldIdentifier: String { showsLabel ? "scope-page-add-host" : "scope-add-host" }
+    private var addButtonIdentifier: String { showsLabel ? "scope-page-add" : "scope-add" }
 
     /// Fixed columns after Host; Host takes what is left, at least `hostMin`.
     private static let limitWidth: CGFloat = 160
@@ -89,10 +97,11 @@ struct ScopePanel: View {
                 draft = host
                 session.scopeSheetHost = nil
                 fieldFocused = true
-            } else if focusesFieldOnAppear || entries.isEmpty {
+            } else if entries.isEmpty {
                 fieldFocused = true
             }
         }
+        .onChange(of: focusRequest) { _, _ in fieldFocused = true }
     }
 
     // MARK: Add
@@ -113,14 +122,12 @@ struct ScopePanel: View {
                     .focused($fieldFocused)
                     .onSubmit(add)
                     .accessibilityLabel("Host to add to scope")
-                    // Stable handles for assistive tech and the release-acceptance harness
-                    // (`tests/e2e/acceptance`, MAC-5 click-before-probe); the label above is its fallback.
-                    .accessibilityIdentifier("scope-add-host")
+                    .accessibilityIdentifier(fieldIdentifier)
                 PrimaryButton("Add", hint: "⌘⏎", action: add)
                     .disabled(!canAdd)
                     .keyboardShortcut(.return, modifiers: .command)
                     .help(validation ?? "Add the host to scope (⌘⏎)")
-                    .accessibilityIdentifier("scope-add")
+                    .accessibilityIdentifier(addButtonIdentifier)
             }
             if let validation {
                 Text(validation).font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Intercept.deep.color)

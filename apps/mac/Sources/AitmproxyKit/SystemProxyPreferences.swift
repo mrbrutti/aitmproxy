@@ -20,18 +20,24 @@ public enum SystemProxyPreferences {
     /// not part of the core's loopback/local `BYPASS_DEFAULT`. Read through `bypassField(_:)`.
     public static let defaultBypassField = "*.anthropic.com, api.anthropic.com, claude.ai, *.claude.ai, github.com, *.githubusercontent.com"
 
-    /// The stored field, or the recommended list when the key has never been written — and on
-    /// that first read the recommended list is WRITTEN under the key, so what the app will pass as
-    /// the bypass list is readable from the store (`defaults read … systemProxy.bypass`) before the
-    /// operator ever opens Settings ▸ Proxy. The release acceptance (MAC-6/MAC-15) reads it there
-    /// to know which hosts "Set as System Proxy" will bypass; on 0.5.14–0.5.16 an unwritten key made
-    /// that step a SKIP. Every reader (core spawn, Apply dirty-check, the live set) goes through here,
-    /// so the first spawn of the embedded core is the first write. An operator's own value, including
-    /// an empty field, is never touched.
+    /// The stored field, or the recommended list when the key has never been written. A pure read;
+    /// `seedBypassDefaultIfUnset(_:)` is what makes the key readable from the store.
     public static func bypassField(_ defaults: UserDefaults) -> String {
-        if let stored = defaults.string(forKey: bypassKey) { return stored }
+        defaults.string(forKey: bypassKey) ?? defaultBypassField
+    }
+
+    /// Writes the recommended list under the key when the store holds NOTHING for it, so what the
+    /// app will pass as the bypass list is readable from the store (`defaults read … systemProxy.bypass`)
+    /// before the operator ever opens Settings ▸ Proxy. The release acceptance (MAC-6/MAC-15) reads it
+    /// there to know which hosts "Set as System Proxy" will bypass; on 0.5.14–0.5.16 an unwritten key
+    /// made that step a SKIP. Called exactly once, where `Store.defaults` is built (so it runs before any
+    /// reader and never races one); an operator's own value — an empty field, or a value stored under
+    /// another type by hand — is never touched. The readers that pass the value on (core spawn, Apply
+    /// dirty-check, the live set) use `bypassField`; Settings ▸ Proxy binds the key with `@AppStorage`
+    /// and shows the same literal as its fallback.
+    public static func seedBypassDefaultIfUnset(_ defaults: UserDefaults) {
+        guard defaults.object(forKey: bypassKey) == nil else { return }
         defaults.set(defaultBypassField, forKey: bypassKey)
-        return defaultBypassField
     }
     /// Bool, default false: the first-run sheet's "Don't ask again".
     public static let promptSuppressedKey = "systemProxy.promptSuppressed"

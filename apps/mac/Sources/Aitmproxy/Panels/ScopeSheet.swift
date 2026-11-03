@@ -7,6 +7,8 @@ import SwiftUI
 struct ScopeSheet: View {
     @Environment(Session.self) private var session
     @Environment(\.dismiss) private var dismiss
+    /// Bumped once the calm-open hook has cleared the first responder; the panel focuses its field on it.
+    @State private var focusRequest = 0
 
     init() {}
 
@@ -18,7 +20,7 @@ struct ScopeSheet: View {
                 Spacer()
             }
             .padding(.horizontal, Space.lg).padding(.top, Space.xl).padding(.bottom, Space.md)
-            ScopePanel(showsLabel: false, focusesFieldOnAppear: true)
+            ScopePanel(showsLabel: false, focusRequest: focusRequest)
             Rule()
             HStack {
                 Spacer()
@@ -29,6 +31,10 @@ struct ScopeSheet: View {
         }
         .frame(width: 640)
         .background(Tok.Ground.surface.color)
+        // Open calm, then focus the one field this sheet is for — the same exception the Compose
+        // sheet makes (rule 51; release acceptance MAC-5). The hook's follow runs right after the
+        // clear, in the same run-loop turn, so an `onAppear` focus cannot be undone by it.
+        .noInitialFocus { focusRequest += 1 }
     }
 
     /// `3 hosts · 13 flows in scope`, or nothing while empty (the panel says so);
