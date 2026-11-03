@@ -211,16 +211,7 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("0", modifiers: .command)
             Button("Breakpoint Rules…") { session.rulesVisible = true }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
-            // On the Scope page the command opens the Edit Scope sheet; elsewhere it goes to the page and,
-            // because choosing Scope… is an intent to edit, the page's add field takes focus on arrival.
-            Button("Scope…") {
-                if session.page == .scope {
-                    session.scopeSheetVisible = true
-                } else {
-                    session.scopeFieldFocusPending = true
-                    session.show(.scope)
-                }
-            }
+            Button("Scope…") { session.openScopeForEditing() }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
             Button("Scan") { session.show(.scan) }
                 .keyboardShortcut("s", modifiers: [.command, .option])

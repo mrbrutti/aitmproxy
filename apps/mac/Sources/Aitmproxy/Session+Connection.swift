@@ -56,7 +56,7 @@ extension Session {
         case .reconnectBus:
             reconnectBus()
         case .openScope:
-            show(.scope)
+            openScopeForEditing()
         case .addScopeHost:
             show(.scope)
             scopeSheetVisible = true

@@ -156,9 +156,10 @@ final class Session {
     var quickLookTick = 0
     /// Typed into the Scope sheet's field when Flow ▸ Add Host to Scope… opens it.
     var scopeSheetHost: String?
-    /// Set by Proxy ▸ Scope… when it navigates to the Scope page: the page's add field takes focus on
-    /// arrival (an explicit intent to edit), then the flag clears. A sidebar click leaves it false, so
-    /// landing on Scope by itself keeps the page calm (focus only an empty list).
+    /// Set by `openScopeForEditing()` when it navigates to the Scope page: the page's add field takes
+    /// focus on arrival (an explicit intent to edit), then the flag clears; `show` to any other page
+    /// clears it too. A sidebar click never sets it, so landing on Scope by itself keeps the page calm
+    /// (focus only an empty list).
     var scopeFieldFocusPending = false
     /// A file is being dragged over the window (S-065): the "Drop to import" face shows.
     var dropTargeted = false
@@ -438,10 +439,26 @@ final class Session {
     /// Selecting an app, or a domain under one, also opens that app's domains (icons spec D4:
     /// collapsing is explicit via the chevron and keeps the selection and the narrowing).
     func show(_ page: SidebarPage, group: FlowGroup? = nil) {
+        // A pending "edit Scope" intent belongs to the navigation that set it: leaving for another page
+        // drops it, so it can never fire on a later, calm arrival (security P10-1).
+        if page != .scope { scopeFieldFocusPending = false }
         self.page = page
         self.group = group
         if case .client(let key) = group { expandedApps.insert(key) }
         if case .clientHost(let key, _) = group { expandedApps.insert(key) }
+    }
+
+    /// The one "open Scope to edit" action behind Proxy ▸ Scope… (⇧⌘O), Settings' "Open Scope…" and the
+    /// Status / advice `.openScope`: on the Scope page it opens the Edit Scope sheet (which focuses its
+    /// own field, #318); elsewhere it goes to the page and the page's add field takes focus on arrival,
+    /// because choosing Scope… is an intent to edit. A sidebar click is not, and stays calm.
+    func openScopeForEditing() {
+        if page == .scope {
+            scopeSheetVisible = true
+        } else {
+            scopeFieldFocusPending = true
+            show(.scope)
+        }
     }
 
     /// The Apps row's chevron: open or close one app's domains without touching the selection.
