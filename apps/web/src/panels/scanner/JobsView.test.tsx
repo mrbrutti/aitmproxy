@@ -79,14 +79,14 @@ describe('JobsView: rows and strip', () => {
     const first = rows[0]!;
     expect(first.getAttribute('data-job')).toBe(JOB);
     expect(first.getAttribute('data-state')).toBe('running');
-    expect(h.field(first, 'state')).toBe('running · auditing');
+    expect(h.field(first, 'state')).toBe('Auditing');
     expect(h.field(first, 'probes')).toBe('418/2000');
     expect(h.field(first, 'points')).toBe('80/120');
     expect(h.field(first, 'elapsed')).toBe('0:42');
     // The row carries no control: the selected job's Cancel lives in the strip and the detail.
     expect(first.querySelector('button')).toBeNull();
     expect(rows[1]!.getAttribute('data-job')).toBe(DONE);
-    expect(h.field(rows[1]!, 'state')).toBe('done');
+    expect(h.field(rows[1]!, 'state')).toBe('Done');
   });
 
   it('strip_mirrors_selected: the strip shows the selected job and Cancel follows its state', async () => {
@@ -106,7 +106,7 @@ describe('JobsView: rows and strip', () => {
     expect(h.s.selectedJob()).toBe(DONE);
     const after = h.strip();
     expect(after.getAttribute('data-job')).toBe(DONE);
-    expect(h.field(after, 'state')).toBe('done');
+    expect(h.field(after, 'state')).toBe('Done');
     const doneCancel = within(after).getByRole('button', { name: `Cancel scan ${DONE}` }) as HTMLButtonElement;
     expect(doneCancel.disabled).toBe(true);
   });
@@ -136,22 +136,64 @@ describe('JobsView: detail texts (W-14)', () => {
     expect(detail.textContent).toContain('standard');
     expect(detail.textContent).toContain('http://127.0.0.1:8080');
 
+    // The D4 sentences (Jobs view W1): the budget figure is the job's own, grouped.
     h.reply('scan.status', { ...statusFixture(), stopped_reason: 'budget' });
     await h.s.refreshStatus(JOB);
-    expect(h.field(h.detail(), 'stopped')).toBe('stopped: probe budget reached');
+    expect(h.field(h.detail(), 'stopped')).toBe(
+      'Stopped early: the probe budget of 2,000 was spent. Raise it in the profile to go further.',
+    );
+    expect(h.field(h.detail(), 'stopped-raw')).toBe('stopped_reason: budget');
 
+    // `cancelled` on a job that is not in the cancelled state still gets its sentence.
     h.reply('scan.status', { ...statusFixture(), stopped_reason: 'cancelled' });
     await h.s.refreshStatus(JOB);
-    expect(h.field(h.detail(), 'stopped')).toBe('cancelled by operator');
+    expect(h.field(h.detail(), 'stopped')).toBe('Stopped early: the job was cancelled.');
 
+    // `failed` with an error: the error line says it, the sentence is the dash, the raw line stays.
     h.reply('scan.status', { ...statusFixture(), state: 'failed', stopped_reason: 'failed', error: 'boom' });
     await h.s.refreshStatus(JOB);
-    expect(h.field(h.detail(), 'stopped')).toBe('failed');
+    expect(h.field(h.detail(), 'stopped')).toBe('—');
+    expect(h.field(h.detail(), 'stopped-raw')).toBe('stopped_reason: failed');
     const error = h.detail().querySelector('[data-field=error]');
     expect(error).not.toBeNull();
     expect(error!.textContent).toBe('boom');
     expect(error!.classList.contains(css.mono!)).toBe(true);
-    expect(h.field(h.row(JOB), 'state')).toBe('failed');
+    expect(h.field(h.row(JOB), 'state')).toBe('Failed');
+  });
+
+  it('stopped_sentence_and_raw_line (AC35): the stopped fact is the D4 sentence and the raw token sits beneath it in the data face', async () => {
+    const h = mount();
+    await tick();
+    // No reason yet: the dash, and no raw line at all (the token appears nowhere else).
+    expect(h.field(h.detail(), 'stopped')).toBe('—');
+    expect(h.detail().querySelector('[data-field="stopped-raw"]')).toBeNull();
+
+    h.reply('scan.status', { ...statusFixture(), state: 'done', phase: 'done', finished_at: 1761900069000, stopped_reason: 'errors' });
+    await h.s.refreshStatus(JOB);
+    expect(h.field(h.detail(), 'stopped')).toBe('Stopped early: too many errors from the target.');
+    const raw = h.detail().querySelector('[data-field="stopped-raw"]');
+    expect(raw).not.toBeNull();
+    expect(raw!.textContent).toBe('stopped_reason: errors');
+    expect(raw!.classList.contains(css.mono!)).toBe(true);
+    // The sentence and the raw line share the one `dd`, the sentence first.
+    expect(raw!.parentElement).toBe(h.detail().querySelector('[data-field=stopped]')!.parentElement);
+    expect(raw!.compareDocumentPosition(h.detail().querySelector('[data-field=stopped]')!) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+  });
+
+  it('crawl_trouble_fact: a crawl with errors adds the D4 line, the last_error words only when the engine sends them', async () => {
+    const h = mount();
+    await tick();
+    expect(h.detail().querySelector('[data-field=crawl]')).toBeNull();
+
+    const raw = statusFixture();
+    const crawl = raw.crawl as Record<string, unknown>;
+    h.reply('scan.status', { ...raw, crawl: { ...crawl, pages: 1, errors: 1 } });
+    await h.s.refreshStatus(JOB);
+    expect(h.field(h.detail(), 'crawl')).toBe('The crawl fetched 1 page and hit 1 error');
+
+    h.reply('scan.status', { ...raw, crawl: { ...crawl, pages: 0, errors: 1, last_error: 'connect_refused' } });
+    await h.s.refreshStatus(JOB);
+    expect(h.field(h.detail(), 'crawl')).toBe('The crawl fetched 0 pages and hit 1 error — the target refused the connection');
   });
 
   it('crawl_facts (PA6): the Crawl section prints crawl.errors and crawl.forms_skipped, 0 as `0` rather than a dash', async () => {
@@ -229,9 +271,28 @@ describe('JobsView: live values', () => {
     fireEvent.click(within(h.detail()).getByRole('button', { name: `Cancel scan ${JOB}` }));
     await tick();
     expect(h.argsOf('scan.cancel')[0]).toEqual({ job: JOB });
-    expect(h.field(h.row(JOB), 'state')).toBe('cancelling · auditing');
+    expect(h.field(h.row(JOB), 'state')).toBe('Cancelling');
     expect(h.row(JOB).getAttribute('data-state')).toBe('cancelling');
-    expect(h.field(h.strip(), 'state')).toBe('cancelling · auditing');
+    expect(h.field(h.strip(), 'state')).toBe('Cancelling');
+  });
+
+  it('cancel_disabled_while_cancelling (AC35): a cancelling status disables the detail Cancel and the strip Cancel', async () => {
+    const h = mount();
+    await tick();
+    const detailCancel = () => within(h.detail()).getByRole('button', { name: `Cancel scan ${JOB}` }) as HTMLButtonElement;
+    const stripCancel = () => within(h.strip()).getByRole('button', { name: `Cancel scan ${JOB}` }) as HTMLButtonElement;
+    expect(detailCancel().disabled).toBe(false);
+    expect(stripCancel().disabled).toBe(false);
+
+    // The list still says `running`; the held status says `cancelling` at the same elapsed, so the
+    // merged state is `cancelling` and neither Cancel can send a second scan.cancel.
+    h.reply('scan.status', { ...statusFixture(), state: 'cancelling' });
+    await h.s.refreshStatus(JOB);
+    expect(h.field(h.detail(), 'state')).toBe('Cancelling');
+    expect(h.strip().getAttribute('data-state')).toBe('cancelling');
+    expect(detailCancel().disabled).toBe(true);
+    expect(stripCancel().disabled).toBe(true);
+    expect(h.count('scan.cancel')).toBe(0);
   });
 });
 
@@ -272,7 +333,7 @@ describe('JobsView: per-job errors (PA4, PA5)', () => {
     expect(line!.textContent).toBe('Not found: scan-1a2b3c4d');
     expect(h.notice).toHaveBeenCalledWith('Not found: scan-1a2b3c4d', 'error');
     // The row keeps what the list said: a refused cancel changes no counter.
-    expect(h.field(h.row(JOB), 'state')).toBe('running · auditing');
+    expect(h.field(h.row(JOB), 'state')).toBe('Auditing');
   });
 });
 

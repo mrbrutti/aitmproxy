@@ -7,18 +7,22 @@
 import { createMemo, Show, type Component } from 'solid-js';
 import { Button } from '~/components';
 import { useApp } from '~/state/context';
-import { fmtElapsed, isTerminal, jobTone, stateWords } from './helpers';
+import { fmtElapsed, isTerminal, jobTone, mergeJob, stateWords } from './helpers';
 import type { JobSummary } from './model';
 import { SeverityBar } from './SeverityBar';
 import { scanStore, type ScanStore } from './store';
 import css from './scanner.module.css';
 
 /**
- * What the strip and a Jobs row show for a job: the full status where loaded (monotonic, see
- * `live.ts`), else the list summary. `JobStatus` is a structural superset of `JobSummary`.
+ * What the strip, a Jobs row and the detail show for a job: the list summary and the held status
+ * merged by D2's rule (`mergeJob`: a terminal status is final, else a terminal list row, else the
+ * later of the two), so the row and the detail can never disagree. A job the list does not carry
+ * yet renders from its status alone (`JobStatus` is a structural superset of `JobSummary`).
  */
 export function jobOf(s: ScanStore, id: string): JobSummary | null {
-  return s.status(id) ?? s.jobs().find((j) => j.job === id) ?? null;
+  const summary = s.jobs().find((j) => j.job === id) ?? null;
+  const status = s.status(id);
+  return summary === null ? status : mergeJob(summary, status);
 }
 
 /** The state token dot (plan P2): a local class with `--color-state-*` tones, not `StatusDot`. */
@@ -32,8 +36,12 @@ export const JobStrip: Component = () => {
     const id = s.selectedJob();
     return id === null ? null : jobOf(s, id);
   });
-  /** Idempotent and disabled once terminal (D-T8.7); every control is off while the bus is away. */
-  const canCancel = (j: JobSummary): boolean => !isTerminal(j.state) && !s.busy() && s.busOpen();
+  /**
+   * Disabled once terminal (D-T8.7) and while the merged state is `cancelling` (D2: a second
+   * scan.cancel is never sent); every control is off while the bus is away.
+   */
+  const canCancel = (j: JobSummary): boolean =>
+    !isTerminal(j.state) && j.state !== 'cancelling' && !s.busy() && s.busOpen();
 
   return (
     <Show when={job()}>

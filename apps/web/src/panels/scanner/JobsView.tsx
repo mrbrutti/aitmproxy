@@ -13,10 +13,10 @@ import { createEffect, createMemo, For, Match, on, Show, Switch, type Component 
 import { Button } from '~/components';
 import { fmtWhenFull } from '~/panels/findings/model';
 import { useApp } from '~/state/context';
-import { fmtElapsed, isTerminal, stateWords, stoppedReasonText } from './helpers';
+import { crawlErrorWords, crawlTroubleText, fmtElapsed, isTerminal, rawReasonLine, stateWords, stoppedReasonText } from './helpers';
 import { jobOf, StateDot } from './JobStrip';
-import { SEVERITY_ORDER, type JobStatus, type JobSummary, type Lane, type StartResult } from './model';
-import { ErrorBlock, Fact, listboxKeys, LoadingBars, ReconnectNote, Section } from './primitives';
+import { SEVERITY_ORDER, type CrawlCounters, type JobStatus, type JobSummary, type Lane, type StartResult } from './model';
+import { Dash, ErrorBlock, Fact, listboxKeys, LoadingBars, ReconnectNote, Section } from './primitives';
 import { SeverityBar } from './SeverityBar';
 import { scanStore } from './store';
 import css from './scanner.module.css';
@@ -31,6 +31,18 @@ const canaryText = (st: JobStatus): string | null => {
   if (session.canary.kind === 'none') return 'none';
   const expected = session.canary.expected_status;
   return `${session.canary.method} ${session.canary.path}${expected === null ? '' : ` → ${expected}`}`;
+};
+
+/**
+ * The D4 crawl line: `The crawl fetched 0 pages and hit 1 error — the target refused the
+ * connection`; the ` — ` suffix only when the engine sent `last_error`; `null` when the crawl hit no
+ * error. W1 spells the join here because `helpers.ts` has no `crawlTroubleLine` yet; the Kit's
+ * helper (Task 3.5) takes it over in the W2 card.
+ */
+const crawlTroubleLine = (crawl: CrawlCounters): string | null => {
+  const text = crawlTroubleText(crawl);
+  if (text === null) return null;
+  return crawl.last_error === null ? text : `${text} — ${crawlErrorWords(crawl.last_error)}`;
 };
 
 /** The after-start notice lines (D-T8.6): clamped, skipped lanes, and `dry_run` only when sent. */
@@ -80,7 +92,9 @@ export const JobsView: Component = () => {
     domId: (id) => `job-${id}`,
   });
 
-  const canCancel = (j: JobSummary): boolean => !isTerminal(j.state) && !s.busy() && !offline();
+  /** Off once terminal and while the merged state is `cancelling` (D2: one scan.cancel per job). */
+  const canCancel = (j: JobSummary): boolean =>
+    !isTerminal(j.state) && j.state !== 'cancelling' && !s.busy() && !offline();
 
   return (
     <div class={css.layout} data-empty={s.jobsLoaded() && rows().length === 0 ? 'true' : undefined}>
@@ -209,7 +223,7 @@ export const JobsView: Component = () => {
 
                 <Section title="Overview">
                   <dl class={css.facts}>
-                    <Fact label="state" value={stateWords(j())} />
+                    <Fact label="state" field="state" value={stateWords(j())} />
                     <Fact label="phase" value={j().phase} />
                     <Fact label="elapsed" value={fmtElapsed(j().elapsed_ms)} mono />
                     <Show when={detail()}>
@@ -223,8 +237,26 @@ export const JobsView: Component = () => {
                           />
                           <Fact label="started" value={fmtWhenFull(st().started_at)} />
                           <Fact label="finished" value={fmtWhenFull(st().finished_at)} />
+                          {/* The D4 sentence from the merged facts, the raw token beneath it in the data
+                              face (the only place the token appears); one `dd`, so the facts grid keeps
+                              its pairs. The sentence is the dash where the state or the error says it. */}
                           <Show when={st().stopped_reason} fallback={<Fact label="stopped" field="stopped" value={null} />}>
-                            {(reason) => <Fact label="stopped" field="stopped" value={stoppedReasonText(reason())} />}
+                            {(reason) => (
+                              <>
+                                <dt>stopped</dt>
+                                <dd>
+                                  <div data-field="stopped">
+                                    {stoppedReasonText(reason(), j().state, j().probes.budget, st().error) ?? <Dash />}
+                                  </div>
+                                  <span class={css.mono} data-field="stopped-raw">
+                                    {rawReasonLine(reason())}
+                                  </span>
+                                </dd>
+                              </>
+                            )}
+                          </Show>
+                          <Show when={crawlTroubleLine(st().crawl)}>
+                            {(line) => <Fact label="crawl" field="crawl" value={line()} />}
                           </Show>
                           <Show when={st().error !== null}>
                             <Fact label="error" field="error" value={st().error} mono />
