@@ -11,7 +11,8 @@ import AppKit
 /// is left on screen during the exit, and hands the quit to `NSApp.terminate(nil)`, which runs
 /// the ordinary orderly-exit path: the delegate's default `NSTerminateNow`,
 /// `willTerminateNotification`, the embedded core's SIGTERM, and the core's system-proxy
-/// restore. Every sheet in this app is work-free, so none is asked about.
+/// restore. A quit never asks about a sheet's contents (spec D4); the Rules draft it discards is
+/// recorded there as accepted.
 ///
 /// This is a helper with two callers (the replaced Quit command and the quit Apple event
 /// handler in `App.swift`) and not an `NSApplication` subclass because SwiftUI's `@main`
