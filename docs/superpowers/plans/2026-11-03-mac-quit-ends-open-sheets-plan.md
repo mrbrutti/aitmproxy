@@ -283,6 +283,8 @@ Kept by the orchestrating session during stage 6. One row per finding. Round 1 r
 | 2+fix | quality | Minor | `QuitRoutesTests` banned any `applicationWillFinishLaunching` | Fixed in 6dbf06e7 (pins `kAEQuitApplication` exactly once instead) |
 | 2+fix | quality | Minor | `thePrincipalClassDetourIsGone` guards a dead end that never reached `main` | Kept: it is spec D6′ item 3 / AC14 as written; flagged to Matt on the PR for trimming later |
 | 2+fix | quality (round 2) | Minor | `Quit.swift` type doc still said every sheet is work-free, which the D4 correction retracted | Fixed in 909443ad (doc comment points at spec D4) |
+| 2+fix | spec (round 2) | Minor | The Rust gate log carries no exit status | Closed: the Terminal printed `RUST GATE EXIT 0` for `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` (recorded on the PR) |
+| 2+fix | spec (round 2) | Minor | The AC12 amendment's "external core from the dev bundle" was not evidenced | Closed: the launch line was `sleep 100000 | AITM_CONFIG=/tmp/claude/qes/ext-config.yaml /tmp/Aitmproxy-dev-qes.app/Contents/Resources/core/aitm` (recorded on the PR; script `/tmp/claude/qes/selftest-live-dev.sh`) |
 | 2+fix | spec | Important | AC12 not fully evidenced: tripwires without output, `selftest-live-embedded.sh` not run | Tripwire output recorded (/tmp/claude/qes/tripwires.log, four EXIT 0). `selftest-live-embedded.sh` runs `./build.sh` (installs over ~/Applications) and quits the installed app by name, both forbidden here; AC12 amended in 4232ea3c: normal-quit teardown proven by the dev-bundle matrix, menu walk by `tools/selftest-live.sh` with `APP_BIN` = dev binary against an external core from the dev bundle (LIVE SELFTEST PASS 99 checks) |
 | 2+fix | spec | Minor | AC7 shown by timing (Termination commencing → complete ≈ 0.12 s inside the 5 s SIGTERM grace), not by core log lines | Accepted as the AC7 evidence |
 | 2+fix | spec | Minor | Compose proof logs printed `sheets=0` beside PASS (a re-query after the gate) | Harness fixed; the final matrix carries the corrected line |
@@ -292,7 +294,7 @@ Kept by the orchestrating session during stage 6. One row per finding. Round 1 r
 
 ## Shipped
 
-Branch `claude/gallant-hawking-61d70e`, PR against `main` opened 2026-11-03 by the session of the same name; merged by the orchestrator (fill the merge SHA at integration).
+Branch `claude/gallant-hawking-61d70e`, PR mrbrutti/aitmproxy#325 against `main` opened 2026-11-03 by the session of the same name; merged by the orchestrator (fill the merge SHA at integration).
 
 **What merged.** `Quit.endSheetsAndTerminate()` (`apps/mac/Sources/Aitmproxy/Quit.swift`): clears `preventsApplicationTerminationWhenModal` on every attached sheet window, ends the sheets innermost first, then `NSApp.terminate(nil)`. Two callers in `App.swift`: the replaced `.appTermination` command ("Quit Aitmproxy", ⌘Q) and a `kAEQuitApplication` Apple event handler registered in `applicationDidFinishLaunching`. `QuitRoutesTests` pins both routes, the helper's shape and order, and the absence of the principal-class detour. One Layout line in `apps/mac/CLAUDE.md`.
 
