@@ -137,7 +137,10 @@ never `git add -A`. The gate for this branch is `npm run build && npm test` from
   rm -f "$EV/.marker"
   ```
 
-  Expect: `REAL FILES UNCHANGED`; two `aitm-live-*` dirs (the startup core and the step-08b restart);
+  Expect: `REAL FILES UNCHANGED`, or a diff that touches `audit.reads.jsonl` alone (the installed core's
+  stream; AC7 amendment) together with the writer attribution
+  `lsof -Fp -- "$REAL/audit.reads.jsonl" | tr -d p | xargs -n1 ps -o pid=,command= -p` saved as
+  `reads-writers.txt` and naming no harness core; two `aitm-live-*` dirs (the startup core and the step-08b restart);
   each with two `audit_log` lines naming its own dir and `audit.jsonl bytes` > 0; `scan.cancel lines` >= 1
   in the startup core's dir when `scan-live.log` shows step 05 PASS. Never `cat` a run's `config.yaml`
   (it holds the operator secret and the bridge token). Before committing the evidence, run
@@ -158,6 +161,7 @@ never `git add -A`. The gate for this branch is `npm run build && npm test` from
 
 ## Review log
 
+- 2026-11-02, live proof (Task 4): the first run passed 27/0/0 with `audit.jsonl`, `audit.agent.jsonl`, `ca-audit.jsonl` and `system-proxy-state.json` byte-identical, but `audit.reads.jsonl` grew (7978037 → 8258225 bytes) during the five minutes: the installed app's core (one `aitm` process holding the real files, pid in `reads-writers.txt`) writes the reads stream on every bus read. AC7 amended to judge the reads stream by writer attribution, as #310's proof did; the harness cores' own reads streams are in their run dirs (119,827 and 3,931 bytes).
 - 2026-11-02, Task 1 coder gap: `npm run build` type-checks test files against `src/types-node-test.d.ts`, which lacked `mkdtempSync`, `writeFileSync` and `node:os`; the shim is added to Task 1's files (above). Prettier is not installed in `apps/web` and the repo has no config, so the coder rule "prettier --write" does not apply here; style is hand-matched to `tester.live-env.test.ts`.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
