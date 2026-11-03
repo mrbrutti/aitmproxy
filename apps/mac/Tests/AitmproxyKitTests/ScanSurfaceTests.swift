@@ -257,18 +257,18 @@ import Testing
         #expect(model.sitemapGroupedByOrigin().count == 1)
     }
 
-    @Test func severityBarSegmentsSkipZeros() throws {
-        let counts = BySeverity(critical: 0, high: 1, medium: 1, low: 1, info: 0)
-        let segments = ScanSurfaceModel.severityBarSegments(counts)
-        #expect(segments.count == 3)
-        #expect(segments.map(\.severity) == [.high, .medium, .low])
-        #expect(segments.map(\.count) == [1, 1, 1])
-        for segment in segments {
-            #expect(abs(segment.fraction - 1.0 / 3.0) < 1e-9)
-        }
-        #expect(ScanSurfaceModel.severityBarSegments(.zero).isEmpty)
+    /// `BySeverity`'s own arithmetic, kept from the severity-bar tests the Jobs view
+    /// plan's Task 2.10 deleted with the bar (spec D10): the zero tally, the total, and
+    /// an unknown severity counting as nothing.
+    @Test func bySeverityTotalsAndZero() {
         #expect(ScanSurfaceModel().issuesBySeverity == .zero)
         #expect(BySeverity.zero == BySeverity(critical: 0, high: 0, medium: 0, low: 0, info: 0))
+        #expect(BySeverity.zero.total == 0)
+        let counts = BySeverity(critical: 1, high: 0, medium: 0, low: 0, info: 3)
+        #expect(counts.total == 4)
+        #expect(counts.count(.critical) == 1)
+        #expect(counts.count(.info) == 3)
+        #expect(counts.count(.other("blocker")) == 0)
     }
 
     // MARK: Profile edits (MS-AC6)
@@ -976,18 +976,6 @@ extension ScanSurfaceTests {
         empty.moveSelection(in: .sitemap, by: 1)
         empty.moveSelection(in: .issues, by: 1)
         #expect(empty == ScanSurfaceModel())
-    }
-
-    @Test func severityBarSegmentsShareTheTotal() {
-        let counts = BySeverity(critical: 1, high: 0, medium: 0, low: 0, info: 3)
-        let segments = ScanSurfaceModel.severityBarSegments(counts)
-        #expect(segments.map(\.severity) == [.critical, .info])
-        #expect(segments.map(\.count) == [1, 3])
-        #expect(abs(segments[0].fraction - 0.25) < 1e-9)
-        #expect(abs(segments[1].fraction - 0.75) < 1e-9)
-        #expect(abs(segments.map(\.fraction).reduce(0, +) - 1) < 1e-9)
-        #expect(counts.total == 4)
-        #expect(counts.count(.other("blocker")) == 0)
     }
 
     @Test func checkTreeListsAMultiLaneCheckUnderEachLane() throws {
@@ -2855,6 +2843,8 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.scanAgainHelpGeneric == "Start a new job with this job's profile and target")
         #expect(ScanFormat.showIssuesHelp == "Open the Issues tab filtered to this job")
         #expect(ScanFormat.showSiteMapHelp == "Open the Site map tab for this job")
+        // D13 / AC26: the refusal line under the card's title row is this prefix + `ScanLaunchError.display`.
+        #expect(ScanFormat.scanAgainErrorPrefix == "Unable to scan again: ")
     }
 
     /// Jobs view D11 *Wells* (plan gap 34g): the Crawl well's conditional rows have
@@ -2988,7 +2978,8 @@ extension ScanSurfaceTests {
             ScanFormat.gaugeLabel, ScanFormat.laneCrawlLabel, ScanFormat.laneAuditLabel, ScanFormat.missingValue,
             ScanFormat.agentDotHelp, ScanFormat.wellCrawlTitle, ScanFormat.wellCrawlSubtitle, ScanFormat.wellIssuesTitle,
             ScanFormat.wellIssuesSubtitle, ScanFormat.scanAgainHelpGeneric, ScanFormat.showIssuesHelp,
-            ScanFormat.showSiteMapHelp, ScanFormat.cancellingTitle, ScanFormat.jobsCaption(total: 4, running: 1),
+            ScanFormat.showSiteMapHelp, ScanFormat.cancellingTitle, ScanFormat.scanAgainErrorPrefix,
+            ScanFormat.jobsCaption(total: 4, running: 1),
             ScanFormat.probesTileHelp(sent: 287, budget: 2000), ScanFormat.probeBudgetText(sent: 287, budget: 0),
             ScanFormat.issuesTileHelp(by: Self.tally(high: 1, low: 3)), ScanFormat.ofText(6468),
             ScanFormat.laneChecksDone(3236), ScanFormat.lanePages(46), ScanFormat.scaleStarted("11:32"),

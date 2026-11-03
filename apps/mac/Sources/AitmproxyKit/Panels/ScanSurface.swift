@@ -213,19 +213,6 @@ public struct ScanOriginGroup: Hashable, Sendable {
     }
 }
 
-/// One slice of the stacked severity bar (D5): its share of the total.
-public struct ScanSeveritySegment: Hashable, Sendable {
-    public var severity: ScanSeverity
-    public var count: Int
-    public var fraction: Double
-
-    public init(severity: ScanSeverity, count: Int, fraction: Double) {
-        self.severity = severity
-        self.count = count
-        self.fraction = fraction
-    }
-}
-
 // MARK: - PoC link (D6)
 
 /// Resolves an issue's `poc_ref` to one of the PoC files the app lists, so the
@@ -1220,18 +1207,6 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         (sitemap?.points ?? []).filter { $0.siteNode == node }
     }
 
-    /// The stacked bar's slices: zero counts omitted, `fraction` = count / total.
-    public static func severityBarSegments(_ counts: BySeverity) -> [ScanSeveritySegment] {
-        let total = counts.total
-        guard total > 0 else { return [] }
-        let order: [ScanSeverity] = [.critical, .high, .medium, .low, .info]
-        return order.compactMap { severity in
-            let count = counts.count(severity)
-            guard count > 0 else { return nil }
-            return ScanSeveritySegment(severity: severity, count: count, fraction: Double(count) / Double(total))
-        }
-    }
-
     // MARK: Mutations: profiles
 
     /// Builtins first (as listed), then custom profiles alphabetically (D4).
@@ -1640,25 +1615,6 @@ public enum ScanFormat {
         return name
     }
 
-    /// PR 1's row line, `Auditing · standard · 127.0.0.1:8080`, spelled from the D10
-    /// cells. `ScanJobRow` reads it until Jobs view plan Task 2.7 lays the row out as
-    /// cells; it is not a home for words of its own.
-    public static func jobRowLine1(_ summary: ScanJobSummary, status: ScanJobStatus?) -> String {
-        let facts = ScanJobFacts(summary: summary, status: status)
-        return [stateWord(facts), profileText(facts), hostsText(facts)].joined(separator: " · ")
-    }
-
-    /// `probes 418 / 2000 · points 80 / 120 audited · 0:42`: PR 1's second row line,
-    /// read by `ScanJobRow` until Task 2.7.
-    public static func jobRowLine2(_ summary: ScanJobSummary) -> String {
-        [probesText(summary.probes), pointsText(summary.points), elapsed(ms: summary.elapsedMs)].joined(separator: " · ")
-    }
-
-    /// PR 1's label signature over the D14 sentence; `ScanJobRow` reads it until Task 2.7.
-    public static func jobAccessibilityLabel(_ summary: ScanJobSummary, status: ScanJobStatus?) -> String {
-        jobAccessibilityLabel(ScanJobFacts(summary: summary, status: status))
-    }
-
     /// `3 issues: 1 high, 1 medium, 1 low` / `no issues`.
     public static func severityCountsInWords(_ counts: BySeverity) -> String {
         let total = counts.total
@@ -1868,6 +1824,10 @@ extension ScanFormat {
     public static let scanAgainHelpGeneric = "Start a new job with this job's profile and target"
     public static let showIssuesHelp = "Open the Issues tab filtered to this job"
     public static let showSiteMapHelp = "Open the Site map tab for this job"
+    /// D13's refusal line under the card's title row: this prefix, then
+    /// `ScanLaunchError.display` (AC26: `Unable to scan again: A scan on this origin is
+    /// already running`).
+    public static let scanAgainErrorPrefix = "Unable to scan again: "
     /// The most characters of a `started_by.client_label` the finding line shows.
     static let startedByLabelMax = 40
 

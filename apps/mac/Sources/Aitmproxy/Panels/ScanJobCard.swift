@@ -67,6 +67,25 @@ enum CardMetrics {
     static let headerHeight: CGFloat = 32
     /// `th:last-child, td:last-child { width: 84px }` — the trailing action column.
     static let actionColumn: CGFloat = 84
+    /// `table { width: 100% }`, `td { white-space: nowrap }` — the comp's auto table sizes
+    /// its other eight columns by content; D10 fixes them in points. The three flexible
+    /// columns (State, Target, Progress) take D10's minimums as shares of the leftover
+    /// (`ScanJobsColumns`); the rest are fixed. State: min 148 pt …
+    static let tableStateShare: CGFloat = 148
+    /// … Profile: 120 pt …
+    static let tableProfileWidth: CGFloat = 120
+    /// … Target: min 220 pt (data face) …
+    static let tableTargetShare: CGFloat = 220
+    /// … Progress: min 220 pt (data face) …
+    static let tableProgressShare: CGFloat = 220
+    /// … Probes: 120 pt, right-aligned …
+    static let tableProbesWidth: CGFloat = 120
+    /// … Points: 120 pt, right-aligned …
+    static let tablePointsWidth: CGFloat = 120
+    /// … Issues: 124 pt, right-aligned …
+    static let tableIssuesWidth: CGFloat = 124
+    /// … and Elapsed: 80 pt, right-aligned.
+    static let tableElapsedWidth: CGFloat = 80
     /// `.enter { transform: translateY(8px) }` — the entrance's rise.
     static let entranceRise: CGFloat = 8
     /// `@keyframes breathe { to { opacity: .4 } }` — the breathing floor.
@@ -236,9 +255,8 @@ struct ScanJobTitleRow: View {
                 verbs
             }
             if let error = state.surface.scanAgainError {
-                // D13's `Unable to scan again: <display>`: the Kit carries the display and no
-                // prefix constant yet (reported), so the refusal stands alone in the error ink.
-                Text(verbatim: error.display)
+                // D13's `Unable to scan again: <display>` in the error ink (AC26).
+                Text(verbatim: ScanFormat.scanAgainErrorPrefix + error.display)
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Status.serverError.color)
                     .textSelection(.enabled)

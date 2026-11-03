@@ -236,17 +236,18 @@ nonisolated struct ScanJobsColumns: Layout {
     var columns: [Column]
 
     /// D10's nine columns in order: State, Profile, Target, Progress, Probes, Points,
-    /// Issues, Elapsed, the action column (`CardMetrics.actionColumn`).
+    /// Issues, Elapsed, the action column; every width is a `CardMetrics.table*`
+    /// constant (one home for the comp's numbers).
     @MainActor static var standard: ScanJobsColumns {
         ScanJobsColumns(columns: [
-            Column(fixed: nil, share: 148, trailing: false),
-            Column(fixed: 120, share: 0, trailing: false),
-            Column(fixed: nil, share: 220, trailing: false),
-            Column(fixed: nil, share: 220, trailing: false),
-            Column(fixed: 120, share: 0, trailing: true),
-            Column(fixed: 120, share: 0, trailing: true),
-            Column(fixed: 124, share: 0, trailing: true),
-            Column(fixed: 80, share: 0, trailing: true),
+            Column(fixed: nil, share: CardMetrics.tableStateShare, trailing: false),
+            Column(fixed: CardMetrics.tableProfileWidth, share: 0, trailing: false),
+            Column(fixed: nil, share: CardMetrics.tableTargetShare, trailing: false),
+            Column(fixed: nil, share: CardMetrics.tableProgressShare, trailing: false),
+            Column(fixed: CardMetrics.tableProbesWidth, share: 0, trailing: true),
+            Column(fixed: CardMetrics.tablePointsWidth, share: 0, trailing: true),
+            Column(fixed: CardMetrics.tableIssuesWidth, share: 0, trailing: true),
+            Column(fixed: CardMetrics.tableElapsedWidth, share: 0, trailing: true),
             Column(fixed: CardMetrics.actionColumn, share: 0, trailing: true),
         ])
     }
@@ -529,49 +530,5 @@ extension View {
     fileprivate func counterTick(value: String, reduceMotion: Bool) -> some View {
         contentTransition(reduceMotion ? .identity : .numericText())
             .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: value)
-    }
-}
-
-// MARK: - Severity bar (Task 2.10 removes)
-
-/// A stacked bar of an issue tally (D5): one `Rectangle` per non-zero severity,
-/// width proportional to its share, in that severity's `Tok.Severity` ink; the
-/// total as a number at the end; a 1 pt rule when there is nothing to show. It
-/// hides from VoiceOver because the row label already reads the counts in words
-/// (D13: severity never by colour alone).
-struct ScanSeverityBar: View {
-    var by: BySeverity
-    var height: CGFloat
-
-    private var segments: [ScanSeveritySegment] { ScanSurfaceModel.severityBarSegments(by) }
-
-    var body: some View {
-        HStack(spacing: Space.sm) {
-            Group {
-                if segments.isEmpty {
-                    Rule(color: Tok.Line.border)
-                } else {
-                    GeometryReader { geo in
-                        // The 1 pt seams between segments come out of the width first,
-                        // so the shares still sum to the bar and never overflow it.
-                        let usable = max(0, geo.size.width - CGFloat(segments.count - 1))
-                        HStack(spacing: 1) {
-                            ForEach(segments, id: \.severity) { segment in
-                                Rectangle()
-                                    .fill(ScanToneColors.severity(segment.severity))
-                                    .frame(width: max(1, usable * segment.fraction))
-                            }
-                        }
-                    }
-                }
-            }
-            .frame(height: height)
-            .frame(maxWidth: .infinity)
-            Text("\(by.total)")
-                .font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
-                .foregroundStyle(Tok.Ink.secondary.color)
-                .frame(width: 32, alignment: .trailing)
-        }
-        .accessibilityHidden(true)
     }
 }

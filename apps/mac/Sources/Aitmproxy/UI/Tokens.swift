@@ -239,7 +239,7 @@ enum Tok {
             /// Badges, single-line cells.
             static let tight: CGFloat = 1.25
         }
-        /// Six sizes.
+        /// Eight sizes.
         enum Size {
             /// Body in comfortable views, sidebar labels, form controls.
             static let base: CGFloat = 14
