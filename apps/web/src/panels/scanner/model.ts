@@ -678,6 +678,49 @@ export interface JobNotification {
 /** The engine's own page ceiling; also the bound on anything we allocate from one payload. */
 const MAX_LIST = 1024;
 
+/**
+ * Hostile-core bounds for the Jobs view (spec D1 amendment, web AC1b; the Kit's `ScanWire` caps and
+ * the TUI's `bound_status`). A status is drawn one row per sample, so every string it carries is
+ * cleaned and cut at decode and every sampled list is cut to the engine's own cap of 8.
+ */
+/** The cap on an error text, a sample field, a skipped reason, a running check id. */
+export const STR_MAX = 400;
+/** The cap on a profile name, a client label, a clamped field. */
+export const TOKEN_MAX = 64;
+/** The engine's cap on `error_samples`, `skipped_samples` and `checks.running`; held against `lanes.skipped` and `clamped` too. */
+export const MAX_SAMPLES = 8;
+
+/** Control, format, line and paragraph separator scalars: none of them belongs in a row. */
+const UNPRINTABLE = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
+
+/**
+ * `v` as a string with `UNPRINTABLE` scalars dropped and cut to `max` code points (not UTF-16
+ * units, so an astral scalar is never split); `''` for a non-string. The strings of a status that a
+ * Jobs row prints go through here, never `str`.
+ */
+function boundedStr(v: unknown, max: number): string {
+  if (typeof v !== 'string') return '';
+  const clean = v.replace(UNPRINTABLE, '');
+  let end = 0;
+  let n = 0;
+  for (const ch of clean) {
+    if (n === max) break;
+    end += ch.length;
+    n += 1;
+  }
+  return end === clean.length ? clean : clean.slice(0, end);
+}
+
+/** `boundedStr`, keeping an absent or non-string value as `null`. */
+function boundedOptStr(v: unknown, max: number): string | null {
+  return typeof v === 'string' ? boundedStr(v, max) : null;
+}
+
+/** The first `MAX_SAMPLES` strings of a list, each bounded to `max`; a non-string item is dropped. */
+function boundedStrList(v: unknown, max: number): string[] {
+  return rows(v, (x) => (typeof x === 'string' ? boundedStr(x, max) : null), MAX_SAMPLES);
+}
+
 type Dict = Record<string, unknown>;
 
 /** A plain object, or `null`. An array is not an object here: it means a drifted contract. */
@@ -883,7 +926,11 @@ function pointCounters(v: unknown): PointCounters {
 function checkErrorSample(v: unknown): CheckErrorSample | null {
   const o = dict(v);
   if (!o) return null;
-  return { check: str(o.check), point: str(o.point), detail: str(o.detail) };
+  return {
+    check: boundedStr(o.check, STR_MAX),
+    point: boundedStr(o.point, STR_MAX),
+    detail: boundedStr(o.detail, STR_MAX),
+  };
 }
 
 function checkCounters(v: unknown): CheckCounters {
@@ -891,11 +938,11 @@ function checkCounters(v: unknown): CheckCounters {
   return {
     scheduled: num(o.scheduled),
     done: num(o.done),
-    running: strList(o.running),
+    running: boundedStrList(o.running, STR_MAX),
     errors: num(o.errors),
-    error_samples: rows(o.error_samples, checkErrorSample),
+    error_samples: rows(o.error_samples, checkErrorSample, MAX_SAMPLES),
     skipped: num(o.skipped),
-    skipped_samples: rows(o.skipped_samples, checkErrorSample),
+    skipped_samples: rows(o.skipped_samples, checkErrorSample, MAX_SAMPLES),
   };
 }
 
@@ -945,7 +992,7 @@ function skippedLane(v: unknown): SkippedLane | null {
   if (!o) return null;
   const lane = token(LANES, o.lane);
   if (lane === null) return null;
-  return { lane, reason: str(o.reason) };
+  return { lane, reason: boundedStr(o.reason, STR_MAX) };
 }
 
 function laneReport(v: unknown): LaneReport {
@@ -953,21 +1000,23 @@ function laneReport(v: unknown): LaneReport {
   return {
     requested: tokenList(LANES, o.requested),
     run: tokenList(LANES, o.run),
-    skipped: rows(o.skipped, skippedLane),
+    skipped: rows(o.skipped, skippedLane, MAX_SAMPLES),
   };
 }
 
 function clamped(v: unknown): Clamped | null {
   const o = dict(v);
   if (!o) return null;
-  const field = reqStr(o.field);
+  // Bounded first: a field that is nothing but unprintable scalars would render blank, so it is
+  // dropped like a missing one.
+  const field = reqStr(boundedStr(o.field, TOKEN_MAX));
   if (field === null) return null;
   return { field, requested: num(o.requested), applied: num(o.applied) };
 }
 
 function startedBy(v: unknown): StartedBy {
   const o = dict(v) ?? {};
-  return { frontend: str(o.frontend), client_label: optStr(o.client_label) };
+  return { frontend: str(o.frontend), client_label: boundedOptStr(o.client_label, TOKEN_MAX) };
 }
 
 /* ------------------------------------------------------------------ job parsers */
@@ -984,7 +1033,7 @@ export function parseJobStatus(raw: unknown): JobStatus | null {
     job,
     state,
     phase,
-    profile_name: str(o.profile_name),
+    profile_name: boundedStr(o.profile_name, TOKEN_MAX),
     targets: strList(o.targets),
     started_by: startedBy(o.started_by),
     started_at: num(o.started_at),
@@ -999,8 +1048,8 @@ export function parseJobStatus(raw: unknown): JobStatus | null {
     l4: l4Counters(o.l4),
     session: sessionStatus(o.session),
     lanes: laneReport(o.lanes),
-    clamped: rows(o.clamped, clamped),
-    error: optStr(o.error),
+    clamped: rows(o.clamped, clamped, MAX_SAMPLES),
+    error: boundedOptStr(o.error, STR_MAX),
   };
 }
 
@@ -1033,7 +1082,7 @@ export function parseStartResult(raw: unknown): StartResult | null {
   return {
     job,
     status,
-    clamped: rows(o.clamped, clamped),
+    clamped: rows(o.clamped, clamped, MAX_SAMPLES),
     lanes: laneReport(o.lanes),
     // The key is absent for a profile with no L4 lane, and absent is not `false`.
     ...(typeof o.dry_run === 'boolean' ? { dry_run: o.dry_run } : {}),

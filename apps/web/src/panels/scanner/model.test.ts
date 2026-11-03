@@ -9,7 +9,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  MAX_SAMPLES,
   SCAN_ERROR_CODES,
+  STR_MAX,
+  TOKEN_MAX,
   parseCheckMeta,
   parseChecksResult,
   parseInsertionPoint,
@@ -141,6 +144,80 @@ describe('parseJobStatus', () => {
       checks: { ...checks, error_samples: [{ check: 'http.xss' }, 'junk', null, 7] },
     })!;
     expect(sparse.checks.error_samples).toEqual([{ check: 'http.xss', point: '', detail: '' }]);
+  });
+
+  it('bounds every Jobs string and sample list', () => {
+    // Task 3.1b (gap 74, web AC1b): the Kit's `ScanWire` bounds, mirrored. A control or format
+    // scalar and a line/paragraph separator never reach a row; a text is cut to its cap in code
+    // points; a sampled list is cut to the engine's own cap of 8.
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const detail = `${'a'.repeat(300)}\u0000${'b'.repeat(300)}\t${'c'.repeat(200)}\u2028${'d'.repeat(197)}`;
+    expect(detail.length).toBe(1000);
+    const sample = (i: number) => ({ check: `check-${i}`, point: `p${i}`, detail: `d${i}` });
+    const nine = (f: (i: number) => unknown) => Array.from({ length: 9 }, (_, i) => f(i));
+    const status = parseJobStatus({
+      ...raw,
+      profile_name: 'p'.repeat(100),
+      started_by: { frontend: 'operator', client_label: 'x'.repeat(100) },
+      checks: {
+        scheduled: 4,
+        done: 3,
+        running: nine((i) => `http.check-${i}`),
+        errors: 9,
+        error_samples: [{ check: 'http.xss', point: 'p1', detail }, ...nine(sample).slice(1)],
+        skipped: 9,
+        skipped_samples: nine(sample),
+      },
+      lanes: {
+        requested: ['http', 'ws'],
+        run: ['http'],
+        skipped: nine((i) => ({ lane: 'ws', reason: `r${i}\u202E${'z'.repeat(500)}` })),
+      },
+      clamped: nine((i) => ({ field: `budget.f${i}.${'q'.repeat(100)}`, requested: 9, applied: 1 })),
+      error: `${'e'.repeat(500)}\n${'f'.repeat(500)}`,
+    })!;
+
+    // 1,000 chars with a NUL, a tab and U+2028 inside: exactly 400 clean chars, the first 400 kept.
+    const bounded = status.checks.error_samples[0]!.detail;
+    expect(bounded).toBe('a'.repeat(300) + 'b'.repeat(100));
+    expect(bounded.length).toBe(400);
+    expect(bounded).not.toMatch(/[\u0000\t\u2028]/);
+    expect(MAX_SAMPLES).toBe(8);
+    expect(STR_MAX).toBe(400);
+    expect(TOKEN_MAX).toBe(64);
+
+    // Nine samples, nine running ids, nine skipped lanes, nine clamps: eight each, the first eight.
+    expect(status.checks.error_samples.length).toBe(8);
+    expect(status.checks.error_samples[7]).toEqual({ check: 'check-7', point: 'p7', detail: 'd7' });
+    expect(status.checks.skipped_samples.length).toBe(8);
+    expect(status.checks.running.length).toBe(8);
+    expect(status.checks.running[7]).toBe('http.check-7');
+    expect(status.lanes.skipped.length).toBe(8);
+    expect(status.clamped.length).toBe(8);
+
+    // Tokens cut to 64; details to 400; `error` keeps its first 400 clean chars with the newline gone.
+    expect(status.started_by.client_label).toBe('x'.repeat(64));
+    expect(status.profile_name).toBe('p'.repeat(64));
+    expect(status.clamped[0]!.field).toBe(`budget.f0.${'q'.repeat(54)}`);
+    expect(status.lanes.skipped[0]!.reason).toBe(`r0${'z'.repeat(398)}`);
+    expect(status.error).toBe('e'.repeat(400));
+
+    // Code points, not UTF-16 units: 401 astral scalars cut to 400 (800 units), none split in half.
+    const astral = parseJobStatus({
+      ...raw,
+      checks: { scheduled: 1, done: 0, running: [], error_samples: [{ check: '😀'.repeat(401) }] },
+    })!;
+    expect([...astral.checks.error_samples[0]!.check].length).toBe(400);
+    expect(astral.checks.error_samples[0]!.check).toBe('😀'.repeat(400));
+
+    // The fixture is under every cap and carries no such scalar: it reads as before.
+    const same = parseJobStatus(raw)!;
+    expect(same.profile_name).toBe('standard');
+    expect(same.started_by.client_label).toBe('web-ui');
+    expect(same.checks.running).toEqual(['http.reflected-xss', 'http.sqli-error']);
+    expect(same.lanes.skipped).toEqual([{ lane: 'ws', reason: 'lane not available on this build' }]);
+    expect(same.clamped).toEqual([]);
+    expect(same.error).toBeNull();
   });
 });
 
