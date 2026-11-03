@@ -2,8 +2,9 @@ import AitmproxyKit
 import SwiftUI
 
 // The Jobs tab's shared pieces (Jobs view spec D10–D12): the row's ring and
-// dots, the card's chip, the one tone → token mapping, the two motion modifiers
-// and the raised-card chrome. `ScanPanel+Jobs.swift` (the table) and
+// dots, the card's chip, the one tone → token mapping, the motion helpers (the
+// breathing, the entrance, the counter tick and the end-swap transition) and the
+// raised-card chrome. `ScanPanel+Jobs.swift` (the table) and
 // `ScanJobCard.swift` (the card) both draw from here; `ScanJobWells.swift` uses
 // the chrome. Every colour, radius and duration is a `Tok.*` or `ScanMotion`
 // token; the comp's geometric constants are `CardMetrics` (ScanJobCard.swift).
@@ -112,18 +113,26 @@ struct ScanAgentDot: View {
 
 // MARK: - Chip
 
-/// The card's state chip (D11): a 22 pt pill in the tone pair with a static 6 pt
-/// dot before the word. The word crossfades and the pair recolours over
-/// `ScanMotion.state` (D12); both are opacity and colour, so Reduce Motion keeps them.
+/// The card's state chip (D11): a 22 pt pill in the tone pair with a 6 pt dot before
+/// the word. The dot breathes only while `breathing` (the caller passes cancelling and
+/// not Reduce Motion, D12: the chip's cancelling dot breathes, its running dot is
+/// static). The word crossfades and the pair recolours over `ScanMotion.state` (D12);
+/// both are opacity and colour, so Reduce Motion keeps them.
 struct ScanStateChip: View {
     var word: String
     var tone: ScanJobTone
+    var breathing: Bool
 
     var body: some View {
+        let dot = Circle()
+            .fill(ScanToneColors.chipForeground(tone))
+            .frame(width: CardMetrics.dot, height: CardMetrics.dot)
         HStack(spacing: Tok.Metric.gapTight) {
-            Circle()
-                .fill(ScanToneColors.chipForeground(tone))
-                .frame(width: CardMetrics.dot, height: CardMetrics.dot)
+            if breathing {
+                dot.modifier(Breathing())
+            } else {
+                dot
+            }
             Text(word)
                 .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
                 .contentTransition(.opacity)
@@ -142,8 +151,9 @@ struct ScanStateChip: View {
 
 /// The breathing (D12): opacity 1 → `CardMetrics.breathFloor` and back on the pulse
 /// curve, forever, started once on appear by a system-driven repeating animation.
-/// Applied to exactly two dots: the lane's now dot while the job is live and not
-/// cancelling, and the cancelling dot. Callers skip it under Reduce Motion.
+/// Applied to exactly two dots: the lane's now dot while the job is running and the
+/// bus is live (D15: stale values do not breathe), and the cancelling dot (the row's
+/// and the chip's). Callers skip it under Reduce Motion.
 struct Breathing: ViewModifier {
     @State private var on = true
 
@@ -203,5 +213,23 @@ extension View {
     /// One block of the card's staggered entrance (D12).
     func cardEntrance(index: Int, generation: Int, reduceMotion: Bool) -> some View {
         modifier(CardEntrance(index: index, generation: generation, reduceMotion: reduceMotion))
+    }
+
+    /// D12's counter tick, the one place it is spelled: the digits of a live number
+    /// ease to their new value over `ScanMotion.counter`; an instant swap under Reduce
+    /// Motion. The card's numerals and the table's cells all read it.
+    func counterTick(value: String, reduceMotion: Bool) -> some View {
+        contentTransition(reduceMotion ? .identity : .numericText())
+            .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: value)
+    }
+}
+
+extension AnyTransition {
+    /// D12's end swap, the one place it is spelled: the leaving view fades while rising
+    /// `CardMetrics.swapTravel` (the now tag ↔ the end sentence, Cancel Scan ↔ Scan
+    /// Again); a plain fade under Reduce Motion. Driven by the caller's
+    /// `.animation(ScanMotion.ease(ScanMotion.endSwap), value:)`.
+    static func swapTransition(reduceMotion: Bool) -> AnyTransition {
+        reduceMotion ? .opacity : .opacity.combined(with: .offset(y: CardMetrics.swapTravel)) // grid: ok D12 end swap travel, a transition, not a layout nudge
     }
 }

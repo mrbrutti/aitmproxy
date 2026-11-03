@@ -4,14 +4,15 @@ import SwiftUI
 /// The Scan page's Jobs tab (Jobs view spec, UX *Surface*; D10, D11, D15): one
 /// scrolling column, top to bottom: the bus banner when the link is away, the
 /// selected job's card, the jobs table, the two wells. Every number on this tab is
-/// a value the bus returned or the Kit derived from one; the view computes none.
-/// Reduce Motion is read here once and passed down (D12).
+/// a value the bus returned or the Kit derived from one; the views add no number of
+/// their own beyond a count, a first line or a fill fraction of those values (gap 39
+/// moves the rest into the Kit). Reduce Motion is read here once and passed down (D12).
 ///
 /// The body reads nothing that rides the state's 1 Hz clock: `state.link` is read
 /// only inside `ScanJobsBanner` and `ScanJobsReadError`, so a clock tick re-renders
 /// those two lines and not the card or the rows (plan gap 34, fix 1.5h).
 struct ScanJobsTab: View {
-    @Bindable var state: ScanPanelState
+    var state: ScanPanelState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var listFocused: Bool
     /// The card's first enabled verb takes focus when true (D14): Return or → in
@@ -25,6 +26,11 @@ struct ScanJobsTab: View {
     /// its generation follows the state's while `firstEntrance` and then holds, which
     /// keeps the table's identity (focus, hover) across every later selection.
     private var tableGeneration: Int { state.firstEntrance ? state.entranceGeneration : 1 }
+
+    /// The selected job's merged facts (D2), read once for the card and the wells.
+    private var selectedFacts: ScanJobFacts? {
+        state.surface.selectedJob.flatMap { state.surface.facts(for: $0) }
+    }
 
     var body: some View {
         ScrollView {
@@ -48,7 +54,7 @@ struct ScanJobsTab: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, Space.section)
                 } else {
-                    if let job = state.surface.selectedJob, let facts = state.surface.facts(for: job) {
+                    if let facts = selectedFacts {
                         ScanJobCard(
                             state: state,
                             facts: facts,
@@ -61,8 +67,10 @@ struct ScanJobsTab: View {
                     }
                     table
                         .cardEntrance(index: 2, generation: tableGeneration, reduceMotion: reduceMotion)
-                    if let job = state.surface.selectedJob, let facts = state.surface.facts(for: job) {
+                    if let facts = selectedFacts {
+                        // 28 pt below the table (D11 Wells): the column's `Space.xl` plus `Space.sm`.
                         ScanJobWells(facts: facts)
+                            .padding(.top, Space.sm)
                             .cardEntrance(index: 3, generation: state.entranceGeneration, reduceMotion: reduceMotion)
                     }
                 }
@@ -78,9 +86,11 @@ struct ScanJobsTab: View {
 
     // MARK: Table
 
-    /// The listed jobs as merged facts (D2), newest first as `scan.list` orders them.
+    /// The listed jobs as merged facts (D2), newest first as `scan.list` orders them:
+    /// each listed row with its stored status, through the Kit's one merge rule.
     private var rows: [ScanJobFacts] {
-        state.surface.jobs.compactMap { state.surface.facts(for: $0.job) }
+        let statuses = state.surface.statuses
+        return state.surface.jobs.map { ScanJobFacts.make(summary: $0, status: statuses[$0.job]) }
     }
 
     /// The jobs table (D10): the header, then one row per job on the same column
@@ -138,9 +148,9 @@ struct ScanJobsTab: View {
     }
 
     /// The row's verbs (D10): Cancel Scan while the job can still be stopped and the
-    /// link is live, Scan Again for a finished job (the Kit's gate and the link decide
-    /// whether it is enabled; the state refuses a second launch while one is on the
-    /// wire), the two tab jumps, and the id for a terminal or a bug report.
+    /// link is live, Scan Again for a finished job (enabled by the state's one predicate,
+    /// the same the card's primary and `scanAgain(job:)` read), the two tab jumps, and
+    /// the id for a terminal or a bug report.
     @ViewBuilder private func rowMenu(_ facts: ScanJobFacts) -> some View {
         let job = facts.job
         if mayCancel(job) {
@@ -148,7 +158,7 @@ struct ScanJobsTab: View {
         }
         if facts.summary.state.isTerminal {
             Button("Scan Again") { Task { await state.scanAgain(job: job) } }
-                .disabled(state.scanAgainRefusal(for: job) != nil || !state.verbsEnabled || state.surface.launchInFlight)
+                .disabled(!state.scanAgainEnabled(for: job))
         }
         Button("Show Issues") { state.showIssues(job: job) }
         Button("Show Site Map") { state.showSitemap(job: job) }
@@ -237,8 +247,8 @@ nonisolated struct ScanJobsColumns: Layout {
 
     /// D10's nine columns in order: State, Profile, Target, Progress, Probes, Points,
     /// Issues, Elapsed, the action column; every width is a `CardMetrics.table*`
-    /// constant (one home for the comp's numbers).
-    @MainActor static var standard: ScanJobsColumns {
+    /// constant (one home for the comp's numbers). Built once: its inputs are constants.
+    static let standard: ScanJobsColumns = {
         ScanJobsColumns(columns: [
             Column(fixed: nil, share: CardMetrics.tableStateShare, trailing: false),
             Column(fixed: CardMetrics.tableProfileWidth, share: 0, trailing: false),
@@ -250,7 +260,7 @@ nonisolated struct ScanJobsColumns: Layout {
             Column(fixed: CardMetrics.tableElapsedWidth, share: 0, trailing: true),
             Column(fixed: CardMetrics.actionColumn, share: 0, trailing: true),
         ])
-    }
+    }()
 
     /// Whether column `index` is right-aligned.
     func trailing(_ index: Int) -> Bool {
@@ -351,7 +361,8 @@ private struct ScanJobRow: View {
     var cancel: () -> Void
 
     private var summary: ScanJobSummary { facts.summary }
-    private var live: Bool { summary.state == .queued || summary.state == .running }
+    /// Queued or running: the slot holds the ring; a dot otherwise (D10).
+    private var showsRing: Bool { summary.state == .queued || summary.state == .running }
     private var showCancel: Bool { hovered && cancelable }
 
     var body: some View {
@@ -403,7 +414,7 @@ private struct ScanJobRow: View {
                 // Always laid out, so a hover never moves anything (D10); it fades in
                 // over `ScanMotion.hoverReveal` (D12) and is inert while hidden.
                 FlatButton("Cancel", action: cancel)
-                    .help(ScanFormat.cancelHelpText)
+                    .help(ScanFormat.cancelScanHelp)
                     .opacity(showCancel ? 1 : 0)
                     .animation(ScanMotion.ease(ScanMotion.hoverReveal), value: showCancel)
                     .disabled(!showCancel)
@@ -439,7 +450,7 @@ private struct ScanJobRow: View {
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: Space.sm) {
                 Group {
-                    if live {
+                    if showsRing {
                         ScanProgressRing(ring: progress.ring, reduceMotion: reduceMotion)
                     } else {
                         ScanStateDot(
@@ -521,14 +532,5 @@ private struct ScanJobRow: View {
             }
         }
         .lineLimit(1)
-    }
-}
-
-extension View {
-    /// D12's counter tick: the digits of a live number ease to their new value over
-    /// `ScanMotion.counter`; an instant swap under Reduce Motion.
-    fileprivate func counterTick(value: String, reduceMotion: Bool) -> some View {
-        contentTransition(reduceMotion ? .identity : .numericText())
-            .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: value)
     }
 }

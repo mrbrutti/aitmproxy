@@ -690,7 +690,7 @@ public struct ScanPace: Equatable, Sendable {
     /// `done / (elapsedMs / 1000)`.
     public var checksPerSecond: Double
 
-    public init(secondsToGo: Int, checksPerSecond: Double) {
+    init(secondsToGo: Int, checksPerSecond: Double) {
         self.secondsToGo = secondsToGo
         self.checksPerSecond = checksPerSecond
     }
@@ -913,7 +913,7 @@ public struct ScanAttentionLine: Equatable, Sendable {
     /// The disclosure's rows; empty for none.
     public var samples: [ScanCheckErrorSample]
 
-    public init(text: String, samples: [ScanCheckErrorSample]) {
+    init(text: String, samples: [ScanCheckErrorSample]) {
         self.text = text
         self.samples = samples
     }
@@ -1513,8 +1513,6 @@ public enum ScanFormat {
     /// The header button's title while the merged state is cancelling: disabled, and
     /// the only button whose title is not a verb (Jobs view D2).
     public static let cancellingTitle = "Cancelling…"
-    /// The help on Cancel Scan and the row's hover Cancel (Jobs view D7 keeps PR 1's words).
-    public static let cancelHelpText = "Stop this job; its issues stay (⌥⌘.)"
 
     /// `m:ss`, or `h:mm:ss` from an hour on.
     public static func elapsed(ms: Int) -> String {
@@ -1533,14 +1531,6 @@ public enum ScanFormat {
         if seconds < 60 { return "\(seconds) s ago" }
         if seconds < 3600 { return "\(seconds / 60) min ago" }
         return "\(seconds / 3600) h ago"
-    }
-
-    public static func probesText(_ probes: ScanProbeCounters) -> String {
-        "probes \(probes.sent) / \(probes.budget)"
-    }
-
-    public static func pointsText(_ points: ScanPointCounters) -> String {
-        "points \(points.audited) / \(points.found) audited"
     }
 
     /// `host[:port]` of an origin, lower-cased; the origin itself when it is not an http(s) URL.
@@ -1623,18 +1613,6 @@ public enum ScanFormat {
     static func profileName(_ facts: ScanJobFacts) -> String? {
         guard let name = facts.status?.profileName, !name.isEmpty else { return nil }
         return name
-    }
-
-    /// `3 issues: 1 high, 1 medium, 1 low` / `no issues`.
-    public static func severityCountsInWords(_ counts: BySeverity) -> String {
-        let total = counts.total
-        guard total > 0 else { return "no issues" }
-        let order: [ScanSeverity] = [.critical, .high, .medium, .low, .info]
-        let parts = order.compactMap { severity -> String? in
-            let count = counts.count(severity)
-            return count > 0 ? "\(count) \(severity.rawValue)" : nil
-        }
-        return "\(plural(total, "issue")): \(parts.joined(separator: ", "))"
     }
 
     /// `http, ws · medium · normal`; `no lanes · medium · normal` for a saved profile with every lane unticked.
@@ -1769,7 +1747,7 @@ public struct ScanFindingLine: Equatable, Sendable {
         public var text: String
         public var role: Role
 
-        public init(text: String, role: Role) {
+        init(text: String, role: Role) {
             self.text = text
             self.role = role
         }
@@ -1784,7 +1762,7 @@ public struct ScanFindingLine: Equatable, Sendable {
     /// Whether an MCP or agent frontend started the job (the `an agent` part is inked).
     public var agentOriginated: Bool
 
-    public init(reason: String?, parts: [Part], text: String, agentOriginated: Bool) {
+    init(reason: String?, parts: [Part], text: String, agentOriginated: Bool) {
         self.reason = reason
         self.parts = parts
         self.text = text
@@ -1801,7 +1779,7 @@ public struct ScanLedgerGroup: Equatable, Sendable {
     /// `4 low`.
     public var word: String
 
-    public init(severity: ScanSeverity, count: Int, marks: Int, word: String) {
+    init(severity: ScanSeverity, count: Int, marks: Int, word: String) {
         self.severity = severity
         self.count = count
         self.marks = marks
@@ -1829,7 +1807,8 @@ extension ScanFormat {
     /// The most marks one ledger group draws; the word carries the true count.
     public static let ledgerMarkCap = 12
     /// The help strings of the UX section, verbatim. `Stop` here is the one allowed
-    /// use of the verb in a Jobs string (AC32).
+    /// use of the verb in a Jobs string (AC32); the card's Cancel Scan and the row's
+    /// hover Cancel both read it (one help for one verb, fix 2.12b).
     public static let cancelScanHelp = "Stop this job; the issues and site map it found stay (⌥⌘.)"
     public static let scanAgainHelpGeneric = "Start a new job with this job's profile and target"
     public static let showIssuesHelp = "Open the Issues tab filtered to this job"
@@ -2099,6 +2078,12 @@ extension ScanFormat {
     /// `287 of 2,000`; `287 probes` when the budget is unknown (`0`).
     public static func probeBudgetText(sent: Int, budget: Int) -> String {
         budget > 0 ? "\(grouped(sent)) of \(grouped(budget))" : plural(sent, "probe", grouped: true)
+    }
+
+    /// `Probe budget, 287 of 2,000`: the gauge's one accessibility element (Jobs view D11 §4,
+    /// D14); `Probe budget, 287 probes` when the budget is unknown.
+    public static func gaugeAccessibilityLabel(sent: Int, budget: Int) -> String {
+        "Probe budget, \(probeBudgetText(sent: sent, budget: budget))"
     }
 
     /// `287 of 2,000 probes sent (the probe budget, not progress)`; `287 probes sent (…)` without a budget.

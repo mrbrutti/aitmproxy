@@ -119,7 +119,7 @@ import Testing
     @Test func jobsViewsCarryNoLiteralsOrTimers() throws {
         let literal = try Regex(
             #"Color\(|\.cornerRadius\(|easeOut\(0\.[0-9]|\.animation\(\.easeOut|Animation\.(easeOut|easeIn|easeInOut|linear|spring)|TimelineView"#)
-        let numeric = try Regex(#": CGFloat = [0-9]|: Double = [0-9]"#)
+        let numeric = try Regex(#": (CGFloat|Double) = -?[0-9]"#)
         var numericOutsideMetrics: [String] = []
         var metricsLines = 0
         for path in Self.jobsViewFiles {
@@ -130,21 +130,21 @@ import Testing
                 let hits = lines.enumerated().filter { $0.element.contains(word) }.map { "\(path):\($0.offset + 1)" }
                 #expect(hits.isEmpty, "\(word) in a Jobs view: \(hits)")
             }
-            // `enum CardMetrics {` at column 0 to the first `}` at column 0 after it.
+            // `enum CardMetrics {` (nonisolated, fix 2.12b) at column 0 to the first `}` at column 0 after it.
             var inside = false
             for (index, line) in lines.enumerated() {
-                if line.hasPrefix("enum CardMetrics") { inside = true; continue }
+                if line.hasSuffix("enum CardMetrics {") { inside = true; continue }
                 if inside, line == "}" { inside = false; continue }
                 guard line.contains(numeric) else { continue }
                 if inside { metricsLines += 1 } else { numericOutsideMetrics.append("\(path):\(index + 1)") }
             }
         }
         #expect(numericOutsideMetrics.isEmpty, "numeric constants outside CardMetrics: \(numericOutsideMetrics)")
-        #expect(metricsLines >= 10, "CardMetrics should hold the comp's constants; found \(metricsLines)")
+        #expect(metricsLines == 40, "CardMetrics holds the comp's 40 constants (spec D11, gaps 34b, 37, 38); found \(metricsLines)")
 
         let appSources = try FileManager.default.subpathsOfDirectory(atPath: Self.root.appending(path: "apps/mac/Sources").path)
             .filter { $0.hasSuffix(".swift") }
-        #expect(appSources.count > 50, "the walk found the app's sources")
+        #expect(appSources.count == 189, "the walk found the app's 189 sources; found \(appSources.count)")
         var survivors: [String] = []
         for path in appSources {
             let text = try Self.source("apps/mac/Sources/\(path)")

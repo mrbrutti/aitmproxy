@@ -203,16 +203,20 @@ final class ScanPanelState {
 
     var canCancel: Bool { cancelTarget != nil }
 
-    /// Why Scan Again may not be sent for the selected job, nil when it may (Jobs view
-    /// D13): the Kit's gate, Start Scan's, over the live scope and tools, so a scope or
-    /// tools change updates it with no read. With nothing selected the Kit is asked
-    /// about a job it does not hold, so its own "finished job" refusal stands and the
-    /// app carries no copy of the words (D17).
-    var scanAgainRefusal: String? { scanAgainRefusal(for: surface.selectedJob ?? "") }
-
-    /// The same gate for any row (the context menu's Scan Again names its own job).
+    /// Why Scan Again may not be sent for a job, nil when it may (Jobs view D13): the
+    /// Kit's gate, Start Scan's, over the live scope and tools, so a scope or tools
+    /// change updates it with no read; the words are the Kit's (D17). The card's
+    /// primary shows it as the help; the context menu names its own job.
     func scanAgainRefusal(for job: String) -> String? {
         surface.scanAgainRefusal(for: job, scopeHosts: session.scopeHosts, tools: session.tools)
+    }
+
+    /// Whether Scan Again may be pressed for a job, the one predicate the card's
+    /// primary, the context menu and `scanAgain(job:)` share (D13): the Kit's gate
+    /// passes, the link has the verbs on (D6), and no launch or confirm sheet owns the
+    /// bus.
+    func scanAgainEnabled(for job: String) -> Bool {
+        scanAgainRefusal(for: job) == nil && verbsEnabled && surface.confirm == nil && !surface.launchInFlight
     }
 
     /// The wall clock in epoch milliseconds, set once a second by `clockTask` so the
@@ -342,6 +346,7 @@ final class ScanPanelState {
             updateSurface { $0.applyList(result) }
             noteSelection(previous: previous, cause: .list)
             announceIfEnded()
+            pruneAnnouncements(to: surface.jobs)
             // The freshness stamp is not part of the published model: it moves on every
             // list beat, and a beat that changed nothing must not republish the page (MS-R1).
             jobsLoadedAt = Self.clockMs
@@ -631,8 +636,7 @@ final class ScanPanelState {
     /// while the link has the verbs gated off, or while a launch or a confirm sheet
     /// owns the bus. A refusal lands under the card's title row, never in the footer.
     func scanAgain(job: String) async {
-        guard scanAgainRefusal(for: job) == nil, verbsEnabled, surface.confirm == nil, !surface.launchInFlight,
-              let call = surface.scanAgainArguments(for: job) else { return }
+        guard scanAgainEnabled(for: job), let call = surface.scanAgainArguments(for: job) else { return }
         surface.launchInFlight = true
         confirmSink = .scanAgain(job: job)
         await send(tool: call.tool, args: call.args, origins: scanAgainOrigins(job),
@@ -1007,6 +1011,14 @@ final class ScanPanelState {
             notification: .announcementRequested,
             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
         Self.scanLog.info("announce: \(facts.job, privacy: .public) \(text, privacy: .private)")
+    }
+
+    /// After a list lands: forget the jobs it no longer carries, so neither record
+    /// outgrows the list (a job the core drops is never re-listed under the same id).
+    private func pruneAnnouncements(to jobs: [ScanJobSummary]) {
+        let listed = Set(jobs.map(\.job))
+        seenStates = seenStates.filter { listed.contains($0.key) }
+        announced = announced.intersection(listed)
     }
 
     /// Takes a status line down after a while, and only while it is still the line

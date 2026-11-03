@@ -407,8 +407,6 @@ import Testing
         #expect(ScanFormat.relative(ms: 1_761_900_000_000, now: 1_761_900_000_000 + 125_000) == "2 min ago")
         #expect(ScanFormat.relative(ms: 1_761_900_000_000, now: 1_761_900_000_000 + 3 * 3_600_000 + 1) == "3 h ago")
 
-        #expect(ScanFormat.probesText(status.probes) == "probes 418 / 2000")
-        #expect(ScanFormat.pointsText(status.points) == "points 80 / 120 audited")
         // The row's cells (Jobs view D10): the phase word while running, `—` for what `scan.status` has not told us yet.
         let auditing = ScanJobFacts.make(summary: list.jobs[0], status: status)
         #expect(ScanFormat.stateWord(auditing) == "Auditing")
@@ -424,9 +422,10 @@ import Testing
         #expect(ScanFormat.jobAccessibilityLabel(auditing)
                 == "Auditing, standard, 127.0.0.1:8080, 75 percent, 180 of 240 checks, 3 issues: 1 high, 1 medium, 1 low, "
                 + "42 seconds.")
-        #expect(ScanFormat.severityCountsInWords(list.jobs[0].issues.bySeverity) == "3 issues: 1 high, 1 medium, 1 low")
-        #expect(ScanFormat.severityCountsInWords(list.jobs[1].issues.bySeverity) == "no issues")
-        #expect(ScanFormat.severityCountsInWords(issues.bySeverity) == "2 issues: 1 high, 1 medium")
+        // The pack's tallies through the surviving reader of the five counts (fix 2.12b: `severityCountsInWords` is gone).
+        #expect(ScanFormat.issuesTileHelp(by: list.jobs[0].issues.bySeverity) == "3 issues: 1 high, 1 medium, 1 low")
+        #expect(ScanFormat.issuesTileHelp(by: list.jobs[1].issues.bySeverity) == "no issues")
+        #expect(ScanFormat.issuesTileHelp(by: issues.bySeverity) == "2 issues: 1 high, 1 medium")
 
         #expect(ScanFormat.profileRowLine2(profileList.profiles[3]) == "http, ws · medium · normal")
         #expect(ScanFormat.profileRowLine2(profileList.profiles[5]) == "l4_stream · medium · normal")
@@ -1184,8 +1183,8 @@ extension ScanSurfaceTests {
         // A finished job with no status read yet.
         let unread = ScanJobFacts(summary: list.jobs[1], status: nil)
         #expect(ScanFormat.jobAccessibilityLabel(unread) == "Done, no issues, 42 seconds.")
-        #expect(ScanFormat.severityCountsInWords(BySeverity(critical: 1, high: 0, medium: 0, low: 0, info: 0)) == "1 issue: 1 critical")
-        #expect(ScanFormat.severityCountsInWords(BySeverity(critical: 2, high: 0, medium: 0, low: 0, info: 3)) == "5 issues: 2 critical, 3 info")
+        #expect(ScanFormat.issuesTileHelp(by: BySeverity(critical: 1, high: 0, medium: 0, low: 0, info: 0)) == "1 issue: 1 critical")
+        #expect(ScanFormat.issuesTileHelp(by: BySeverity(critical: 2, high: 0, medium: 0, low: 0, info: 3)) == "5 issues: 2 critical, 3 info")
 
         // Two targets join with a comma; a target with a path or scheme in capitals is reduced to its authority.
         let two = ScanPack.edited(try Self.load("scan.status.json"), path: ["targets"], to: ["http://127.0.0.1:8080", "HTTPS://api.shop-staging.test/"])
@@ -2812,6 +2811,9 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.lanePages(46) == "46 pages")
         #expect(ScanFormat.lanePages(1) == "1 page")
         #expect(ScanFormat.gaugeLabel == "probe budget")
+        // D11 §4 / D14: the gauge is one accessibility element reading `Probe budget, 287 of 2,000` (fix 2.12b).
+        #expect(ScanFormat.gaugeAccessibilityLabel(sent: 287, budget: 2000) == "Probe budget, 287 of 2,000")
+        #expect(ScanFormat.gaugeAccessibilityLabel(sent: 287, budget: 0) == "Probe budget, 287 probes")
         #expect(ScanFormat.laneCrawlLabel == "crawl")
         #expect(ScanFormat.laneAuditLabel == "audit")
         #expect(ScanFormat.missingValue == "—")
@@ -2990,6 +2992,7 @@ extension ScanSurfaceTests {
             ScanFormat.showSiteMapHelp, ScanFormat.cancellingTitle, ScanFormat.scanAgainErrorPrefix,
             ScanFormat.jobsCaption(total: 4, running: 1),
             ScanFormat.probesTileHelp(sent: 287, budget: 2000), ScanFormat.probeBudgetText(sent: 287, budget: 0),
+            ScanFormat.gaugeAccessibilityLabel(sent: 287, budget: 2000),
             ScanFormat.issuesTileHelp(by: Self.tally(high: 1, low: 3)), ScanFormat.ofText(6468),
             ScanFormat.laneChecksDone(3236), ScanFormat.lanePages(46), ScanFormat.scaleStarted("11:32"),
             ScanFormat.scaleElapsed(ms: 64_000), ScanFormat.elapsedWords(ms: 3_723_000),
@@ -3006,8 +3009,8 @@ extension ScanSurfaceTests {
             strings.append(ScanEndText.rawCrawlErrorLine(kind))
         }
         // Task 2.11: the Jobs strings the first sweep did not reach: the raw-token lines, D15's
-        // banners, the Scan Again gate and help (D13), the confirm summary, the Cancel helps (both
-        // allowed, below), the notices' words and the inline list error (D6).
+        // banners, the Scan Again gate and help (D13), the confirm summary, the one Cancel help
+        // (allowed, below), the notices' words and the inline list error (D6).
         for reason in [ScanStoppedReason.budget, .time, .cancelled, .sessionLost, .errors, .policy, .guardRefused, .failed, .other("paused")] {
             strings.append(ScanEndText.rawReasonLine(reason))
         }
@@ -3018,7 +3021,7 @@ extension ScanSurfaceTests {
             ScanJobsLink.make(bus: .disconnected, readFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000).bannerText ?? "",
             ScanJobsLink.make(bus: .disconnected, readFailedAt: nil, jobsLoadedAt: nil, now: 43_000).bannerText ?? "",
             scanL4Hint, ScanFormat.outOfScopeText(origin: "http://127.0.0.1:8117"),
-            ScanFormat.cancelScanHelp, ScanFormat.cancelHelpText,
+            ScanFormat.cancelScanHelp,
             ScanFormat.clampedText(ScanClamped(field: "budget.probes", requested: 50000, applied: 20000)),
             ScanFormat.skippedLaneText(ScanSkippedLane(lane: .ws, reason: "lane not available on this build")),
             ScanFormat.yesNo(true), ScanFormat.yesNo(false),
@@ -3057,14 +3060,14 @@ extension ScanSurfaceTests {
             if let status = f.status { strings += ScanEndText.notices(status, launchNotices: []) }
         }
         let banned = try Regex("(?i)\\b(stop|abort|finding|task)\\b")
-        // AC32's two allowances, excepted by name: the Cancel help's `Stop this job; …` (the
-        // card's `cancelScanHelp` and the row's PR 1 `cancelHelpText` share that opening), and
+        // AC32's two allowances, excepted by name: the one Cancel help `cancelScanHelp` (the card's
+        // primary and the row's hover Cancel read it; PR 1's `cancelHelpText` is gone, fix 2.12b), and
         // D4's session-lost sentence, kept as shipped with the verb in it (gap 29, second
         // allowance). Each exception must still be in the sweep and still trip the matcher, so a
         // reworded string drops out of the list instead of being silently excused.
         let sessionLost = try #require(ScanEndText.stoppedReason(.sessionLost, state: .done, probesBudget: 0, error: nil))
         #expect(sessionLost == "Stopped early: the session was lost and the profile says stop when that happens.")
-        let allowed = [ScanFormat.cancelScanHelp, ScanFormat.cancelHelpText, sessionLost]
+        let allowed = [ScanFormat.cancelScanHelp, sessionLost]
         for text in allowed {
             #expect(text.hasPrefix("Stop"), "the allowances are the two `Stop` sentences, nothing else: \(text)")
             #expect(strings.contains(text), "the exception is live, in the sweep: \(text)")

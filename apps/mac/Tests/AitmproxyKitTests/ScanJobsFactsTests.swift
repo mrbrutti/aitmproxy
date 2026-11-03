@@ -475,7 +475,6 @@ import Testing
     /// Any failed Jobs read (list, status, cancel) marks the link (D6 amendment).
     @Test func cancellingTitleAndInlineListError() throws {
         #expect(ScanFormat.cancellingTitle == "Cancelling…")
-        #expect(ScanFormat.cancelHelpText == "Stop this job; its issues stay (⌥⌘.)")
 
         var model = ScanSurfaceModel()
         model.noteReadFailure(

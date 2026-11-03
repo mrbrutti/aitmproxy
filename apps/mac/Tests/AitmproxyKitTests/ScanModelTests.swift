@@ -873,16 +873,20 @@ extension ScanModelTests {
         #expect(rounded.probes.sent == top)
 
         // Every tally at the top of the range: the sum the Kit takes still fits, and the
-        // words that read it (the row label's counts) spell every count in full.
+        // words that read it (the ledger's and the Issues cells' counts) spell every count
+        // in full, grouped (fix 2.12b: `severityCountsInWords` is gone; these are its readers).
         var all = status
         for key in ["critical", "high", "medium", "low", "info"] {
             all = ScanPack.edited(all, path: ["issues", "by_severity", key], to: 9_007_199_254_740_992)
         }
         let full = try ScanJobStatus(json: all)
         #expect(full.issues.bySeverity.total == 45_035_996_273_704_960)
-        #expect(ScanFormat.severityCountsInWords(full.issues.bySeverity)
-                == "45035996273704960 issues: 9007199254740992 critical, 9007199254740992 high, "
-                    + "9007199254740992 medium, 9007199254740992 low, 9007199254740992 info")
+        #expect(ScanFormat.issuesTileHelp(by: full.issues.bySeverity)
+                == "45,035,996,273,704,960 issues: 9,007,199,254,740,992 critical, 9,007,199,254,740,992 high, "
+                    + "9,007,199,254,740,992 medium, 9,007,199,254,740,992 low, 9,007,199,254,740,992 info")
+        #expect(ScanFormat.severityWordParts(by: full.issues.bySeverity).map(\.1)
+                == ["9,007,199,254,740,992 critical", "9,007,199,254,740,992 high", "9,007,199,254,740,992 medium",
+                    "9,007,199,254,740,992 low", "9,007,199,254,740,992 info"])
 
         // The formatters subtract and divide a top-of-range stamp without a trap.
         // Tester finding T-F2: `elapsed(ms:)` formats its 64-bit hour count with `%d`, so
@@ -895,8 +899,6 @@ extension ScanModelTests {
         #expect(ScanFormat.relative(ms: 0, now: top) == "2501999792 h ago")
         let late = try ScanJobStatus(json: ScanPack.edited(status, path: ["elapsed_ms"], to: 9_007_199_254_740_992))
         #expect(late.elapsedMs == top)
-        #expect(ScanFormat.probesText(late.summary.probes) == "probes 418 / 2000")
-        #expect(ScanFormat.pointsText(late.summary.points) == "points 80 / 120 audited")
         #expect(ScanFormat.elapsed(ms: late.summary.elapsedMs) == "2501999792:59:00")
 
         // The other whole-number readers of a status refuse the same way.

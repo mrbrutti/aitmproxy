@@ -7,8 +7,10 @@ import SwiftUI
 /// `docs/design/mockup/scan-jobs/committed.html`), each named after the CSS rule
 /// it comes from. Everything else the Jobs views draw is a `Tok.*` or `ScanMotion`
 /// token (AC22). Internal rather than private because `ScanProgressViews.swift`
-/// draws the ring, the dots, the chip and the entrance from the same numbers.
-enum CardMetrics {
+/// draws the ring, the dots, the chip and the entrance from the same numbers;
+/// nonisolated because they are constants and the table's `Layout` (nonisolated by
+/// its protocol) builds its columns from them once.
+nonisolated enum CardMetrics {
     /// `.card::before { width: 3px }` — the card's tone edge; also the selected row's edge (D10).
     static let edge: CGFloat = 3
     /// `.now { width: 2px }` — the lane's now mark.
@@ -157,7 +159,7 @@ private enum ScanInked {
 /// number of its own; its verb slot reads `state.verbsEnabled`, never the 1 Hz `link`
 /// (plan gap 34d), so a clock tick re-evaluates nothing here.
 struct ScanJobCard: View {
-    @Bindable var state: ScanPanelState
+    var state: ScanPanelState
     var facts: ScanJobFacts
     var progress: ScanJobProgress
     var reduceMotion: Bool
@@ -179,7 +181,7 @@ struct ScanJobCard: View {
             )
             .cardEntrance(index: 0, generation: generation, reduceMotion: reduceMotion)
             VStack(alignment: .leading, spacing: CardMetrics.ledgerGap) {
-                ScanJobLane(progress: progress, facts: facts, reduceMotion: reduceMotion)
+                ScanJobLane(progress: progress, facts: facts, reduceMotion: reduceMotion, verbsEnabled: state.verbsEnabled)
                 ScanIssueLedger(
                     groups: ScanFormat.ledgerGroups(by: by), running: !facts.summary.state.isTerminal,
                     reduceMotion: reduceMotion, accessibilityLabel: ScanFormat.issuesTileHelp(by: by))
@@ -218,7 +220,7 @@ struct ScanJobCard: View {
 /// `state.verbsEnabled` is false (D6, D15); Escape returns focus to the table and clears
 /// the Scan Again refusal; the refusal's text sits under the row (D13).
 struct ScanJobTitleRow: View {
-    @Bindable var state: ScanPanelState
+    var state: ScanPanelState
     var facts: ScanJobFacts
     var reduceMotion: Bool
     var inspectorFocused: FocusState<Bool>.Binding
@@ -232,7 +234,10 @@ struct ScanJobTitleRow: View {
             HStack(alignment: .top, spacing: Space.md) {
                 VStack(alignment: .leading, spacing: Space.xs) {
                     HStack(spacing: Space.md) {
-                        ScanStateChip(word: ScanFormat.stateWord(facts), tone: ScanFormat.tone(facts))
+                        // The chip's dot breathes while cancelling and Reduce Motion is off (D12).
+                        ScanStateChip(
+                            word: ScanFormat.stateWord(facts), tone: ScanFormat.tone(facts),
+                            breathing: facts.summary.state == .cancelling && !reduceMotion)
                         Text(ScanFormat.jobHeading(facts))
                             .font(Tok.Face.data(Tok.Typography.Size.xxl, .semibold))
                             .foregroundStyle(Tok.Ink.primary.color)
@@ -292,9 +297,9 @@ struct ScanJobTitleRow: View {
                 .accessibilityHint(ScanFormat.showIssuesHelp)
             ZStack {
                 if terminal {
-                    scanAgainButton.transition(swap)
+                    scanAgainButton.transition(.swapTransition(reduceMotion: reduceMotion))
                 } else {
-                    primaryLiveVerb.transition(swap)
+                    primaryLiveVerb.transition(.swapTransition(reduceMotion: reduceMotion))
                 }
             }
             .animation(ScanMotion.ease(ScanMotion.endSwap), value: terminal)
@@ -305,10 +310,6 @@ struct ScanJobTitleRow: View {
             onEscape()
             state.surface.clearScanAgainError()
         }
-    }
-
-    private var swap: AnyTransition {
-        reduceMotion ? .opacity : .opacity.combined(with: .offset(y: CardMetrics.swapTravel)) // grid: ok D12 end swap travel, a transition, not a layout nudge
     }
 
     /// Cancel Scan while the merged state is queued or running; the cancelling word,
@@ -337,16 +338,15 @@ struct ScanJobTitleRow: View {
             .disabled(true)
     }
 
-    /// Scan Again for a finished job (D13): Start Scan's gate, off while the verbs are
-    /// gated, a launch is on the wire or a confirm sheet is up; its help is the refusal
-    /// when there is one, else the Kit's sentence naming the profile and the target.
+    /// Scan Again for a finished job (D13): enabled by the state's one predicate
+    /// (`scanAgainEnabled(for:)`: the Kit's gate, the verb gate, no launch on the wire, no
+    /// confirm sheet up; the same guard `scanAgain(job:)` sends under); its help is the
+    /// refusal when there is one, else the Kit's sentence naming the profile and the target.
     private var scanAgainButton: some View {
         let refusal = state.scanAgainRefusal(for: facts.job)
         let help = refusal ?? facts.status.map(ScanSurfaceModel.scanAgainHelp) ?? ScanFormat.scanAgainHelpGeneric
         return PrimaryButton("Scan Again") { Task { await state.scanAgain(job: facts.job) } }
-            .disabled(
-                refusal != nil || !state.verbsEnabled || state.surface.launchInFlight || state.surface.confirm != nil
-            )
+            .disabled(!state.scanAgainEnabled(for: facts.job))
             .help(help)
             .accessibilityHint(help)
     }
@@ -361,10 +361,13 @@ struct ScanJobTitleRow: View {
 /// track; the fill, the mark and the tag ease under `ScanMotion.progress` and the now
 /// tag gives way to the end sentence under `ScanMotion.endSwap` (D12). One
 /// accessibility element labelled `Progress` with the percent or the phase line (D14).
+/// `verbsEnabled` is the state's clock-free verb gate (gap 34d): while the bus is away
+/// the values are stale, so the now dot stops breathing but stays (D15).
 struct ScanJobLane: View {
     var progress: ScanJobProgress
     var facts: ScanJobFacts
     var reduceMotion: Bool
+    var verbsEnabled: Bool
 
     /// The now tag's measured width, for clamping it inside the track.
     @State private var tagWidth = CGFloat.zero
@@ -372,9 +375,10 @@ struct ScanJobLane: View {
     private var summary: ScanJobSummary { facts.summary }
     private var status: ScanJobStatus? { facts.status }
     private var terminal: Bool { summary.state.isTerminal }
-    /// Running or cancelling: the mark is shown; it breathes only while running (D12).
-    private var live: Bool { summary.state == .running || summary.state == .cancelling }
-    private var breathing: Bool { summary.state == .running && !reduceMotion }
+    /// Running or cancelling: the mark is shown (it fades under `endSwap` otherwise).
+    private var marked: Bool { summary.state == .running || summary.state == .cancelling }
+    /// The dot breathes only while running, with the bus live and Reduce Motion off (D12, D15).
+    private var breathing: Bool { summary.state == .running && !reduceMotion && verbsEnabled }
 
     /// What the track draws, decided once from the merged state and phase (D11 §2).
     private enum Track: Equatable {
@@ -461,10 +465,7 @@ struct ScanJobLane: View {
     }
 
     private var progressAnimation: Animation? { reduceMotion ? nil : ScanMotion.ease(ScanMotion.progress) }
-
-    private var swap: AnyTransition {
-        reduceMotion ? .opacity : .opacity.combined(with: .offset(y: CardMetrics.swapTravel)) // grid: ok D12 end swap travel, a transition, not a layout nudge
-    }
+    private var swap: AnyTransition { .swapTransition(reduceMotion: reduceMotion) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -524,8 +525,7 @@ struct ScanJobLane: View {
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.tertiary.color)
                     .monospacedDigit()
-                    .contentTransition(reduceMotion ? .identity : .numericText())
-                    .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: toGo)
+                    .counterTick(value: toGo, reduceMotion: reduceMotion)
                     .padding(.top, CardMetrics.laneLabelInset)
                     .padding(.trailing, Space.md)
             }
@@ -534,9 +534,9 @@ struct ScanJobLane: View {
             if g.markPresent {
                 nowMark
                     .padding(.leading, max(0, g.markX - CardMetrics.nowDot / 2))
-                    .opacity(live ? 1 : 0)
+                    .opacity(marked ? 1 : 0)
                     .animation(progressAnimation, value: fillFraction)
-                    .animation(ScanMotion.ease(ScanMotion.endSwap), value: live)
+                    .animation(ScanMotion.ease(ScanMotion.endSwap), value: marked)
             }
         }
     }
@@ -588,8 +588,7 @@ struct ScanJobLane: View {
                 .font(Tok.Face.ui(Tok.Typography.Size.sm))
                 .opacity(CardMetrics.laneSubOpacity)
                 .monospacedDigit()
-                .contentTransition(reduceMotion ? .identity : .numericText())
-                .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: lower)
+                .counterTick(value: lower, reduceMotion: reduceMotion)
         }
         .lineLimit(1)
         .fixedSize()
@@ -601,7 +600,7 @@ struct ScanJobLane: View {
 
     /// The now mark: a 2 pt line of the primary ink overshooting the track by 10 pt each
     /// way inside a 3 pt halo at 12 %, with the 10 pt dot centred on its top end; the dot
-    /// breathes while the job is running and Reduce Motion is off (D12).
+    /// breathes while the job is running, the bus is live and Reduce Motion is off (D12, D15).
     private var nowMark: some View {
         let height = Tok.Size.Row.card + 2 * CardMetrics.nowOvershoot
         let dot = Circle()
@@ -676,14 +675,12 @@ struct ScanJobLane: View {
             Spacer(minLength: 0)
             ScanInked.digits(elapsed, size: size, ink: ink)
                 .monospacedDigit()
-                .contentTransition(reduceMotion ? .identity : .numericText())
-                .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: elapsed)
+                .counterTick(value: elapsed, reduceMotion: reduceMotion)
             Spacer(minLength: 0)
             if let estimate = progress.estimateText {
                 ScanInked.digits(estimate, size: size, ink: ink)
                     .monospacedDigit()
-                    .contentTransition(reduceMotion ? .identity : .numericText())
-                    .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: estimate)
+                    .counterTick(value: estimate, reduceMotion: reduceMotion)
                     .help(progress.estimateHelp ?? "")
             }
         }
@@ -729,8 +726,7 @@ struct ScanIssueLedger: View {
                         Text(verbatim: group.word)
                             .foregroundStyle(ink)
                             .monospacedDigit()
-                            .contentTransition(reduceMotion ? .identity : .numericText())
-                            .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: group.word)
+                            .counterTick(value: group.word, reduceMotion: reduceMotion)
                             .padding(.leading, Tok.Metric.gapTight - CardMetrics.markGap)
                     }
                 }
@@ -750,7 +746,7 @@ struct ScanIssueLedger: View {
 /// `sent / budget` in the tertiary ink, amber once the Kit's warning holds (colour
 /// under `ScanMotion.state`, width under `ScanMotion.progress`), and the Kit's text;
 /// the track is hidden when the budget is unknown. One accessibility element reading
-/// `probe budget, 287 of 2,000` (D14).
+/// the Kit's `Probe budget, 287 of 2,000` (D11 §4, D14).
 struct ScanProbeGauge: View {
     var sent: Int
     var budget: Int
@@ -781,13 +777,11 @@ struct ScanProbeGauge: View {
             Text(verbatim: text)
                 .font(Tok.Face.data(Tok.Typography.Size.sm))
                 .monospacedDigit()
-                .contentTransition(reduceMotion ? .identity : .numericText())
-                .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: text)
+                .counterTick(value: text, reduceMotion: reduceMotion)
         }
         .foregroundStyle(Tok.Ink.secondary.color)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(ScanFormat.gaugeLabel)
-        .accessibilityValue(text)
+        .accessibilityLabel(ScanFormat.gaugeAccessibilityLabel(sent: sent, budget: budget))
         .help(ScanFormat.probesTileHelp(sent: sent, budget: budget))
     }
 }
@@ -866,15 +860,13 @@ struct ScanKPICell: View {
                     .font(Tok.Face.data(Tok.Typography.Size.display))
                     .foregroundStyle(lead ? Tok.Accent.base.color : Tok.Ink.primary.color)
                     .monospacedDigit()
-                    .contentTransition(reduceMotion ? .identity : .numericText())
-                    .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: value)
+                    .counterTick(value: value, reduceMotion: reduceMotion)
                 if let unit {
                     Text(verbatim: unit)
                         .font(Tok.Face.ui(Tok.Typography.Size.md))
                         .foregroundStyle(Tok.Ink.secondary.color)
                         .monospacedDigit()
-                        .contentTransition(reduceMotion ? .identity : .numericText())
-                        .animation(reduceMotion ? nil : ScanMotion.ease(ScanMotion.counter), value: unit)
+                        .counterTick(value: unit, reduceMotion: reduceMotion)
                 }
                 if !severity.isEmpty {
                     severityText
