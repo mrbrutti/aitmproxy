@@ -1,0 +1,11 @@
+# Writer attribution of the real audit files, taken in the Terminal right after the run (2026-11-02 20:36).
+# lsof -Fp -- "$HOME/Library/Application Support/aitmproxy/audit.reads.jsonl" | tr -d p | xargs -n1 ps -o pid=,command= -p
+11561 /Applications/Aitmproxy.app/Contents/Resources/core/aitm --config /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm…
+# ps -o pid=,ppid=,lstart=,command= -p 11561
+11561 11513 Mon Nov  2 14:50:14 2026 /Applications/Aitmproxy.app/Contents/Resources/core/aitm --config /var/folders/…/T/aitm…
+# lsof -p 11561 | grep -i 'audit|system-proxy'  (paths, last field)
+~/Library/Application Support/aitmproxy/audit.jsonl
+~/Library/Application Support/aitmproxy/audit.agent.jsonl
+~/Library/Application Support/aitmproxy/audit.reads.jsonl
+# The only process holding the real files is the installed app's embedded core, started 14:50, hours before the
+# proof (20:30–20:35). Both harness cores had exited; their three streams are in their run dirs (run-dirs.txt).

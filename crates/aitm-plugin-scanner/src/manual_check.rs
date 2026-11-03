@@ -183,15 +183,18 @@ impl Command for ManualCheck {
             deadline,
             cancel.clone(),
         ));
-        let client: Arc<dyn ProxyClient> = Arc::new(JobClient::new(
-            Arc::clone(&services.client),
-            &job_id,
-            Arc::clone(&budget),
-            Arc::new(ProbeMeter::default()),
-            profile.http.record_probes,
-            profile.http.version,
-            profile.budget.per_host_errors.clone(),
-        ));
+        let client: Arc<dyn ProxyClient> = Arc::new(
+            JobClient::new(
+                Arc::clone(&services.client),
+                &job_id,
+                Arc::clone(&budget),
+                Arc::new(ProbeMeter::default()),
+                profile.http.record_probes,
+                profile.http.version,
+                profile.budget.per_host_errors.clone(),
+            )
+            .with_guard(Arc::clone(&services.guard)),
+        );
 
         let job: Arc<dyn JobCtx> = Arc::new(ManualJob {
             job: job_id,
