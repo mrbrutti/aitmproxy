@@ -761,7 +761,7 @@ adds no motion, no new layout and no Scan Again. It is reviewable as a
 behaviour fix plus a decoder extension, and it is the base PR 2 is cut from.
 
 **Amendment (2026-11-02, PR 1 panel).** The Cancel help text stays PR 1's
-words, `Stop this job; its issues stay (⌥⌘.)`, now one Kit constant
+words, `Stop this job; its issues stay (⌥⌘.)`, now one Kit constant (PR 2, fix 2.12b: the row's hover Cancel reads `cancelScanHelp` as well and `cancelHelpText` is deleted; one Cancel help on screen.)
 (`ScanFormat.cancelHelpText`); the hover-help wording of the UX section is
 PR 2's (D11). The Stopped section shows only for a terminal job (D4
 amendment); a live job with crawl errors shows nothing there in PR 1.
@@ -1081,7 +1081,7 @@ horizontal, a 3 pt left edge in the tone's colour clipped to the radius,
    > 0.8 × budget`, `budget > 0`); text `ScanFormat.probeBudgetText(sent:budget:)`
    (`287 of 2,000`; `287 probes` with the track hidden when `budget == 0`,
    Architect's call) in the data face, `Tok.Ink.secondary`, `numericText`.
-   One accessibility element `Probe budget, 287 of 2,000`;
+   One accessibility element `Probe budget, 287 of 2,000` (`ScanFormat.gaugeAccessibilityLabel(sent:budget:)`);
    `.help(ScanFormat.probesTileHelp(sent:budget:))`.
 5. **KPI strip** (`ScanKPIStrip(facts:progress:)`): one container on
    `Tok.Ground.surface`, 1 pt `Tok.Line.border`, `Tok.Radius.panel`, 20 pt
