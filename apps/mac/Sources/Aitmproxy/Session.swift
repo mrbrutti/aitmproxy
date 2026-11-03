@@ -156,6 +156,10 @@ final class Session {
     var quickLookTick = 0
     /// Typed into the Scope sheet's field when Flow ▸ Add Host to Scope… opens it.
     var scopeSheetHost: String?
+    /// Set by Proxy ▸ Scope… when it navigates to the Scope page: the page's add field takes focus on
+    /// arrival (an explicit intent to edit), then the flag clears. A sidebar click leaves it false, so
+    /// landing on Scope by itself keeps the page calm (focus only an empty list).
+    var scopeFieldFocusPending = false
     /// A file is being dragged over the window (S-065): the "Drop to import" face shows.
     var dropTargeted = false
 

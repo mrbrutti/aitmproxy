@@ -97,6 +97,10 @@ struct ScopePanel: View {
                 draft = host
                 session.scopeSheetHost = nil
                 fieldFocused = true
+            } else if session.scopeFieldFocusPending {
+                // Proxy ▸ Scope… brought the operator here to edit: the page's field takes focus once.
+                session.scopeFieldFocusPending = false
+                fieldFocused = true
             } else if entries.isEmpty {
                 fieldFocused = true
             }
