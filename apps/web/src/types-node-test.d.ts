@@ -10,6 +10,8 @@ declare module 'node:fs' {
   // `live-env.audit-log.test.ts` writes the config documents `assertAuditLogIsolated` reads.
   export function mkdtempSync(prefix: string): string;
   export function writeFileSync(path: string, data: string): void;
+  // ... and removes its temp dir in `afterAll`.
+  export function rmSync(path: string, opts?: { recursive?: boolean; force?: boolean }): void;
 }
 declare module 'node:os' {
   export function tmpdir(): string;

@@ -109,6 +109,12 @@ export function renderConfig({
   if (auditLogDir != null && !isAbsolute(auditLogDir)) {
     throw new Error('live-env: auditLogDir must be an absolute path; got ' + JSON.stringify(auditLogDir));
   }
+  // `JSON.stringify` escapes `"` and `\\` but writes C0 controls, U+0085, U+2028 and U+2029 in forms
+  // libyaml folds to a space inside a double-quoted scalar, so the guard's byte comparison and the
+  // core's parse would disagree on the path. Refuse them; the value is not echoed.
+  if (auditLogDir != null && /[\u0000-\u001f\u0085\u2028\u2029]/.test(auditLogDir)) {
+    throw new Error('live-env: auditLogDir contains a control or Unicode line-break character; refusing to write it into YAML');
+  }
   return [
     `listen: 127.0.0.1:${proxyPort}`,
     `browser:`,
@@ -331,12 +337,12 @@ export async function startAitm({
   // disk when it aborts; the messages therefore name where the run dir would be made.
   const inheritedAuditLog = process.env.AITM_AUDIT_LOG;
   if (inheritedAuditLog !== undefined) {
-    const runDir = join(tmpdir(), 'aitm-live-*');
+    const runDirPattern = join(tmpdir(), 'aitm-live-*');
     if (inheritedAuditLog === 'off') {
-      console.error(`live-env: AITM_AUDIT_LOG=off is set in this environment; this core writes no general audit log (mcp.audit_log in ${runDir} is overridden)`);
+      console.error(`live-env: AITM_AUDIT_LOG=off is set in this environment; this core writes no general audit log (mcp.audit_log in ${runDirPattern} is overridden)`);
     } else {
       throw new Error(
-        `live-env: AITM_AUDIT_LOG is set to a value other than off in this environment; it would override mcp.audit_log and send this core's general audit log outside ${runDir}. Unset it (env -u AITM_AUDIT_LOG) and retry.`,
+        `live-env: AITM_AUDIT_LOG is set to a value other than off in this environment; it would override mcp.audit_log and send this core's general audit log outside ${runDirPattern}. Unset it (env -u AITM_AUDIT_LOG) and retry.`,
       );
     }
   }
