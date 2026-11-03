@@ -358,7 +358,9 @@ struct CaptureSettings: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     // The same action as Proxy ▸ Scope… (one home: `Session.openScopeForEditing`).
-                    Button("Open Scope…") { session.openScopeForEditing() }
+                    Button("Open Scope…") {
+                        session.openScopeForEditing()
+                    }
                 }
                 if let reason = capability.degradedReason {
                     Text(reason)

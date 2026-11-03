@@ -430,7 +430,11 @@ has "security-3 the poll loop refreshes the scope so the advice never argues wit
 has "NS-AC2 Settings computes the advice from the published capability, support and live scope" "$settings_code" 'CaptureAdvice.make('
 has "NS-AC2 Settings shows the empty-scope callout only when the advice offers Scope" "$settings_code" 'if advice.offersScope {'
 has "NS-AC2 Settings offers Open Scope" "$settings_code" 'Button("Open Scope'
-has "NS-AC2 Open Scope goes to the Scope page like Proxy > Scope" "$settings_code" 'session.show(.scope)'
+# One home for "open Scope to edit" (plan 2026-10-31-macos-scope-persistence row 23): Settings calls the same
+# Session action as Proxy > Scope..., and that action is where the page navigation lives.
+has "NS-AC2 Open Scope goes to the Scope page like Proxy > Scope" "$settings_code" 'session.openScopeForEditing()'
+has "NS-AC2 the one open-Scope action navigates to the page" "$(code_lines Sources/Aitmproxy/Session.swift)" 'func openScopeForEditing()'
+has "NS-AC2 the one open-Scope action lands on the Scope page" "$(body_of Sources/Aitmproxy/Session.swift 'func openScopeForEditing[(]')" 'show(.scope)'
 has "NS-AC3 the Apps banner view exists" "$shell_code" 'struct AppsAttributionBanner: View'
 has "NS-AC3 the Apps empty state view exists" "$shell_code" 'struct AppsEmptyState: View'
 banner_body=$(body_of "$shell" 'struct AppsAttributionBanner: View')
@@ -485,11 +489,11 @@ has "NS-AC2 the callout reads the advice detail" "$cap_body" 'advice.detail'
 cap_status=$(line_of "$cap_body" 'LabeledContent[(]"Status"[)]')
 cap_gate=$(line_of "$cap_body" 'if advice[.]offersScope [{]')
 cap_button=$(line_of "$cap_body" 'Button[(]"Open Scope')
-cap_show=$(line_of "$cap_body" 'session[.]show[(][.]scope[)]')
+cap_show=$(line_of "$cap_body" 'session[.]openScopeForEditing[(][)]')
 cap_reason=$(line_of "$cap_body" 'if let reason = capability[.]degradedReason')
 ordered "NS-AC2 the callout comes after the Status row" "$cap_status" "$cap_gate"
 ordered "NS-AC2 Open Scope sits inside the callout's offersScope gate" "$cap_gate" "$cap_button"
-ordered "NS-AC2 Open Scope calls session.show(.scope)" "$cap_button" "$cap_show"
+ordered "NS-AC2 Open Scope calls session.openScopeForEditing()" "$cap_button" "$cap_show"
 ordered "NS-AC2 the callout closes before the degraded reason line" "$cap_show" "$cap_reason"
 
 # NS-AC3/4: the two Apps surfaces. Each is advice-driven, offers each action only through its gate,
@@ -507,7 +511,7 @@ apps_surface() { # apps_surface <label> <struct body>
     ordered "NS-AC3 $label offers Open Scope only inside the offersScope gate" "$g" "$b"
     ordered "NS-AC3 $label's Settings branch follows the Scope branch" "$b" "$sg"
     ordered "NS-AC3 $label offers Open Settings only inside the offersSettings gate" "$sg" "$sb"
-    has "NS-AC3 $label's Open Scope opens the Scope page" "$(grep -F 'Button("Open Scope' <<<"$body")" 'session.show(.scope)'
+    has "NS-AC3 $label's Open Scope opens the Scope page" "$(grep -F 'Button("Open Scope' <<<"$body")" 'session.openScopeForEditing()'
     has "NS-AC3 $label's Open Settings opens Settings (from its button on, in whatever shape the closure takes)" "$(awk -F: -v a="$sb" '$1 >= a' <<<"$body")" 'openSettings()'
     hasnt "NS-AC3 $label has no hard-coded extension wording (the advice owns the words)" "$body" '"[^"]*[Ee]xtension'
     hasnt "NS-AC4 $label never toggles capture or reads its stored choice" "$body" \
