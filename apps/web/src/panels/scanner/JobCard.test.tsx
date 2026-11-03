@@ -276,6 +276,32 @@ describe('JobCard: the comp', () => {
     expect(card.querySelector('[data-field="stopped-raw"]')).toBeNull();
   });
 
+  it('scheduling_card: the phase line sits in the empty track as .phaseLine, after the cap; a queued job has it alone', () => {
+    // Auditing with nothing scheduled yet (D11 §2): the cap, then `Scheduling checks` inside the empty track.
+    const h = mount(factsOf(compStatus({ checks: { scheduled: 0, done: 0, running: [] } })));
+    const lane = h.field('lane');
+    expect(lane.getAttribute('aria-valuenow')).toBeNull();
+    expect(lane.getAttribute('aria-valuetext')).toBe('Scheduling checks');
+    const track = lane.querySelector(`.${css.track}`)!;
+    expect(track.querySelector(`.${css.crawl}`)).not.toBeNull();
+    expect(track.querySelector(`.${css.audit}`)).toBeNull();
+    const phase = h.field('phase');
+    expect(phase.textContent).toBe('Scheduling checks');
+    expect(phase.classList.contains(css.phaseLine!)).toBe(true);
+    expect(phase.classList.contains(css.toGo!)).toBe(false);
+    expect(h.card().querySelector('[data-field=to-go]')).toBeNull();
+    // The cap precedes the line in the track, so the sheet's `.crawl ~ .phaseLine` offset applies.
+    expect(phase.previousElementSibling?.classList.contains(css.crawl!)).toBe(true);
+
+    // Queued: the empty track with the phase line centred inside, no cap, no mark.
+    h.setFacts(factsOf(compStatus({ state: 'queued', phase: 'queued', checks: { scheduled: 0, done: 0, running: [] } })));
+    const queued = h.field('phase');
+    expect(queued.textContent).toBe('Waiting for the engine to start this job.');
+    expect(queued.classList.contains(css.phaseLine!)).toBe(true);
+    expect(h.field('lane').querySelector(`.${css.crawl}`)).toBeNull();
+    expect(h.field('lane').querySelector(`.${css.nowMark}`)).toBeNull();
+  });
+
   it('cancelling_card: the chip breathes, the primary verb reads Cancelling… and is off, the now dot is still', () => {
     const h = mount(factsOf(compStatus({ state: 'cancelling' })));
     const card = h.card();

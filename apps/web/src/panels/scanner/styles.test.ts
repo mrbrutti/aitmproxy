@@ -293,6 +293,7 @@ const REQUIRED_JOBS = [
   'segLabel',
   'segSub',
   'toGo',
+  'phaseLine',
   'nowMark',
   'nowDot',
   'nowTag',
@@ -534,6 +535,8 @@ describe('jobs.module.css (Jobs view D18 W2)', () => {
       ".part[data-role='figure']",
       ".part[data-role='checkId']",
       ".part[data-role='agent']",
+      '.kv > span:first-child',
+      '.crawl ~ .phaseLine',
       JOBS_GRID,
       'width: calc((100% - var(--jobs-crawl-cap)) * var(--jobs-f, 0));',
       'stroke-dasharray: 1;',
@@ -550,6 +553,15 @@ describe('jobs.module.css (Jobs view D18 W2)', () => {
     expect(all.find((b) => b.selector === ".gauge[data-warn='true'] .gaugeFill")?.body).toContain('background: var(--color-intercept-base)');
     expect(all.find((b) => b.selector === "[data-ink='muted']")?.body).toContain('color: var(--color-text-tertiary)');
     expect(all.find((b) => b.selector === '.row:hover .hoverCancel')?.body).toContain('opacity: 1');
+    // Gap 77: the well key in the secondary ink (the comp's `.kv span:first-child{color:var(--muted)}`); the
+    // phase line centred inside the empty track in the secondary ink (D11 §2), moved right of the cap when
+    // the scheduling variant draws one.
+    expect(all.find((b) => b.selector === '.kv > span:first-child')?.body).toContain('color: var(--color-text-secondary)');
+    const phaseLine = all.find((b) => b.selector === '.phaseLine')?.body ?? '';
+    expect(phaseLine).toContain('color: var(--color-text-secondary)');
+    expect(phaseLine).toContain('justify-content: center');
+    expect(phaseLine).toContain('align-items: center');
+    expect(all.find((b) => b.selector === '.crawl ~ .phaseLine')?.body).toContain('left: var(--jobs-crawl-cap)');
     // The table and its header share one grid.
     expect(source.split(JOBS_GRID).length - 1).toBe(1);
     expect(all.find((b) => b.body.includes(JOBS_GRID))?.selector.replace(/\s+/g, ' ')).toBe('.head, .row');

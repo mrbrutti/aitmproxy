@@ -95,10 +95,17 @@ export const JobsView: Component = () => {
   );
 
   let root: HTMLDivElement | undefined;
-  /** Enter in the listbox: the card's first enabled verb, else the card itself (D14). */
+  /**
+   * Enter in the listbox: the card's primary verb (`Cancel scan <job>` / `Scan again <job>`) when
+   * enabled, else its first enabled verb, else the card itself (D14 as gap 77 amends it: the comp
+   * lists Show Site Map and Show Issues before the primary, and the mac's Return goes to Cancel Scan).
+   */
   const focusCard = (): void => {
     const card = root?.querySelector<HTMLElement>('section[role=region][aria-label="Selected job"]');
-    const verb = card?.querySelector<HTMLElement>('button:not([disabled])');
+    const primary = card?.querySelector<HTMLElement>(
+      'button[aria-label^="Cancel scan "]:not([disabled]), button[aria-label^="Scan again "]:not([disabled])',
+    );
+    const verb = primary ?? card?.querySelector<HTMLElement>('button:not([disabled])');
     (verb ?? card)?.focus({ preventScroll: true });
   };
 

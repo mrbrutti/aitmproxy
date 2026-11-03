@@ -382,14 +382,14 @@ export const JobCard: Component<JobCardProps> = (props) => {
                   </div>
                 </Show>
                 <Show when={schedulingInTrack()}>
-                  <span class={css.toGo} data-field="phase">
+                  <span class={css.phaseLine} data-field="phase">
                     {progress().phaseLine}
                   </span>
                 </Show>
               </Show>
               {/* Queued, passive, or before the status lands: the phase line inside the empty track. */}
               <Show when={phaseInTrack()}>
-                <span class={css.toGo} data-field="phase">
+                <span class={css.phaseLine} data-field="phase">
                   {progress().phaseLine}
                 </span>
               </Show>

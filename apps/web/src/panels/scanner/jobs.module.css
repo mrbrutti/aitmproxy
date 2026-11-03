@@ -8,7 +8,7 @@
    Markup the rules assume (Tasks 3.8–3.8c read this sheet):
    .jobs > .banner, section.card[data-tone][data-entrance] > (.titleRow.enter, .scanAgainError,
    .lane.enter > (.track > (.crawl, .audit[--jobs-f] > (.segLabel, .segSub, .nowMark > .nowDot, .nowTag),
-   .toGo, .endSentence.endSwap), .scale, .ledger > .group > (.mark[data-severity]*, .ledgerWord.sev),
+   .toGo | .phaseLine, .endSentence.endSwap), .scale, .ledger > .group > (.mark[data-severity]*, .ledgerWord.sev),
    .gauge[data-warn] > (span, .track > .gaugeFill, span)), .kpis.enter > .kpi > (.kpiLabel, .kpiValue >
    (.tick, .kpiUnit | .sev)), .attention), .head > .cell*9, .rows[role=listbox].enter > .row > .cell*9,
    .wells.enter > .well > (.wellTitle > .wellSub, .kv*). The now mark and the now tag are children of the
@@ -331,6 +331,24 @@
   font-size: var(--font-size-sm);
   line-height: var(--line-height-tight);
   white-space: nowrap;
+}
+/* The phase line (`Waiting for the engine…`, `Passive checks…`, `Scheduling checks`) centred inside the
+   empty track in the secondary ink (D11 §2); when the scheduling variant draws the crawl cap, the line
+   is centred in what is left of the track, right of the cap. Gap 77. */
+.phaseLine {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-tight);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.crawl ~ .phaseLine {
+  left: var(--jobs-crawl-cap);
 }
 /* The now mark rides the audit fill's trailing edge: a 2 px bar in the primary ink overshooting the
    track by 10 px, with a 12 % halo; its dot sits on the top end and breathes while the job is live. */
@@ -793,6 +811,11 @@
   border-top: var(--jobs-hairline) solid var(--color-line-rule);
   font-size: var(--font-size-md);
   white-space: nowrap;
+}
+/* The key in the secondary ink (the comp's `.kv span:first-child{color:var(--muted)}`; D11: keys are
+   secondary, values primary). Gap 77. */
+.kv > span:first-child {
+  color: var(--color-text-secondary);
 }
 
 /* ---------- Reduce Motion (D12's right-hand column). base.css zeroes every duration with `!important`

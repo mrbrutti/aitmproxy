@@ -412,9 +412,21 @@ describe('JobsView: keyboard and the entrance (W-17, D12)', () => {
     expect(h.s.selectedJob()).toBe(JOB);
 
     fireEvent.keyDown(list, { key: 'Enter' });
-    // The card's first enabled verb takes focus (D14).
+    // The card's primary verb takes focus (D14 as gap 77 amends it: the primary, else the first enabled):
+    // Cancel on a live job, though the comp lists Show Site Map and Show Issues before it.
     expect(h.region().contains(document.activeElement)).toBe(true);
     expect(document.activeElement).toBe(h.cancelButton(h.region(), JOB));
+
+    // A done job: Enter focuses Scan Again, the terminal primary.
+    h.reply('scan.status', (args) => (args.job === DONE ? doneStatus() : statusFixture()));
+    list.focus();
+    fireEvent.keyDown(list, { key: 'ArrowDown' });
+    await tick();
+    expect(h.region().getAttribute('data-job')).toBe(DONE);
+    fireEvent.keyDown(list, { key: 'Enter' });
+    const again = within(h.region()).getByRole('button', { name: `Scan again ${DONE}` }) as HTMLButtonElement;
+    expect(again.disabled).toBe(false);
+    expect(document.activeElement).toBe(again);
   });
 
   it('entrance_follows_the_pointer_not_the_keyboard: a click bumps the generation and plays, an arrow changes the job without either, a start plays again', async () => {
