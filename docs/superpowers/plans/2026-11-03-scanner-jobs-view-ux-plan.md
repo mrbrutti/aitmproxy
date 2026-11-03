@@ -368,7 +368,7 @@ forbidden in the Jobs views (AC32).
 - **Satisfies:** AC13, AC15, AC17, AC20, AC22, AC23, AC25, AC28, AC32, AC44, AC45 mapped to tests and gate commands
 - **Depends on:** Tasks 2.1–2.10
 - **Files:** `apps/mac/Tests/AitmproxyKitTests/ScanSurfaceTests.swift` (strengthen only)
-- **Change:** run the mac gate, the Rust gate (Terminal, log kept), the AC22/AC23/AC32 greps over the four view files; confirm the parity-pin rows P1–P23 exist in `ScanSurfaceTests`; quote every output.
+- **Change:** run the mac gate, the Rust gate (Terminal, log kept), the AC22/AC23/AC32 greps over the four view files; confirm the parity-pin rows P1–P14 exist in `ScanJobsFactsTests` and P15–P23 in `ScanSurfaceTests`; quote every output.
 - **Done when:** the report quotes all of it green.
 
 ### Task 2.12: Panel review, Part 2
