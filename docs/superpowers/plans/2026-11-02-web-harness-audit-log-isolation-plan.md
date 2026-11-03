@@ -1,6 +1,6 @@
 # Web live-harness audit-log isolation implementation plan
 
-**Status:** draft
+**Status:** approved (autonomous mode, 2026-11-02)
 **Spec:** `docs/superpowers/specs/2026-11-02-web-harness-audit-log-isolation.md`
 **Branch / worktree:** `fix/web-harness-audit-log` at
 `/Users/matt/Security/aitmproxy/.claude/worktrees/scan-jobs-ux-9202be/.claude/worktrees/web-harness-audit-log`
@@ -56,14 +56,22 @@ never `git add -A`. The gate for this branch is `npm run build && npm test` from
   `apps/web/src/panels/scanner/live-env.audit-log.test.ts` (modify, append)
 - **Change:** spec Design 3, exactly: `renderConfig({ ..., auditLogDir: dir })`;
   `assertAuditLogIsolated(cfg, dir)` after `writeFileSync(cfg, ...)` and before `spawn(aitmBin, ...)`;
-  spawn env `{ ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info' }`; the `console.error` warning
-  when `process.env.AITM_AUDIT_LOG !== undefined`; the doc comment names both behaviours. Callers untouched.
+  spawn env `{ ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info' }`; before `renderConfig`, the
+  `process.env.AITM_AUDIT_LOG` check of spec Design 3 (undefined: nothing; `off`: the `console.error` warning;
+  anything else: `throw new Error(<abort message>)` before any file or dir is written, the value never echoed);
+  the doc comment names all three behaviours. Callers untouched.
 - **Test:** `startAitm wires the guard before the spawn and no longer forces the audit log off`: reads
   `live-env.mjs` as text (`readFileSync` on the resolved path), slices from `export async function startAitm(`
   to the next `\nexport `, and asserts: `indexOf('assertAuditLogIsolated(cfg, dir)')` is `>= 0` and less
   than `indexOf('spawn(aitmBin')`; contains `auditLogDir: dir`; does not contain
   `AITM_AUDIT_LOG: process.env.AITM_AUDIT_LOG ?? 'off'`; contains
-  `live-env: AITM_AUDIT_LOG is set in this environment and overrides mcp.audit_log; this core's general audit log may not be in `.
+  `live-env: AITM_AUDIT_LOG=off is set in this environment; this core writes no general audit log (mcp.audit_log in ` and
+  `live-env: AITM_AUDIT_LOG is set to a value other than off in this environment; it would override mcp.audit_log and send this core's general audit log outside `.
+  Second test `startAitm refuses an inherited AITM_AUDIT_LOG other than off before writing anything`: with
+  `process.env.AITM_AUDIT_LOG = 'on'` (saved and restored in `finally`) `await startAitm({ aitmBin: '/nonexistent/aitm' })`
+  rejects with a message starting `live-env: AITM_AUDIT_LOG is set to a value other than off`; with `'off'` it rejects with
+  the binary-not-found message (`aitm binary not found at /nonexistent/aitm`) and `console.error` (spied) received the
+  `off` warning once; with the variable deleted it rejects with the binary-not-found message and `console.error` was not called.
   Red before the edit, green after.
 - **Done when:** red/green quoted; `npm run build && npm test` exit 0; `git -C "$WT" diff --stat BASE` lists
   only `live-env.mjs` and the new test file (plus the spec and plan); one commit.
@@ -107,8 +115,8 @@ never `git add -A`. The gate for this branch is `npm run build && npm test` from
   snap > "$EV/real-before.txt"
   touch "$EV/.marker"
   cd "$WT/apps/web"
-  env -u AITM_AUDIT_LOG AITM_BIN="$WT/target/debug/aitm" \
-    AITM_TESTTARGET_BIN="$WT/target/debug/aitm-testtarget-serve" \
+  env -u AITM_AUDIT_LOG AITM_BIN="$WT/target/release/aitm" \
+    AITM_TESTTARGET_BIN="$WT/target/release/aitm-testtarget-serve" \
     node scripts/scan-live.mjs > "$EV/scan-live.log" 2>&1
   echo "scan-live exit $?" >> "$EV/scan-live.log"
   snap > "$EV/real-after.txt"
