@@ -956,3 +956,43 @@ AXStaticText		Unable to scan again: A scan on this origin is already running
 [18:56:03] second light-http cancelled (cleanup)
 [18:56:03] real audit log size after: 94174 (before 94174) -> #310 PASS
 [18:56:03] == evidence copy
+[18:56:03] == done pass A6; quitting the bundle (quit-when-idle rule)
+down
+[18:56:06] targets stopped
+[19:01:11] == pass A7 (relaunch): app and core from the bundle tree 282cb428 = feat/scan-jobs-view-redesign 549ffa9d + #310
+[19:01:11] real audit log size before: 94174
+share
+app pid 35590
+core pid 35600 proxy port 61155 bus 127.0.0.1:61160
+[19:01:27] #310 PASS: audit log under the isolated store
+pressed AXButton 'Not Now' -> 0
+resize result 0 now 1440x900
+pressed Proxy > Scan -> 0
+pressed AXButton 'Jobs' -> 0
+[19:01:33] standard job scan-2cefcd3e (row 2 after the next start)
+[19:01:41] standard job scan-8e98dee9 (row 1, newest; selected by the start)
+left-clicked 3285 -541 in pid 35590 via HID tap
+selected now: scan-job-scan-8e98dee9 (wanted scan-job-scan-8e98dee9)
+[19:02:26] == AC50: entrance on a pointer click of row 2 (scan-2cefcd3e) while row 1 is selected; recording 2.5 s, click at +0.5 s
+left-clicked 3285 -496 in pid 35590 via HID tap
+selected now: scan-job-scan-2cefcd3e (wanted scan-job-scan-2cefcd3e)
+[19:02:29] click at +527 ms (recording clock)
+captured 143 changed frames in 2.5 s -> /tmp/claude/jobsux-proof/pr2/entrance
+110 changed frames, last change at 3067 ms
+[19:03:00] still +0 ms -> frame t531
+[19:03:00] still +60 ms -> frame t588
+[19:03:00] still +120 ms -> frame t662
+[19:03:00] still +180 ms -> frame t720
+[19:03:00] still +240 ms -> frame t777
+[19:03:00] still +300 ms -> frame t828
+[19:03:00] still +400 ms -> frame t929
+[19:03:00] still +600 ms -> frame t1142
+scan-job-scan-8e98dee9	AXButton	selected=nil	focused=nil
+scan-job-scan-2cefcd3e	AXButton	selected=true	focused=nil
+rows: 2
+[19:03:00] jobs cancelled (cleanup)
+[19:03:00] real audit log size after: 94174 (before 94174) -> #310 PASS
+[19:03:00] == done pass A7; quitting the bundle (quit-when-idle rule)
+down
+[19:03:02] targets stopped
+[19:05:31] AC50 pass A7 stills re-cut from the selection change at t01652 (the click's HID event landed ~1.1 s after the recording clock's +527 ms mark: leftclick activates the app first): click+0..+600 ms
