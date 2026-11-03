@@ -134,4 +134,17 @@ describe('ReconnectNote', () => {
     expect(screen.getByRole('status').textContent).toBe(RECONNECT_NOTE);
     expect(RECONNECT_NOTE).toBe('reconnecting: controls are disabled until the bus is back');
   });
+
+  it('reconnect_note_reads_the_jobs_banner (D15, AC38): with an age it is the Kit banner, with null the ageless one, and without the prop the shared sentence', () => {
+    render(() => <ReconnectNote valuesAgeMs={42_000} />);
+    const banner = screen.getByRole('status');
+    expect(banner.textContent).toBe('Bus disconnected · showing values from 0:42 ago · reconnecting…');
+    expect(banner.hasAttribute('data-reconnect')).toBe(true);
+    cleanup();
+    render(() => <ReconnectNote valuesAgeMs={null} />);
+    expect(screen.getByRole('status').textContent).toBe('Bus disconnected · reconnecting…');
+    cleanup();
+    render(() => <ReconnectNote valuesAgeMs={undefined} />);
+    expect(screen.getByRole('status').textContent).toBe(RECONNECT_NOTE);
+  });
 });

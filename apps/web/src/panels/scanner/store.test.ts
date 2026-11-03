@@ -10,7 +10,7 @@ import type { AppStore } from '~/state/app';
 import type { PocRun } from '~/bus/types';
 import { findingsState } from '~/panels/findings/state';
 import { fixture, stubApp } from './testkit';
-import { parseScanProfile, type ScanProfile } from './model';
+import { parseScanProfile, type JobStatus, type ScanProfile } from './model';
 import { scanStore, type ScanStore } from './store';
 
 const JOB = 'scan-1a2b3c4d';
@@ -19,6 +19,16 @@ const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
 
 /** The `standard` built-in, parsed fresh per test so a mutation cannot leak. */
 const standard = (): ScanProfile => parseScanProfile(fixture('scan.profile.get.json'))!;
+
+/** The status fixture as a finished `standard` job against the comp's target (D13, AC37). */
+const finished = (over: Partial<JobStatus> = {}): unknown => ({
+  ...(fixture('scan.status.json') as Record<string, unknown>),
+  state: 'done',
+  phase: 'done',
+  finished_at: 1761900064000,
+  targets: ['http://127.0.0.1:8117'],
+  ...over,
+});
 
 const poc = (id: string, pocPath: string): PocRun => ({
   id,
@@ -327,8 +337,6 @@ describe('scanStore: launch (D-T8.6)', () => {
     expect(h.s.tab()).toBe('jobs');
     expect(h.s.startNotice()!.clamped[0]!.applied).toBe(20000);
     expect(h.notice).toHaveBeenCalledWith('scan-1a2b3c4d started');
-    h.s.dismissStartNotice();
-    expect(h.s.startNotice()).toBeNull();
   });
 
   it('confirm_flow: the dialog is the core prompt, cancel sends nothing, confirm carries the token (W-9)', async () => {
@@ -427,6 +435,137 @@ describe('scanStore: launch (D-T8.6)', () => {
     expect(h.argsOf('scan.start')[1]!._confirm).toBe('t1');
     expect(h.s.pendingConfirm()!.prompt).toBe('P2');
     expect(h.s.pendingConfirm()!.token).toBe('t2');
+  });
+});
+
+describe('scanStore: Scan Again (Jobs view D13, AC37)', () => {
+  it('scan_again_sends_profile_name_and_overrides: the held status names the profile and the origins', async () => {
+    const h = harness();
+    await tick();
+    h.reply('scan.status', finished());
+    await h.s.refreshStatus(JOB);
+    expect(h.s.status(JOB)!.state).toBe('done');
+    h.reply('scan.start', { status: 'needs_confirmation', prompt: 'P', confirm_token: 't1' });
+
+    const first = await h.s.scanAgain(JOB);
+
+    expect(first.kind).toBe('confirm');
+    expect(h.argsOf('scan.start')[0]).toEqual({
+      profile_name: 'standard',
+      overrides: { target: { origins: ['http://127.0.0.1:8117'] } },
+    });
+    expect(Object.keys(h.argsOf('scan.start')[0]!)).toEqual(['profile_name', 'overrides']);
+    const pending = h.s.pendingConfirm()!;
+    expect(pending.prompt).toBe('P');
+    expect(pending.token).toBe('t1');
+    expect(pending.source.kind).toBe('again');
+    if (pending.source.kind !== 'again') throw new Error('expected an again source');
+    expect(pending.source.args).toEqual({
+      profile_name: 'standard',
+      overrides: { target: { origins: ['http://127.0.0.1:8117'] } },
+    });
+
+    h.reply('scan.start', fixture('scan.start.json'));
+    const outcome = await h.s.confirmLaunch();
+
+    expect(outcome.kind).toBe('started');
+    expect(h.argsOf('scan.start')[1]).toEqual({
+      profile_name: 'standard',
+      overrides: { target: { origins: ['http://127.0.0.1:8117'] } },
+      _confirm: 't1',
+    });
+    expect(h.count('scan.start')).toBe(2);
+    expect(h.s.pendingConfirm()).toBeNull();
+    expect(h.s.selectedJob()).toBe(JOB);
+    expect(h.s.tab()).toBe('jobs');
+    expect(h.s.lastError()).toBeNull();
+  });
+
+  it('a direct start result runs through the same after-start path as Start Scan', async () => {
+    const h = harness();
+    await tick();
+    h.reply('scan.status', finished());
+    await h.s.refreshStatus(JOB);
+    h.s.setSelectedJob('scan-55667788');
+
+    const outcome = await h.s.scanAgain(JOB);
+
+    expect(outcome.kind).toBe('started');
+    expect(h.count('scan.start')).toBe(1);
+    expect(h.s.selectedJob()).toBe(JOB);
+    expect(h.notice).toHaveBeenCalledWith('scan-1a2b3c4d started');
+  });
+
+  it('refuses without a held terminal status: "Select a finished job." through report, nothing sent', async () => {
+    const h = harness();
+    await tick();
+    // Nothing held yet for this job.
+    let outcome = await h.s.scanAgain(JOB);
+    expect(outcome.kind).toBe('refused');
+    expect(h.s.lastError()).toEqual({ source: 'launch', code: null, text: 'Select a finished job.' });
+    expect(h.notice).toHaveBeenCalledWith('Select a finished job.', 'error');
+
+    // Held, but still running (the fixture's state).
+    await h.s.refreshStatus(JOB);
+    expect(h.s.status(JOB)!.state).toBe('running');
+    outcome = await h.s.scanAgain(JOB);
+    expect(outcome.kind).toBe('refused');
+    if (outcome.kind !== 'refused') throw new Error('expected refused');
+    expect(outcome.message).toBe('Select a finished job.');
+    expect(h.count('scan.start')).toBe(0);
+    expect(h.s.pendingConfirm()).toBeNull();
+  });
+
+  it('a core refusal of Scan Again is reported under launch, never softened', async () => {
+    const h = harness();
+    await tick();
+    h.reply('scan.status', finished({ profile_name: '' }));
+    await h.s.refreshStatus(JOB);
+    h.fail('scan.start', 'scan: invalid_profile: no profile named');
+
+    const outcome = await h.s.scanAgain(JOB);
+
+    expect(outcome.kind).toBe('refused');
+    expect(h.argsOf('scan.start')[0]).toEqual({ profile_name: '', overrides: { target: { origins: ['http://127.0.0.1:8117'] } } });
+    expect(h.s.lastError()).toEqual({ source: 'launch', code: 'invalid_profile', text: 'Invalid profile: no profile named' });
+    expect(h.s.busy()).toBe(false);
+  });
+
+  it('a stale Scan Again token re-runs the Scan Again handshake, not a profile launch', async () => {
+    const h = harness();
+    await tick();
+    h.reply('scan.status', finished());
+    await h.s.refreshStatus(JOB);
+    let prompts = 0;
+    h.reply('scan.start', (args) => {
+      if (typeof args._confirm === 'string') return Promise.reject(new Error('scan: confirm_required: stale'));
+      prompts += 1;
+      return { status: 'needs_confirmation', prompt: `P${prompts}`, confirm_token: `t${prompts}` };
+    });
+
+    await h.s.scanAgain(JOB);
+    const outcome = await h.s.confirmLaunch();
+
+    expect(outcome.kind).toBe('confirm');
+    expect(h.s.lastError()!.code).toBe('confirm_required');
+    expect(h.count('scan.start')).toBe(3);
+    for (const args of h.argsOf('scan.start')) {
+      expect(args.profile_name).toBe('standard');
+      expect(args.profile).toBeUndefined();
+    }
+    expect(h.s.pendingConfirm()!.source.kind).toBe('again');
+    expect(h.s.pendingConfirm()!.token).toBe('t2');
+  });
+
+  it('a Start Scan confirmation carries a profile source', async () => {
+    const h = harness({ replies: { 'scan.map': { status: 'needs_confirmation', prompt: 'P', confirm_token: 't1' } } });
+    const profile = standard();
+    await h.s.launch(profile, 'map');
+    const pending = h.s.pendingConfirm()!;
+    expect(pending.source.kind).toBe('profile');
+    if (pending.source.kind !== 'profile') throw new Error('expected a profile source');
+    expect(pending.source.mode).toBe('map');
+    expect(pending.source.profile).toEqual(profile);
   });
 });
 
@@ -556,5 +695,25 @@ describe('scanStore: crossing into the rest of the app (D-T8.8, D-T8.9)', () => 
     expect(h.refreshSide).toHaveBeenCalledTimes(1);
     expect(h.notice).toHaveBeenCalledWith('PoC missing is not in the Findings list', 'error');
     expect(h.setSidebar).not.toHaveBeenCalled();
+  });
+});
+
+describe('scanStore: the clock (Jobs view D6 amendment, D16, AC38)', () => {
+  it('now_ms_ticks_once_a_second_and_stops_on_dispose: the store owns the one timer the banner age reads', async () => {
+    const T = Date.UTC(2026, 9, 31, 14, 3, 22);
+    vi.setSystemTime(T);
+    const h = harness();
+    expect(h.s.nowMs()).toBe(T);
+    await tick(1_000);
+    expect(h.s.nowMs()).toBe(T + 1_000);
+    await tick(1_000);
+    expect(h.s.nowMs()).toBe(T + 2_000);
+    // Nothing between the ticks moves it: the clock is the interval's, not every read's.
+    vi.setSystemTime(T + 2_500);
+    expect(h.s.nowMs()).toBe(T + 2_000);
+
+    h.s.dispose();
+    await tick(3_000);
+    expect(h.s.nowMs()).toBe(T + 2_000);
   });
 });

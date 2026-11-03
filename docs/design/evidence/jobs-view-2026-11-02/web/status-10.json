@@ -1,0 +1,206 @@
+{
+  "job": "scan-9b98b419",
+  "cancelled": {
+    "checks": {
+      "done": 467,
+      "error_samples": [
+        {
+          "check": "ldapi",
+          "detail": "error: check-ldap-injection:40 — hook 'anon$2d2f2932e702f7c8' failed: probe.send failed: scan: probe failed: probe refused: the job was cancelled\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "d60a7027-d0b3-4e19-a832-aa8948829814:body_param:2"
+        }
+      ],
+      "errors": 1,
+      "running": [],
+      "scheduled": 1072,
+      "skipped": 0,
+      "skipped_samples": []
+    },
+    "clamped": [],
+    "crawl": {
+      "depth": 0,
+      "errors": 0,
+      "forms_skipped": 0,
+      "forms_submitted": 5,
+      "last_error": null,
+      "pages": 33,
+      "queued": 0
+    },
+    "elapsed_ms": 18034,
+    "error": null,
+    "finished_at": 1793728729473,
+    "issues": {
+      "by_confidence": {
+        "certain": 1,
+        "firm": 2,
+        "tentative": 1
+      },
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "info": 0,
+        "low": 4,
+        "medium": 0
+      },
+      "total": 4
+    },
+    "job": "scan-9b98b419",
+    "l4": null,
+    "lanes": {
+      "requested": [
+        "http",
+        "ws"
+      ],
+      "run": [
+        "http",
+        "ws"
+      ],
+      "skipped": []
+    },
+    "phase": "done",
+    "points": {
+      "audited": 6,
+      "found": 154,
+      "queued": 1072,
+      "skipped": {
+        "frequent": 66,
+        "ignored": 0,
+        "limit": 0
+      }
+    },
+    "probes": {
+      "budget": 2000,
+      "by_lane": {
+        "http": 44
+      },
+      "errors": 0,
+      "rate_waits": 0,
+      "sent": 44,
+      "timeouts": 0
+    },
+    "profile_name": "standard",
+    "session": {
+      "browser_partial": false,
+      "canary": {
+        "kind": "none"
+      },
+      "lost": false,
+      "reused": false
+    },
+    "started_at": 1793728711439,
+    "started_by": {
+      "client_label": "web-bridge",
+      "frontend": "operator"
+    },
+    "state": "cancelled",
+    "stopped_reason": "cancelled",
+    "targets": [
+      "http://127.0.0.1:53356"
+    ]
+  },
+  "final": {
+    "checks": {
+      "done": 467,
+      "error_samples": [
+        {
+          "check": "ldapi",
+          "detail": "error: check-ldap-injection:40 — hook 'anon$2d2f2932e702f7c8' failed: probe.send failed: scan: probe failed: probe refused: the job was cancelled\n  help: the flow was forwarded unchanged. Fix the hook and reload the script.",
+          "point": "d60a7027-d0b3-4e19-a832-aa8948829814:body_param:2"
+        }
+      ],
+      "errors": 1,
+      "running": [],
+      "scheduled": 1072,
+      "skipped": 0,
+      "skipped_samples": []
+    },
+    "clamped": [],
+    "crawl": {
+      "depth": 0,
+      "errors": 0,
+      "forms_skipped": 0,
+      "forms_submitted": 5,
+      "last_error": null,
+      "pages": 33,
+      "queued": 0
+    },
+    "elapsed_ms": 18034,
+    "error": null,
+    "finished_at": 1793728729473,
+    "issues": {
+      "by_confidence": {
+        "certain": 1,
+        "firm": 2,
+        "tentative": 1
+      },
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "info": 0,
+        "low": 4,
+        "medium": 0
+      },
+      "total": 4
+    },
+    "job": "scan-9b98b419",
+    "l4": null,
+    "lanes": {
+      "requested": [
+        "http",
+        "ws"
+      ],
+      "run": [
+        "http",
+        "ws"
+      ],
+      "skipped": []
+    },
+    "phase": "done",
+    "points": {
+      "audited": 6,
+      "found": 154,
+      "queued": 1072,
+      "skipped": {
+        "frequent": 66,
+        "ignored": 0,
+        "limit": 0
+      }
+    },
+    "probes": {
+      "budget": 2000,
+      "by_lane": {
+        "http": 44
+      },
+      "errors": 0,
+      "rate_waits": 0,
+      "sent": 44,
+      "timeouts": 0
+    },
+    "profile_name": "standard",
+    "session": {
+      "browser_partial": false,
+      "canary": {
+        "kind": "none"
+      },
+      "lost": false,
+      "reused": false
+    },
+    "started_at": 1793728711439,
+    "started_by": {
+      "client_label": "web-bridge",
+      "frontend": "operator"
+    },
+    "state": "cancelled",
+    "stopped_reason": "cancelled",
+    "targets": [
+      "http://127.0.0.1:53356"
+    ]
+  },
+  "rendered": {
+    "chip": "Cancelled",
+    "rowState": "Cancelled",
+    "end": "Cancelled after 0:18; 467 of 1,072 checks had run. What it found stays.",
+    "stopped": null,
+    "rowProgress": "467 of 1,072"
+  }
+}

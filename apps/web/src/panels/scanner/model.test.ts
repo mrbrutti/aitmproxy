@@ -9,7 +9,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  MAX_SAMPLES,
   SCAN_ERROR_CODES,
+  STAMP_MAX,
+  STR_MAX,
+  TARGET_MAX,
+  TOKEN_MAX,
+  boundedStr,
   parseCheckMeta,
   parseChecksResult,
   parseInsertionPoint,
@@ -83,6 +89,193 @@ describe('parseJobStatus', () => {
     const status = parseJobStatus(fixture('scan.cancel.json'));
     expect(status!.state).toBe('cancelling');
     expect(status!.stopped_reason).toBe('cancelled');
+  });
+
+  // Spec AC33 (D18 W1), the web copy of AC1 and AC2: the check-error and crawl-error fields the
+  // Jobs view's sentences read, with 0 / [] / null defaults so an older core still parses.
+  it('reads check errors, samples, skips and the crawl last_error', () => {
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const checks = {
+      scheduled: 4,
+      done: 3,
+      running: [],
+      errors: 7,
+      error_samples: [{ check: 'http.xss', point: 'p1', detail: 'Connection refused (os error 61)' }],
+      skipped: 3,
+      skipped_samples: [{ check: 'fake.point', point: 'p2', detail: 'the lane hosts nothing' }],
+    };
+    const crawl = {
+      pages: 1,
+      queued: 0,
+      depth: 0,
+      forms_submitted: 0,
+      errors: 1,
+      forms_skipped: 2,
+      last_error: 'connect_refused',
+    };
+    const status = parseJobStatus({ ...raw, checks, crawl })!;
+    expect(status.checks.errors).toBe(7);
+    expect(status.checks.error_samples.length).toBe(1);
+    expect(status.checks.error_samples[0]).toEqual({
+      check: 'http.xss',
+      point: 'p1',
+      detail: 'Connection refused (os error 61)',
+    });
+    expect(status.checks.error_samples[0]!.detail).toBe('Connection refused (os error 61)');
+    expect(status.checks.skipped).toBe(3);
+    expect(status.checks.skipped_samples.length).toBe(1);
+    expect(status.checks.skipped_samples[0]!.check).toBe('fake.point');
+    expect(status.crawl.errors).toBe(1);
+    expect(status.crawl.forms_skipped).toBe(2);
+    expect(status.crawl.last_error).toBe('connect_refused');
+
+    // An unknown token is null, not a string the view would print as-is.
+    expect(parseJobStatus({ ...raw, crawl: { ...crawl, last_error: 'weird' } })!.crawl.last_error).toBeNull();
+
+    // The fixture pack predates these keys: 0, [], 0, [], null.
+    const old = parseJobStatus(raw)!;
+    expect(old.checks.errors).toBe(0);
+    expect(old.checks.error_samples).toEqual([]);
+    expect(old.checks.skipped).toBe(0);
+    expect(old.checks.skipped_samples).toEqual([]);
+    expect(old.crawl.last_error).toBeNull();
+
+    // A sample missing a key reads it as '' (the engine's `#[serde(default)]`); a non-object
+    // sample is dropped, not kept as a half-built row.
+    const sparse = parseJobStatus({
+      ...raw,
+      checks: { ...checks, error_samples: [{ check: 'http.xss' }, 'junk', null, 7] },
+    })!;
+    expect(sparse.checks.error_samples).toEqual([{ check: 'http.xss', point: '', detail: '' }]);
+  });
+
+  it('bounds every Jobs string and sample list', () => {
+    // Task 3.1b (gap 74, web AC1b): the Kit's `ScanWire` bounds, mirrored. A control or format
+    // scalar and a line/paragraph separator never reach a row; a text is cut to its cap in code
+    // points; a sampled list is cut to the engine's own cap of 8.
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const detail = `${'a'.repeat(300)}\u0000${'b'.repeat(300)}\t${'c'.repeat(200)}\u2028${'d'.repeat(197)}`;
+    expect(detail.length).toBe(1000);
+    const sample = (i: number) => ({ check: `check-${i}`, point: `p${i}`, detail: `d${i}` });
+    const nine = (f: (i: number) => unknown) => Array.from({ length: 9 }, (_, i) => f(i));
+    const status = parseJobStatus({
+      ...raw,
+      profile_name: 'p'.repeat(100),
+      started_by: { frontend: 'operator', client_label: 'x'.repeat(100) },
+      checks: {
+        scheduled: 4,
+        done: 3,
+        running: nine((i) => `http.check-${i}`),
+        errors: 9,
+        error_samples: [{ check: 'http.xss', point: 'p1', detail }, ...nine(sample).slice(1)],
+        skipped: 9,
+        skipped_samples: nine(sample),
+      },
+      lanes: {
+        requested: ['http', 'ws'],
+        run: ['http'],
+        skipped: nine((i) => ({ lane: 'ws', reason: `r${i}\u202E${'z'.repeat(500)}` })),
+      },
+      clamped: nine((i) => ({ field: `budget.f${i}.${'q'.repeat(100)}`, requested: 9, applied: 1 })),
+      error: `${'e'.repeat(500)}\n${'f'.repeat(500)}`,
+    })!;
+
+    // 1,000 chars with a NUL, a tab and U+2028 inside: exactly 400 clean chars, the first 400 kept.
+    const bounded = status.checks.error_samples[0]!.detail;
+    expect(bounded).toBe('a'.repeat(300) + 'b'.repeat(100));
+    expect(bounded.length).toBe(400);
+    expect(bounded).not.toMatch(/[\u0000\t\u2028]/);
+    expect(MAX_SAMPLES).toBe(8);
+    expect(STR_MAX).toBe(400);
+    expect(TOKEN_MAX).toBe(64);
+
+    // Nine samples, nine running ids, nine skipped lanes, nine clamps: eight each, the first eight.
+    expect(status.checks.error_samples.length).toBe(8);
+    expect(status.checks.error_samples[7]).toEqual({ check: 'check-7', point: 'p7', detail: 'd7' });
+    expect(status.checks.skipped_samples.length).toBe(8);
+    expect(status.checks.running.length).toBe(8);
+    expect(status.checks.running[7]).toBe('http.check-7');
+    expect(status.lanes.skipped.length).toBe(8);
+    expect(status.clamped.length).toBe(8);
+
+    // Tokens cut to 64; details to 400; `error` keeps its first 400 clean chars with the newline gone.
+    expect(status.started_by.client_label).toBe('x'.repeat(64));
+    expect(status.profile_name).toBe('p'.repeat(64));
+    expect(status.clamped[0]!.field).toBe(`budget.f0.${'q'.repeat(54)}`);
+    expect(status.lanes.skipped[0]!.reason).toBe(`r0${'z'.repeat(398)}`);
+    expect(status.error).toBe('e'.repeat(400));
+
+    // Code points, not UTF-16 units: 401 astral scalars cut to 400 (800 units), none split in half.
+    const astral = parseJobStatus({
+      ...raw,
+      checks: { scheduled: 1, done: 0, running: [], error_samples: [{ check: '😀'.repeat(401) }] },
+    })!;
+    expect([...astral.checks.error_samples[0]!.check].length).toBe(400);
+    expect(astral.checks.error_samples[0]!.check).toBe('😀'.repeat(400));
+
+    // The fixture is under every cap and carries no such scalar: it reads as before.
+    const same = parseJobStatus(raw)!;
+    expect(same.profile_name).toBe('standard');
+    expect(same.started_by.client_label).toBe('web-ui');
+    expect(same.checks.running).toEqual(['http.reflected-xss', 'http.sqli-error']);
+    expect(same.lanes.skipped).toEqual([{ lane: 'ws', reason: 'lane not available on this build' }]);
+    expect(same.clamped).toEqual([]);
+    expect(same.error).toBeNull();
+  });
+
+  it('boundedStr and STAMP_MAX are the one cleaning rule the helpers share (gap 79)', () => {
+    expect(STAMP_MAX).toBe(8.64e15);
+    // Control, format, line and paragraph separators go; the cut is in code points, so an astral scalar is never split.
+    expect(boundedStr('a\u0000b\tc\u202Ed\u2028e', 10)).toBe('abcde');
+    expect(boundedStr('\u{1F600}\u{1F600}\u{1F600}', 2)).toBe('\u{1F600}\u{1F600}');
+    expect(boundedStr('abcdef', 3)).toBe('abc');
+    expect(boundedStr('abc', 3)).toBe('abc');
+    expect(boundedStr(5, 3)).toBe('');
+    expect(boundedStr(null, 3)).toBe('');
+  });
+
+  it('bounds targets to 200 chars and 8 entries and rejects a stamp no date holds', () => {
+    // Task 3.1c (gap 78, web AC1b): the Kit's `ScanWire.targetMax` (200) and `listMax` (8) on
+    // `targets`, which Task 3.1b left on `strList`; and a millisecond stamp that is not an integer
+    // in `0 … 8.64e15` (what `Date` holds) reads 0, the card's "unknown", so `clock` never prints
+    // `00:00` for garbage.
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const host = `${'a'.repeat(5000)}\u202E${'b'.repeat(4999)}`;
+    expect(host.length).toBe(10_000);
+    expect(TARGET_MAX).toBe(200);
+
+    // 10,000 chars with a bidi override: the first 200 clean chars (`http://` and 193 of the host).
+    const one = parseJobStatus({ ...raw, targets: [`http://${host}:8117`] })!;
+    expect(one.targets).toEqual([`http://${'a'.repeat(193)}`]);
+    expect(one.targets[0]!.length).toBe(200);
+    expect(one.targets[0]).not.toMatch(/\u202E/);
+    // Nine targets: the first eight; a non-string entry is dropped.
+    const nine = parseJobStatus({ ...raw, targets: Array.from({ length: 9 }, (_, i) => `http://a${i}.test`) })!;
+    expect(nine.targets).toHaveLength(8);
+    expect(nine.targets[7]).toBe('http://a7.test');
+    const mixed = parseJobStatus({ ...raw, targets: ['http://a.test', 7, null, 'http://b.test'] })!;
+    expect(mixed.targets).toEqual(['http://a.test', 'http://b.test']);
+
+    // `started_at`: out of range, negative, non-finite, fractional, a string or absent → 0; in range kept whole.
+    for (const bad of [1e300, 8.64e15 + 1, -5, Number.NaN, Number.POSITIVE_INFINITY, 1.5, '1782901920000', null, undefined]) {
+      expect(parseJobStatus({ ...raw, started_at: bad })!.started_at, String(bad)).toBe(0);
+    }
+    expect(parseJobStatus({ ...raw, started_at: 1_782_901_920_000 })!.started_at).toBe(1_782_901_920_000);
+    expect(parseJobStatus({ ...raw, started_at: 8.64e15 })!.started_at).toBe(8.64e15);
+    expect(parseJobStatus({ ...raw, started_at: 0 })!.started_at).toBe(0);
+    // `finished_at` is optional: `null`, absent, out of range or negative all read `null` (not known); in range kept whole.
+    expect(parseJobStatus({ ...raw, finished_at: null })!.finished_at).toBeNull();
+    expect(parseJobStatus({ ...raw, finished_at: 1e300 })!.finished_at).toBeNull();
+    expect(parseJobStatus({ ...raw, finished_at: 8.64e15 + 1 })!.finished_at).toBeNull();
+    expect(parseJobStatus({ ...raw, finished_at: -1 })!.finished_at).toBeNull();
+    expect(parseJobStatus({ ...raw, finished_at: 0 })!.finished_at).toBe(0);
+    expect(parseJobStatus({ ...raw, finished_at: 1_782_901_984_000 })!.finished_at).toBe(1_782_901_984_000);
+
+    // The fixture's targets are under the cap and its stamps in range: they read as before.
+    const same = parseJobStatus(raw)!;
+    expect(same.targets).toEqual(raw.targets);
+    expect(same.started_at).toBe(1_761_900_000_000);
+    expect(same.finished_at).toBeNull();
   });
 });
 

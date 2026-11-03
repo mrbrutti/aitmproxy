@@ -137,6 +137,10 @@ export type L4Transport = (typeof L4_TRANSPORTS)[number];
 export const CRAWL_STRATEGIES = ['fast', 'normal', 'thorough'] as const;
 export type CrawlStrategy = (typeof CRAWL_STRATEGIES)[number];
 
+/** Why an all-failing client crawl failed (`CrawlCounters.last_error`, job.rs `CrawlErrorKind`). */
+export const CRAWL_ERROR_KINDS = ['h2_not_negotiated', 'connect_refused', 'tls', 'timeout', 'transport', 'other'] as const;
+export type CrawlErrorKind = (typeof CRAWL_ERROR_KINDS)[number];
+
 export const USE_BROWSER = ['auto', 'always', 'never'] as const;
 export type UseBrowser = (typeof USE_BROWSER)[number];
 
@@ -201,6 +205,8 @@ export interface CrawlCounters {
   errors: number;
   /** Forms the crawler saw but did not submit (`submit_forms: false`, or a form it would not fill). Absent → 0. */
   forms_skipped: number;
+  /** Why every request of the crawl failed, when it did. Absent or an unknown token → `null`. */
+  last_error: CrawlErrorKind | null;
 }
 
 export interface SkippedPoints {
@@ -216,10 +222,25 @@ export interface PointCounters {
   skipped: SkippedPoints;
 }
 
+/** One sampled check `error` (or skip): which check, the first point it hit, and its detail. */
+export interface CheckErrorSample {
+  check: string;
+  point: string;
+  detail: string;
+}
+
 export interface CheckCounters {
   scheduled: number;
   done: number;
   running: string[];
+  /** Checks that ended in an `error` verdict. Absent → 0. */
+  errors: number;
+  /** The engine keeps the first few distinct `(check, detail)` pairs. Absent → `[]`. */
+  error_samples: CheckErrorSample[];
+  /** Checks skipped (a lane that hosts nothing, a point the check does not fit). Absent → 0. */
+  skipped: number;
+  /** Samples of the skips, apart from the errors so a skip never reads as a failure. Absent → `[]`. */
+  skipped_samples: CheckErrorSample[];
 }
 
 export interface IssueCounters {
@@ -657,6 +678,53 @@ export interface JobNotification {
 /** The engine's own page ceiling; also the bound on anything we allocate from one payload. */
 const MAX_LIST = 1024;
 
+/**
+ * Hostile-core bounds for the Jobs view (spec D1 amendment, web AC1b; the Kit's `ScanWire` caps and
+ * the TUI's `bound_status`). A status is drawn one row per sample, so every string it carries is
+ * cleaned and cut at decode and every sampled list is cut to the engine's own cap of 8.
+ */
+/** The cap on an error text, a sample field, a skipped reason, a running check id. */
+export const STR_MAX = 400;
+/** The cap on a profile name, a client label, a clamped field. */
+export const TOKEN_MAX = 64;
+/** The cap on one target origin (the Kit's `ScanWire.targetMax`); the list holds `MAX_SAMPLES`. */
+export const TARGET_MAX = 200;
+/** The engine's cap on `error_samples`, `skipped_samples` and `checks.running`; held against `lanes.skipped`, `clamped` and `targets` too. */
+export const MAX_SAMPLES = 8;
+/** The largest millisecond stamp a `Date` can hold (±8.64e15; the wire's stamps are epoch ms, so only the positive side). */
+export const STAMP_MAX = 8.64e15;
+
+/** Control, format, line and paragraph separator scalars: none of them belongs in a row. */
+const UNPRINTABLE = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
+
+/**
+ * `v` as a string with `UNPRINTABLE` scalars dropped and cut to `max` code points (not UTF-16
+ * units, so an astral scalar is never split); `''` for a non-string. The strings of a status that a
+ * Jobs row prints go through here, never `str`; `helpers.ts` cleans its own labels with it too (gap 79).
+ */
+export function boundedStr(v: unknown, max: number): string {
+  if (typeof v !== 'string') return '';
+  const clean = v.replace(UNPRINTABLE, '');
+  let end = 0;
+  let n = 0;
+  for (const ch of clean) {
+    if (n === max) break;
+    end += ch.length;
+    n += 1;
+  }
+  return end === clean.length ? clean : clean.slice(0, end);
+}
+
+/** `boundedStr`, keeping an absent or non-string value as `null`. */
+function boundedOptStr(v: unknown, max: number): string | null {
+  return typeof v === 'string' ? boundedStr(v, max) : null;
+}
+
+/** The first `MAX_SAMPLES` strings of a list, each bounded to `max`; a non-string item is dropped. */
+function boundedStrList(v: unknown, max: number): string[] {
+  return rows(v, (x) => (typeof x === 'string' ? boundedStr(x, max) : null), MAX_SAMPLES);
+}
+
 type Dict = Record<string, unknown>;
 
 /** A plain object, or `null`. An array is not an object here: it means a drifted contract. */
@@ -713,6 +781,20 @@ function num(v: unknown, fallback = 0): number {
 
 function optNum(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+/**
+ * A millisecond stamp the Jobs view puts through `clock`: an integer in `0 … STAMP_MAX`, or `0`
+ * (the card's "unknown", read as `started —`). `num` alone would pass a finite `1e300`, which no
+ * `Date` holds and the clock would print as `00:00`.
+ */
+function stamp(v: unknown): number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= STAMP_MAX ? v : 0;
+}
+
+/** `stamp` for an optional one: a stamp `stamp` would reject, like an absent value, is `null` (not known). */
+function optStamp(v: unknown): number | null {
+  return typeof v === 'number' && stamp(v) === v ? v : null;
 }
 
 /** A finite number of either sign: a regression slope or a correlation coefficient. */
@@ -843,6 +925,7 @@ function crawlCounters(v: unknown): CrawlCounters {
     forms_submitted: num(o.forms_submitted),
     errors: num(o.errors),
     forms_skipped: num(o.forms_skipped),
+    last_error: token(CRAWL_ERROR_KINDS, o.last_error),
   };
 }
 
@@ -857,9 +940,28 @@ function pointCounters(v: unknown): PointCounters {
   };
 }
 
+/** A sample is `#[serde(default)]` on the engine: a missing key reads `''`; a non-object is dropped. */
+function checkErrorSample(v: unknown): CheckErrorSample | null {
+  const o = dict(v);
+  if (!o) return null;
+  return {
+    check: boundedStr(o.check, STR_MAX),
+    point: boundedStr(o.point, STR_MAX),
+    detail: boundedStr(o.detail, STR_MAX),
+  };
+}
+
 function checkCounters(v: unknown): CheckCounters {
   const o = dict(v) ?? {};
-  return { scheduled: num(o.scheduled), done: num(o.done), running: strList(o.running) };
+  return {
+    scheduled: num(o.scheduled),
+    done: num(o.done),
+    running: boundedStrList(o.running, STR_MAX),
+    errors: num(o.errors),
+    error_samples: rows(o.error_samples, checkErrorSample, MAX_SAMPLES),
+    skipped: num(o.skipped),
+    skipped_samples: rows(o.skipped_samples, checkErrorSample, MAX_SAMPLES),
+  };
 }
 
 function issueCounters(v: unknown): IssueCounters {
@@ -908,7 +1010,7 @@ function skippedLane(v: unknown): SkippedLane | null {
   if (!o) return null;
   const lane = token(LANES, o.lane);
   if (lane === null) return null;
-  return { lane, reason: str(o.reason) };
+  return { lane, reason: boundedStr(o.reason, STR_MAX) };
 }
 
 function laneReport(v: unknown): LaneReport {
@@ -916,21 +1018,23 @@ function laneReport(v: unknown): LaneReport {
   return {
     requested: tokenList(LANES, o.requested),
     run: tokenList(LANES, o.run),
-    skipped: rows(o.skipped, skippedLane),
+    skipped: rows(o.skipped, skippedLane, MAX_SAMPLES),
   };
 }
 
 function clamped(v: unknown): Clamped | null {
   const o = dict(v);
   if (!o) return null;
-  const field = reqStr(o.field);
+  // Bounded first: a field that is nothing but unprintable scalars would render blank, so it is
+  // dropped like a missing one.
+  const field = reqStr(boundedStr(o.field, TOKEN_MAX));
   if (field === null) return null;
   return { field, requested: num(o.requested), applied: num(o.applied) };
 }
 
 function startedBy(v: unknown): StartedBy {
   const o = dict(v) ?? {};
-  return { frontend: str(o.frontend), client_label: optStr(o.client_label) };
+  return { frontend: str(o.frontend), client_label: boundedOptStr(o.client_label, TOKEN_MAX) };
 }
 
 /* ------------------------------------------------------------------ job parsers */
@@ -947,11 +1051,11 @@ export function parseJobStatus(raw: unknown): JobStatus | null {
     job,
     state,
     phase,
-    profile_name: str(o.profile_name),
-    targets: strList(o.targets),
+    profile_name: boundedStr(o.profile_name, TOKEN_MAX),
+    targets: boundedStrList(o.targets, TARGET_MAX),
     started_by: startedBy(o.started_by),
-    started_at: num(o.started_at),
-    finished_at: optNum(o.finished_at),
+    started_at: stamp(o.started_at),
+    finished_at: optStamp(o.finished_at),
     elapsed_ms: num(o.elapsed_ms),
     stopped_reason: token(STOPPED_REASONS, o.stopped_reason),
     probes: probeCounters(o.probes),
@@ -962,8 +1066,8 @@ export function parseJobStatus(raw: unknown): JobStatus | null {
     l4: l4Counters(o.l4),
     session: sessionStatus(o.session),
     lanes: laneReport(o.lanes),
-    clamped: rows(o.clamped, clamped),
-    error: optStr(o.error),
+    clamped: rows(o.clamped, clamped, MAX_SAMPLES),
+    error: boundedOptStr(o.error, STR_MAX),
   };
 }
 
@@ -996,7 +1100,7 @@ export function parseStartResult(raw: unknown): StartResult | null {
   return {
     job,
     status,
-    clamped: rows(o.clamped, clamped),
+    clamped: rows(o.clamped, clamped, MAX_SAMPLES),
     lanes: laneReport(o.lanes),
     // The key is absent for a profile with no L4 lane, and absent is not `false`.
     ...(typeof o.dry_run === 'boolean' ? { dry_run: o.dry_run } : {}),
