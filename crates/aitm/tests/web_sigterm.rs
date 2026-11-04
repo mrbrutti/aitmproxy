@@ -192,9 +192,11 @@ fn web_on_a_terminal_in_a_background_group_is_not_stopped_and_exits_on_sigterm()
     let joined = run.said().join("\n");
 
     // (a) The withheld-transport note; (g) the signal arm, and no EOF note.
-    assert!(
-        joined.contains(WEB_STDIO_TTY_NOTE),
-        "the log lacks the withheld-transport note {WEB_STDIO_TTY_NOTE:?}:\n{}",
+    let notes = joined.matches(WEB_STDIO_TTY_NOTE).count();
+    assert_eq!(
+        notes,
+        1,
+        "the withheld-transport note {WEB_STDIO_TTY_NOTE:?} must appear exactly once (spec D2, G4); seen {notes} times:\n{}",
         mask_link_tokens(&joined)
     );
     assert!(
