@@ -1439,4 +1439,68 @@ import Testing
         #expect(s.tooltip.split(separator: "\n", omittingEmptySubsequences: false).count == 3)
         #expect(make(core: core(.starting, proxy: "127.0.0.1:8081")).coreAddressShown == false)
     }
+
+    /// Tester — the pill's dot follows `core.state`, not `overall`: with the fallback and a failed bus the core lane
+    /// is still `.warning` and still carries the fact (address shown, four tooltip lines), while `overall`/`worst`
+    /// name the bus (`.error` outranks `.warning`). The fallback never masks a worse lane and a worse lane never
+    /// hides the fallback.
+    @Test func aWorseLaneStillOutranksTheFallbackAndTheFallbackStays() {
+        let s = make(core: core(.ready, proxy: "127.0.0.1:8081"), bus: .failed("connection refused"), role: "operator")
+        #expect(s.core.state == .warning)
+        #expect(s.core.remedy == fallbackRemedy)
+        #expect(s.portFallback == ListenPortFallback(preferred: 8080, bound: 8081))
+        #expect(s.coreAddressShown == true)
+        #expect(s.overall == .error)
+        #expect(s.worst.kind == .bus)
+        #expect(s.tooltip.hasSuffix("\n" + fallbackNotice))
+        #expect(s.tooltip.split(separator: "\n", omittingEmptySubsequences: false).count == 4)
+    }
+
+    /// Tester — `coreAddressShown` (spec D3) is true for exactly the `.ok` lane and the fallback lane: every other
+    /// embedded status with the same mismatched address, and no core at all, keep the pill's ` · core <word>`
+    /// branch. The `coreRunning` step widening (D3, "the step is true") is tied to the fallback, not to the address
+    /// mismatch: a failed or stopped core on 8081 is still "Start the core" with no detail.
+    @Test func coreAddressShownIsFalseForEveryStateButReadyAndTheFallback() {
+        for status in [CoreConnection.Status.connecting, .degraded(reason: "exited with status 1"), .stopped] {
+            let s = make(core: core(status, proxy: "127.0.0.1:8081"), bus: .connected("x"), role: "operator")
+            #expect(s.coreAddressShown == false, "\(status)")
+            #expect(s.portFallback == nil, "\(status)")
+            #expect(step(s, .coreRunning)?.done == false, "\(status)")
+            #expect(step(s, .coreRunning)?.title == "Start the core", "\(status)")
+            #expect(step(s, .coreRunning)?.detail == nil, "\(status)")
+            #expect(s.tooltip.split(separator: "\n", omittingEmptySubsequences: false).count == 3, "\(status)")
+        }
+        let none = make(core: nil, bus: .connected("x"), role: "operator")
+        #expect(none.coreAddressShown == false)
+        #expect(none.portFallback == nil)
+        #expect(step(none, .coreRunning)?.done == false)
+        // The contrast: the same address under `.ready` is the one case that is shown and done.
+        let falling = make(core: core(.ready, proxy: "127.0.0.1:8081"), bus: .connected("x"), role: "operator")
+        #expect(falling.coreAddressShown == true)
+        #expect(step(falling, .coreRunning)?.done == true)
+        #expect(step(falling, .coreRunning)?.title == "Core is running")
+    }
+
+    /// Tester — the fact survives an IPv6 bound address end to end (the parse reads the port after the last colon):
+    /// the lane detail quotes the address as bound and the words interpolate the ports, not the host.
+    @Test func theFallbackHoldsForABracketedIPv6BoundAddress() {
+        let s = make(core: core(.ready, proxy: "[::1]:8081"), bus: .connected("x"), role: "operator")
+        #expect(s.portFallback == ListenPortFallback(preferred: 8080, bound: 8081))
+        #expect(s.core.state == .warning)
+        #expect(s.core.detail == "Embedded · proxy [::1]:8081")
+        #expect(s.core.remedy == fallbackRemedy)
+        #expect(step(s, .coreRunning)?.detail == fallbackNotice)
+        #expect(make(core: core(.ready, proxy: "[::1]:8080"), bus: .connected("x"), role: "operator").portFallback == nil)
+    }
+
+    /// Tester — D3 adds the notice to the tooltip only: the spoken accessibility sentence keeps its three clauses
+    /// and the lane word `running` (MAC-1 pins the word), so VoiceOver reads the same sentence as a healthy core
+    /// and the tooltip is the place that says why the dot is amber.
+    @Test func theSpokenSentenceIsUnchangedWhileFallingBack() {
+        let falling = make(core: core(.ready, proxy: "127.0.0.1:8081"), bus: .connected("x"), role: "operator")
+        let plain = make(core: core(.ready), bus: .connected("x"), role: "operator")
+        #expect(falling.spoken == plain.spoken)
+        #expect(falling.spoken == "core: running, bus: connected, all apps off")
+        #expect(!falling.spoken.contains("was busy"))
+    }
 }

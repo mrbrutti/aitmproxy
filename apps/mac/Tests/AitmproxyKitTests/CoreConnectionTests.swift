@@ -209,4 +209,32 @@ import Testing
         #expect(cleared.portFallback == nil)
         #expect(cleared != a)
     }
+
+    /// Tester — the parse behind AC1 on the address shapes the core can bind (spec D2: "the port after the last
+    /// colon"): a bracketed IPv6 address keeps its port, a matching IPv6 port is no fallback, and a string with no
+    /// port after its last colon (bracketed host alone, trailing colon, empty, trailing space) is unknown → nil.
+    @Test func port_fallback_reads_the_port_after_the_last_colon_for_ipv6_and_edge_shapes() {
+        #expect(embedded(proxyAddress: "[::1]:8081", appliedPort: 8080).portFallback
+            == ListenPortFallback(preferred: 8080, bound: 8081))
+        #expect(embedded(proxyAddress: "[::1]:8080", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "0.0.0.0:8081", appliedPort: 8080).portFallback
+            == ListenPortFallback(preferred: 8080, bound: 8081))
+        #expect(embedded(proxyAddress: "[::1]", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "127.0.0.1:", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "127.0.0.1:8081 ", appliedPort: 8080).portFallback == nil)
+        // The helper itself, so a change of parse is a deliberate one.
+        #expect(ListenPortFallback.port(from: "127.0.0.1:8081") == 8081)
+        #expect(ListenPortFallback.port(from: "[::1]:8081") == 8081)
+        #expect(ListenPortFallback.port(from: "[::1]") == nil)
+        #expect(ListenPortFallback.port(from: "127.0.0.1") == nil)
+        #expect(ListenPortFallback.port(from: "127.0.0.1:") == nil)
+    }
+
+    /// Tester — AC1's "non-ready status gives nil" for the two statuses D9 does not list: `.connecting` and
+    /// `.stopped` with a mismatched address are nil too, so a core that is coming up or gone never says "was busy".
+    @Test func port_fallback_is_nil_while_connecting_and_when_stopped() {
+        #expect(embedded(status: .connecting, proxyAddress: "127.0.0.1:8081", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(status: .stopped, proxyAddress: "127.0.0.1:8081", appliedPort: 8080).portFallback == nil)
+    }
 }
