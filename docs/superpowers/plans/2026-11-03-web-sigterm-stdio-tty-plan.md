@@ -467,6 +467,7 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 2 | orchestrator (stage 5 evidence) | note | The pre-fix red on main 1e891779 + `web_sigterm.rs` did not land at AC1 (b) as planned: with `set -m`, bash's `wait $!` returns as soon as the job is **stopped**, so the relay printed `EXIT 149` (128 + SIGTTIN = the stop itself) and exited, the pty session ended, the kernel sent SIGHUP+SIGCONT to the orphaned stopped group and the test panicked one step earlier with `aitm web (pid 86508) is gone before the signal` followed by the relayed output ending in `EXIT 149`. Same mechanism, earlier observation. Post-fix on 50ea08a3: both tests `ok` (`/tmp/claude/web-sigterm-redgreen.out`). | recorded; no code change (the test fails pre-fix and passes post-fix for the right reason) |
 
 ## Shipped
 
