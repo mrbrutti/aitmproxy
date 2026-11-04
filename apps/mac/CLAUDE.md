@@ -7,6 +7,7 @@ SwiftData database and no server.
 
 - `Sources/Aitmproxy/` the app. `App.swift` has the window, menus, and the database location.
 - `Sources/Aitmproxy/Quit.swift` the quit helper: `Quit.endSheetsAndTerminate()` ends open sheets and then calls `NSApp.terminate`, reached from the replaced Quit command and the quit Apple event handler in `App.swift`, so Quit is never refused by an attached sheet.
+- `Sources/AitmproxyKit/ListenPortFallback.swift` the listen-port fallback fact (`Port 8080 was busy; listening on 8081`), derived by `CoreConnection.portFallback` and printed by `ConnectionSummary` as the one sentence on every surface that names the listener (pill tooltip, Status lane remedy, Settings ▸ Proxy, Getting Started step).
 - `Sources/AitmproxyKit/` rules and data logic with no SwiftUI. Tests in `Tests/AitmproxyKitTests/`.
 - `Package.swift` a Swift package. There is no Xcode project.
 - `build.sh` builds, signs, and installs `~/Applications/Aitmproxy.app`. Only `--ne` builds the Network Extension and installs to `/Applications`.

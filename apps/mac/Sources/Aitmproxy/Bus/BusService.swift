@@ -375,6 +375,9 @@ final class BusService: FlowActions {
     /// `proxy.status` → `Session.capturing` and `Session.interceptArmed`: both are the core's
     /// facts (another client can pause or arm), so the Proxy switch and the pill's "intercept
     /// armed" follow the core, not this client's memory. A core without the verb leaves both alone.
+    /// `address` → `Session.listenAddress` on every poll (listen-port fallback spec D6): the running
+    /// core's bound address replaces the `config.yaml` read from connect time, written before the
+    /// `system_proxy` parse so `effectiveListenAddress` is fresh for the facts on the same tick.
     private func refreshProxyStatus() async {
         guard let client, let status = try? await client.call("proxy.status") else { return }
         if let capturing = status["capturing"]?.boolValue, capturing != session.capturing {
@@ -387,6 +390,9 @@ final class BusService: FlowActions {
         // notifies even when the value is equal, and every route surface reads it.
         let decrypt = status["decrypt"].flatMap(DecryptStatus.init)
         if session.decrypt != decrypt { session.decrypt = decrypt }
+        if let address = status["address"]?.stringValue, !address.isEmpty, address != session.listenAddress {
+            session.listenAddress = address
+        }
         // `system_proxy` (system-proxy spec D6, D13 "Facts in"): the verb's compact object, read against the
         // address the summary compares the services with; the endpoint half follows it (nil = unknown,
         // never off). Absent on an older core → nil, which the route model reads as "no verb on this bus".

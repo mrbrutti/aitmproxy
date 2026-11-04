@@ -272,8 +272,16 @@ public struct ConnectionSummary: Hashable, Sendable {
     public let routes: TrafficRoutes
     /// The proxy address clients point at; the last step quotes it.
     public let listenAddress: String
+    /// The embedded core bound a port other than the preferred one (`CoreConnection.portFallback`); nil for an
+    /// external active kind whatever the connection says (spec 2026-11-03-mac-listen-port-fallback-notice-design
+    /// D3). The core lane's remedy, the tooltip's fourth line and the `coreRunning` step's detail print its words.
+    public let portFallback: ListenPortFallback?
 
     public var lanes: [ConnectionLane] { [core, bus, capture] }
+
+    /// Whether the toolbar pill draws the bound address: the ok lane as before, and the `.warning` fallback lane
+    /// (the core is running, on another port). Every other state keeps the ` · core <word>` branch.
+    public var coreAddressShown: Bool { core.state == .ok || portFallback != nil }
 
     /// The worst lane state.
     public var overall: LaneState { lanes.map(\.state).max() ?? .ok }
@@ -283,9 +291,11 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     public var allStepsDone: Bool { steps.allSatisfy(\.done) }
 
-    /// The three lanes in one line, for tooltips: "Core: running — Embedded · proxy …\nBus: …".
+    /// The three lanes in one line, for tooltips: "Core: running — Embedded · proxy …\nBus: …"; a fourth line,
+    /// the fallback notice, only while the embedded core is on a port other than the preferred one.
     public var tooltip: String {
-        lanes.map { "\($0.kind.title): \($0.word) — \($0.detail)" }.joined(separator: "\n")
+        let lines = lanes.map { "\($0.kind.title): \($0.word) — \($0.detail)" }
+        return (lines + [portFallback?.notice].compactMap { $0 }).joined(separator: "\n")
     }
 
     /// The three lanes as one spoken sentence, for accessibility labels.
@@ -338,6 +348,7 @@ public struct ConnectionSummary: Hashable, Sendable {
         decrypt: DecryptStatus? = nil
     ) -> ConnectionSummary {
         let core = coreLane(connection, activeKind: activeKind, bus: bus)
+        let portFallback = activeKind == .embedded ? connection?.portFallback : nil
         let busLane = self.busLane(bus, role: role, roleWarning: roleWarning, activeKind: activeKind, core: connection)
         let advice = CaptureAdvice.make(capability: capability, supported: captureSupported, scopeHostCount: scopeHostCount)
         let capture = captureLane(advice, capability: capability, activeKind: activeKind,
@@ -350,8 +361,9 @@ public struct ConnectionSummary: Hashable, Sendable {
                                  bus: busLane, scopeHostCount: scopeHostCount, flowCount: flowCount,
                                  tunnelledFlowCount: tunnelledFlowCount, decrypt: decrypt, listenAddress: listenAddress)
         let steps = self.steps(core: core, bus: busLane, activeKind: activeKind, advice: advice, allApps: allApps, routes: routes,
-                               caTrust: caTrust, flowCount: flowCount, listenAddress: listenAddress)
-        return ConnectionSummary(core: core, bus: busLane, capture: capture, steps: steps, routes: routes, listenAddress: listenAddress)
+                               caTrust: caTrust, flowCount: flowCount, listenAddress: listenAddress, portFallback: portFallback)
+        return ConnectionSummary(core: core, bus: busLane, capture: capture, steps: steps, routes: routes,
+                                 listenAddress: listenAddress, portFallback: portFallback)
     }
 
     // MARK: Lanes
@@ -375,6 +387,12 @@ public struct ConnectionSummary: Hashable, Sendable {
         let address = connection.proxyAddress.map { "Embedded · proxy \($0)" } ?? "Embedded core"
         switch connection.status {
         case .ready:
+            // Bound a port other than the preferred one: the same word and detail (the core is running, there),
+            // under a warning with the one sentence and what Restart Core does about it.
+            if let fallback = connection.portFallback {
+                return ConnectionLane(kind: .core, state: .warning, word: "running", detail: address,
+                                      remedy: fallback.remedy, actions: [.restartCore, .showCoreLog])
+            }
             return ConnectionLane(kind: .core, state: .ok, word: "running", detail: address,
                                   actions: [.restartCore, .showCoreLog])
         case .starting, .connecting:
@@ -647,14 +665,16 @@ public struct ConnectionSummary: Hashable, Sendable {
     /// and detail are the step's. `advice` picks the step's action, which differs from the route's button.
     private static func steps(core: ConnectionLane, bus: ConnectionLane, activeKind: ActiveCoreKind, advice: CaptureAdvice,
                               allApps: TrafficRoute?, routes: TrafficRoutes, caTrust: CATrustFacts?, flowCount: Int,
-                              listenAddress: String) -> [GettingStartedStep] {
-        // An external core is the operator's; it counts as running once the bus reaches it.
-        let coreDone = core.state == .ok || (activeKind == .external && bus.state == .ok)
+                              listenAddress: String, portFallback: ListenPortFallback?) -> [GettingStartedStep] {
+        // An external core is the operator's; it counts as running once the bus reaches it. A core on its fallback
+        // port is running too (the lane warns, but the step is true); the notice goes in the row's detail.
+        let coreDone = core.state == .ok || portFallback != nil || (activeKind == .external && bus.state == .ok)
         let busDone = bus.state == .ok
         var steps = [
             GettingStartedStep(kind: .coreRunning,
                                title: coreDone ? "Core is running" : "Start the core",
-                               done: coreDone, action: coreDone ? nil : core.actions.first),
+                               done: coreDone, action: coreDone ? nil : core.actions.first,
+                               detail: portFallback?.notice),
             GettingStartedStep(kind: .busConnected,
                                title: busDone ? "Bus connected" : "Connect to the bus",
                                done: busDone, action: busDone ? nil : bus.actions.first),
