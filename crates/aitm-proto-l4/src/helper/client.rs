@@ -392,12 +392,20 @@ impl Shared {
     /// Mark the session closed with `reason` (first close wins), fail every
     /// inject waiter with [`SessionError::Closed`] and end every capture
     /// subscription with a `Closed` event.
+    ///
+    /// The reason is written before `closed` is raised, so a caller that
+    /// observes [`Shared::is_closed`] always finds the reason set; the reason
+    /// lock doubles as the first-close guard.
     fn close(&self, reason: SessionError) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
         let text = format!("helper session closed: {reason}");
-        *lock(&self.reason) = Some(reason);
+        {
+            let mut slot = lock(&self.reason);
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(reason);
+            self.closed.store(true, Ordering::Release);
+        }
         for (_, tx) in lock(&self.pending).drain() {
             let _ = tx.send(Err(SessionError::Closed));
         }
@@ -1046,6 +1054,27 @@ mod tests {
             Some(SessionError::UnexpectedMessage("CaptureOpen"))
         );
         assert_eq!(read_msg(&mut peer), Err(ProtoError::Eof));
+    }
+
+    #[test]
+    fn close_reason_is_set_before_closed_is_observable() {
+        // Regression: `close` once raised `closed` before writing the reason,
+        // so a reader that saw `is_closed()` could still read `None`.
+        for _ in 0..2_000 {
+            let shared = Arc::new(Shared::new());
+            let closer = {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || shared.close(SessionError::Proto(ProtoError::Eof)))
+            };
+            while !shared.is_closed() {
+                std::hint::spin_loop();
+            }
+            assert_eq!(
+                lock(&shared.reason).clone(),
+                Some(SessionError::Proto(ProtoError::Eof))
+            );
+            closer.join().expect("closer thread");
+        }
     }
 
     #[test]
