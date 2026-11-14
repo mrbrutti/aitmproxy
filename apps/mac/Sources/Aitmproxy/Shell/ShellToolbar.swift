@@ -68,7 +68,7 @@ struct ListeningPill: View {
                 HStack(spacing: Tok.Metric.gapTight) {
                     Circle().fill(summary.core.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
                     Text("aitmproxy").fontWeight(.medium).foregroundStyle(Tok.Ink.primary.color)
-                    if summary.core.state == .ok {
+                    if summary.coreAddressShown {
                         Text(session.capturing ? " · " : " · paused ")
                         Text(session.coreHealth.connection?.proxyAddress ?? session.listenAddress)
                             .font(Tok.Face.data(Tok.Typography.Size.sm, .medium))

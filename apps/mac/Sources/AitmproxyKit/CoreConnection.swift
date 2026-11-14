@@ -86,6 +86,22 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
     public var appliedSystemProxyAuto: Bool?
     public var appliedSystemProxyBypass: String?
 
+    /// The listen-port fallback this embedded core is running under, or nil when there is none to report.
+    ///
+    /// Non-nil only when the core is embedded and ready, `appliedPort` (the preferred port) is known, `proxyAddress`
+    /// carries a port, and the two differ. Derived from the stored fields, so it takes no part in `Hashable`, a
+    /// crash-restart's fresh `.ready` (which re-picks the port) recomputes it, and a successful Restart Core on the
+    /// preferred port clears it (spec 2026-11-03-mac-listen-port-fallback-notice, D2).
+    public var portFallback: ListenPortFallback? {
+        guard kind == .embedded, status == .ready,
+              let preferred = appliedPort,
+              let address = proxyAddress,
+              let bound = ListenPortFallback.port(from: address),
+              bound != preferred
+        else { return nil }
+        return ListenPortFallback(preferred: preferred, bound: bound)
+    }
+
     public init(
         id: CoreID = CoreID(),
         kind: Kind,

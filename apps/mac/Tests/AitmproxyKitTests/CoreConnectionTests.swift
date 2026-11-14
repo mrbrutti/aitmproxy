@@ -149,4 +149,92 @@ import Testing
         #expect(registry.connection(for: applied.id)?.appliedSystemProxyAuto == true)
         #expect(registry.connection(for: applied.id)?.appliedSystemProxyBypass == "corp.test, *.local")
     }
+
+    // MARK: - Listen-port fallback (spec 2026-11-03-mac-listen-port-fallback-notice, D1/D2; AC1, AC2)
+
+    /// An embedded, ready connection with every field the fallback derivation reads.
+    private func embedded(
+        kind: CoreConnection.Kind = .embedded,
+        status: CoreConnection.Status = .ready,
+        proxyAddress: String?,
+        appliedPort: Int?
+    ) -> CoreConnection {
+        CoreConnection(id: CoreID(rawValue: "embedded"), kind: kind, endpoint: endpoint(port: 9001),
+                       status: status, label: "Embedded core", proxyAddress: proxyAddress, appliedPort: appliedPort)
+    }
+
+    /// AC1: the fact exists only when an embedded, ready core bound a port other than its applied preferred port.
+    @Test func port_fallback_is_the_fact_when_an_embedded_ready_core_bound_another_port() {
+        let c = embedded(proxyAddress: "127.0.0.1:8081", appliedPort: 8080)
+        #expect(c.portFallback == ListenPortFallback(preferred: 8080, bound: 8081))
+        #expect(c.portFallback?.preferred == 8080)
+        #expect(c.portFallback?.bound == 8081)
+    }
+
+    /// AC1: every unknown, a match, a non-embedded kind, or a non-ready status gives nil.
+    @Test func port_fallback_is_nil_without_a_mismatch_or_a_known_pair() {
+        #expect(embedded(proxyAddress: "127.0.0.1:8080", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "127.0.0.1:8081", appliedPort: nil).portFallback == nil)
+        #expect(embedded(proxyAddress: nil, appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "127.0.0.1", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(kind: .external, proxyAddress: "127.0.0.1:8081", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(status: .starting, proxyAddress: "127.0.0.1:8081", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(status: .degraded(reason: "x"), proxyAddress: "127.0.0.1:8081", appliedPort: 8080)
+            .portFallback == nil)
+    }
+
+    /// AC2: the three strings are the spec literals; the interpolation is pinned on the live-proof numbers too.
+    @Test func port_fallback_words_are_the_spec_literals() {
+        let f = ListenPortFallback(preferred: 8080, bound: 8081)
+        #expect(f.notice == "Port 8080 was busy; listening on 8081")
+        #expect(f.restartTitle == "Restart on 8080")
+        #expect(f.remedy == "Port 8080 was busy; listening on 8081 — Restart Core tries 8080 again")
+        let live = ListenPortFallback(preferred: 18090, bound: 18091)
+        #expect(live.notice == "Port 18090 was busy; listening on 18091")
+        #expect(live.restartTitle == "Restart on 18090")
+        #expect(live.remedy == "Port 18090 was busy; listening on 18091 — Restart Core tries 18090 again")
+    }
+
+    /// `portFallback` is derived from the stored fields, so two connections equal in every stored field stay `==`
+    /// (the registry dirty-check and `Set` behave as before) and it recomputes when the fields change.
+    @Test func port_fallback_does_not_take_part_in_equality() {
+        let a = embedded(proxyAddress: "127.0.0.1:8081", appliedPort: 8080)
+        let b = embedded(proxyAddress: "127.0.0.1:8081", appliedPort: 8080)
+        #expect(a == b)
+        #expect(a.hashValue == b.hashValue)
+        #expect(Set([a, b]).count == 1)
+        #expect(a.portFallback != nil)
+        var cleared = a
+        cleared.proxyAddress = "127.0.0.1:8080"
+        #expect(cleared.portFallback == nil)
+        #expect(cleared != a)
+    }
+
+    /// Tester — the parse behind AC1 on the address shapes the core can bind (spec D2: "the port after the last
+    /// colon"): a bracketed IPv6 address keeps its port, a matching IPv6 port is no fallback, and a string with no
+    /// port after its last colon (bracketed host alone, trailing colon, empty, trailing space) is unknown → nil.
+    @Test func port_fallback_reads_the_port_after_the_last_colon_for_ipv6_and_edge_shapes() {
+        #expect(embedded(proxyAddress: "[::1]:8081", appliedPort: 8080).portFallback
+            == ListenPortFallback(preferred: 8080, bound: 8081))
+        #expect(embedded(proxyAddress: "[::1]:8080", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "0.0.0.0:8081", appliedPort: 8080).portFallback
+            == ListenPortFallback(preferred: 8080, bound: 8081))
+        #expect(embedded(proxyAddress: "[::1]", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "127.0.0.1:", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(proxyAddress: "127.0.0.1:8081 ", appliedPort: 8080).portFallback == nil)
+        // The helper itself, so a change of parse is a deliberate one.
+        #expect(ListenPortFallback.port(from: "127.0.0.1:8081") == 8081)
+        #expect(ListenPortFallback.port(from: "[::1]:8081") == 8081)
+        #expect(ListenPortFallback.port(from: "[::1]") == nil)
+        #expect(ListenPortFallback.port(from: "127.0.0.1") == nil)
+        #expect(ListenPortFallback.port(from: "127.0.0.1:") == nil)
+    }
+
+    /// Tester — AC1's "non-ready status gives nil" for the two statuses D9 does not list: `.connecting` and
+    /// `.stopped` with a mismatched address are nil too, so a core that is coming up or gone never says "was busy".
+    @Test func port_fallback_is_nil_while_connecting_and_when_stopped() {
+        #expect(embedded(status: .connecting, proxyAddress: "127.0.0.1:8081", appliedPort: 8080).portFallback == nil)
+        #expect(embedded(status: .stopped, proxyAddress: "127.0.0.1:8081", appliedPort: 8080).portFallback == nil)
+    }
 }

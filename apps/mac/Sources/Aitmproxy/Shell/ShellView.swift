@@ -251,7 +251,7 @@ struct MainView: View {
                              onCompose: { session.openCompose() })
         .overlay {
             if session.visibleRows.isEmpty {
-                EmptyFlows(filtered: !session.rows.isEmpty, listen: session.listenAddress, routes: routes.advice,
+                EmptyFlows(filtered: !session.rows.isEmpty, listen: session.effectiveListenAddress, routes: routes.advice,
                            caTrustControlLive: session.caTrustControlLive,
                            systemProxyControlLive: session.systemProxyControlLive) { action in
                     RouteActions.run(action, session: session, openSettings: openSettings)
