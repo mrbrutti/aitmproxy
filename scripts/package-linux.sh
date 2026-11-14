@@ -38,7 +38,7 @@ cd "$repo_root"
 
 tag=${OBSCURA_TAG:-aitm-v1}
 fork_repo=mrbrutti/obscura
-export MAINTAINER=${MAINTAINER:-"aitmproxy maintainers <noreply@anthropic.com>"}
+export MAINTAINER=${MAINTAINER:-"aitmproxy maintainers <matias@section9labs.com>"}
 
 # Map the Rust target triple to the obscura asset name and the nfpm arch
 # values. nfpm's `arch` field takes a GOARCH value (amd64/arm64) and emits the
